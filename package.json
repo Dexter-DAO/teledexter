@@ -3,12 +3,14 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "tsx watch src/server.ts",
-    "start": "node --import tsx src/server.ts",
-    "build": "tsc --noEmit",
+    "dev": "tsx watch src/broker/main.ts",
+    "start": "node dist/broker/main.js",
+    "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test tests/**/*.test.ts",
-    "calls": "node scripts/calls.mjs"
+    "calls": "node scripts/calls.mjs",
+    "start:legacy": "node --import tsx src/server.ts",
+    "broker": "node --import tsx scripts/broker.mts"
   },
   "dependencies": {
     "@fastify/formbody": "^8.0.2",

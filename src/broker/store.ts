@@ -1,0 +1,113 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { bindDurableFileParent, durablyReplaceJsonFile, type DurableParentBinding } from '../outbound/DurableFile.js';
+
+export type CallStatus = 'prepared' | 'dialing' | 'queued' | 'ringing' | 'in-progress' | 'completed' | 'busy' | 'no-answer' | 'canceled' | 'failed' | 'unknown';
+export const terminalCallStatuses = new Set<CallStatus>(['completed', 'busy', 'no-answer', 'canceled', 'failed']);
+export interface BrokerCall {
+  id: string; requestId: string; direction: 'inbound' | 'outbound'; purpose: string;
+  number: string; callSid?: string; streamSid?: string; status: CallStatus;
+  createdAt: string; updatedAt: string; endedAt?: string;
+  primary?: { bindingId: string; name: string | null; context: string };
+  liveSessionId?: string; transcript?: unknown; transcriptRevision?: number;
+  mediaStartedAt?: string;
+  finalized?: boolean; failure?: { code: string; message: string };
+  canonicalTurns?: Record<string, unknown>;
+  acousticSpans?: unknown;
+  primaryClosePending?: boolean;
+  callback?: { requestId: string; consentedAt: string; state: 'requested' | 'started' | 'unavailable' };
+  transcriptCapture?: {
+    state: 'pending' | 'complete';
+    assistantPlaybackComplete: boolean;
+    sessionFinalized: boolean;
+    pending: number;
+    unsupported: string[];
+  };
+  metrics?: { receivedAudioBytes: number; sentAudioBytes: number; playedAudioBytes: number; clearedAudioBytes: number };
+  delegations: Record<string, { requestId: string; status: string; updatedAt: string; result?: string }>;
+}
+
+interface State { version: 1; calls: Record<string, BrokerCall> }
+
+/** One process owns call admission. Provider dispatch always follows a durable state write. */
+export class BrokerStore {
+  private state: State;
+  private readonly file: string;
+  private readonly lock: string;
+  private readonly lockId = randomUUID();
+  private readonly parent: DurableParentBinding;
+  private closed = false;
+
+  constructor(readonly directory: string) {
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    this.file = path.join(directory, 'calls.json');
+    this.lock = path.join(directory, 'writer.lock');
+    this.parent = bindDurableFileParent(this.file);
+    try { this.acquire(); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      const previous = JSON.parse(fs.readFileSync(this.lock, 'utf8')) as { pid: number };
+      if (!Number.isInteger(previous.pid) || previous.pid < 1) throw new Error('Invalid broker writer lock');
+      try { process.kill(previous.pid, 0); throw new Error('Another broker process owns this state'); }
+      catch (probe) { if ((probe as NodeJS.ErrnoException).code !== 'ESRCH') throw probe; }
+      fs.unlinkSync(this.lock);
+      this.acquire();
+    }
+    try {
+      this.state = fs.existsSync(this.file) ? JSON.parse(fs.readFileSync(this.file, 'utf8')) : { version: 1, calls: {} };
+      if (this.state.version !== 1 || !this.state.calls || typeof this.state.calls !== 'object' || Array.isArray(this.state.calls)) throw new Error('Invalid broker call store');
+      for (const [id, call] of Object.entries(this.state.calls)) {
+        if (call.id !== id || !call.requestId || !call.number || !call.createdAt || !call.delegations) throw new Error('Invalid broker call record');
+      }
+    } catch (error) { this.close(); throw error; }
+  }
+
+  private acquire() {
+    const fd = fs.openSync(this.lock, 'wx', 0o600);
+    try { fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, id: this.lockId })); fs.fsyncSync(fd); }
+    finally { fs.closeSync(fd); }
+  }
+
+  private persist(next: State) {
+    if (this.closed) throw new Error('Broker store is closed');
+    durablyReplaceJsonFile(this.file, JSON.stringify(next), fs, this.parent);
+    this.state = next;
+  }
+
+  get(id: string): BrokerCall | undefined { const call = this.state.calls[id]; return call && structuredClone(call); }
+  bySid(sid: string): BrokerCall | undefined { return this.list().find(call => call.callSid === sid); }
+  list(): BrokerCall[] { return structuredClone(Object.values(this.state.calls)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
+
+  reserve(input: Pick<BrokerCall, 'requestId' | 'direction' | 'purpose' | 'number'> & { callSid?: string }): { call: BrokerCall; existing: boolean } {
+    const existing = this.list().find(call => call.requestId === input.requestId || (input.callSid && call.callSid === input.callSid));
+    if (existing) {
+      if (existing.number !== input.number || existing.direction !== input.direction || existing.purpose !== input.purpose || (input.callSid && existing.callSid !== input.callSid)) throw new Error('Call request identity conflicts with its saved record');
+      return { call: existing, existing: true };
+    }
+    const now = new Date().toISOString();
+    const call: BrokerCall = { id: randomUUID(), ...input, status: 'prepared', createdAt: now, updatedAt: now, delegations: {} };
+    this.persist({ version: 1, calls: { ...this.state.calls, [call.id]: call } });
+    return { call: structuredClone(call), existing: false };
+  }
+
+  update(id: string, patch: Partial<Omit<BrokerCall, 'id' | 'requestId' | 'number' | 'direction' | 'purpose' | 'createdAt'>>): BrokerCall {
+    const previous = this.state.calls[id];
+    if (!previous) throw new Error('Unknown broker call');
+    if (previous.callSid && patch.callSid && previous.callSid !== patch.callSid) throw new Error('Call SID cannot change');
+    if (patch.callSid && Object.values(this.state.calls).some(call => call.id !== id && call.callSid === patch.callSid)) throw new Error('Call SID is already bound');
+    const rank: Partial<Record<CallStatus, number>> = { prepared: 0, dialing: 1, queued: 2, ringing: 3, 'in-progress': 4 };
+    const nextPatch = { ...patch };
+    if (nextPatch.status && (terminalCallStatuses.has(previous.status) || (previous.status !== 'unknown' && ((rank[nextPatch.status] ?? 9) < (rank[previous.status] ?? -1))))) delete nextPatch.status;
+    if (nextPatch.transcriptRevision !== undefined && nextPatch.transcriptRevision < (previous.transcriptRevision ?? 0)) { delete nextPatch.transcript; delete nextPatch.transcriptRevision; }
+    const call: BrokerCall = { ...previous, ...nextPatch, updatedAt: new Date().toISOString() };
+    this.persist({ version: 1, calls: { ...this.state.calls, [id]: call } });
+    return structuredClone(call);
+  }
+
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    try { const lock = JSON.parse(fs.readFileSync(this.lock, 'utf8')); if (lock.id === this.lockId) fs.unlinkSync(this.lock); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  }
+}

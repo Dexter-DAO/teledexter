@@ -1,0 +1,114 @@
+# Broker operations
+
+The broker connects Twilio telephone audio to GPT-Live and delegates account work to Primary Dexter. It runs as one process with a durable call journal. Primary owns account authority and accepted requests.
+
+## Release state
+
+As of September 21, 2026, the integration exists in source and has local tests with injected providers. The most recent provider preflight was blocked by exhausted credits. There is no completed call proving the combined GPT-Live and Primary path.
+
+Deployment files in this repository prepare port `3213` and the `/broker/` path. Angel owns applying the nginx change after Wallet acceptance. The existing service on port `3212` and the Twilio number's current inbound configuration stay in place. A source checkout, compiled build, running process, provider configuration, and completed call are separate evidence states; record each when it is verified.
+
+The Primary ingress must be released independently. Its current admission contract permits verified outbound calls. It rejects inbound account binding with `caller_possession_required`, because caller ID alone does not establish possession. The transport's inbound handler does not make inbound account access available.
+
+Primary's waiting/question/answer continuation is outstanding. The client accepts `queued`, `running`, `completed`, `failed`, and `cancelled`. A completed result requires an identified assistant message. A missing result or an unsupported waiting state remains unresolved. Hangup ends voice delivery and closes admission after source recovery; it does not cancel work already accepted by Primary. Later transcript corrections are recorded as source revisions and do not retroactively change an admitted action.
+
+## Configuration
+
+`src/broker/main.ts` and the operator CLI load the file named by `BROKER_ENV_FILE`, falling back to `.env`. Existing process environment values take precedence. Keep production credentials outside releases in `/var/lib/dexter-broker/config/production.env`, readable only by the service owner. Load the file through the application; shell-sourcing it is unnecessary.
+
+| Variable | Required value or default |
+| --- | --- |
+| `BROKER_HOST` | Deployment pins `127.0.0.1`. |
+| `BROKER_PORT` | Deployment pins `3213`. |
+| `BROKER_PUBLIC_ORIGIN` | HTTPS origin only, normally `https://phone.dexter.cash`; no `/broker` suffix. |
+| `BROKER_STATE_DIR` | Absolute directory outside the checkout or release. Deployment uses `/var/lib/dexter-broker/state`. |
+| `BROKER_CONTROL_TOKEN` | At least 32 characters; authenticates local operator routes. |
+| `OPENAI_API_KEY` | Provider key with GPT-Live access and available credits. |
+| `BROKER_LIVE_MODEL` | `gpt-live-1`. Keep this value for the implemented voice transport. |
+| `BROKER_LIVE_VOICE` | Defaults to `marin`. |
+| `BROKER_MAX_CALL_SECONDS` | Defaults to `1800`; accepted values are `30` through `14400`. |
+| `BROKER_ALLOWED_TO` | Comma-separated E.164 outbound destinations. One entry becomes the default destination. Empty permits no outbound calls. |
+| `TWILIO_ACCOUNT_SID` | Account owning the caller number. |
+| `TWILIO_AUTH_TOKEN` | Validates callbacks and authenticates the Twilio client. |
+| `TWILIO_PHONE_NUMBER` | E.164 caller number; must differ from allowed destinations. |
+| `DEXTER_API_URL` | API base URL, normally `https://api.dexter.cash`. HTTPS is required except for loopback. |
+| `PHONE_SERVICE_SECRET` | At least 32 characters; must match the API's phone callback signing secret. |
+| `BROKER_REVISION` | Release identifier exposed by the health endpoint. The PM2 configuration defaults to the release directory name. |
+
+The Primary client uses `/internal/primary-dexter/channels/phone`. Its bearer token is the hexadecimal HMAC-SHA256 of `dexter-broker/primary-ingress/v1` under `PHONE_SERVICE_SECRET`. The API uses `HARK_PHONE_CALLBACK_SIGNING_SECRET` for the matching value. Never put either the secret or the derived bearer in commands, receipts, or documentation.
+
+The private journal contains phone numbers, transcripts, and account context. Its directory is created with mode `0700`; the writer lock uses `0600`. Preserve the directory and its ownership across releases. The operator call list returns only the recipient's last four digits, but purpose and failure text can still contain personal information.
+
+## Isolated deployment
+
+Prepare an immutable directory under `/var/lib/dexter-broker/releases/<release-id>` containing the reviewed source, lockfile, compiled `dist`, and installed dependencies. Build and validate that exact release before starting it:
+
+```sh
+npm ci
+npm run typecheck
+npm test
+npm run build
+```
+
+The release includes `tsx` because `npm run broker` uses the operator script. `npm start` itself runs compiled JavaScript. Record the source revision and build checks with the release receipt.
+
+The PM2 configuration requires `BROKER_RELEASE_DIR` to name the actual immutable directory. It rejects symbolic-link release paths. Set it in the operator environment, then use the configuration from that release:
+
+```sh
+pm2 start "$BROKER_RELEASE_DIR/deploy/ecosystem.config.cjs" --only dexter-broker
+```
+
+Use this command only when applying the reviewed deployment. The configuration starts one forked process and gives shutdown 65 seconds; the application has a 60-second shutdown deadline. The journal permits one writer, so upgrades require the previous broker process to stop before the replacement starts. Avoid a rolling overlap against the same state directory. A rollback selects the previous immutable release and retains the same journal; verify journal compatibility first.
+
+`deploy/nginx-broker.conf` is a location snippet for the existing HTTPS `server` block for `phone.dexter.cash`. Include it without replacing existing locations. Its `proxy_pass` preserves the `/broker/` prefix and supports WebSocket upgrades. It exposes no `/internal/broker/` routes. Angel applies the snippet after Wallet acceptance, checks the full configuration with `nginx -t`, and reloads nginx only after that check passes.
+
+`GET /broker/health` reports process readiness, model, revision, and active call count. A successful health response establishes HTTP reachability. It does not establish provider credits, Primary eligibility, working audio, or a completed call.
+
+Outbound call creation sets its own answer and status callbacks under `/broker/answer/:id` and `/broker/status/:id`; it can use the existing sender without rerouting the number. Future inbound activation would require a stronger possession mechanism plus explicit number configuration: voice POST to `/broker/incoming-call` and status POST to `/broker/status`. That activation is outside this deployment preparation.
+
+## Controlled call
+
+Run the CLI from the release with `BROKER_ENV_FILE` pointing to its private configuration. The CLI connects to loopback and supplies the control token internally.
+
+```sh
+npm run broker -- status
+```
+
+After provider credits and the Primary ingress release are available, an authorized operator can run a provider preflight:
+
+```sh
+npm run broker -- preflight
+```
+
+Preflight opens one GPT-Live session for at most 15 seconds. Success requires actual output audio and the matching final `session.closed` event. It makes no telephone call. It has no retry or reconnect loop.
+
+For an authorized test call, save one UUID as `BROKER_REQUEST_ID` before dispatch. Keep it with the purpose and receipt. Use the same ID if the local HTTP response is lost:
+
+```sh
+npm run broker -- call --request-id "$BROKER_REQUEST_ID" --purpose 'An authorized test of our Dexter phone conversation.' --receipt "$BROKER_RECEIPT_PATH"
+```
+
+The receipt path must be a new private file. With one allowed destination, the CLI needs no number in the command. Multiple destinations require `--to` with an allowed E.164 number. The service first saves the request, checks account readiness, and runs another mandatory audio preflight before dispatching to Twilio. Repeating the same request returns the saved call instead of dialing again. A different request to a person with an unresolved call is blocked.
+
+Confirm the saved provider SID, audible conversation, and an identified Primary result. Check both provider termination and local closeout afterward. A financial-action claim additionally needs the corresponding Primary result and transaction or receipt evidence. A spoken acknowledgment alone is insufficient.
+
+## Close and recovery
+
+These commands use the broker call UUID returned by `status`, not the Twilio SID:
+
+```sh
+npm run broker -- end --id "$BROKER_CALL_ID"
+npm run broker -- reconcile --id "$BROKER_CALL_ID"
+```
+
+`end` stops the active call or requests provider completion for its saved SID. `reconcile` fetches that exact SID, checks the direction and both numbers, and updates local status. Neither command creates a call. Reconciliation requires a saved provider SID.
+
+Before closing Primary admission, the service marks `primaryClosePending: true` in `calls.json`. It restores saved delegation and source journals, reads uncertain request admission using the original request ID, and replays pending source captures with their original IDs, revision, text, and timestamp. An uncertain submission is recovered through result GETs; it is never dispatched again by closeout. Pending capture keeps the Primary binding open.
+
+Once pending captures are acknowledged, the service closes the same binding. A failed close leaves `primaryClosePending` set. Maintenance retries pending recovery every 10 seconds while the process accepts work, including records loaded after restart. Explicit `reconcile` also attempts closeout for terminal calls or a pending binding. Inspect `primaryClosePending` and `transcriptCapture` in `status`; an HTTP success from reconciliation can still carry pending work.
+
+`transcriptCapture.state: complete` means no eligible journaled captures remain pending. Its `unsupported` field can still show omitted turns. Caller turns require acoustic completion evidence. Assistant capture requires confirmed playback and session finalization. Interrupted, discarded, or unconfirmed speech stays unqualified; it cannot become proof that the person heard a result.
+
+A call with status `unknown` and no provider SID needs operator investigation of the original dispatch. Preserve the request ID and journal, establish the provider outcome, and resolve that record before attempting another call. Generating a new request ID to bypass uncertainty risks a duplicate call. Do not delete the writer lock while its owning process is alive.
+
+Maintenance also reconciles inactive, unresolved calls older than 60 seconds by saved SID and ends a provider call that is still open. During shutdown the service drains HTTP requests, stops its active calls, and awaits closeout before releasing the journal lock. A forced exit leaves recovery evidence on disk for the next process.

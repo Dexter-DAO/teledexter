@@ -1,0 +1,583 @@
+import { createHash } from 'node:crypto';
+import type { BrokerLiveBackend, LiveBackendChannel, LiveDelegationRequest, LiveTranscriptSnapshot } from '../live/session.js';
+import { LIVE_APPEND_MAX_BYTES } from '../live/session.js';
+import type { PrimaryApiClient, PrimaryResult, PrimarySubmission, PrimaryTurn } from './primaryApi.js';
+import type { BrokerCall, BrokerStore } from './store.js';
+
+export interface PrimaryBackendOptions {
+  callId: string;
+  callSid: string;
+  bindingId: string;
+  api: Pick<PrimaryApiClient, 'submit' | 'result' | 'captureTurn'>;
+  store: Pick<BrokerStore, 'get' | 'update'>;
+  stabilityMs?: number;
+  maxWaitMs?: number;
+  pollIntervalMs?: number;
+  maxPollMs?: number;
+  now?: () => number;
+  lastCallerSpeechAt?: () => number | undefined;
+  mediaStartedAt?: string;
+}
+
+export interface PrimaryBackend extends BrokerLiveBackend {
+  /** Host-observed acoustic speech time, in Date.now() milliseconds. */
+  noteCallerSpeech(atMs?: number, audioOffsetMs?: number): void;
+  /** Freeze the observed spans before the host reconstructs closeout after disconnect. */
+  persistAcousticEvidence(): void;
+  captureCompletedTurns(snapshot: LiveTranscriptSnapshot, proof: { assistantPlaybackComplete: boolean; sessionFinalized?: boolean }): Promise<{
+    captured: number; pending: number; unsupported: string[];
+  }>;
+  /** Reconcile uncertain admission with GET, then replay only exact journalled captures. */
+  flushPendingCaptures(): Promise<{ pending: number; unsupported: string[] }>;
+}
+
+export interface BrokerDelegationRecord {
+  version: 1;
+  requestId: string;
+  callId: string;
+  callSid: string;
+  bindingId: string;
+  sessionId: string;
+  delegationIds: string[];
+  status: 'prepared' | 'dispatching' | 'dispatch_unknown' | 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+  updatedAt: string;
+  submission: PrimarySubmission;
+  frozenCallerRevision: number;
+  firstSequence: number;
+  lastSequence: number;
+  completionBasis: 'transcript_stability' | 'speech_and_transcript_stability';
+  sourceRevision: number;
+  capturedText: string;
+  pendingCapture?: PrimaryTurn;
+  captureState?: 'dispatching' | 'accepted' | 'unknown';
+  laterCallerRevision?: number;
+  correctionState?: 'recorded_not_applied';
+  primaryResult?: PrimaryResult;
+  result?: string;
+  delivery?: string;
+  deferredTurns?: Array<{ delegationId: string; sourceEventId: string; text: string; firstSequence: number;
+    callerRevision: number; status: 'recorded_not_submitted' }>;
+}
+
+const terminal = (state: string) => ['completed', 'failed', 'cancelled'].includes(state);
+const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+interface AcousticSpan { startMs: number; endMs: number; lastSpeechAt: number }
+interface CanonicalTurnRecord extends PrimaryTurn {
+  state: 'dispatching' | 'captured' | 'unknown';
+  acousticSpan?: AcousticSpan;
+  recordId?: string;
+}
+// A closeout backend can coexist briefly with the detached voice backend. Both
+// must serialize the same call journal and capture submissions.
+const storeAdmissions = new WeakMap<object, Map<string, Promise<void>>>();
+
+/** Timestamp grouping is application presentation state, not a provider turn-complete event. */
+function callerGroups(snapshot: LiveTranscriptSnapshot) {
+  const fragments = snapshot.fragments.filter(fragment => fragment.role === 'user')
+    .sort((a, b) => a.startMs - b.startMs || a.sequence - b.sequence);
+  const groups: typeof fragments[] = [];
+  for (const fragment of fragments) {
+    const previous = groups.at(-1);
+    if (!previous || fragment.startMs - Math.max(...previous.map(part => part.endMs)) > 1200) groups.push([fragment]);
+    else previous.push(fragment);
+  }
+  return groups;
+}
+
+const validTurnText = (text: string) => text.trim().length > 0 && [...text].length <= 4000
+  && !text.includes('\0') && !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(text);
+
+/** Deterministic UUIDs separate source identity from the provider delegation ID. */
+export function brokerIdentity(kind: string, ...parts: string[]): string {
+  const hash = createHash('sha256').update(JSON.stringify(['dexter-broker/primary/v1', kind, ...parts])).digest('hex');
+  return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-5${hash.slice(13, 16)}-a${hash.slice(17, 20)}-${hash.slice(20, 32)}`;
+}
+
+/** Split at whitespace, retaining every character and keeping numeric tokens intact. */
+export function liveResultChunks(text: string): string[] {
+  const chunks: string[] = [];
+  let current = '';
+  for (const token of text.match(/\S+\s*|\s+/gu) ?? []) {
+    if (Buffer.byteLength(token) > LIVE_APPEND_MAX_BYTES) throw new Error('result_token_exceeds_voice_limit');
+    if (Buffer.byteLength(current + token) > LIVE_APPEND_MAX_BYTES) { chunks.push(current); current = ''; }
+    current += token;
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+function shortSpokenResult(text: string): string {
+  if (Buffer.byteLength(text) <= LIVE_APPEND_MAX_BYTES) return text;
+  const sentence = text.match(/^\s*[\s\S]*?[.!?](?=\s|$)/u)?.[0]?.trim();
+  if (sentence && Buffer.byteLength(sentence) <= LIVE_APPEND_MAX_BYTES) return sentence;
+  return 'I have the full answer available. Which detail would you like first?';
+}
+
+function delay(ms: number, signal: AbortSignal): Promise<boolean> {
+  if (signal.aborted) return Promise.resolve(false);
+  return new Promise(resolve => {
+    const finish = (elapsed: boolean) => { clearTimeout(timer); signal.removeEventListener('abort', abort); resolve(elapsed); };
+    const abort = () => finish(false);
+    const timer = setTimeout(() => finish(true), ms);
+    signal.addEventListener('abort', abort, { once: true });
+  });
+}
+
+export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBackend {
+  const now = options.now ?? Date.now;
+  const positive = (value: number | undefined, fallback: number, max: number) => {
+    const result = value ?? fallback;
+    if (!Number.isInteger(result) || result < 1 || result > max) throw new Error('invalid_backend_timing');
+    return result;
+  };
+  const stabilityMs = positive(options.stabilityMs, 700, 10_000);
+  const maxWaitMs = positive(options.maxWaitMs, 30_000, 60_000);
+  const pollIntervalMs = positive(options.pollIntervalMs, 750, 10_000);
+  const maxPollMs = positive(options.maxPollMs, 90_000, 300_000);
+  if (maxWaitMs < stabilityMs || !options.callId || !options.callSid || !uuidPattern.test(options.bindingId))
+    throw new Error('invalid_backend_configuration');
+  let lastSpeechAt: number | undefined;
+  const savedSpans = options.store.get(options.callId)?.acousticSpans;
+  const acousticSpans: AcousticSpan[] = Array.isArray(savedSpans) ? savedSpans.map((span: AcousticSpan) => {
+    if (!span || ![span.startMs, span.endMs, span.lastSpeechAt].every(Number.isFinite)
+        || span.startMs < 0 || span.endMs < span.startMs || span.lastSpeechAt < 0) throw new Error('invalid_saved_acoustic_span');
+    return { ...span };
+  }) : [];
+  const speechListeners = new Set<() => void>();
+  let admissions = storeAdmissions.get(options.store);
+  if (!admissions) { admissions = new Map(); storeAdmissions.set(options.store, admissions); }
+  const locked = async <T>(fn: () => Promise<T>): Promise<T> => {
+    const previous = admissions!.get(options.callId) ?? Promise.resolve();
+    let release!: () => void;
+    const tail = new Promise<void>(resolve => { release = resolve; });
+    admissions!.set(options.callId, tail);
+    await previous;
+    try { return await fn(); } finally {
+      release();
+      if (admissions!.get(options.callId) === tail) admissions!.delete(options.callId);
+    }
+  };
+  const boundCall = (sessionId: string): BrokerCall => {
+    const call = options.store.get(options.callId);
+    if (!call || call.id !== options.callId || call.callSid !== options.callSid
+        || call.primary?.bindingId !== options.bindingId || call.liveSessionId !== sessionId)
+      throw new Error('broker_call_identity_mismatch');
+    return call;
+  };
+  const entries = (sessionId: string): BrokerDelegationRecord[] => {
+    return Object.values(boundCall(sessionId).delegations).map(value => {
+      const entry = value as BrokerDelegationRecord;
+      if (entry.version !== 1 || !uuidPattern.test(entry.requestId) || entry.callId !== options.callId
+          || entry.callSid !== options.callSid || entry.bindingId !== options.bindingId
+          || !Array.isArray(entry.delegationIds) || !entry.submission?.source
+          || !uuidPattern.test(entry.submission.source.sourceEventId)) throw new Error('invalid_saved_delegation');
+      return entry;
+    }).filter(entry => entry.sessionId === sessionId);
+  };
+  const save = (entry: BrokerDelegationRecord): BrokerDelegationRecord => {
+    const call = boundCall(entry.sessionId);
+    const next = { ...entry, updatedAt: new Date(now()).toISOString() };
+    options.store.update(call.id, { delegations: { ...call.delegations, [entry.requestId]: next } });
+    return next;
+  };
+  const load = (entry: BrokerDelegationRecord) => entries(entry.sessionId).find(value => value.requestId === entry.requestId)!;
+  const mediaOrigin = (sessionId: string): number => {
+    const origin = options.mediaStartedAt ?? boundCall(sessionId).mediaStartedAt;
+    if (!origin || !Number.isFinite(Date.parse(origin))) throw new Error('media_time_origin_missing');
+    return Date.parse(origin);
+  };
+  const speechTime = () => options.lastCallerSpeechAt?.() ?? lastSpeechAt;
+  const acousticGroups = (snapshot: LiveTranscriptSnapshot, observedAt = now()) => {
+    const grouped = acousticSpans.map(span => ({ span, fragments: [] as LiveTranscriptSnapshot['fragments'], ambiguous: false }));
+    for (const fragment of snapshot.fragments.filter(f => f.role === 'user')) {
+      // Provider timestamps are approximate. Match one acoustic span only; ambiguous
+      // fragments stay unqualified instead of silently crossing source boundaries.
+      const matches = grouped.filter(({ span }) => fragment.endMs >= span.startMs - 300 && fragment.startMs <= span.endMs + 300);
+      if (matches.length === 1) matches[0].fragments.push(fragment);
+      else for (const match of matches) match.ambiguous = true;
+    }
+    return grouped.filter(({ span, fragments, ambiguous }, index) => fragments.length && !ambiguous
+      && (index < acousticSpans.length - 1 || observedAt - span.lastSpeechAt >= stabilityMs))
+      // Timing chooses the source span; delta text itself is appended exactly in
+      // provider delivery order, as required by the Live transcript contract.
+      .map(group => ({ ...group, fragments: group.fragments.sort((a, b) => a.sequence - b.sequence) }));
+  };
+  const stableContext = (channel: LiveBackendChannel): Promise<LiveTranscriptSnapshot | undefined> => {
+    if (channel.signal.aborted) return Promise.resolve(undefined);
+    return new Promise(resolve => {
+      let ended = false, timer: ReturnType<typeof setTimeout> | undefined;
+      let revision = channel.getContext().callerRevision;
+      let changedAt = now();
+      const finish = (snapshot?: LiveTranscriptSnapshot) => {
+        if (ended) return;
+        ended = true; clearTimeout(timer); clearTimeout(limit);
+        unsubscribe(); speechListeners.delete(schedule); channel.signal.removeEventListener('abort', abort);
+        resolve(snapshot);
+      };
+      const schedule = () => {
+        if (ended) return;
+        clearTimeout(timer);
+        const snapshot = channel.getContext();
+        if (snapshot.callerRevision !== revision) { revision = snapshot.callerRevision; changedAt = now(); }
+        const last = Math.max(changedAt, speechTime() ?? 0);
+        timer = setTimeout(() => {
+          const current = channel.getContext();
+          if (current.callerRevision !== revision || now() - Math.max(changedAt, speechTime() ?? 0) < stabilityMs) { schedule(); return; }
+          if (current.fragments.some(fragment => fragment.role === 'user' && fragment.text.trim())) finish(current);
+        }, Math.max(1, stabilityMs - (now() - last)));
+      };
+      const abort = () => finish();
+      const unsubscribe = channel.subscribeContext(schedule);
+      const limit = setTimeout(() => finish(), maxWaitMs);
+      speechListeners.add(schedule); channel.signal.addEventListener('abort', abort, { once: true });
+      schedule();
+    });
+  };
+  const accept = async (request: LiveDelegationRequest, channel: LiveBackendChannel): Promise<BrokerDelegationRecord | undefined> => {
+    if (request.callId !== options.callId) throw new Error('broker_call_identity_mismatch');
+    const before = entries(request.sessionId);
+    const replay = before.find(entry => entry.delegationIds.includes(request.delegationId));
+    if (replay) return replay;
+    const snapshot = await stableContext(channel);
+    if (!snapshot || channel.signal.aborted) return undefined;
+    return locked(async () => {
+      if (channel.signal.aborted) return undefined;
+      if (boundCall(request.sessionId).endedAt) throw new Error('broker_call_ended');
+      const saved = entries(request.sessionId);
+      const duplicate = saved.find(entry => entry.delegationIds.includes(request.delegationId));
+      if (duplicate) return duplicate;
+      const callStartedAt = mediaOrigin(request.sessionId);
+      const latestSourceStart = Math.max(0, ...saved.map(entry => Date.parse(entry.submission.source.receivedAt) - callStartedAt));
+      const candidate = acousticGroups(snapshot).filter(group => {
+        const first = group.fragments.reduce((a, b) => a.sequence < b.sequence ? a : b);
+        const source = brokerIdentity('source', options.callId, request.sessionId, first.eventId);
+        return first.startMs >= latestSourceStart && !saved.some(entry => entry.submission.source.sourceEventId === source
+          || entry.deferredTurns?.some(turn => turn.sourceEventId === source));
+      }).at(-1);
+      const fragments = candidate?.fragments;
+      const active = saved.find(entry => !terminal(entry.status));
+      if (active) {
+        const deferredTurns = [...active.deferredTurns ?? []];
+        if (fragments?.length) {
+          const first = fragments.reduce((a, b) => a.sequence < b.sequence ? a : b);
+          const text = fragments.map(fragment => fragment.text).join('');
+          if (validTurnText(text)) deferredTurns.push({ delegationId: request.delegationId,
+            sourceEventId: brokerIdentity('source', options.callId, request.sessionId, first.eventId), text,
+            firstSequence: first.sequence, callerRevision: snapshot.callerRevision, status: 'recorded_not_submitted' });
+        }
+        // Preserve a separate caller request without guessing whether it corrects the
+        // admitted action. It requires another caller utterance, never an automatic run.
+        return save({ ...active, deferredTurns, delegationIds: [...active.delegationIds, request.delegationId] });
+      }
+      if (!fragments?.length) {
+        const latest = saved.sort((a, b) => b.lastSequence - a.lastSequence)[0];
+        return latest ? save({ ...latest, delegationIds: [...latest.delegationIds, request.delegationId] }) : undefined;
+      }
+      const text = fragments.map(fragment => fragment.text).join('');
+      if (!validTurnText(text)) throw new Error('invalid_completed_caller_turn');
+      const first = fragments.reduce((a, b) => a.sequence < b.sequence ? a : b);
+      options.store.update(options.callId, { acousticSpans: structuredClone(acousticSpans) });
+      const sourceEventId = brokerIdentity('source', options.callId, request.sessionId, first.eventId);
+      const duplicateSource = saved.find(entry => entry.submission.source.sourceEventId === sourceEventId);
+      if (duplicateSource) return save({ ...duplicateSource, delegationIds: [...duplicateSource.delegationIds, request.delegationId] });
+      let entry: BrokerDelegationRecord = {
+        version: 1, requestId: brokerIdentity('request', options.callId, request.sessionId, request.delegationId),
+        callId: options.callId, callSid: options.callSid, bindingId: options.bindingId, sessionId: request.sessionId,
+        delegationIds: [request.delegationId], status: 'prepared', updatedAt: new Date(now()).toISOString(),
+        submission: { source: { callSid: options.callSid, itemId: `live-turn-${sourceEventId}`,
+          sourceEventId, revision: 1, receivedAt: new Date(mediaOrigin(request.sessionId) + first.startMs).toISOString(), role: 'user' }, text },
+        frozenCallerRevision: snapshot.callerRevision, firstSequence: first.sequence,
+        lastSequence: Math.max(...fragments.map(fragment => fragment.sequence)),
+        completionBasis: 'speech_and_transcript_stability',
+        sourceRevision: 1, capturedText: text,
+      };
+      entry = save(entry); // This source and exact request survive a crash before POST.
+      entry = save({ ...entry, status: 'dispatching' });
+      try {
+        const result = await options.api.submit(options.bindingId, entry.requestId, structuredClone(entry.submission));
+        entry = applyResult(entry, result);
+      } catch {
+        // The server may have admitted the run. Only GET by this request ID may follow.
+        entry = save({ ...entry, status: 'dispatch_unknown' });
+      }
+      return entry;
+    });
+  };
+  const applyResult = (entry: BrokerDelegationRecord, result: PrimaryResult): BrokerDelegationRecord => {
+    if (result.bindingId !== options.bindingId || result.requestId !== entry.requestId)
+      throw new Error('primary_result_identity_mismatch');
+    if (!['queued', 'running', 'completed', 'failed', 'cancelled'].includes(result.state)
+        || (result.state === 'completed' && !result.assistant?.text?.trim())) throw new Error('invalid_primary_result');
+    const current = load(entry);
+    if (terminal(current.status) && !terminal(result.state)) return current;
+    const outcome = (value: PrimaryResult) => JSON.stringify([value.state, value.assistant ?? null, value.error ?? null]);
+    if (terminal(current.status) && current.primaryResult && outcome(current.primaryResult) !== outcome(result))
+      throw new Error('primary_terminal_result_changed');
+    return save({ ...current, status: result.state, primaryResult: structuredClone(result),
+      ...(result.assistant ? { result: result.assistant.text } : {}) });
+  };
+  const captureRevision = async (entry: BrokerDelegationRecord, channel: LiveBackendChannel): Promise<BrokerDelegationRecord> => {
+    const latest = channel.getContext();
+    if (latest.callerRevision <= entry.frozenCallerRevision || channel.signal.aborted) return load(entry);
+    const stable = await stableContext(channel);
+    if (!stable || channel.signal.aborted) return load(entry);
+    return locked(async () => {
+      let current = load(entry);
+      if (channel.signal.aborted || boundCall(entry.sessionId).endedAt) return current;
+      if (current.captureState === 'unknown' || current.captureState === 'dispatching') return current;
+      const fragments = acousticGroups(stable).find(group => group.fragments.some(fragment => fragment.sequence === current.firstSequence))?.fragments;
+      if (!fragments) return current;
+      const text = fragments.map(fragment => fragment.text).join('');
+      if (text === current.capturedText) return current;
+      if (!validTurnText(text)) return current;
+      const turn: PrimaryTurn = { sourceEventId: current.submission.source.sourceEventId, revision: current.sourceRevision + 1,
+        itemId: current.submission.source.itemId, role: 'user', text, occurredAt: current.submission.source.receivedAt };
+      current = save({ ...current, pendingCapture: turn, captureState: 'dispatching',
+        laterCallerRevision: stable.callerRevision, lastSequence: Math.max(current.lastSequence, ...fragments.map(f => f.sequence)),
+        correctionState: 'recorded_not_applied' });
+      try {
+        const result = await options.api.captureTurn(options.bindingId, structuredClone(turn));
+        if (result.bindingId !== options.bindingId || result.sourceEventId !== turn.sourceEventId || result.revision !== turn.revision || result.recordId !== turn.sourceEventId)
+          throw new Error('capture_identity_mismatch');
+        return save({ ...current, sourceRevision: turn.revision, capturedText: text, pendingCapture: undefined, captureState: 'accepted' });
+      } catch { return save({ ...current, captureState: 'unknown' }); }
+    });
+  };
+  const deliver = async (entry: BrokerDelegationRecord, channel: LiveBackendChannel) => {
+    if (channel.signal.aborted) return;
+    const current = channel.getContext();
+    const changed = current.callerRevision !== entry.frozenCallerRevision;
+    let text: string;
+    if (changed) {
+      const state = terminal(entry.status)
+        ? `The original request ${entry.status === 'completed' ? 'completed' : entry.status === 'failed' ? 'failed' : 'was cancelled'}.`
+        : 'I am still checking the original request.';
+      text = entry.correctionState === 'recorded_not_applied'
+        ? `${state} Your correction has not changed that request.` : state;
+    }
+    else if (entry.status === 'completed') text = entry.primaryResult!.assistant!.text;
+    else if (entry.status === 'failed') text = 'The request failed. Its saved result is available for review.';
+    else if (entry.status === 'cancelled') text = 'The request was cancelled.';
+    else if (['dispatching', 'dispatch_unknown', 'prepared'].includes(entry.status))
+      text = 'I could not confirm the outcome. Please check the request status before trying again.';
+    else text = 'Your request is still pending. I can check its status again.';
+    if (entry.deferredTurns?.length) text += ' I also recorded what you said afterward, but have not acted on it. Please state the next request when you are ready.';
+    const prefix = `${entry.requestId}_${current.callerRevision}`;
+    if (changed && entry.status === 'completed') {
+      let resultChunks: string[];
+      try { resultChunks = liveResultChunks(entry.primaryResult!.assistant!.text); }
+      catch { resultChunks = []; }
+      if (resultChunks.length) {
+        const provenance = await channel.publish({ id: `${prefix}_original_result_scope`, kind: 'progress',
+          text: 'The following saved result belongs to the original request. It does not answer or apply anything the caller said afterward.',
+          speak: false, expectedCallerRevision: current.callerRevision });
+        if (provenance.status !== 'accepted') { save({ ...load(entry), delivery: provenance.status }); return; }
+        for (const [index, chunk] of resultChunks.entries()) {
+          const delivery = await channel.publish({ id: `${prefix}_original_result_${index}`, kind: 'progress', text: chunk,
+            speak: false, expectedCallerRevision: current.callerRevision });
+          if (delivery.status !== 'accepted') { save({ ...load(entry), delivery: delivery.status }); return; }
+        }
+      }
+    }
+    let chunks: string[];
+    try { chunks = liveResultChunks(text); }
+    catch {
+      const outcome = await channel.publish({ id: `${prefix}_format_unavailable`, kind: 'result',
+        text: 'I received the result, but cannot read that format accurately over this call. The full result has been saved.',
+        expectedCallerRevision: current.callerRevision });
+      save({ ...load(entry), delivery: `format_unsupported:${outcome.status}` });
+      return;
+    }
+    if (chunks.length > 1) {
+      for (const [index, chunk] of chunks.entries()) {
+        const delivery = await channel.publish({ id: `${prefix}_context_${index}`, kind: 'progress', text: chunk,
+          speak: false, expectedCallerRevision: current.callerRevision });
+        if (delivery.status !== 'accepted') { save({ ...load(entry), delivery: delivery.status }); return; }
+      }
+    }
+    const outcome = await channel.publish({ id: `${prefix}_${entry.status}_result`, kind: 'result',
+      text: shortSpokenResult(text), expectedCallerRevision: current.callerRevision });
+    save({ ...load(entry), delivery: outcome.status });
+  };
+  const persistCanonical = (sessionId: string, turn: CanonicalTurnRecord) => {
+    const call = boundCall(sessionId);
+    options.store.update(call.id, { canonicalTurns: { ...call.canonicalTurns, [turn.sourceEventId]: turn } });
+  };
+  const canonicalPayload = (turn: PrimaryTurn): PrimaryTurn => {
+    if (!uuidPattern.test(turn.sourceEventId) || !Number.isInteger(turn.revision) || turn.revision < 1
+        || !/^[A-Za-z0-9_-]{1,128}$/.test(turn.itemId) || !['user', 'assistant'].includes(turn.role)
+        || !validTurnText(turn.text) || !Number.isFinite(Date.parse(turn.occurredAt))) throw new Error('invalid_saved_capture');
+    return { sourceEventId: turn.sourceEventId, revision: turn.revision, itemId: turn.itemId,
+      role: turn.role, text: turn.text, occurredAt: turn.occurredAt };
+  };
+  const pendingCount = (sessionId: string) => {
+    const delegated = entries(sessionId);
+    return delegated.filter(entry => ['prepared', 'dispatching', 'dispatch_unknown'].includes(entry.status)).length
+      + delegated.filter(entry => entry.pendingCapture).length
+      + Object.values(boundCall(sessionId).canonicalTurns ?? {}).filter(value => (value as CanonicalTurnRecord).state !== 'captured').length;
+  };
+  const currentSession = () => {
+    const sessionId = options.store.get(options.callId)?.liveSessionId;
+    if (!sessionId) throw new Error('missing_live_session');
+    boundCall(sessionId);
+    return sessionId;
+  };
+  return {
+    persistAcousticEvidence() {
+      const sessionId = currentSession();
+      options.store.update(boundCall(sessionId).id, { acousticSpans: structuredClone(acousticSpans) });
+    },
+    noteCallerSpeech(atMs = now(), audioOffsetMs) {
+      if (options.store.get(options.callId)?.endedAt) throw new Error('broker_call_ended');
+      if (!Number.isFinite(atMs) || atMs < 0) throw new Error('invalid_speech_time');
+      lastSpeechAt = Math.max(lastSpeechAt ?? 0, atMs);
+      if (audioOffsetMs !== undefined) {
+        if (!Number.isFinite(audioOffsetMs) || audioOffsetMs < 0) throw new Error('invalid_audio_offset');
+        const last = acousticSpans.at(-1);
+        if (last && audioOffsetMs < last.endMs) throw new Error('audio_offset_regressed');
+        if (!last || audioOffsetMs - last.endMs > stabilityMs) {
+          acousticSpans.push({ startMs: Math.max(0, audioOffsetMs - 20), endMs: audioOffsetMs, lastSpeechAt: atMs });
+        } else { last.endMs = audioOffsetMs; last.lastSpeechAt = atMs; }
+      }
+      for (const listener of speechListeners) listener();
+    },
+    async flushPendingCaptures() {
+      const sessionId = currentSession();
+      return locked(async () => {
+        const unsupported: string[] = [];
+        for (let entry of entries(sessionId)) {
+          if (['prepared', 'dispatching', 'dispatch_unknown'].includes(entry.status)) {
+            try { entry = applyResult(entry, await options.api.result(options.bindingId, entry.requestId)); }
+            catch { unsupported.push('source_admission_unknown'); continue; }
+          }
+          if (!entry.pendingCapture) continue;
+          try {
+            const turn = canonicalPayload(entry.pendingCapture);
+            const receipt = await options.api.captureTurn(options.bindingId, turn);
+            if (receipt.bindingId !== options.bindingId || receipt.sourceEventId !== turn.sourceEventId
+                || receipt.revision !== turn.revision || receipt.recordId !== turn.sourceEventId) throw new Error('capture_identity_mismatch');
+            save({ ...load(entry), sourceRevision: turn.revision, capturedText: turn.text,
+              pendingCapture: undefined, captureState: 'accepted' });
+          } catch { save({ ...load(entry), captureState: 'unknown' }); unsupported.push('capture_outcome_unknown'); }
+        }
+        for (const value of Object.values(boundCall(sessionId).canonicalTurns ?? {})) {
+          const turn = value as CanonicalTurnRecord;
+          if (turn.state === 'captured') continue;
+          try {
+            const payload = canonicalPayload(turn);
+            const delegated = entries(sessionId).find(entry => entry.submission.source.sourceEventId === turn.sourceEventId);
+            if (delegated?.pendingCapture || (delegated && ['prepared', 'dispatching', 'dispatch_unknown'].includes(delegated.status))) {
+              unsupported.push('source_admission_unknown'); continue;
+            }
+            const receipt = await options.api.captureTurn(options.bindingId, payload);
+            if (receipt.bindingId !== options.bindingId || receipt.sourceEventId !== turn.sourceEventId
+                || receipt.revision !== turn.revision || receipt.recordId !== turn.sourceEventId) throw new Error('capture_identity_mismatch');
+            persistCanonical(sessionId, { ...turn, state: 'captured', recordId: receipt.recordId });
+            if (delegated) save({ ...load(delegated), sourceRevision: turn.revision, capturedText: turn.text, correctionState: 'recorded_not_applied' });
+          } catch { persistCanonical(sessionId, { ...turn, state: 'unknown' }); unsupported.push('capture_outcome_unknown'); }
+        }
+        return { pending: pendingCount(sessionId), unsupported: [...new Set(unsupported)] };
+      });
+    },
+    async captureCompletedTurns(snapshot, proof) {
+      const sessionId = currentSession();
+      if (!proof.sessionFinalized) return { captured: 0, pending: pendingCount(sessionId), unsupported: ['transcript_finalization_unconfirmed'] };
+      const unsupported: string[] = [];
+      const call = boundCall(sessionId);
+      // A quiet interval after hangup supplies no evidence about whether the caller
+      // had finished. Freeze the observation clock at the host's disconnect time.
+      const observedAt = call.endedAt ? Math.min(now(), Date.parse(call.endedAt)) : now();
+      options.store.update(call.id, { acousticSpans: structuredClone(acousticSpans) });
+      const groups: Array<{ role: 'user' | 'assistant'; fragments: LiveTranscriptSnapshot['fragments']; span?: AcousticSpan }> =
+        acousticGroups(snapshot, observedAt).map(group => ({ role: 'user', fragments: group.fragments, span: group.span }));
+      const included = new Set(groups.flatMap(group => group.fragments.map(f => f.eventId)));
+      if (snapshot.fragments.some(f => f.role === 'user' && !included.has(f.eventId))) unsupported.push('unqualified_caller_turn');
+      const assistant = snapshot.fragments.filter(f => f.role === 'assistant');
+      if (assistant.length && !proof.assistantPlaybackComplete) unsupported.push('assistant_playback_unconfirmed');
+      if (proof.assistantPlaybackComplete) {
+        // Group captions only after the host has confirmed the whole uninterrupted
+        // output stream played. Neither provider text nor finalization supplies that proof.
+        const typed = callerGroups({ ...snapshot, fragments: assistant.map(f => ({ ...f, role: 'user' })) });
+        for (const group of typed) groups.push({ role: 'assistant', fragments: group.sort((a, b) => a.sequence - b.sequence) });
+      }
+      groups.sort((a, b) => a.fragments[0].startMs - b.fragments[0].startMs || a.fragments[0].sequence - b.fragments[0].sequence);
+      let captured = 0;
+      for (const group of groups) {
+        const result = await locked(async () => {
+          const current = boundCall(sessionId);
+          const first = group.fragments.reduce((a, b) => a.sequence < b.sequence ? a : b);
+          const sourceEventId = brokerIdentity('source', options.callId, sessionId, first.eventId);
+          const text = group.fragments.map(f => f.text).join('');
+          if (!validTurnText(text)) return 'invalid_completed_turn';
+          const delegated = entries(sessionId).find(entry => entry.submission.source.sourceEventId === sourceEventId);
+          if (delegated && ['prepared', 'dispatching', 'dispatch_unknown'].includes(delegated.status)) return 'source_admission_unknown';
+          if (delegated?.pendingCapture) return 'capture_outcome_unknown';
+          const previous = current.canonicalTurns?.[sourceEventId] as CanonicalTurnRecord | undefined;
+          if (previous && previous.state !== 'captured') return 'capture_outcome_unknown';
+          if ((previous?.text ?? delegated?.capturedText) === text) return 'already_captured';
+          const turn: CanonicalTurnRecord = {
+            sourceEventId, revision: (previous?.revision ?? delegated?.sourceRevision ?? 0) + 1,
+            itemId: delegated?.submission.source.itemId ?? `live-turn-${sourceEventId}`,
+            role: group.role, text, occurredAt: previous?.occurredAt ?? delegated?.submission.source.receivedAt
+              ?? new Date(mediaOrigin(sessionId) + first.startMs).toISOString(),
+            state: 'dispatching', ...(group.span ? { acousticSpan: { ...group.span } } : {}),
+          };
+          const persist = (value: CanonicalTurnRecord) => persistCanonical(sessionId, value);
+          persist(turn);
+          try {
+            const receipt = await options.api.captureTurn(options.bindingId, {
+              sourceEventId: turn.sourceEventId, revision: turn.revision, itemId: turn.itemId,
+              role: turn.role, text: turn.text, occurredAt: turn.occurredAt,
+            });
+            if (receipt.bindingId !== options.bindingId || receipt.sourceEventId !== sourceEventId || receipt.revision !== turn.revision || receipt.recordId !== turn.sourceEventId)
+              throw new Error('capture_identity_mismatch');
+            persist({ ...turn, state: 'captured', recordId: receipt.recordId });
+            if (delegated) save({ ...load(delegated), sourceRevision: turn.revision, capturedText: text, correctionState: 'recorded_not_applied' });
+            return 'captured';
+          } catch { persist({ ...turn, state: 'unknown' }); return 'capture_outcome_unknown'; }
+        });
+        if (result === 'captured') captured++;
+        else if (result !== 'already_captured') unsupported.push(result);
+      }
+      return { captured, pending: pendingCount(sessionId), unsupported: [...new Set(unsupported)] };
+    },
+    async delegate(request, channel) {
+      let entry = await accept(request, channel);
+      if (channel.signal.aborted) return;
+      if (!entry) {
+        await channel.publish({ id: `${request.requestId}_clarify`, kind: 'result',
+          text: 'Please finish your request, then give me a moment to check it.',
+          expectedCallerRevision: channel.getContext().callerRevision });
+        return;
+      }
+      const deadline = now() + maxPollMs;
+      // Preserve caller changes in the local journal immediately. Only stable snapshots
+      // go to the source-revision API; revisions never create another run here.
+      const unsubscribe = channel.subscribeContext(snapshot => {
+        if (snapshot.callerRevision > entry!.frozenCallerRevision) {
+          const saved = load(entry!);
+          const original = acousticGroups(snapshot).find(group => group.fragments.some(fragment => fragment.sequence === saved.firstSequence));
+          if (original && original.fragments.map(fragment => fragment.text).join('') !== saved.capturedText) {
+            save({ ...saved, laterCallerRevision: snapshot.callerRevision, correctionState: 'recorded_not_applied',
+              lastSequence: Math.max(saved.lastSequence, ...original.fragments.map(f => f.sequence)) });
+          }
+        }
+      });
+      try {
+        while (!channel.signal.aborted) {
+          entry = load(entry);
+          if (!terminal(entry.status)) {
+            try { entry = applyResult(entry, await options.api.result(options.bindingId, entry.requestId)); }
+            catch { /* An absent or unreadable result does not justify another POST. */ }
+          }
+          entry = await captureRevision(entry, channel);
+          if (channel.signal.aborted) return;
+          if (terminal(entry.status) || now() >= deadline) break;
+          if (!(await delay(pollIntervalMs, channel.signal))) return;
+        }
+        await deliver(load(entry), channel);
+      } finally { unsubscribe(); }
+    },
+  };
+}

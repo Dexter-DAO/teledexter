@@ -1,0 +1,389 @@
+import { createHmac } from 'node:crypto';
+import { z } from 'zod';
+
+export interface PrimaryProviderProof {
+  url: string;
+  signature: string;
+  params: Record<string, string>;
+}
+
+export interface PrimaryContextMessage {
+  id: string;
+  role: 'user' | 'assistant';
+  text: string;
+}
+
+export interface PrimaryContext {
+  primaryDexterId: string;
+  threadId: string;
+  displayName: string;
+  messages: PrimaryContextMessage[];
+}
+
+export interface PrimaryCall {
+  bindingId: string;
+  callSid: string;
+  state: 'open' | 'closed';
+  context: PrimaryContext;
+}
+
+export interface PrimarySubmission {
+  source: {
+    callSid: string;
+    itemId: string;
+    sourceEventId: string;
+    revision: 1;
+    receivedAt: string;
+    role: 'user';
+  };
+  text: string;
+}
+
+export interface PrimaryTurn {
+  sourceEventId: string;
+  revision: number;
+  itemId: string;
+  role: 'user' | 'assistant';
+  text: string;
+  occurredAt: string;
+}
+
+export interface PrimaryApiOptions {
+  apiBaseUrl: string;
+  phoneServiceSecret: string;
+  fetch?: typeof globalThis.fetch;
+  timeoutMs?: number;
+  maxBodyBytes?: number;
+}
+
+export type PrimaryReadinessReason = 'ready' | 'caller_unlinked'
+  | 'caller_binding_ambiguous' | 'primary_unavailable'
+  | 'authority_unavailable' | 'runtime_unavailable';
+
+export interface PrimaryReadiness {
+  eligible: boolean;
+  reason: PrimaryReadinessReason;
+}
+
+export interface PrimaryAssistant {
+  messageId: string;
+  eventId: string;
+  sequence: string;
+  text: string;
+}
+
+export type PrimaryRequestResult = {
+  requestId: string;
+  bindingId: string;
+  replayed?: boolean;
+} & (
+  | { state: 'queued' | 'running'; assistant?: never; error?: never }
+  | { state: 'completed'; assistant: PrimaryAssistant; error?: never }
+  | { state: 'failed' | 'cancelled'; assistant?: never; error: { code: string; retryable: false } }
+);
+
+export type PrimaryResult = PrimaryRequestResult;
+
+export interface PrimaryTurnReceipt {
+  bindingId: string;
+  sourceEventId: string;
+  revision: number;
+  recordId: string;
+  replayed: boolean;
+}
+
+export interface PrimaryClosedCall {
+  bindingId: string;
+  callSid: string;
+  state: 'closed';
+}
+
+export interface PrimaryApiClient {
+  readiness(callerNumber: string): Promise<PrimaryReadiness>;
+  openCall(providerProof: PrimaryProviderProof): Promise<PrimaryCall>;
+  getContext(bindingId: string): Promise<PrimaryCall>;
+  submit(bindingId: string, requestId: string, input: PrimarySubmission): Promise<PrimaryRequestResult>;
+  result(bindingId: string, requestId: string): Promise<PrimaryRequestResult>;
+  captureTurn(bindingId: string, input: PrimaryTurn): Promise<PrimaryTurnReceipt>;
+  close(bindingId: string): Promise<PrimaryClosedCall>;
+}
+
+export type PrimaryApiErrorCode =
+  | 'invalid_configuration' | 'invalid_request' | 'request_timeout'
+  | 'request_failed' | 'http_error' | 'response_too_large'
+  | 'invalid_response' | 'identity_mismatch';
+
+/** Never carries raw provider errors, request bodies, bearer tokens or URLs. */
+export class PrimaryApiError extends Error {
+  readonly remoteCode?: string;
+  readonly retryable?: boolean;
+  constructor(readonly code: PrimaryApiErrorCode, readonly status?: number,
+    remote?: { code: string; retryable: boolean }) {
+    super(`Primary API request failed: ${code}${status === undefined ? '' : ` (HTTP ${status})`}`);
+    this.name = 'PrimaryApiError';
+    this.remoteCode = remote?.code;
+    this.retryable = remote?.retryable;
+  }
+}
+
+const PREFIX = '/internal/primary-dexter/channels/phone';
+const MAX_TIMEOUT_MS = 30_000;
+const MAX_BODY_BYTES = 64 * 1024;
+const MAX_REQUEST_BYTES = 24 * 1024;
+
+function createTransport(options: PrimaryApiOptions) {
+  let base: URL;
+  try { base = new URL(options.apiBaseUrl); }
+  catch { throw new PrimaryApiError('invalid_configuration'); }
+  const timeoutMs = options.timeoutMs ?? 10_000;
+  const maxBodyBytes = options.maxBodyBytes ?? MAX_BODY_BYTES;
+  if (!['https:', 'http:'].includes(base.protocol) || base.username || base.password
+    || base.search || base.hash
+    || (base.protocol === 'http:' && !['localhost', '127.0.0.1', '[::1]'].includes(base.hostname))
+    || typeof options.phoneServiceSecret !== 'string' || options.phoneServiceSecret.length < 32
+    || !Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_TIMEOUT_MS
+    || !Number.isInteger(maxBodyBytes) || maxBodyBytes < 1 || maxBodyBytes > MAX_BODY_BYTES) {
+    throw new PrimaryApiError('invalid_configuration');
+  }
+  const baseUrl = base.href.replace(/\/+$/, '') + PREFIX;
+  const bearer = createHmac('sha256', options.phoneServiceSecret)
+    .update('dexter-broker/primary-ingress/v1').digest('hex');
+  const fetcher = options.fetch ?? globalThis.fetch;
+
+  return async (method: 'GET' | 'POST', path: string,
+    body?: unknown, headers?: Record<string, string>, expectedStatus = 200): Promise<unknown> => {
+    let serialized: string | undefined;
+    if (body !== undefined) {
+      try { serialized = JSON.stringify(body); }
+      catch { throw new PrimaryApiError('invalid_request'); }
+      if (serialized === undefined || Buffer.byteLength(serialized) > MAX_REQUEST_BYTES) {
+        throw new PrimaryApiError('invalid_request');
+      }
+    }
+    const controller = new AbortController();
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    let timedOut = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+        void reader?.cancel().catch(() => {});
+        reject(new PrimaryApiError('request_timeout'));
+      }, timeoutMs);
+    });
+    const request = async () => {
+      // One attempt. In particular, an uncertain POST must be recovered by its
+      // existing identity, never repeated by a generic transport retry.
+      const response = await fetcher(baseUrl + path, {
+        method, redirect: 'error', signal: controller.signal,
+        headers: {
+          Accept: 'application/json', Authorization: `Bearer ${bearer}`,
+          ...(serialized === undefined ? {} : { 'Content-Type': 'application/json' }),
+          ...headers,
+        },
+        ...(serialized === undefined ? {} : { body: serialized }),
+      });
+      if (response.status >= 300 && response.status < 400) {
+        void response.body?.cancel().catch(() => {});
+        throw new PrimaryApiError('http_error', response.status);
+      }
+      const length = response.headers.get('content-length');
+      if (length && /^\d+$/.test(length) && Number(length) > maxBodyBytes) {
+        void response.body?.cancel().catch(() => {});
+        throw new PrimaryApiError('response_too_large', response.status);
+      }
+      const chunks: Uint8Array[] = [];
+      let size = 0;
+      if (response.body) {
+        reader = response.body.getReader();
+        try {
+          for (;;) {
+            const chunk = await reader.read();
+            if (chunk.done) break;
+            size += chunk.value.byteLength;
+            if (size > maxBodyBytes) {
+              void reader.cancel().catch(() => {});
+              throw new PrimaryApiError('response_too_large', response.status);
+            }
+            chunks.push(chunk.value);
+          }
+        } finally { reader.releaseLock(); reader = undefined; }
+      }
+      let decoded: unknown;
+      try {
+        const text = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks));
+        decoded = size ? JSON.parse(text) : undefined;
+      } catch {
+        throw new PrimaryApiError(response.ok ? 'invalid_response' : 'http_error', response.status);
+      }
+      if (!response.ok) {
+        const remote = errorEnvelope.safeParse(decoded);
+        const safeRemote = remote.success
+          && !remote.data.error.code.includes(bearer)
+          && !remote.data.error.code.includes(options.phoneServiceSecret)
+          ? remote.data.error : undefined;
+        throw new PrimaryApiError('http_error', response.status, safeRemote);
+      }
+      if (response.status !== expectedStatus) throw new PrimaryApiError('invalid_response', response.status);
+      return decoded;
+    };
+    try { return await Promise.race([request(), deadline]); }
+    catch (error) {
+      if (timedOut) throw new PrimaryApiError('request_timeout');
+      if (error instanceof PrimaryApiError) throw error;
+      throw new PrimaryApiError('request_failed');
+    } finally { clearTimeout(timer!); }
+  };
+}
+
+const uuid = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+const callSid = z.string().regex(/^CA[0-9a-fA-F]{32}$/);
+const itemId = z.string().regex(/^[a-zA-Z0-9_-]{1,128}$/);
+const textValue = z.string().min(1).max(MAX_BODY_BYTES);
+const sourceText = z.string().refine((value) => {
+  if (!value.trim() || value.includes('\0')) return false;
+  const scalars = Array.from(value);
+  return scalars.length <= 4000 && scalars.every((character) => {
+    const point = character.codePointAt(0)!;
+    return point < 0xd800 || point > 0xdfff;
+  });
+});
+const timestamp = z.iso.datetime({ offset: true });
+const revision = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER);
+const errorEnvelope = z.object({ error: z.object({
+  code: z.string().regex(/^[a-z][a-z0-9_]{1,79}$/), retryable: z.boolean(),
+}) });
+const contextSchema = z.object({
+  primaryDexterId: uuid, threadId: uuid, displayName: z.string().min(1).max(200),
+  messages: z.array(z.object({ id: uuid, role: z.enum(['user', 'assistant']), text: textValue })).max(20),
+}).refine((value) => value.messages.reduce((size, message) => size + Buffer.byteLength(message.text), 0) <= MAX_REQUEST_BYTES);
+const callSchema = z.object({
+  bindingId: uuid, callSid, state: z.enum(['open', 'closed']), context: contextSchema,
+});
+const requestBase = z.object({ requestId: uuid, bindingId: uuid, replayed: z.boolean().optional() });
+const requestSchema = z.discriminatedUnion('state', [
+  requestBase.extend({ state: z.enum(['queued', 'running']), assistant: z.never().optional(), error: z.never().optional() }),
+  requestBase.extend({ state: z.literal('completed'), error: z.never().optional(), assistant: z.object({
+    messageId: uuid, eventId: uuid, sequence: z.string().regex(/^[1-9][0-9]{0,39}$/), text: textValue,
+  }) }),
+  requestBase.extend({ state: z.enum(['failed', 'cancelled']), assistant: z.never().optional(), error: errorEnvelope.shape.error.extend({ retryable: z.literal(false) }) }),
+]);
+const submissionSchema = z.object({
+  source: z.object({ callSid, itemId, sourceEventId: uuid, revision: z.literal(1), receivedAt: timestamp, role: z.literal('user') }).strict(),
+  text: sourceText,
+}).strict();
+const turnSchema = z.object({
+  sourceEventId: uuid, revision, itemId, role: z.enum(['user', 'assistant']), text: sourceText, occurredAt: timestamp,
+}).strict();
+const turnReceiptSchema = z.object({ bindingId: uuid, sourceEventId: uuid, revision, recordId: uuid, replayed: z.boolean() });
+const closedSchema = z.object({ bindingId: uuid, callSid, state: z.literal('closed') });
+const readinessSchema = z.object({
+  eligible: z.boolean(),
+  reason: z.enum(['ready', 'caller_unlinked', 'caller_binding_ambiguous', 'primary_unavailable', 'authority_unavailable', 'runtime_unavailable']),
+}).refine((value) => value.eligible === (value.reason === 'ready'));
+
+function parse<T>(schema: z.ZodType<T>, value: unknown, code: 'invalid_request' | 'invalid_response'): T {
+  const result = schema.safeParse(value);
+  if (!result.success) throw new PrimaryApiError(code);
+  return result.data;
+}
+
+function same(actual: string | number, expected: string | number) {
+  if (actual !== expected) throw new PrimaryApiError('identity_mismatch');
+}
+
+export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiClient {
+  const request = createTransport(options);
+  // Known bindings add a second consistency check across open/context/submit/
+  // close. Recovery in a fresh process still validates exact wire identities.
+  const calls = new Map<string, {
+    callSid: string; primaryDexterId: string; threadId: string; state: 'open' | 'closed';
+  }>();
+  const bindingHeaders = (bindingId: string) => {
+    parse(uuid, bindingId, 'invalid_request');
+    return { 'X-Dexter-Binding-Id': bindingId };
+  };
+  const remember = (call: PrimaryCall) => {
+    const existing = calls.get(call.bindingId);
+    if (existing) {
+      same(call.callSid, existing.callSid);
+      same(call.context.primaryDexterId, existing.primaryDexterId);
+      same(call.context.threadId, existing.threadId);
+      if (existing.state === 'closed' && call.state !== 'closed') throw new PrimaryApiError('identity_mismatch');
+    }
+    calls.set(call.bindingId, {
+      callSid: call.callSid, primaryDexterId: call.context.primaryDexterId,
+      threadId: call.context.threadId, state: call.state,
+    });
+    return call;
+  };
+  const decodeResult = (value: unknown, bindingId: string, requestId: string, submit: boolean) => {
+    const result = parse(requestSchema, value, 'invalid_response');
+    same(result.bindingId, bindingId); same(result.requestId, requestId);
+    if (submit && typeof result.replayed !== 'boolean') throw new PrimaryApiError('invalid_response');
+    return result;
+  };
+  return {
+    async readiness(callerNumber) {
+      parse(z.string().regex(/^\+[1-9]\d{7,14}$/), callerNumber, 'invalid_request');
+      return parse(readinessSchema, await request('POST', '/readiness', { callerNumber }), 'invalid_response');
+    },
+    async openCall(providerProof) {
+      const proof = parse(z.object({
+        url: z.string().url().max(2048), signature: z.string().min(1).max(512),
+        params: z.record(z.string().min(1).max(128), z.string().max(2048))
+          .refine((value) => Object.keys(value).length <= 80),
+      }).strict(), providerProof, 'invalid_request');
+      const proofUrl = new URL(proof.url);
+      if (proofUrl.protocol !== 'https:' || proofUrl.username || proofUrl.password || proofUrl.hash) {
+        throw new PrimaryApiError('invalid_request');
+      }
+      const expectedCallSid = parse(callSid, proof.params.CallSid, 'invalid_request');
+      for (const key of ['AccountSid', 'Direction', 'From', 'To']) {
+        if (!proof.params[key]) throw new PrimaryApiError('invalid_request');
+      }
+      const call = parse(callSchema, await request('POST', '/calls', { providerProof: proof }), 'invalid_response');
+      same(call.callSid, expectedCallSid);
+      return remember(call);
+    },
+    async getContext(bindingId) {
+      const call = parse(callSchema, await request('GET', `/calls/${bindingId}/context`, undefined, bindingHeaders(bindingId)), 'invalid_response');
+      same(call.bindingId, bindingId);
+      return remember(call);
+    },
+    async submit(bindingId, requestId, input) {
+      const headers = bindingHeaders(bindingId);
+      parse(uuid, requestId, 'invalid_request');
+      const parsed = parse(submissionSchema, input, 'invalid_request');
+      const existing = calls.get(bindingId);
+      if (existing) same(parsed.source.callSid, existing.callSid);
+      const { role, ...source } = parsed.source;
+      return decodeResult(await request('POST', '/requests', { bindingId, source, role, text: parsed.text },
+        { ...headers, 'Idempotency-Key': requestId }, 202), bindingId, requestId, true);
+    },
+    async result(bindingId, requestId) {
+      const headers = bindingHeaders(bindingId);
+      parse(uuid, requestId, 'invalid_request');
+      return decodeResult(await request('GET', `/requests/${requestId}`, undefined, headers), bindingId, requestId, false);
+    },
+    async captureTurn(bindingId, input) {
+      const headers = bindingHeaders(bindingId);
+      const turn = parse(turnSchema, input, 'invalid_request');
+      const receipt = parse(turnReceiptSchema, await request('POST', `/calls/${bindingId}/turns`, turn, headers), 'invalid_response');
+      same(receipt.bindingId, bindingId); same(receipt.sourceEventId, turn.sourceEventId); same(receipt.revision, turn.revision);
+      same(receipt.recordId, turn.sourceEventId);
+      return receipt;
+    },
+    async close(bindingId) {
+      const closed = parse(closedSchema, await request('POST', `/calls/${bindingId}/close`, {}, bindingHeaders(bindingId)), 'invalid_response');
+      same(closed.bindingId, bindingId);
+      const existing = calls.get(bindingId);
+      if (existing) {
+        same(closed.callSid, existing.callSid);
+        calls.set(bindingId, { ...existing, state: 'closed' });
+      }
+      return closed;
+    },
+  };
+}

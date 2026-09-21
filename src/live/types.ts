@@ -1,0 +1,118 @@
+import type { ClientEvent } from 'openai/resources/live/live';
+
+/** One provider connection. Tests inject this boundary without opening a socket. */
+export interface BrokerLiveConnection {
+  onOpen(listener: () => void): void;
+  onEvent(listener: (event: unknown) => void): void;
+  onError(listener: (error: unknown) => void): void;
+  onClose(listener: () => void): void;
+  isOpen(): boolean;
+  send(event: ClientEvent): void;
+  close(): void;
+  terminate(): void;
+}
+
+export interface LiveTranscriptFragment {
+  eventId: string;
+  role: 'user' | 'assistant';
+  text: string;
+  startMs: number;
+  endMs: number;
+  sequence: number;
+}
+
+/** Fragments preserve provider text exactly. No fragment implies a finished turn. */
+export interface LiveTranscriptSnapshot {
+  revision: number;
+  callerRevision: number;
+  fragments: LiveTranscriptFragment[];
+}
+
+export interface LiveDelegationRequest {
+  callId: string;
+  sessionId: string;
+  delegationId: string;
+  /** Stable across duplicate delivery of this exact call/session/delegation. */
+  requestId: string;
+  offsetMs: number;
+  transcript: LiveTranscriptSnapshot;
+}
+
+export interface LiveDelivery {
+  eventId: string;
+  status: 'accepted' | 'rejected' | 'unconfirmed' | 'stale' | 'closed';
+  reason?: string;
+}
+
+export interface LiveBackendUpdate {
+  /** Backend-owned update identity, retained with the durable work record. */
+  id: string;
+  kind: 'progress' | 'result';
+  text: string;
+  /** Caller revision the backend reviewed. Required for a result. */
+  expectedCallerRevision?: number;
+  /** Progress is quiet by default; results are spoken by default. */
+  speak?: boolean;
+}
+
+export interface LiveBackendChannel {
+  getContext(): LiveTranscriptSnapshot;
+  subscribeContext(listener: (snapshot: LiveTranscriptSnapshot) => void): () => void;
+  publish(update: LiveBackendUpdate): Promise<LiveDelivery>;
+  /** Cancels this voice subscription only. It does not cancel durable work. */
+  signal: AbortSignal;
+}
+
+export interface BrokerLiveBackend {
+  /** Persist requestId and account binding before performing or resuming work. */
+  delegate(request: LiveDelegationRequest, channel: LiveBackendChannel): Promise<void>;
+}
+
+export interface LiveSessionClosed {
+  callId: string;
+  sessionId?: string;
+  finalized: boolean;
+  /** Separate from provider finalization; false if capture failed or its drain timed out. */
+  transcriptPersisted: boolean;
+  /** Any output audio suppressed by interruption or teardown makes heard-text proof incomplete. */
+  outputAudioDiscarded: boolean;
+  reason: string;
+  usageSeconds?: number;
+}
+
+export interface BrokerLiveEvent {
+  type: string;
+  [key: string]: unknown;
+}
+
+export interface BrokerLiveSessionOptions {
+  apiKey: string;
+  callId: string;
+  instructions: string;
+  voice?: string;
+  history?: Array<{ role: 'user' | 'assistant' | 'developer'; text: string }>;
+  backend: BrokerLiveBackend;
+  /** Output audio has an event ID but no provider timing or audio-done event. */
+  onAudio(base64: string, metadata: { eventId: string }): void;
+  onTranscript(snapshot: LiveTranscriptSnapshot): void | Promise<void>;
+  onReady(metadata: { callId: string; sessionId: string }): void;
+  onClosed(result: LiveSessionClosed): void;
+  onEvent?(event: BrokerLiveEvent): void;
+  /** Only explicit application interruption or session teardown clears playback. */
+  onPlaybackClear?(reason: 'application_interrupt' | 'session_closed' | 'session_failed'): void;
+  connectionFactory?: (apiKey: string) => BrokerLiveConnection;
+  startupTimeoutMs?: number;
+  closeTimeoutMs?: number;
+  appendAckTimeoutMs?: number;
+}
+
+export interface BrokerLiveSession {
+  appendAudio(base64: string): boolean;
+  appendContext(text: string): Promise<LiveDelivery>;
+  appendInstructions(text: string): Promise<LiveDelivery>;
+  /** Drops queued/new output until the application explicitly resumes playback. */
+  interruptPlayback(instruction: string): Promise<LiveDelivery>;
+  resumePlayback(): void;
+  getTranscript(): LiveTranscriptSnapshot;
+  close(reason?: string): Promise<LiveSessionClosed>;
+}
