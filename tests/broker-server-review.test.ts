@@ -230,8 +230,8 @@ test('terminal callback during account binding closes the late binding without s
 test('media stays claimed while provider stop is pending, preventing a second voice session', { timeout: 5000 }, async t => {
   const updateGate = deferred();
   const f = await fixture(t, { updateGate });
-  await f.webhook('/broker/incoming-call', f.params('inbound'));
-  const id = f.broker.store.list()[0].id;
+  const id = await f.dial();
+  await f.webhook(`/broker/answer/${id}`, f.params('outbound-api'));
   const ws = await f.media(id);
   ws.close();
   await f.updateStarted.promise;
@@ -324,7 +324,7 @@ test('a terminal call with failed Primary close is recoverable through explicit 
   assert.equal(f.created(), 1);
 });
 
-test('signed inbound completion before media opens closes the existing binding', { timeout: 5000 }, async t => {
+test('signed inbound completion ends the public leg without creating an account binding', { timeout: 5000 }, async t => {
   const f = await fixture(t);
   await f.webhook('/broker/incoming-call', f.params('inbound'));
   const id = f.broker.store.list()[0].id;
@@ -333,7 +333,9 @@ test('signed inbound completion before media opens closes the existing binding',
   assert.equal(f.closures.length, 0);
   assert.equal((await f.webhook('/broker/status', f.params('inbound', 'completed'))).status, 200);
   assert.equal(f.broker.store.get(id)!.status, 'completed');
-  assert.deepEqual(f.closures, [f.bindingId]);
+  assert.deepEqual(f.closures, []);
+  assert.equal(f.proofs.length, 0);
+  assert.equal(f.broker.store.get(id)!.primary, undefined);
   assert.equal(f.voices(), 0);
   assert.equal(f.created(), 0);
 });
@@ -341,8 +343,8 @@ test('signed inbound completion before media opens closes the existing binding',
 test('voice startup failure uses audible TwiML on the same call before provider hangup', { timeout: 5000 }, async t => {
   const updateGate = deferred();
   const f = await fixture(t, { updateGate });
-  await f.webhook('/broker/incoming-call', f.params('inbound'));
-  const id = f.broker.store.list()[0].id;
+  const id = await f.dial();
+  await f.webhook(`/broker/answer/${id}`, f.params('outbound-api'));
   const ws = await f.media(id);
   let replacementAccepted = false;
   let closedBeforeReplacement = false;
@@ -357,7 +359,7 @@ test('voice startup failure uses audible TwiML on the same call before provider 
   assert.equal(typeof firstUpdate.args.twiml, 'string');
   assert.match(String(firstUpdate.args.twiml), /<Say/);
   assert.match(String(firstUpdate.args.twiml), /<Hangup/);
-  assert.equal(f.created(), 0);
+  assert.equal(f.created(), 1);
   // The provider update is deliberately unresolved. Closing this stream now
   // would resume the original TwiML's Hangup before the replacement can speak.
   await new Promise<void>(resolve => setTimeout(resolve, 40));

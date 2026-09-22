@@ -4,11 +4,11 @@ The broker connects Twilio telephone audio to GPT-Live and delegates account wor
 
 ## Release state
 
-As of September 21, 2026, the integration exists in source and has local tests with injected providers. The most recent provider preflight was blocked by exhausted credits. There is no completed call proving the combined GPT-Live and Primary path.
+As of September 22, 2026, the integration exists in source and has local tests with injected providers. The most recent provider preflight was blocked by exhausted credits. There is no completed call proving the combined GPT-Live and Primary path. The inbound callback addition awaits the broker successor release; the existing number has not been rerouted to it.
 
 Deployment files in this repository prepare port `3213` and the `/broker/` path. Angel owns applying the nginx change after Wallet acceptance. The existing service on port `3212` and the Twilio number's current inbound configuration stay in place. A source checkout, compiled build, running process, provider configuration, and completed call are separate evidence states; record each when it is verified.
 
-The Primary ingress must be released independently. Its current admission contract permits verified outbound calls. It rejects inbound account binding with `caller_possession_required`, because caller ID alone does not establish possession. The transport's inbound handler does not make inbound account access available.
+The Primary ingress must be released independently. Its current admission contract permits verified outbound calls. It rejects inbound account binding with `caller_possession_required`, because caller ID alone does not establish possession. The inbound handler therefore offers a callback without opening Primary, reading account data, or starting GPT-Live. The outbound leg establishes possession of the current saved destination.
 
 Primary's waiting/question/answer continuation is outstanding. The client accepts `queued`, `running`, `completed`, `failed`, and `cancelled`. A completed result requires an identified assistant message. A missing result or an unsupported waiting state remains unresolved. Hangup ends voice delivery and closes admission after source recovery; it does not cancel work already accepted by Primary. Later transcript corrections are recorded as source revisions and do not retroactively change an admitted action.
 
@@ -64,7 +64,21 @@ Use this command only when applying the reviewed deployment. The configuration s
 
 `GET /broker/health` reports process readiness, model, revision, and active call count. A successful health response establishes HTTP reachability. It does not establish provider credits, Primary eligibility, working audio, or a completed call.
 
-Outbound call creation sets its own answer and status callbacks under `/broker/answer/:id` and `/broker/status/:id`; it can use the existing sender without rerouting the number. Future inbound activation would require a stronger possession mechanism plus explicit number configuration: voice POST to `/broker/incoming-call` and status POST to `/broker/status`. That activation is outside this deployment preparation.
+Outbound call creation sets its own answer and status callbacks under `/broker/answer/:id` and `/broker/status/:id`; it can use the existing sender without rerouting the number. Inbound activation requires the callback source to be released and the number to be configured explicitly: voice POST to `/broker/incoming-call` and status POST to `/broker/status`. The Gather action posts to `/broker/callback/:id`. The existing number configuration remains unchanged by this preparation.
+
+## Inbound callback
+
+The inbound response offers one DTMF choice: press 1 to request a callback. The offer and acknowledgment use the same wording whether the caller's account is ready or unavailable. The inbound leg supplies no account context to the caller or a voice model.
+
+Consent requires the signed Twilio POST for the exact inbound call, caller number, owned destination, and provider account. A fresh Twilio read must confirm those identities and an active call before consent is saved. This read has a four-second deadline. A matching caller ID alone never opens Primary.
+
+The consent record stores a stable request UUID derived from the provider account and inbound CallSid, its timestamp, and state in the existing call journal. The HTTP response says the person can hang up and ends the inbound leg. Maintenance checks pending callbacks every 10 seconds. It fetches the exact inbound call again and requires provider-confirmed termination before invoking the existing outbound executor.
+
+For the initial trial, the destination must be in `BROKER_ALLOWED_TO`. The shared outbound executor then asks the API to confirm that exact number remains a verified saved destination with ready Primary authority. Only after that check does it run the mandatory GPT-Live audio preflight and dial. A failed readiness check prevents preflight and dialing.
+
+Consent expires after five minutes. The callback helper admits at most three requests per number per hour, with at least 60 seconds between admissions; these limits survive process restart. They apply to inbound callback requests. Exact webhook retries retain the original consent and request ID. An existing outbound request is recovered even when its outcome is uncertain, so a timeout or restart cannot produce a second dial.
+
+The operator call list includes `callback.state`: `requested` means consent is waiting for dispatch, `started` means an outbound request is already saved, and `unavailable` means this callback will receive no further dispatch attempt. `started` does not prove that the phone rang or a person answered; inspect the associated outbound call status and provider evidence. If readiness or credits were unavailable, the caller can make a fresh request after the underlying issue is resolved and the callback limits allow it.
 
 ## Controlled call
 

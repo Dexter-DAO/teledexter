@@ -8,7 +8,9 @@ The voice instructions keep replies brief, let you interrupt, and ask Primary fo
 
 The broker service, GPT-Live adapter, and authenticated Primary client are implemented in this repository. Local tests use injected provider connections. The latest provider preflight was blocked by exhausted credits. A completed call through GPT-Live and Primary has not been demonstrated.
 
-Outbound calls require an allowed destination, account readiness, and a successful audio preflight before dialing. The API admits the account through a verified outbound call. Inbound transport is prepared, but inbound account access remains disabled until per-call possession is established. Primary's question-and-answer continuation contract is still pending; a request waiting for an answer cannot be presented as completed.
+Outbound calls require an allowed destination, account readiness, and a successful audio preflight before dialing. The API admits the account through a verified outbound call. When you call Dexter, the inbound flow offers a callback: press 1, hang up, and Dexter can call the verified number saved to your account. Account access begins on that outbound call. The inbound leg reads no private account information.
+
+The callback flow is implemented and tested locally; it awaits the broker successor release and inbound number configuration. Consent expires after five minutes, and repeated callbacks recover the same saved request. Phone integration with Primary's question-and-answer continuation is still pending; a request waiting for an answer cannot be presented as completed.
 
 The deployment configuration prepares a separate service on `127.0.0.1:3213`, exposed through `/broker/` on `phone.dexter.cash`. Existing Phone runs on port `3212`. Applying this configuration and changing a Twilio number's inbound routing are separate operations. See [operations](docs/BROKER_OPERATIONS.md) for deployment state, configuration, and call recovery.
 

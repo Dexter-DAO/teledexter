@@ -6,6 +6,7 @@ import { createBrokerLiveSession, type BrokerLiveSession, type BrokerLiveSession
 import type { LiveTranscriptSnapshot } from '../live/session.js';
 import { createPrimaryApiClient, type PrimaryApiClient } from './primaryApi.js';
 import { createPrimaryBackend } from './backend.js';
+import { createCallbackFlow } from './callback.js';
 import { type BrokerConfig, isPhoneNumber } from './config.js';
 import { BrokerStore, type BrokerCall, type CallStatus, terminalCallStatuses } from './store.js';
 import { brokerInstructions } from './instructions.js';
@@ -34,6 +35,7 @@ const publicCall = (call: BrokerCall) => ({
   createdAt: call.createdAt, updatedAt: call.updatedAt, endedAt: call.endedAt,
   primaryConnected: Boolean(call.primary), finalized: call.finalized, failure: call.failure,
   primaryClosePending: call.primaryClosePending ?? false, transcriptCapture: call.transcriptCapture,
+  callback: call.callback,
   metrics: call.metrics, delegationCount: Object.keys(call.delegations).length,
 });
 
@@ -60,6 +62,10 @@ export function createBrokerServer(options: BrokerServerOptions) {
   const sessionCalls = new Set<string>();
   const closingBindings = new Map<string, Promise<void>>();
   let accepting = true;
+  const callbacks = createCallbackFlow({ config, store,
+    fetchCall: sid => provider.calls(sid).fetch(),
+    requestOutbound: input => requestOutbound(input).then(result => result.call),
+  });
 
   function closePrimary(call: BrokerCall): Promise<void> {
     if (!call.primary) return Promise.resolve();
@@ -94,6 +100,50 @@ export function createBrokerServer(options: BrokerServerOptions) {
     return pending;
   }
 
+  async function requestOutbound(input: { requestId: string; purpose: string; to: string; callbackFor?: string }): Promise<{ replayed: boolean; call: BrokerCall }> {
+    const to = input.to;
+    if (!accepting || !UUID.test(input.requestId) || !config.allowedTo.includes(to)) throw new Error('call_not_available');
+    if (input.callbackFor) {
+      const inbound = store.get(input.callbackFor);
+      if (!inbound || inbound.direction !== 'inbound' || inbound.number !== to || !terminalCallStatuses.has(inbound.status)
+        || inbound.callback?.requestId !== input.requestId || inbound.callback.state !== 'requested') throw new Error('callback_identity_mismatch');
+    }
+    const reservation = store.reserve({ requestId: input.requestId, direction: 'outbound', purpose: input.purpose.trim(), number: to });
+    if (reservation.existing) return { replayed: true, call: reservation.call };
+    const call = reservation.call;
+    sessionCalls.add(call.id);
+    if (dialing.has(to) || store.list().some(other => other.id !== call.id && other.number === to && !terminalCallStatuses.has(other.status))) {
+      store.update(call.id, { status: 'canceled', failure: { code: 'call_already_open', message: 'Another call for this person needs to finish first' } });
+      throw Object.assign(new Error('Another call is already open'), { code: 'call_already_open' });
+    }
+    dialing.add(to);
+    try {
+      try {
+        const readiness = await primary.readiness(to);
+        if (!readiness.eligible) throw Object.assign(new Error('The account is not ready for this call'), { code: readiness.reason });
+        await probe({ apiKey: config.apiKey, voice: config.voice, model: config.model });
+      }
+      catch (error) { store.update(call.id, { status: 'failed', failure: safeFailure(error) }); throw error; }
+      if (!accepting) { store.update(call.id, { status: 'canceled' }); throw new Error('service_shutting_down'); }
+      store.update(call.id, { status: 'dialing' });
+      try {
+        const created = await provider.calls.create({ from: config.from, to,
+          url: `${config.publicOrigin}/broker/answer/${call.id}`, method: 'POST',
+          statusCallback: `${config.publicOrigin}/broker/status/${call.id}`, statusCallbackMethod: 'POST',
+          statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
+          timeout: 30, timeLimit: config.maxCallSeconds, record: false,
+        });
+        if (!CALL_SID.test(created.sid)) throw new Error('invalid_provider_call_id');
+        const saved = store.update(call.id, { callSid: created.sid, status: 'queued' });
+        return { replayed: false, call: saved };
+      } catch (error) {
+        const status = (error as { status?: number }).status;
+        store.update(call.id, { status: status && status >= 400 && status < 500 ? 'failed' : 'unknown', failure: safeFailure(error) });
+        throw error;
+      }
+    } finally { dialing.delete(to); }
+  }
+
   async function bind(call: BrokerCall, proof: ProviderCallProof): Promise<BrokerCall> {
     const binding = await primary.openCall(proof);
     if (binding.callSid !== call.callSid || binding.state !== 'open') throw new Error('primary_call_identity_mismatch');
@@ -118,40 +168,13 @@ export function createBrokerServer(options: BrokerServerOptions) {
           || Object.keys(input).some(key => !['requestId', 'purpose', 'to'].includes(key))) return json(response, 400, { error: 'invalid_call_request' });
         const to = input.to as string | undefined ?? (config.allowedTo.length === 1 ? config.allowedTo[0] : undefined);
         if (!to || !config.allowedTo.includes(to)) return json(response, 403, { error: 'recipient_not_authorized' });
-        const reservation = store.reserve({ requestId: input.requestId, direction: 'outbound', purpose: input.purpose.trim(), number: to });
-        if (reservation.existing) return json(response, 200, { replayed: true, call: publicCall(reservation.call) });
-        const call = reservation.call;
-        sessionCalls.add(call.id);
-        if (dialing.has(to) || store.list().some(other => other.id !== call.id && other.number === to && !terminalCallStatuses.has(other.status))) {
-          store.update(call.id, { status: 'canceled', failure: { code: 'call_already_open', message: 'Another call for this person needs to finish first' } });
-          return json(response, 409, { error: 'call_already_open' });
-        }
-        dialing.add(to);
         try {
-          try {
-            const readiness = await primary.readiness(to);
-            if (!readiness.eligible) throw Object.assign(new Error('The account is not ready for this call'), { code: readiness.reason });
-            await probe({ apiKey: config.apiKey, voice: config.voice, model: config.model });
-          }
-          catch (error) { store.update(call.id, { status: 'failed', failure: safeFailure(error) }); throw error; }
-          if (!accepting) { store.update(call.id, { status: 'canceled' }); return json(response, 503, { error: 'service_shutting_down' }); }
-          store.update(call.id, { status: 'dialing' });
-          try {
-            const created = await provider.calls.create({ from: config.from, to,
-              url: `${config.publicOrigin}/broker/answer/${call.id}`, method: 'POST',
-              statusCallback: `${config.publicOrigin}/broker/status/${call.id}`, statusCallbackMethod: 'POST',
-              statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
-              timeout: 30, timeLimit: config.maxCallSeconds, record: false,
-            });
-            if (!CALL_SID.test(created.sid)) throw new Error('invalid_provider_call_id');
-            const saved = store.update(call.id, { callSid: created.sid, status: 'queued' });
-            return json(response, 201, { replayed: false, call: publicCall(saved) });
-          } catch (error) {
-            const status = (error as { status?: number }).status;
-            store.update(call.id, { status: status && status >= 400 && status < 500 ? 'failed' : 'unknown', failure: safeFailure(error) });
-            throw error;
-          }
-        } finally { dialing.delete(to); }
+          const result = await requestOutbound({ requestId: input.requestId, purpose: input.purpose.trim(), to });
+          return json(response, result.replayed ? 200 : 201, { replayed: result.replayed, call: publicCall(result.call) });
+        } catch (error) {
+          if ((error as { code?: string }).code === 'call_already_open') return json(response, 409, { error: 'call_already_open' });
+          throw error;
+        }
       }
       if (route === '/internal/broker/end' || route === '/internal/broker/reconcile') {
         if (typeof input.id !== 'string' || !UUID.test(input.id)) return json(response, 400, { error: 'invalid_call_id' });
@@ -180,7 +203,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
 
     if (request.method !== 'POST') return json(response, 404, { error: 'not_found' });
     const incoming = route === '/broker/incoming-call';
-    const match = route.match(/^\/broker\/(answer|status)\/([0-9a-f-]{36})$/);
+    const match = route.match(/^\/broker\/(answer|status|callback)\/([0-9a-f-]{36})$/);
     const genericStatus = route === '/broker/status';
     if (!incoming && !match && !genericStatus) return json(response, 404, { error: 'not_found' });
     const raw = new URLSearchParams(await body(request));
@@ -195,6 +218,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
       const requestId = createHash('sha256').update(`incoming:${params.CallSid}`).digest('hex');
       call = store.reserve({ requestId, direction: 'inbound', purpose: 'The person called Dexter.', number: params.From, callSid: params.CallSid }).call;
       sessionCalls.add(call.id);
+      return xml(response, callbacks.offer(call, proof));
     } else {
       const saved = genericStatus ? store.bySid(params.CallSid) : store.get(match![2]);
       if (!saved || (saved.direction === 'outbound' && (params.From !== config.from || params.To !== saved.number))
@@ -202,6 +226,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
           || (saved.direction === 'inbound' && match?.[1] === 'answer')
           || (saved.callSid && saved.callSid !== params.CallSid)) return json(response, 403, { error: 'call_identity_mismatch' });
       call = saved.callSid ? saved : store.update(saved.id, { callSid: params.CallSid });
+      if (match?.[1] === 'callback') return xml(response, await callbacks.consent(call, proof));
       if (genericStatus || match![1] === 'status') {
         if (providerStates.has(params.CallStatus as CallStatus)) {
           const state = params.CallStatus as CallStatus;
@@ -359,6 +384,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
   const maintenanceTimer = setInterval(() => {
     if (!accepting || maintenance) return;
     maintenance = (async () => {
+      await callbacks.dispatchPending();
       for (const call of store.list()) {
         if (active.has(call.id) || claimed.has(call.id)) continue;
         if (call.primaryClosePending) await closePrimary(call);
