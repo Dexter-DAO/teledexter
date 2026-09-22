@@ -207,3 +207,81 @@ test('completed source validation counts Unicode scalars and rejects provisional
   }
   assert.equal(requests.length, 1);
 });
+
+const questionId = '88888888-8888-4888-8888-888888888888';
+const replyId = '99999999-9999-4999-8999-999999999999';
+const pendingQuestion = { id: questionId, revision: 1, expiresAt: '2026-09-28T21:00:00.000Z',
+  runState: 'waiting_for_reply', runId: sourceEventId, threadId, agent: { id: primaryDexterId, name: 'Dexter' },
+  question: 'Which amount should I use?', context: 'You asked about buying a stock.', proposedAnswer: 'Ten dollars.',
+  yesMeaning: 'Use ten dollars.', noMeaning: 'Do not place the order.', state: 'pending', createdAt: when, reply: null };
+const replyInput = { source: { callSid, itemId: 'answer_1', sourceEventId, revision: 1 as const, receivedAt: when },
+  role: 'user' as const, text: 'No.', reply: { questionRevision: 1 as const, clientReplyId: replyId, answer: 'no' as const, text: null } };
+const answeredQuestion = { ...pendingQuestion, runState: 'queued', state: 'answered',
+  reply: { ...replyInput.reply, interpretedAnswer: pendingQuestion.noMeaning, receivedAt: when } };
+
+test('waiting exposes the exact saved question and never becomes a completed result', async () => {
+  const waiting = { bindingId, requestId, state: 'waiting_for_reply', question: pendingQuestion };
+  assert.deepEqual(await harness([json(waiting)]).client.result(bindingId, requestId), waiting);
+  await assert.rejects(harness([json({ bindingId, requestId, state: 'waiting_for_reply' })]).client.result(bindingId, requestId), code('invalid_response'));
+  await assert.rejects(harness([json({ ...waiting, assistant })]).client.result(bindingId, requestId), code('invalid_response'));
+  const wrongThread = harness([json(call), json({ ...waiting, question: { ...pendingQuestion, threadId: eventId } })]);
+  await wrongThread.client.openCall(proof);
+  await assert.rejects(wrongThread.client.result(bindingId, requestId), code('identity_mismatch'));
+});
+
+test('expired question remains visible while its original run is waiting for reply', async () => {
+  const expired = { ...pendingQuestion, state: 'expired', expiresAt: when };
+  const waiting = { bindingId, requestId, state: 'waiting_for_reply', question: expired };
+  const { client, requests } = harness([json(waiting), json(waiting), json({ error: { code: 'question_expired', retryable: false } }, 410)]);
+  assert.deepEqual(await client.result(bindingId, requestId), waiting);
+  assert.deepEqual(await client.question(bindingId, requestId, questionId), waiting);
+  await assert.rejects(client.reply(bindingId, requestId, questionId, replyInput), (error: unknown) => {
+    assert.ok(error instanceof PrimaryApiError);
+    assert.equal(error.code, 'http_error');
+    assert.equal(error.status, 410);
+    assert.equal(error.remoteCode, 'question_expired');
+    assert.equal(error.retryable, false);
+    return true;
+  });
+  assert.equal(requests.length, 3);
+  assert.equal(requests.filter(request => request.init.method === 'POST').length, 1);
+  assert.ok(requests[2].url.endsWith(`/requests/${requestId}/questions/${questionId}/reply`));
+  for (const state of ['answered', 'cancelled', 'unavailable']) {
+    const question = state === 'answered' ? { ...answeredQuestion, runState: 'waiting_for_reply' } : { ...expired, state };
+    await assert.rejects(harness([json({ ...waiting, question })]).client.result(bindingId, requestId), code('invalid_response'));
+  }
+});
+
+test('spoken answers use the exact same request and question with canonical reply identity, without submission headers', async () => {
+  const envelope = { bindingId, requestId, state: 'queued', question: answeredQuestion, replayed: false };
+  const { client, requests } = harness([json(envelope)]);
+  assert.deepEqual(await client.reply(bindingId, requestId, questionId, replyInput), envelope);
+  assert.equal(requests.length, 1);
+  assert.ok(requests[0].url.endsWith(`/requests/${requestId}/questions/${questionId}/reply`));
+  assert.equal(new Headers(requests[0].init.headers).get('Idempotency-Key'), null);
+  assert.equal(new Headers(requests[0].init.headers).get('X-Dexter-Binding-Id'), bindingId);
+  assert.deepEqual(JSON.parse(String(requests[0].init.body)), replyInput);
+  const changed = { ...envelope, question: { ...answeredQuestion, reply: { ...answeredQuestion.reply, answer: 'yes' } } };
+  await assert.rejects(harness([json(changed)]).client.reply(bindingId, requestId, questionId, replyInput), code('identity_mismatch'));
+});
+
+test('unknown answer dispatch is not retried and exact GET can recover an older answer after a later question', async () => {
+  const older = { bindingId, requestId, state: 'waiting_for_reply', question: { ...answeredQuestion, runState: 'waiting_for_reply' } };
+  const { client, requests } = harness([json(older)]);
+  assert.deepEqual(await client.question(bindingId, requestId, questionId), older);
+  assert.equal(requests[0].init.method, 'GET');
+  let attempts = 0;
+  const uncertain = createPrimaryApiClient({ apiBaseUrl: 'https://api.example.test', phoneServiceSecret: secret,
+    fetch: async () => { attempts++; throw new Error('synthetic_transport_loss'); } });
+  await assert.rejects(uncertain.reply(bindingId, requestId, questionId, replyInput), code('request_failed'));
+  assert.equal(attempts, 1);
+  await assert.rejects(harness([json({ ...older, question: { ...older.question, id: eventId } })]).client.question(bindingId, requestId, questionId), code('identity_mismatch'));
+});
+
+test('reply validation refuses oversized, contradictory and caller-supplied extra authority fields before dispatch', async () => {
+  const { client, requests } = harness([]);
+  await assert.rejects(client.reply(bindingId, requestId, questionId, { ...replyInput, reply: { ...replyInput.reply, text: 'Use ten dollars.' } }), code('invalid_request'));
+  await assert.rejects(client.reply(bindingId, requestId, questionId, { ...replyInput, reply: { ...replyInput.reply, answer: 'other', text: '🙂'.repeat(501) } }), code('invalid_request'));
+  await assert.rejects(client.reply(bindingId, requestId, questionId, { ...replyInput, owner: 'another-owner' } as typeof replyInput), code('invalid_request'));
+  assert.equal(requests.length, 0);
+});

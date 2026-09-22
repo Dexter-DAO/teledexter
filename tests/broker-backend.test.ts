@@ -4,8 +4,9 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { BrokerStore } from '../src/broker/store.js';
-import { createPrimaryBackend, type PrimaryBackendOptions, type BrokerDelegationRecord } from '../src/broker/backend.js';
-import type { PrimaryResult, PrimarySubmission, PrimaryTurn } from '../src/broker/primaryApi.js';
+import { createPrimaryBackend, literalPhoneAnswer, type PrimaryBackendOptions, type BrokerDelegationRecord } from '../src/broker/backend.js';
+import type { PrimaryQuestion, PrimaryQuestionResult, PrimaryReplyInput, PrimaryResult, PrimarySubmission, PrimaryTurn } from '../src/broker/primaryApi.js';
+import { PrimaryApiError } from '../src/broker/primaryApi.js';
 import type { LiveBackendChannel, LiveBackendUpdate, LiveDelegationRequest, LiveTranscriptSnapshot } from '../src/live/session.js';
 
 const bindingId = '11111111-1111-5111-a111-111111111111';
@@ -45,6 +46,8 @@ async function fixture(t: TestContext, overrides: Partial<PrimaryBackendOptions>
   const posts: Array<{ bindingId: string; requestId: string; input: PrimarySubmission }> = [];
   const reads: string[] = [];
   const captures: PrimaryTurn[] = [];
+  const replies: Array<{ bindingId: string; requestId: string; questionId: string; input: PrimaryReplyInput }> = [];
+  const questionReads: Array<{ bindingId: string; requestId: string; questionId: string }> = [];
   let resultText = 'Your balance is $10.25 USDC.';
   const completed = (requestId: string): PrimaryResult => ({ bindingId, requestId, state: 'completed', assistant: {
     messageId: '33333333-3333-5333-a333-333333333333', eventId: '44444444-4444-5444-a444-444444444444', sequence: '1', text: resultText,
@@ -53,6 +56,8 @@ async function fixture(t: TestContext, overrides: Partial<PrimaryBackendOptions>
     submit: async (id: string): Promise<PrimaryResult & { replayed: boolean }> => ({ bindingId, requestId: id, state: 'queued', replayed: false }),
     result: async (id: string): Promise<PrimaryResult> => completed(id),
     capture: async (_turn: PrimaryTurn) => {},
+    question: async (_id: string, _questionId: string): Promise<PrimaryQuestionResult> => { throw new Error('No question configured'); },
+    reply: async (_id: string, _questionId: string, _input: PrimaryReplyInput): Promise<PrimaryQuestionResult> => { throw new Error('No reply configured'); },
   };
   const api: PrimaryBackendOptions['api'] = {
     submit: async (binding, id, input) => {
@@ -68,6 +73,18 @@ async function fixture(t: TestContext, overrides: Partial<PrimaryBackendOptions>
       captures.push(structuredClone(turn)); await behavior.capture(turn);
       return { bindingId: binding, sourceEventId: turn.sourceEventId, revision: turn.revision, recordId: turn.sourceEventId, replayed: false };
     },
+    question: async (binding, id, questionId) => {
+      questionReads.push({ bindingId: binding, requestId: id, questionId });
+      return behavior.question(id, questionId);
+    },
+    reply: async (binding, id, questionId, input) => {
+      const saved = JSON.parse(await readFile(path.join(directory, 'calls.json'), 'utf8'));
+      const reply = saved.calls[call.id].delegations[id].questions[questionId].reply;
+      assert.equal(reply.status, 'dispatching');
+      assert.deepEqual(reply.input, input);
+      replies.push({ bindingId: binding, requestId: id, questionId, input: structuredClone(input) });
+      return behavior.reply(id, questionId, input);
+    },
   };
   const options: PrimaryBackendOptions = { callId: call.id, callSid: 'CA_test', bindingId, api, store,
     stabilityMs: 5, maxWaitMs: 50, pollIntervalMs: 5, maxPollMs: 30, ...overrides };
@@ -78,7 +95,7 @@ async function fixture(t: TestContext, overrides: Partial<PrimaryBackendOptions>
   const request = (delegationId = 'del_1'): LiveDelegationRequest => ({ callId: call.id, sessionId: 'sess_test', delegationId,
     requestId: `live_${delegationId}`, offsetMs: 1200, transcript: c.channel.getContext() });
   const saved = () => Object.values(store.get(call.id)!.delegations) as BrokerDelegationRecord[];
-  return { ...c, directory, store, call, api, options, backend, speech, request, posts, reads, captures, behavior, completed,
+  return { ...c, directory, store, call, api, options, backend, speech, request, posts, reads, captures, replies, questionReads, behavior, completed,
     saved, result: (text: string) => { resultText = text; } };
 }
 
@@ -364,4 +381,442 @@ test('an unsplittable numeric token is saved in full and produces an explicit vo
   assert.equal(f.saved()[0].result, text);
   assert.match(f.updates.at(-1)!.text, /cannot read that format accurately/);
   assert.ok(!f.updates.at(-1)!.text.includes('111'));
+});
+
+const firstQuestionId = '55555555-5555-5555-a555-555555555555';
+const secondQuestionId = '66666666-6666-5666-a666-666666666666';
+const question = (id = firstQuestionId, overrides: Partial<PrimaryQuestion> = {}): PrimaryQuestion => ({
+  id, revision: 1, expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  runState: 'waiting_for_reply', runId: '77777777-7777-5777-a777-777777777777',
+  threadId: '88888888-8888-5888-a888-888888888888', agent: { id: '99999999-9999-5999-a999-999999999999', name: 'Dexter' },
+  question: 'Would you like to buy $10.25 of this stock?', context: 'This continues the purchase you requested.',
+  proposedAnswer: 'Buy $10.25.', yesMeaning: 'Continue with the $10.25 purchase.', noMeaning: 'Keep the current position.',
+  state: 'pending', createdAt: new Date(Date.now() - 1_000).toISOString(), reply: null, ...overrides,
+});
+const questionResult = (requestId: string, value: PrimaryQuestion): PrimaryQuestionResult => ({
+  requestId, bindingId, state: value.runState, question: structuredClone(value),
+});
+const waiting = (requestId: string, value: PrimaryQuestion): PrimaryResult => ({
+  requestId, bindingId, state: 'waiting_for_reply', question: structuredClone(value),
+});
+const answered = (value: PrimaryQuestion, input: PrimaryReplyInput): PrimaryQuestion => ({
+  ...value, state: 'answered', runState: 'running', reply: { ...input.reply,
+    interpretedAnswer: input.reply.answer === 'yes' ? value.yesMeaning : input.reply.answer === 'no' ? value.noMeaning : input.reply.text!,
+    receivedAt: new Date().toISOString(),
+  },
+});
+
+async function waitingFixture(t: TestContext, value = question()) {
+  const f = await fixture(t);
+  let current = value;
+  f.behavior.result = async id => current.state === 'pending' ? waiting(id, current) : f.completed(id);
+  f.behavior.question = async (id, questionId) => {
+    assert.equal(questionId, current.id);
+    return questionResult(id, current);
+  };
+  f.behavior.reply = async (id, questionId, input) => {
+    assert.equal(questionId, current.id);
+    current = answered(current, input);
+    return { ...questionResult(id, current), replayed: false };
+  };
+  f.add('Please buy $10.25 of this stock.'); f.speech();
+  await f.backend.delegate(f.request(), f.channel);
+  return { ...f, currentQuestion: () => current, setQuestion: (next: PrimaryQuestion) => { current = next; } };
+}
+
+test('a presented question takes a literal reply on the original run and captures its source once', async t => {
+  const f = await waitingFixture(t);
+  assert.equal(f.saved()[0].status, 'waiting_for_reply');
+  assert.equal(f.saved()[0].questions![firstQuestionId].presentation!.callerRevision, 1);
+  const presentation = f.updates.map(update => update.text).join('');
+  for (const field of ['question', 'context', 'proposedAnswer', 'yesMeaning', 'noMeaning'] as const)
+    assert.ok(presentation.includes(f.currentQuestion()[field]));
+  f.add('Yes.', 3000, 3200); f.speech(3000, 3200);
+  await f.backend.delegate(f.request('answer'), f.channel);
+  assert.equal(f.posts.length, 1); assert.equal(f.replies.length, 1);
+  assert.equal(f.replies[0].requestId, f.posts[0].requestId);
+  assert.equal(f.replies[0].questionId, firstQuestionId);
+  assert.equal(f.replies[0].input.text, 'Yes.');
+  assert.equal(f.replies[0].input.reply.answer, 'yes'); assert.equal(f.replies[0].input.reply.text, null);
+  assert.equal(f.saved()[0].status, 'completed');
+  assert.equal(f.updates.at(-1)!.text, 'Your balance is $10.25 USDC.');
+  assert.deepEqual(await f.backend.captureCompletedTurns(f.channel.getContext(), { assistantPlaybackComplete: true, sessionFinalized: true }),
+    { captured: 0, pending: 0, unsupported: [] });
+  assert.equal(f.captures.length, 0);
+  await f.backend.delegate(f.request('duplicate_answer'), f.channel);
+  assert.equal(f.posts.length, 1); assert.equal(f.replies.length, 1);
+});
+
+test('literal reply mapping preserves canonical yes and no meanings and leaves qualified speech as other', () => {
+  for (const text of ['yes', ' Yes. ', 'YES!']) assert.deepEqual(literalPhoneAnswer(text), { answer: 'yes', text: null });
+  for (const text of ['no', ' No. ', 'NO!']) assert.deepEqual(literalPhoneAnswer(text), { answer: 'no', text: null });
+  for (const text of ['yes?', 'yes, but buy $20 instead', 'no thanks', 'sure', 'I guess yes'])
+    assert.deepEqual(literalPhoneAnswer(text), { answer: 'other', text });
+  assert.throws(() => literalPhoneAnswer('é'.repeat(1001)), /answer_too_long/);
+});
+
+test('a no reply carries no even when the canonical no meaning continues the request', async t => {
+  const f = await waitingFixture(t, question(firstQuestionId, {
+    question: 'Would you like to stop this purchase?', yesMeaning: 'Stop the purchase.', noMeaning: 'Continue buying $10.25.',
+  }));
+  f.add('No!', 3000, 3200); f.speech(3000, 3200);
+  await f.backend.delegate(f.request('no_answer'), f.channel);
+  assert.equal(f.replies[0].input.reply.answer, 'no');
+  assert.equal(f.currentQuestion().reply!.interpretedAnswer, 'Continue buying $10.25.');
+  assert.equal(f.posts.length, 1);
+});
+
+test('qualified caller text is preserved as other without inventing an approval', async t => {
+  const f = await waitingFixture(t);
+  const text = 'Yes, but buy $20 instead.';
+  f.add(text, 3000, 3200); f.speech(3000, 3200);
+  await f.backend.delegate(f.request('qualified_answer'), f.channel);
+  assert.equal(f.replies[0].input.text, text);
+  assert.deepEqual(f.replies[0].input.reply, { questionRevision: 1,
+    clientReplyId: f.replies[0].input.reply.clientReplyId, answer: 'other', text });
+  assert.equal(f.posts.length, 1);
+});
+
+test('a lost reply response is recovered through the exact old question after a later question appears', async t => {
+  const f = await waitingFixture(t);
+  const old = f.currentQuestion();
+  const next = question(secondQuestionId, { question: 'Would you also like the receipt read aloud?' });
+  let accepted: PrimaryQuestion | undefined;
+  f.behavior.reply = async (_id, questionId, input) => {
+    assert.equal(questionId, firstQuestionId);
+    accepted = answered(old, input);
+    throw new Error('reply response lost');
+  };
+  f.behavior.question = async (id, questionId) => {
+    assert.equal(questionId, firstQuestionId);
+    return questionResult(id, accepted ? { ...accepted, runState: 'waiting_for_reply' } : old);
+  };
+  f.behavior.result = async id => waiting(id, accepted ? next : old);
+  f.add('Yes.', 3000, 3200); f.speech(3000, 3200);
+  await f.backend.delegate(f.request('answer'), f.channel);
+  assert.equal(f.saved()[0].questions![firstQuestionId].reply!.status, 'accepted');
+  assert.ok(f.saved()[0].questions![secondQuestionId].presentation);
+  assert.equal(f.replies.length, 1); assert.equal(f.posts.length, 1);
+  assert.ok(f.questionReads.every(read => read.questionId === firstQuestionId));
+  assert.ok(f.questionReads.every(read => read.requestId === f.posts[0].requestId));
+});
+
+test('two sequential questions use separate reply identities and one original Primary run', async t => {
+  const f = await waitingFixture(t);
+  const first = f.currentQuestion();
+  const next = question(secondQuestionId, { question: 'Should I read the saved receipt?' });
+  let step = 0;
+  const questions: Record<string, PrimaryQuestion> = { [firstQuestionId]: first, [secondQuestionId]: next };
+  f.behavior.question = async (id, questionId) => questionResult(id, questions[questionId]);
+  f.behavior.reply = async (id, questionId, input) => {
+    questions[questionId] = answered(questions[questionId], input); step++;
+    return { ...questionResult(id, questions[questionId]), replayed: false };
+  };
+  f.behavior.result = async id => step < 2 ? waiting(id, questions[step ? secondQuestionId : firstQuestionId]) : f.completed(id);
+  f.add('Yes.', 3000, 3200); f.speech(3000, 3200);
+  await f.backend.delegate(f.request('answer_one'), f.channel);
+  assert.equal(f.saved()[0].currentQuestionId, secondQuestionId);
+  f.add('No.', 5000, 5200); f.speech(5000, 5200);
+  await f.backend.delegate(f.request('answer_two'), f.channel);
+  assert.equal(f.posts.length, 1); assert.equal(f.replies.length, 2);
+  assert.equal(f.replies[0].requestId, f.replies[1].requestId);
+  assert.notEqual(f.replies[0].input.reply.clientReplyId, f.replies[1].input.reply.clientReplyId);
+  assert.notEqual(f.replies[0].input.source.sourceEventId, f.replies[1].input.source.sourceEventId);
+  assert.equal(f.saved()[0].status, 'completed');
+  assert.equal((await f.backend.captureCompletedTurns(f.channel.getContext(), { assistantPlaybackComplete: true, sessionFinalized: true })).captured, 0);
+  assert.equal(f.captures.length, 0);
+});
+
+test('reply recovery stays pending across call end until the exact client reply is observed', async t => {
+  const f = await waitingFixture(t);
+  const original = f.currentQuestion();
+  let accepted: PrimaryQuestion | undefined;
+  f.behavior.reply = async () => { throw new Error('reply outcome unknown'); };
+  f.behavior.question = async id => questionResult(id, accepted ?? original);
+  f.add('Yes.', 3000, 3200); f.speech(3000, 3200);
+  await f.backend.delegate(f.request('answer_unknown'), f.channel);
+  const input = structuredClone(f.replies[0].input);
+  f.store.update(f.call.id, { endedAt: new Date().toISOString() });
+  const restored = createPrimaryBackend(f.options);
+  assert.deepEqual(await restored.flushPendingCaptures(), { pending: 1, unsupported: ['reply_outcome_unknown'] });
+  const capture = await restored.captureCompletedTurns(f.channel.getContext(), { assistantPlaybackComplete: true, sessionFinalized: true });
+  assert.equal(capture.pending, 1); assert.ok(capture.unsupported.includes('reply_outcome_unknown'));
+  assert.equal(f.captures.length, 0);
+  accepted = answered(original, input);
+  assert.deepEqual(await restored.flushPendingCaptures(), { pending: 0, unsupported: [] });
+  assert.equal(f.saved()[0].questions![firstQuestionId].reply!.status, 'accepted');
+  assert.equal(f.store.get(f.call.id)!.canonicalTurns![input.source.sourceEventId] &&
+    (f.store.get(f.call.id)!.canonicalTurns![input.source.sourceEventId] as { text: string }).text, 'Yes.');
+  assert.equal(f.replies.length, 1); assert.equal(f.posts.length, 1); assert.equal(f.captures.length, 0);
+});
+
+test('caller speech arriving before the complete question presentation cannot answer it', async t => {
+  const f = await fixture(t);
+  const value = question();
+  f.behavior.result = async id => waiting(id, value);
+  f.behavior.question = async id => questionResult(id, value);
+  const originalPublish = f.channel.publish;
+  let interrupt = true;
+  f.channel.publish = async update => {
+    if (interrupt) { interrupt = false; f.add('Yes.', 3000, 3200); f.speech(3000, 3200); }
+    return originalPublish(update);
+  };
+  f.add('Buy the stock.'); f.speech();
+  await f.backend.delegate(f.request(), f.channel);
+  assert.equal(f.saved()[0].questions![firstQuestionId].presentation, undefined);
+  await f.backend.delegate(f.request('early_yes'), f.channel);
+  assert.equal(f.replies.length, 0);
+  assert.equal(f.posts.length, 1);
+  assert.equal(f.saved()[0].questions![firstQuestionId].presentation!.callerRevision, 2);
+  assert.equal(f.saved()[0].deferredTurns![0].text, 'Yes.');
+});
+
+test('an overlong answer asks for a shorter reply and stays on the waiting request', async t => {
+  const f = await waitingFixture(t);
+  f.add('é'.repeat(1001), 3000, 3200); f.speech(3000, 3200);
+  await f.backend.delegate(f.request('long_answer'), f.channel);
+  assert.equal(f.posts.length, 1); assert.equal(f.replies.length, 0);
+  assert.equal(f.saved()[0].status, 'waiting_for_reply');
+  assert.ok(f.updates.some(update => /shorter answer/.test(update.text)));
+});
+
+test('expired questions remain waiting without admitting a reply or a second run', async t => {
+  const f = await fixture(t);
+  const value = question(firstQuestionId, { state: 'expired', expiresAt: new Date(Date.now() - 1).toISOString() });
+  f.behavior.result = async id => waiting(id, value);
+  f.add('Buy the stock.'); f.speech();
+  await f.backend.delegate(f.request(), f.channel);
+  f.add('Yes.', 3000, 3200); f.speech(3000, 3200);
+  await f.backend.delegate(f.request('expired_answer'), f.channel);
+  assert.equal(f.replies.length, 0); assert.equal(f.posts.length, 1);
+  assert.match(f.updates.at(-1)!.text, /no longer available/);
+  assert.equal(f.saved()[0].questions![firstQuestionId].presentation, undefined);
+});
+
+test('an exact question read with a foreign identity refuses the reply', async t => {
+  for (const change of [{ id: secondQuestionId }, { runId: secondQuestionId }, { threadId: secondQuestionId }]) {
+    await t.test(Object.keys(change)[0], async sub => {
+      const f = await waitingFixture(sub);
+      f.behavior.question = async id => questionResult(id, { ...f.currentQuestion(), ...change });
+      f.add('Yes.', 3000, 3200); f.speech(3000, 3200);
+      await f.backend.delegate(f.request('foreign_answer'), f.channel);
+      assert.equal(f.replies.length, 0); assert.equal(f.posts.length, 1);
+      assert.equal(f.saved()[0].questions![firstQuestionId].reply, undefined);
+    });
+  }
+});
+
+test('a revised answer is captured as a later revision of the original source without changing the reply', async t => {
+  const f = await waitingFixture(t);
+  f.add('Yes', 3000, 3200); f.speech(3000, 3200);
+  await f.backend.delegate(f.request('answer'), f.channel);
+  const input = structuredClone(f.replies[0].input);
+  f.add(', actually let me think.', 3200, 3400); f.speech(3200, 3400); await wait(7);
+  const captured = await f.backend.captureCompletedTurns(f.channel.getContext(), { assistantPlaybackComplete: true, sessionFinalized: true });
+  assert.equal(captured.captured, 1);
+  assert.equal(f.captures[0].sourceEventId, input.source.sourceEventId);
+  assert.equal(f.captures[0].revision, 2); assert.equal(f.captures[0].text, 'Yes, actually let me think.');
+  assert.deepEqual(f.saved()[0].questions![firstQuestionId].reply!.input, input);
+  assert.equal(f.saved()[0].correctionState, 'recorded_not_applied');
+  assert.equal(f.replies.length, 1); assert.equal(f.posts.length, 1);
+});
+
+test('a different saved client reply cannot be claimed as this caller answer', async t => {
+  const f = await waitingFixture(t);
+  const value = f.currentQuestion();
+  let other: PrimaryQuestion | undefined;
+  f.behavior.reply = async (_id, _questionId, input) => {
+    other = answered(value, { ...input, reply: { ...input.reply, clientReplyId: secondQuestionId } });
+    throw new Error('reply conflicted');
+  };
+  f.behavior.question = async id => questionResult(id, other ?? value);
+  f.behavior.result = async id => other ? f.completed(id) : waiting(id, value);
+  f.add('Yes.', 3000, 3200); f.speech(3000, 3200);
+  await f.backend.delegate(f.request('conflicting_answer'), f.channel);
+  assert.equal(f.saved()[0].questions![firstQuestionId].reply!.status, 'refused');
+  const capture = f.store.get(f.call.id)!.canonicalTurns![f.replies[0].input.source.sourceEventId] as PrimaryTurn & { state: string };
+  assert.equal(capture.state, 'dispatching');
+  assert.equal(capture.text, f.replies[0].input.text);
+  assert.equal(f.replies.length, 1); assert.equal(f.posts.length, 1);
+});
+
+test('question chunks preserve all context and exact numeric meanings before enabling a reply', async t => {
+  const value = question(firstQuestionId, {
+    context: 'Your current position contains 12.345678 shares at $123.456789 each. '.repeat(10).trim(),
+    yesMeaning: 'Spend exactly $10.25 with a maximum price of $123.456789 per share.',
+  });
+  const f = await waitingFixture(t, value);
+  const chunks = f.updates.filter(update => update.id.includes('_prompt_'));
+  assert.ok(chunks.length > 1);
+  assert.ok(chunks.every(update => Buffer.byteLength(update.text) <= 500 && update.speak === true));
+  assert.equal(chunks.map(chunk => chunk.text).join(''), [value.question, value.context,
+    `Proposed answer: ${value.proposedAnswer}`, `If you say yes: ${value.yesMeaning}`, `If you say no: ${value.noMeaning}`].join('\n'));
+  assert.ok(f.saved()[0].questions![firstQuestionId].presentation);
+});
+
+test('a Primary display-name change leaves exact question recovery available', async t => {
+  const f = await waitingFixture(t);
+  const original = f.currentQuestion();
+  let accepted: PrimaryQuestion | undefined;
+  f.behavior.reply = async (_id, _questionId, input) => {
+    accepted = answered({ ...original, agent: { ...original.agent, name: 'My renamed Dexter' } }, input);
+    throw new Error('reply response lost');
+  };
+  f.behavior.question = async id => questionResult(id, accepted ?? { ...original, agent: { ...original.agent, name: 'My renamed Dexter' } });
+  f.behavior.result = async id => accepted ? { ...f.completed(id), question: accepted } : waiting(id, original);
+  f.add('Yes.', 3000, 3200); f.speech(3000, 3200);
+  await f.backend.delegate(f.request('renamed_answer'), f.channel);
+  assert.equal(f.saved()[0].questions![firstQuestionId].reply!.status, 'accepted');
+  assert.equal(f.saved()[0].questions![firstQuestionId].question.agent.name, 'My renamed Dexter');
+  assert.equal(f.saved()[0].status, 'completed');
+  assert.equal(f.replies.length, 1);
+});
+
+test('definite question expiry resolves an unknown reply and captures the caller turn without claiming an answer', async t => {
+  const f = await waitingFixture(t);
+  const original = f.currentQuestion();
+  let expired = false;
+  f.behavior.reply = async () => { throw new Error('reply response lost'); };
+  f.behavior.question = async id => questionResult(id, expired ? { ...original, state: 'expired' } : original);
+  f.add('Yes.', 3000, 3200); f.speech(3000, 3200);
+  await f.backend.delegate(f.request('unknown_answer'), f.channel);
+  const input = structuredClone(f.replies[0].input);
+  f.backend.persistAcousticEvidence();
+  f.store.update(f.call.id, { endedAt: new Date().toISOString() });
+  expired = true;
+  const restored = createPrimaryBackend(f.options);
+  assert.deepEqual(await restored.flushPendingCaptures(), { pending: 0, unsupported: [] });
+  assert.equal(f.saved()[0].questions![firstQuestionId].reply!.status, 'refused');
+  const captured = await restored.captureCompletedTurns(f.channel.getContext(), { assistantPlaybackComplete: true, sessionFinalized: true });
+  assert.equal(captured.captured, 0); assert.equal(captured.pending, 0);
+  assert.equal(f.captures[0].sourceEventId, input.source.sourceEventId);
+  assert.equal(f.captures[0].text, input.text); assert.equal(f.captures[0].revision, 1);
+  assert.equal(f.posts.length, 1); assert.equal(f.replies.length, 1);
+});
+
+test('first-attempt explicit API non-admission and local validation refuse the reply without unresolved closeout', async t => {
+  const errors = [
+    new PrimaryApiError('invalid_request'),
+    ...([ [400, 'invalid_request'], [401, 'invalid_service_credential'], [403, 'binding_unauthorized'],
+      [404, 'question_not_found'], [409, 'call_closed'], [409, 'idempotency_conflict'],
+      [410, 'question_expired'], [415, 'unsupported_media_type'], [503, 'phone_questions_unavailable'],
+      [503, 'primary_unavailable'] ] as const).map(([status, code]) => new PrimaryApiError('http_error', status, { code, retryable: status === 503 })),
+  ];
+  for (const error of errors) await t.test(error.remoteCode ?? error.code, async sub => {
+    const f = await waitingFixture(sub);
+    f.behavior.reply = async () => { throw error; };
+    f.add('Yes.', 3000, 3200); f.speech(3000, 3200);
+    await f.backend.delegate(f.request('refused'), f.channel);
+    const saved = f.saved()[0].questions![firstQuestionId].reply!;
+    assert.equal(saved.status, 'refused');
+    assert.equal(saved.refusal!.code, error.remoteCode ?? error.code);
+    assert.deepEqual(saved.input, f.replies[0].input);
+    assert.deepEqual(await createPrimaryBackend(f.options).flushPendingCaptures(), { pending: 0, unsupported: [] });
+    assert.equal(f.replies.length, 1); assert.equal(f.posts.length, 1);
+    await f.backend.delegate(f.request('repeat_without_new_speech'), f.channel);
+    assert.equal(f.replies.length, 1); assert.equal(f.posts.length, 1);
+  });
+});
+
+test('ambiguous errors retain the exact unresolved reply and do not admit a replacement', async t => {
+  const errors = [
+    new PrimaryApiError('request_timeout'), new PrimaryApiError('request_failed'), new PrimaryApiError('invalid_response'),
+    new PrimaryApiError('http_error', 400),
+    ...([ [403, 'unrecognized_remote_error'], [409, 'question_unavailable'], [500, 'request_inconsistent'],
+      [503, 'temporarily_unavailable'], [503, 'reply_too_large'] ] as const)
+      .map(([status, code]) => new PrimaryApiError('http_error', status, { code, retryable: true })),
+  ];
+  for (const error of errors) await t.test(error.remoteCode ?? error.code, async sub => {
+    const f = await waitingFixture(sub);
+    f.behavior.reply = async () => { throw error; };
+    f.add('Yes.', 3000, 3200); f.speech(3000, 3200);
+    await f.backend.delegate(f.request('unknown'), f.channel);
+    const input = structuredClone(f.replies[0].input);
+    assert.equal(f.saved()[0].questions![firstQuestionId].reply!.status, 'unknown');
+    assert.deepEqual(await createPrimaryBackend(f.options).flushPendingCaptures(), { pending: 1, unsupported: ['reply_outcome_unknown'] });
+    f.add('No.', 5000, 5200); f.speech(5000, 5200);
+    await f.backend.delegate(f.request('corrected_but_unknown'), f.channel);
+    assert.equal(f.replies.length, 1); assert.equal(f.posts.length, 1);
+    assert.deepEqual(f.saved()[0].questions![firstQuestionId].reply!.input, input);
+    assert.equal(f.saved()[0].questions![firstQuestionId].refusedReplies!.length, 0);
+  });
+});
+
+test('a fresh corrected answer follows definite refusal on the same request and preserves both source histories', async t => {
+  const f = await waitingFixture(t);
+  const accept = f.behavior.reply;
+  f.behavior.reply = async () => { throw new PrimaryApiError('http_error', 400, { code: 'invalid_request', retryable: false }); };
+  f.add('Yes, buy $20 instead.', 3000, 3200); f.speech(3000, 3200);
+  await f.backend.delegate(f.request('bad_answer'), f.channel);
+  const refused = structuredClone(f.saved()[0].questions![firstQuestionId].reply!);
+  f.behavior.reply = accept;
+  f.add('No.', 5000, 5200); f.speech(5000, 5200);
+  await f.backend.delegate(f.request('corrected_answer'), f.channel);
+  const record = f.saved()[0].questions![firstQuestionId];
+  assert.deepEqual(record.refusedReplies, [refused]);
+  assert.equal(record.reply!.status, 'accepted');
+  assert.notEqual(record.reply!.input.source.sourceEventId, refused.input.source.sourceEventId);
+  assert.notEqual(record.reply!.input.reply.clientReplyId, refused.input.reply.clientReplyId);
+  assert.equal(f.replies[0].requestId, f.replies[1].requestId);
+  assert.equal(f.posts.length, 1); assert.equal(f.replies.length, 2);
+  f.backend.persistAcousticEvidence();
+  f.store.update(f.call.id, { endedAt: new Date().toISOString() });
+  const restored = createPrimaryBackend(f.options);
+  assert.deepEqual(await restored.flushPendingCaptures(), { pending: 0, unsupported: [] });
+  const capture = await restored.captureCompletedTurns(f.channel.getContext(), { assistantPlaybackComplete: true, sessionFinalized: true });
+  assert.equal(capture.captured, 0); assert.equal(capture.pending, 0);
+  assert.equal(f.captures[0].sourceEventId, refused.input.source.sourceEventId);
+  assert.equal(f.captures[0].text, refused.input.text); assert.equal(f.captures[0].revision, 1);
+  assert.deepEqual(f.saved()[0].questions![firstQuestionId].refusedReplies, [refused]);
+  assert.deepEqual(f.saved()[0].questions![firstQuestionId].reply!.input, f.replies[1].input);
+});
+
+test('a refused source preserves its original first revision until capture acknowledgment before a late correction', async t => {
+  const f = await waitingFixture(t);
+  f.behavior.reply = async () => { throw new PrimaryApiError('http_error', 400, { code: 'invalid_request', retryable: false }); };
+  f.add('Yes', 3000, 3200); f.speech(3000, 3200);
+  await f.backend.delegate(f.request('refused_answer'), f.channel);
+  const refused = structuredClone(f.saved()[0].questions![firstQuestionId].reply!);
+  const sourceId = refused.input.source.sourceEventId;
+  const initial = f.store.get(f.call.id)!.canonicalTurns![sourceId] as PrimaryTurn & { state: string };
+  assert.equal(initial.revision, 1); assert.equal(initial.text, 'Yes'); assert.equal(initial.state, 'dispatching');
+  f.add(', actually let me think.', 3200, 3400); f.speech(3200, 3400); await wait(7);
+  f.backend.persistAcousticEvidence();
+  f.store.update(f.call.id, { endedAt: new Date().toISOString() });
+  const restored = createPrimaryBackend(f.options);
+  const proof = { assistantPlaybackComplete: true, sessionFinalized: true };
+  const finalSnapshot = f.channel.getContext();
+  assert.deepEqual(await restored.captureCompletedTurns(finalSnapshot, proof),
+    { captured: 0, pending: 1, unsupported: ['capture_outcome_unknown'] });
+  assert.equal(f.captures.length, 0);
+  f.behavior.capture = async () => { throw new PrimaryApiError('request_timeout'); };
+  assert.deepEqual(await restored.flushPendingCaptures(), { pending: 1, unsupported: ['capture_outcome_unknown'] });
+  assert.equal(f.captures[0].revision, 1); assert.equal(f.captures[0].text, 'Yes');
+  assert.deepEqual(await restored.captureCompletedTurns(finalSnapshot, proof),
+    { captured: 0, pending: 1, unsupported: ['capture_outcome_unknown'] });
+  assert.equal(f.captures.length, 1);
+  f.behavior.capture = async () => {};
+  assert.deepEqual(await createPrimaryBackend(f.options).flushPendingCaptures(), { pending: 0, unsupported: [] });
+  assert.deepEqual(f.captures[1], f.captures[0]);
+  assert.deepEqual(await restored.captureCompletedTurns(finalSnapshot, proof), { captured: 1, pending: 0, unsupported: [] });
+  assert.equal(f.captures[2].sourceEventId, sourceId);
+  assert.equal(f.captures[2].revision, 2); assert.equal(f.captures[2].text, 'Yes, actually let me think.');
+  assert.deepEqual(f.saved()[0].questions![firstQuestionId].reply, refused);
+  assert.equal(f.posts.length, 1); assert.equal(f.replies.length, 1);
+});
+
+test('a pre-admission-looking error during GET cannot turn an older unknown POST into a refusal', async t => {
+  const f = await waitingFixture(t);
+  let posted = false;
+  const originalRead = f.behavior.question;
+  f.behavior.reply = async () => { posted = true; throw new PrimaryApiError('request_timeout'); };
+  f.behavior.question = async (id, questionId) => {
+    if (posted) throw new PrimaryApiError('http_error', 503, { code: 'phone_questions_unavailable', retryable: true });
+    return originalRead(id, questionId);
+  };
+  f.add('Yes.', 3000, 3200); f.speech(3000, 3200);
+  await f.backend.delegate(f.request('unknown'), f.channel);
+  assert.deepEqual(await createPrimaryBackend(f.options).flushPendingCaptures(), { pending: 1, unsupported: ['reply_outcome_unknown'] });
+  assert.equal(f.saved()[0].questions![firstQuestionId].reply!.status, 'unknown');
+  assert.equal(f.replies.length, 1); assert.equal(f.posts.length, 1);
 });

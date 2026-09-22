@@ -4,13 +4,23 @@ The broker connects Twilio telephone audio to GPT-Live and delegates account wor
 
 ## Release state
 
-As of September 22, 2026, the integration exists in source and has local tests with injected providers. The most recent provider preflight was blocked by exhausted credits. There is no completed call proving the combined GPT-Live and Primary path. The inbound callback addition awaits the broker successor release; the existing number has not been rerouted to it.
+As of September 22, 2026, the initial `fb3553f` service is running on port `3213`. Its public `/broker/health` route passed acceptance at 00:14 UTC. Callback and question continuation are qualified in the source successor and await its release. The most recent GPT-Live preflight was blocked by exhausted credits. There is no completed call proving the combined GPT-Live and Primary path; the existing number has not been rerouted to the broker.
 
-Deployment files in this repository prepare port `3213` and the `/broker/` path. Angel owns applying the nginx change after Wallet acceptance. The existing service on port `3212` and the Twilio number's current inbound configuration stay in place. A source checkout, compiled build, running process, provider configuration, and completed call are separate evidence states; record each when it is verified.
+Angel applied the nginx location for `/broker/` after Wallet acceptance. The existing service on port `3212` and the Twilio number's current inbound configuration remain in place. Record the exact source, installed package, running process, provider configuration, and completed call when each is verified.
 
 The Primary ingress must be released independently. Its current admission contract permits verified outbound calls. It rejects inbound account binding with `caller_possession_required`, because caller ID alone does not establish possession. The inbound handler therefore offers a callback without opening Primary, reading account data, or starting GPT-Live. The outbound leg establishes possession of the current saved destination.
 
-Primary's waiting/question/answer continuation is outstanding. The client accepts `queued`, `running`, `completed`, `failed`, and `cancelled`. A completed result requires an identified assistant message. A missing result or an unsupported waiting state remains unresolved. Hangup ends voice delivery and closes admission after source recovery; it does not cancel work already accepted by Primary. Later transcript corrections are recorded as source revisions and do not retroactively change an admitted action.
+The successor accepts `queued`, `running`, `waiting_for_reply`, `completed`, `failed`, and `cancelled`. A waiting result carries its saved question. Completion requires the identified terminal assistant output; an earlier question is not a completed result. Hangup ends voice delivery and closes admission after source recovery; it does not cancel work already accepted by Primary. Later transcript corrections are recorded as source revisions and do not retroactively change an admitted action.
+
+## Questions during a call
+
+When Primary asks a question, the broker passes its wording, context, proposed answer, and the meaning of each choice to Live. It waits for those updates to be accepted and a subsequent completed caller turn before answering. Provider acceptance of those instructions does not prove the caller heard them; audible delivery remains part of the call trial.
+
+Literal yes and no answers, including ordinary trailing punctuation, select the corresponding saved choice. Qualified answers retain the caller's words as `other`. The broker saves the answer and its completed source turn before sending it to the exact original request and question. The API joins the answer, transcript source, and continuation of the same run in one transaction.
+
+If the response is lost, recovery reads that exact question and checks the saved reply identity and content. It can still recover the old answer after Primary has asked a second question. A changed reply, expired question, or answer already supplied elsewhere cannot become a new request. Closeout keeps unresolved reply recovery pending with the original binding.
+
+This release supports answers within the original verified call. Attaching a later verified callback to an earlier question is proposed separately. Until that integration is qualified, a different call or thread cannot reuse the original request's answer authority.
 
 ## Configuration
 
@@ -60,7 +70,9 @@ pm2 start "$BROKER_RELEASE_DIR/deploy/ecosystem.config.cjs" --only dexter-broker
 
 Use this command only when applying the reviewed deployment. The configuration starts one forked process and gives shutdown 65 seconds; the application has a 60-second shutdown deadline. The journal permits one writer, so upgrades require the previous broker process to stop before the replacement starts. Avoid a rolling overlap against the same state directory. A rollback selects the previous immutable release and retains the same journal; verify journal compatibility first.
 
-`deploy/nginx-broker.conf` is a location snippet for the existing HTTPS `server` block for `phone.dexter.cash`. Include it without replacing existing locations. Its `proxy_pass` preserves the `/broker/` prefix and supports WebSocket upgrades. It exposes no `/internal/broker/` routes. Angel applies the snippet after Wallet acceptance, checks the full configuration with `nginx -t`, and reloads nginx only after that check passes.
+The initial `fb3553f` release can read the journal's JSON shape but cannot recover the successor's pending callbacks or question replies. After the successor handles that work, use a release that understands those records for recovery. Preserve the current journal; restoring an earlier snapshot could erase evidence of an accepted answer or an outbound call.
+
+`deploy/nginx-broker.conf` is the accepted location snippet for the existing HTTPS `server` block for `phone.dexter.cash`. Its `proxy_pass` preserves the `/broker/` prefix and supports WebSocket upgrades. It exposes no `/internal/broker/` routes. Future changes go through Angel's shared nginx release: preserve existing locations, check the full configuration with `nginx -t`, then reload.
 
 `GET /broker/health` reports process readiness, model, revision, and active call count. A successful health response establishes HTTP reachability. It does not establish provider credits, Primary eligibility, working audio, or a completed call.
 

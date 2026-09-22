@@ -1,14 +1,15 @@
 import { createHash } from 'node:crypto';
 import type { BrokerLiveBackend, LiveBackendChannel, LiveDelegationRequest, LiveTranscriptSnapshot } from '../live/session.js';
 import { LIVE_APPEND_MAX_BYTES } from '../live/session.js';
-import type { PrimaryApiClient, PrimaryResult, PrimarySubmission, PrimaryTurn } from './primaryApi.js';
+import type { PrimaryApiClient, PrimaryQuestion, PrimaryQuestionResult, PrimaryReplyInput, PrimaryResult, PrimarySubmission, PrimaryTurn } from './primaryApi.js';
+import { PrimaryApiError } from './primaryApi.js';
 import type { BrokerCall, BrokerStore } from './store.js';
 
 export interface PrimaryBackendOptions {
   callId: string;
   callSid: string;
   bindingId: string;
-  api: Pick<PrimaryApiClient, 'submit' | 'result' | 'captureTurn'>;
+  api: Pick<PrimaryApiClient, 'submit' | 'result' | 'captureTurn' | 'question' | 'reply'>;
   store: Pick<BrokerStore, 'get' | 'update'>;
   stabilityMs?: number;
   maxWaitMs?: number;
@@ -39,7 +40,7 @@ export interface BrokerDelegationRecord {
   bindingId: string;
   sessionId: string;
   delegationIds: string[];
-  status: 'prepared' | 'dispatching' | 'dispatch_unknown' | 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+  status: 'prepared' | 'dispatching' | 'dispatch_unknown' | 'queued' | 'running' | 'waiting_for_reply' | 'completed' | 'failed' | 'cancelled';
   updatedAt: string;
   submission: PrimarySubmission;
   frozenCallerRevision: number;
@@ -55,12 +56,70 @@ export interface BrokerDelegationRecord {
   primaryResult?: PrimaryResult;
   result?: string;
   delivery?: string;
+  questions?: Record<string, BrokerQuestionRecord>;
+  currentQuestionId?: string;
+  questionNotice?: 'answer_too_long' | 'reply_unknown' | 'reply_refused' | 'question_unavailable' | 'answered_elsewhere';
   deferredTurns?: Array<{ delegationId: string; sourceEventId: string; text: string; firstSequence: number;
     callerRevision: number; status: 'recorded_not_submitted' }>;
 }
 
+export interface BrokerQuestionRecord {
+  question: PrimaryQuestion;
+  identityDigest: string;
+  presentation?: { callerRevision: number; sequence: number; lastCallerEndMs: number; acceptedAt: string };
+  reply?: BrokerQuestionReplyRecord;
+  /** Earlier proven non-admissions remain owned evidence when the caller answers again. */
+  refusedReplies?: BrokerQuestionReplyRecord[];
+}
+
+export interface BrokerQuestionReplyRecord {
+  input: PrimaryReplyInput;
+  inputDigest: string;
+  status: 'prepared' | 'dispatching' | 'unknown' | 'accepted' | 'refused';
+  callerRevision: number;
+  firstSequence: number;
+  lastSequence: number;
+  refusal?: { origin: 'local_validation' | 'api_non_admission'; code: string; status?: number };
+}
+
 const terminal = (state: string) => ['completed', 'failed', 'cancelled'].includes(state);
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+const unresolvedReply = (reply: BrokerQuestionRecord['reply']) => reply && ['prepared', 'dispatching', 'unknown'].includes(reply.status);
+const replyAttempts = (record: BrokerQuestionRecord) => [...(record.refusedReplies ?? []), ...(record.reply ? [record.reply] : [])];
+// These codes precede new-answer admission in the exact Phone source contract.
+// This classifier is used only for a first POST, never to resolve an older unknown POST.
+const firstReplyNonAdmission = (error: unknown): BrokerQuestionReplyRecord['refusal'] => {
+  if (!(error instanceof PrimaryApiError)) return undefined;
+  if (error.code === 'invalid_request') return { origin: 'local_validation', code: error.code };
+  if (error.code !== 'http_error' || !error.status || !error.remoteCode) return undefined;
+  const codes: Record<number, readonly string[]> = {
+    400: ['invalid_request'],
+    401: ['invalid_service_credential'],
+    403: ['caller_possession_required', 'binding_unauthorized', 'caller_unlinked', 'caller_binding_ambiguous'],
+    404: ['request_not_found', 'question_not_found'],
+    409: ['call_closed', 'source_conflict', 'idempotency_conflict', 'question_cancelled', 'already_answered'],
+    410: ['question_expired'],
+    415: ['unsupported_media_type'],
+    503: ['phone_questions_unavailable', 'primary_unavailable'],
+  };
+  return codes[error.status]?.includes(error.remoteCode)
+    ? { origin: 'api_non_admission', code: error.remoteCode, status: error.status } : undefined;
+};
+const questionIdentity = (question: PrimaryQuestion) => digest([
+  question.id, question.revision, question.expiresAt, question.runId, question.threadId,
+  question.agent.id, question.question, question.context, question.proposedAnswer,
+  question.yesMeaning, question.noMeaning, question.createdAt,
+]);
+
+/** Only literal yes/no chooses the canonical meanings supplied by the question. */
+export function literalPhoneAnswer(text: string): Pick<PrimaryReplyInput['reply'], 'answer' | 'text'> {
+  const literal = text.trim().toLowerCase();
+  const word = literal.match(/^(yes|no)[.!]?$/)?.[1];
+  if (word === 'yes' || word === 'no') return { answer: word, text: null };
+  if (!text.trim() || Buffer.byteLength(text) > 2000) throw new Error('answer_too_long');
+  return { answer: 'other', text: text.trim() };
+}
 
 interface AcousticSpan { startMs: number; endMs: number; lastSpeechAt: number }
 interface CanonicalTurnRecord extends PrimaryTurn {
@@ -172,16 +231,106 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
           || entry.callSid !== options.callSid || entry.bindingId !== options.bindingId
           || !Array.isArray(entry.delegationIds) || !entry.submission?.source
           || !uuidPattern.test(entry.submission.source.sourceEventId)) throw new Error('invalid_saved_delegation');
+      for (const [questionId, record] of Object.entries(entry.questions ?? {})) {
+        if (record.question.id !== questionId || record.identityDigest !== questionIdentity(record.question))
+          throw new Error('invalid_saved_question');
+        if (record.refusedReplies?.some(reply => reply.status !== 'refused')) throw new Error('invalid_saved_reply_history');
+        for (const reply of replyAttempts(record)) if (reply.inputDigest !== digest(reply.input) || reply.input.source.callSid !== options.callSid
+            || reply.input.source.revision !== 1 || reply.input.reply.questionRevision !== 1
+            || !uuidPattern.test(reply.input.reply.clientReplyId) || !uuidPattern.test(reply.input.source.sourceEventId))
+          throw new Error('invalid_saved_reply');
+      }
       return entry;
     }).filter(entry => entry.sessionId === sessionId);
   };
   const save = (entry: BrokerDelegationRecord): BrokerDelegationRecord => {
     const call = boundCall(entry.sessionId);
     const next = { ...entry, updatedAt: new Date(now()).toISOString() };
-    options.store.update(call.id, { delegations: { ...call.delegations, [entry.requestId]: next } });
+    const canonicalTurns = { ...call.canonicalTurns };
+    // Refusal proves that reply admission did not capture this turn. Freeze its
+    // original source/text atomically with the refusal, before STT can revise it.
+    // Ordinary capture recovery acknowledges revision 1 before revision 2 is sent.
+    for (const question of Object.values(next.questions ?? {})) for (const reply of replyAttempts(question)) {
+      if (reply.status !== 'refused') continue;
+      const input = reply.input;
+      const previous = canonicalTurns[input.source.sourceEventId] as CanonicalTurnRecord | undefined;
+      if (previous && (previous.itemId !== input.source.itemId || previous.occurredAt !== input.source.receivedAt
+          || previous.role !== 'user' || (previous.revision === 1 && previous.text !== input.text)))
+        throw new Error('reply_source_identity_changed');
+      if (!previous) canonicalTurns[input.source.sourceEventId] = {
+        sourceEventId: input.source.sourceEventId, revision: 1, itemId: input.source.itemId,
+        role: 'user', text: input.text, occurredAt: input.source.receivedAt, state: 'dispatching',
+      } satisfies CanonicalTurnRecord;
+    }
+    options.store.update(call.id, { delegations: { ...call.delegations, [entry.requestId]: next }, canonicalTurns });
     return next;
   };
   const load = (entry: BrokerDelegationRecord) => entries(entry.sessionId).find(value => value.requestId === entry.requestId)!;
+  const knownReply = (sessionId: string, sourceEventId: string) => {
+    for (const entry of entries(sessionId)) for (const [questionId, record] of Object.entries(entry.questions ?? {})) {
+      const reply = replyAttempts(record).find(attempt => attempt.input.source.sourceEventId === sourceEventId);
+      if (reply) return { entry, questionId, record, reply };
+    }
+  };
+  const observeQuestion = (entry: BrokerDelegationRecord, question: PrimaryQuestion): BrokerDelegationRecord => {
+    if (!uuidPattern.test(question.id) || question.revision !== 1 || !uuidPattern.test(question.runId)
+        || !uuidPattern.test(question.threadId) || !uuidPattern.test(question.agent.id)
+        || !Number.isFinite(Date.parse(question.expiresAt)) || !Number.isFinite(Date.parse(question.createdAt))
+        || !['pending', 'answered', 'expired', 'cancelled', 'unavailable'].includes(question.state)
+        || (question.state === 'answered') !== Boolean(question.reply)) throw new Error('invalid_primary_question');
+    const known = Object.values(entry.questions ?? {})[0]?.question;
+    if (known && (known.runId !== question.runId || known.threadId !== question.threadId || known.agent.id !== question.agent.id))
+      throw new Error('primary_question_owner_mismatch');
+    const previous = entry.questions?.[question.id];
+    const identityDigest = questionIdentity(question);
+    if (previous && (previous.identityDigest !== identityDigest
+        || (previous.question.state !== 'pending' && question.state === 'pending')
+        || (previous.question.reply && digest(previous.question.reply) !== digest(question.reply))))
+      throw new Error('primary_question_identity_changed');
+    return { ...entry, questions: { ...entry.questions,
+      [question.id]: { ...previous, question: structuredClone(question), identityDigest } } };
+  };
+  const applyReplyObservation = (entry: BrokerDelegationRecord, questionId: string, result: PrimaryQuestionResult) => {
+    if (result.bindingId !== options.bindingId || result.requestId !== entry.requestId || result.question.id !== questionId)
+      throw new Error('primary_question_identity_mismatch');
+    let current = observeQuestion(load(entry), result.question);
+    const record = current.questions![questionId];
+    const reply = record.reply;
+    if (!reply) return save(current);
+    if (result.question.state === 'answered') {
+      const received = result.question.reply!;
+      const expected = reply.input.reply;
+      if (received.clientReplyId !== expected.clientReplyId) {
+        if (reply.status === 'accepted') throw new Error('primary_reply_identity_changed');
+        return save({ ...current, questionNotice: 'answered_elsewhere', questions: { ...current.questions,
+          [questionId]: { ...record, reply: { ...reply, status: 'refused' } } } });
+      }
+      if (received.questionRevision !== expected.questionRevision || received.answer !== expected.answer || received.text !== expected.text)
+        throw new Error('primary_reply_identity_changed');
+      const input = reply.input;
+      const previous = boundCall(entry.sessionId).canonicalTurns?.[input.source.sourceEventId] as CanonicalTurnRecord | undefined;
+      if (previous && (previous.itemId !== input.source.itemId || previous.occurredAt !== input.source.receivedAt
+          || (previous.revision === 1 && previous.text !== input.text))) throw new Error('reply_source_identity_changed');
+      if (!previous) persistCanonical(entry.sessionId, { sourceEventId: input.source.sourceEventId,
+        revision: 1, itemId: input.source.itemId, role: 'user', text: input.text,
+        occurredAt: input.source.receivedAt, state: 'captured', recordId: input.source.sourceEventId });
+      current = { ...current, status: terminal(current.status) ? current.status : 'running', questionNotice: undefined,
+        questions: { ...current.questions, [questionId]: { ...record, reply: { ...reply, status: 'accepted' } } } };
+    } else if (result.question.state !== 'pending') {
+      current = { ...current, questionNotice: 'question_unavailable', questions: { ...current.questions,
+        [questionId]: { ...record, reply: { ...reply, status: 'refused' } } } };
+    } else if (unresolvedReply(reply)) current = { ...current, questionNotice: 'reply_unknown' };
+    return save(current);
+  };
+  const recoverReplies = async (entry: BrokerDelegationRecord) => {
+    let current = load(entry);
+    for (const [questionId, record] of Object.entries(current.questions ?? {})) {
+      if (!unresolvedReply(record.reply)) continue;
+      try { current = applyReplyObservation(current, questionId, await options.api.question(options.bindingId, current.requestId, questionId)); }
+      catch { current = save({ ...load(current), questionNotice: 'reply_unknown' }); }
+    }
+    return current;
+  };
   const mediaOrigin = (sessionId: string): number => {
     const origin = options.mediaStartedAt ?? boundCall(sessionId).mediaStartedAt;
     if (!origin || !Number.isFinite(Date.parse(origin))) throw new Error('media_time_origin_missing');
@@ -253,11 +402,68 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
         const first = group.fragments.reduce((a, b) => a.sequence < b.sequence ? a : b);
         const source = brokerIdentity('source', options.callId, request.sessionId, first.eventId);
         return first.startMs >= latestSourceStart && !saved.some(entry => entry.submission.source.sourceEventId === source
-          || entry.deferredTurns?.some(turn => turn.sourceEventId === source));
+          || entry.deferredTurns?.some(turn => turn.sourceEventId === source)
+          || Object.values(entry.questions ?? {}).some(record => replyAttempts(record).some(reply => reply.input.source.sourceEventId === source)));
       }).at(-1);
       const fragments = candidate?.fragments;
       const active = saved.find(entry => !terminal(entry.status));
       if (active) {
+        let current = save({ ...active, delegationIds: [...active.delegationIds, request.delegationId] });
+        if (Object.values(current.questions ?? {}).some(record => unresolvedReply(record.reply))) {
+          current = await recoverReplies(current);
+          if (Object.values(current.questions ?? {}).some(record => unresolvedReply(record.reply))) return current;
+        }
+        const questionId = current.currentQuestionId;
+        const question = questionId ? current.questions?.[questionId] : undefined;
+        const presentation = question && question.presentation;
+        const first = fragments?.reduce((a, b) => a.sequence < b.sequence ? a : b);
+        if (current.status === 'waiting_for_reply' && question && questionId && question.question.state === 'pending'
+            && (!question.reply || question.reply.status === 'refused') && presentation && first && first.sequence > presentation.sequence
+            && snapshot.callerRevision > presentation.callerRevision && first.startMs > presentation.lastCallerEndMs) {
+          const text = fragments!.map(fragment => fragment.text).join('');
+          if (!validTurnText(text)) throw new Error('invalid_completed_caller_turn');
+          let answer: ReturnType<typeof literalPhoneAnswer>;
+          try { answer = literalPhoneAnswer(text); }
+          catch {
+            return save({ ...current, questionNotice: 'answer_too_long', deferredTurns: [...current.deferredTurns ?? [], {
+              delegationId: request.delegationId, sourceEventId: brokerIdentity('source', options.callId, request.sessionId, first.eventId),
+              text, firstSequence: first.sequence, callerRevision: snapshot.callerRevision, status: 'recorded_not_submitted',
+            }] });
+          }
+          // Re-read this exact question before admitting a reply; another channel may
+          // already have answered it or its authority may have changed.
+          try {
+            current = applyReplyObservation(current, questionId, await options.api.question(options.bindingId, current.requestId, questionId));
+          } catch { return save({ ...load(current), questionNotice: 'question_unavailable' }); }
+          const refreshed = current.questions![questionId];
+          if (refreshed.question.state !== 'pending' || Date.parse(refreshed.question.expiresAt) <= now())
+            return save({ ...current, questionNotice: 'question_unavailable' });
+          if (channel.signal.aborted || boundCall(request.sessionId).endedAt) return current;
+          const sourceEventId = brokerIdentity('source', options.callId, request.sessionId, first.eventId);
+          const input: PrimaryReplyInput = {
+            source: { callSid: options.callSid, itemId: `live-turn-${sourceEventId}`, sourceEventId, revision: 1,
+              receivedAt: new Date(mediaOrigin(request.sessionId) + first.startMs).toISOString() },
+            role: 'user', text, reply: { questionRevision: 1,
+              clientReplyId: brokerIdentity('question-reply', options.callId, request.sessionId, current.requestId, questionId, sourceEventId), ...answer },
+          };
+          options.store.update(options.callId, { acousticSpans: structuredClone(acousticSpans) });
+          const reply: NonNullable<BrokerQuestionRecord['reply']> = { input, inputDigest: digest(input), status: 'prepared',
+            callerRevision: snapshot.callerRevision, firstSequence: first.sequence,
+            lastSequence: Math.max(...fragments!.map(fragment => fragment.sequence)) };
+          if (refreshed.reply && refreshed.reply.status !== 'refused') return current;
+          current = save({ ...current, questionNotice: undefined, questions: { ...current.questions,
+            [questionId]: { ...refreshed, refusedReplies: [...refreshed.refusedReplies ?? [], ...refreshed.reply ? [refreshed.reply] : []], reply } } });
+          current = save({ ...current, questions: { ...current.questions,
+            [questionId]: { ...current.questions![questionId], reply: { ...reply, status: 'dispatching' } } } });
+          try {
+            return applyReplyObservation(current, questionId, await options.api.reply(options.bindingId, current.requestId, questionId, structuredClone(input)));
+          } catch (error) {
+            const refusal = firstReplyNonAdmission(error);
+            return save({ ...load(current), questionNotice: refusal ? 'reply_refused' : 'reply_unknown', questions: { ...load(current).questions,
+              [questionId]: { ...load(current).questions![questionId], reply: { ...reply,
+                status: refusal ? 'refused' : 'unknown', ...(refusal ? { refusal } : {}) } } } });
+          }
+        }
         const deferredTurns = [...active.deferredTurns ?? []];
         if (fragments?.length) {
           const first = fragments.reduce((a, b) => a.sequence < b.sequence ? a : b);
@@ -268,7 +474,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
         }
         // Preserve a separate caller request without guessing whether it corrects the
         // admitted action. It requires another caller utterance, never an automatic run.
-        return save({ ...active, deferredTurns, delegationIds: [...active.delegationIds, request.delegationId] });
+        return save({ ...current, deferredTurns });
       }
       if (!fragments?.length) {
         const latest = saved.sort((a, b) => b.lastSequence - a.lastSequence)[0];
@@ -307,14 +513,17 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
   const applyResult = (entry: BrokerDelegationRecord, result: PrimaryResult): BrokerDelegationRecord => {
     if (result.bindingId !== options.bindingId || result.requestId !== entry.requestId)
       throw new Error('primary_result_identity_mismatch');
-    if (!['queued', 'running', 'completed', 'failed', 'cancelled'].includes(result.state)
+    if (!['queued', 'running', 'waiting_for_reply', 'completed', 'failed', 'cancelled'].includes(result.state)
         || (result.state === 'completed' && !result.assistant?.text?.trim())) throw new Error('invalid_primary_result');
-    const current = load(entry);
+    let current = load(entry);
     if (terminal(current.status) && !terminal(result.state)) return current;
     const outcome = (value: PrimaryResult) => JSON.stringify([value.state, value.assistant ?? null, value.error ?? null]);
     if (terminal(current.status) && current.primaryResult && outcome(current.primaryResult) !== outcome(result))
       throw new Error('primary_terminal_result_changed');
+    if (result.question) current = observeQuestion(current, result.question);
+    if (result.state === 'waiting_for_reply' && !result.question) throw new Error('invalid_primary_result');
     return save({ ...current, status: result.state, primaryResult: structuredClone(result),
+      ...(result.question ? { currentQuestionId: result.question.id } : {}),
       ...(result.assistant ? { result: result.assistant.text } : {}) });
   };
   const captureRevision = async (entry: BrokerDelegationRecord, channel: LiveBackendChannel): Promise<BrokerDelegationRecord> => {
@@ -344,10 +553,74 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       } catch { return save({ ...current, captureState: 'unknown' }); }
     });
   };
+  const deliverQuestion = async (entry: BrokerDelegationRecord, channel: LiveBackendChannel) => locked(async () => {
+    let current = load(entry);
+    const questionId = current.currentQuestionId;
+    const record = questionId ? current.questions?.[questionId] : undefined;
+    const snapshot = channel.getContext();
+    if (channel.signal.aborted) return;
+    const prefix = `${entry.requestId}_${questionId ?? 'question'}_${snapshot.callerRevision}`;
+    const tell = async (text: string, suffix: string) => {
+      const delivery = await channel.publish({ id: `${prefix}_${suffix}`, kind: 'result', text,
+        expectedCallerRevision: snapshot.callerRevision });
+      save({ ...load(entry), delivery: delivery.status });
+    };
+    if (Object.values(current.questions ?? {}).some(value => unresolvedReply(value.reply))) {
+      await tell('I am checking whether your answer was saved. I will use that saved answer when it is confirmed.', 'reply_unknown');
+      return;
+    }
+    if (!record || !questionId || record.question.state !== 'pending'
+        || Date.parse(record.question.expiresAt) <= now() || current.questionNotice === 'question_unavailable') {
+      await tell(record?.question.state === 'answered'
+        ? 'This question has already been answered. I am checking how the request continued.'
+        : 'This question is no longer available to answer. I can check the request status.', 'unavailable');
+      return;
+    }
+    const question = record.question;
+    const text = [question.question, question.context, `Proposed answer: ${question.proposedAnswer}`,
+      `If you say yes: ${question.yesMeaning}`, `If you say no: ${question.noMeaning}`].join('\n');
+    let chunks: string[];
+    try { chunks = liveResultChunks(text); }
+    catch { await tell('I cannot read this question accurately over the phone. Please open it in Dexter.', 'format_unavailable'); return; }
+    if (current.questionNotice === 'answer_too_long') {
+      const delivery = await channel.publish({ id: `${prefix}_shorter_answer`, kind: 'progress', speak: true,
+        text: 'Please give me a shorter answer to this question.', expectedCallerRevision: snapshot.callerRevision });
+      if (delivery.status !== 'accepted') return;
+    }
+    if (current.questionNotice === 'reply_refused') {
+      const delivery = await channel.publish({ id: `${prefix}_reply_refused`, kind: 'progress', speak: true,
+        text: record.reply?.refusal?.code === 'invalid_request'
+          ? 'I could not accept that answer. Please say it again.'
+          : 'That answer was not accepted. The request is still waiting for a reply.',
+        expectedCallerRevision: snapshot.callerRevision });
+      if (delivery.status !== 'accepted') return;
+    }
+    // Commentary appends preserve the question and both meanings, including amounts.
+    // Only completion of every append establishes the barrier for a later caller turn.
+    for (const [index, chunk] of chunks.entries()) {
+      const delivery = await channel.publish({ id: `${prefix}_prompt_${index}`, kind: 'result', text: chunk,
+        speak: true, expectedCallerRevision: snapshot.callerRevision });
+      if (delivery.status !== 'accepted') { save({ ...load(entry), delivery: delivery.status }); return; }
+    }
+    const after = channel.getContext();
+    if (channel.signal.aborted || after.callerRevision !== snapshot.callerRevision || boundCall(entry.sessionId).endedAt) return;
+    current = load(entry);
+    save({ ...current, delivery: 'accepted', questionNotice: undefined, questions: { ...current.questions,
+      [questionId]: { ...current.questions![questionId], presentation: {
+        callerRevision: after.callerRevision, sequence: Math.max(0, ...after.fragments.map(fragment => fragment.sequence)),
+        lastCallerEndMs: Math.max(0, ...after.fragments.filter(fragment => fragment.role === 'user').map(fragment => fragment.endMs)),
+        acceptedAt: new Date(now()).toISOString(),
+      } } } });
+  });
   const deliver = async (entry: BrokerDelegationRecord, channel: LiveBackendChannel) => {
     if (channel.signal.aborted) return;
+    if (entry.status === 'waiting_for_reply' || Object.values(entry.questions ?? {}).some(record => unresolvedReply(record.reply))) {
+      await deliverQuestion(entry, channel); return;
+    }
     const current = channel.getContext();
-    const changed = current.callerRevision !== entry.frozenCallerRevision;
+    const reviewedRevision = Math.max(entry.frozenCallerRevision, ...Object.values(entry.questions ?? {})
+      .filter(record => record.reply?.status === 'accepted').map(record => record.reply!.callerRevision));
+    const changed = current.callerRevision !== reviewedRevision;
     let text: string;
     if (changed) {
       const state = terminal(entry.status)
@@ -415,6 +688,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     const delegated = entries(sessionId);
     return delegated.filter(entry => ['prepared', 'dispatching', 'dispatch_unknown'].includes(entry.status)).length
       + delegated.filter(entry => entry.pendingCapture).length
+      + delegated.reduce((count, entry) => count + Object.values(entry.questions ?? {}).filter(record => unresolvedReply(record.reply)).length, 0)
       + Object.values(boundCall(sessionId).canonicalTurns ?? {}).filter(value => (value as CanonicalTurnRecord).state !== 'captured').length;
   };
   const currentSession = () => {
@@ -451,6 +725,8 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
             try { entry = applyResult(entry, await options.api.result(options.bindingId, entry.requestId)); }
             catch { unsupported.push('source_admission_unknown'); continue; }
           }
+          entry = await recoverReplies(entry);
+          if (Object.values(entry.questions ?? {}).some(record => unresolvedReply(record.reply))) unsupported.push('reply_outcome_unknown');
           if (!entry.pendingCapture) continue;
           try {
             const turn = canonicalPayload(entry.pendingCapture);
@@ -467,6 +743,8 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
           try {
             const payload = canonicalPayload(turn);
             const delegated = entries(sessionId).find(entry => entry.submission.source.sourceEventId === turn.sourceEventId);
+            const reply = knownReply(sessionId, turn.sourceEventId);
+            if (unresolvedReply(reply?.reply)) { unsupported.push('reply_outcome_unknown'); continue; }
             if (delegated?.pendingCapture || (delegated && ['prepared', 'dispatching', 'dispatch_unknown'].includes(delegated.status))) {
               unsupported.push('source_admission_unknown'); continue;
             }
@@ -475,6 +753,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
                 || receipt.revision !== turn.revision || receipt.recordId !== turn.sourceEventId) throw new Error('capture_identity_mismatch');
             persistCanonical(sessionId, { ...turn, state: 'captured', recordId: receipt.recordId });
             if (delegated) save({ ...load(delegated), sourceRevision: turn.revision, capturedText: turn.text, correctionState: 'recorded_not_applied' });
+            if (reply?.reply.status === 'accepted') save({ ...load(reply.entry), correctionState: 'recorded_not_applied' });
           } catch { persistCanonical(sessionId, { ...turn, state: 'unknown' }); unsupported.push('capture_outcome_unknown'); }
         }
         return { pending: pendingCount(sessionId), unsupported: [...new Set(unsupported)] };
@@ -511,6 +790,8 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
           const text = group.fragments.map(f => f.text).join('');
           if (!validTurnText(text)) return 'invalid_completed_turn';
           const delegated = entries(sessionId).find(entry => entry.submission.source.sourceEventId === sourceEventId);
+          const reply = knownReply(sessionId, sourceEventId);
+          if (unresolvedReply(reply?.reply)) return 'reply_outcome_unknown';
           if (delegated && ['prepared', 'dispatching', 'dispatch_unknown'].includes(delegated.status)) return 'source_admission_unknown';
           if (delegated?.pendingCapture) return 'capture_outcome_unknown';
           const previous = current.canonicalTurns?.[sourceEventId] as CanonicalTurnRecord | undefined;
@@ -534,6 +815,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
               throw new Error('capture_identity_mismatch');
             persist({ ...turn, state: 'captured', recordId: receipt.recordId });
             if (delegated) save({ ...load(delegated), sourceRevision: turn.revision, capturedText: text, correctionState: 'recorded_not_applied' });
+            if (reply?.reply.status === 'accepted') save({ ...load(reply.entry), correctionState: 'recorded_not_applied' });
             return 'captured';
           } catch { persist({ ...turn, state: 'unknown' }); return 'capture_outcome_unknown'; }
         });
@@ -567,13 +849,15 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       try {
         while (!channel.signal.aborted) {
           entry = load(entry);
+          if (Object.values(entry.questions ?? {}).some(record => unresolvedReply(record.reply)))
+            entry = await locked(() => recoverReplies(entry!));
           if (!terminal(entry.status)) {
             try { entry = applyResult(entry, await options.api.result(options.bindingId, entry.requestId)); }
             catch { /* An absent or unreadable result does not justify another POST. */ }
           }
           entry = await captureRevision(entry, channel);
           if (channel.signal.aborted) return;
-          if (terminal(entry.status) || now() >= deadline) break;
+          if (terminal(entry.status) || entry.status === 'waiting_for_reply' || now() >= deadline) break;
           if (!(await delay(pollIntervalMs, channel.signal))) return;
         }
         await deliver(load(entry), channel);

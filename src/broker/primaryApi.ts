@@ -72,14 +72,35 @@ export interface PrimaryAssistant {
   text: string;
 }
 
+export interface PrimaryQuestion {
+  id: string; revision: 1; expiresAt: string;
+  runState: 'queued' | 'running' | 'waiting_for_reply' | 'completed' | 'failed' | 'cancelled';
+  runId: string; threadId: string; agent: { id: string; name: string };
+  question: string; context: string; proposedAnswer: string; yesMeaning: string; noMeaning: string;
+  state: 'pending' | 'answered' | 'expired' | 'cancelled' | 'unavailable'; createdAt: string;
+  reply: (PrimaryReply & { interpretedAnswer: string; receivedAt: string }) | null;
+}
+export interface PrimaryReply {
+  questionRevision: 1; clientReplyId: string; answer: 'yes' | 'no' | 'other'; text: string | null;
+}
+export interface PrimaryReplyInput {
+  source: Omit<PrimarySubmission['source'], 'role'>;
+  role: 'user'; text: string; reply: PrimaryReply;
+}
+export interface PrimaryQuestionResult {
+  requestId: string; bindingId: string; state: PrimaryQuestion['runState']; question: PrimaryQuestion; replayed?: boolean;
+}
+
 export type PrimaryRequestResult = {
   requestId: string;
   bindingId: string;
   replayed?: boolean;
+  question?: PrimaryQuestion;
 } & (
   | { state: 'queued' | 'running'; assistant?: never; error?: never }
   | { state: 'completed'; assistant: PrimaryAssistant; error?: never }
   | { state: 'failed' | 'cancelled'; assistant?: never; error: { code: string; retryable: false } }
+  | { state: 'waiting_for_reply'; question: PrimaryQuestion; assistant?: never; error?: never }
 );
 
 export type PrimaryResult = PrimaryRequestResult;
@@ -104,6 +125,8 @@ export interface PrimaryApiClient {
   getContext(bindingId: string): Promise<PrimaryCall>;
   submit(bindingId: string, requestId: string, input: PrimarySubmission): Promise<PrimaryRequestResult>;
   result(bindingId: string, requestId: string): Promise<PrimaryRequestResult>;
+  question(bindingId: string, requestId: string, questionId: string): Promise<PrimaryQuestionResult>;
+  reply(bindingId: string, requestId: string, questionId: string, input: PrimaryReplyInput): Promise<PrimaryQuestionResult>;
   captureTurn(bindingId: string, input: PrimaryTurn): Promise<PrimaryTurnReceipt>;
   close(bindingId: string): Promise<PrimaryClosedCall>;
 }
@@ -250,7 +273,7 @@ const sourceText = z.string().refine((value) => {
   });
 });
 const timestamp = z.iso.datetime({ offset: true });
-const revision = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER);
+const revision = z.number().int().min(1).max(2147483647);
 const errorEnvelope = z.object({ error: z.object({
   code: z.string().regex(/^[a-z][a-z0-9_]{1,79}$/), retryable: z.boolean(),
 }) });
@@ -261,14 +284,41 @@ const contextSchema = z.object({
 const callSchema = z.object({
   bindingId: uuid, callSid, state: z.enum(['open', 'closed']), context: contextSchema,
 });
-const requestBase = z.object({ requestId: uuid, bindingId: uuid, replayed: z.boolean().optional() });
+const questionText = (limit: number) => z.string().min(1).refine(value => value.trim() === value
+  && Buffer.byteLength(value) <= limit && !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value)
+  && Array.from(value).every(c => c.codePointAt(0)! < 0xd800 || c.codePointAt(0)! > 0xdfff));
+const replySchema = z.object({ questionRevision: z.literal(1), clientReplyId: uuid,
+  answer: z.enum(['yes', 'no', 'other']), text: questionText(2000).nullable(),
+}).strict().refine(value => (value.answer === 'other') === (value.text !== null));
+const questionSchema = z.object({
+  id: uuid, revision: z.literal(1), expiresAt: timestamp,
+  runState: z.enum(['queued', 'running', 'waiting_for_reply', 'completed', 'failed', 'cancelled']),
+  runId: uuid, threadId: uuid, agent: z.object({ id: uuid, name: questionText(512) }),
+  question: questionText(400), context: questionText(1000), proposedAnswer: questionText(400),
+  yesMeaning: questionText(400), noMeaning: questionText(400),
+  state: z.enum(['pending', 'answered', 'expired', 'cancelled', 'unavailable']), createdAt: timestamp,
+  reply: z.object({ questionRevision: z.literal(1), clientReplyId: uuid, answer: z.enum(['yes', 'no', 'other']),
+    text: questionText(2000).nullable(), interpretedAnswer: questionText(2000), receivedAt: timestamp,
+  }).refine(value => (value.answer === 'other') === (value.text !== null)).nullable(),
+}).refine(value => (value.state === 'answered') === (value.reply !== null));
+const requestBase = z.object({ requestId: uuid, bindingId: uuid, replayed: z.boolean().optional(), question: questionSchema.optional() });
 const requestSchema = z.discriminatedUnion('state', [
   requestBase.extend({ state: z.enum(['queued', 'running']), assistant: z.never().optional(), error: z.never().optional() }),
   requestBase.extend({ state: z.literal('completed'), error: z.never().optional(), assistant: z.object({
     messageId: uuid, eventId: uuid, sequence: z.string().regex(/^[1-9][0-9]{0,39}$/), text: textValue,
   }) }),
   requestBase.extend({ state: z.enum(['failed', 'cancelled']), assistant: z.never().optional(), error: errorEnvelope.shape.error.extend({ retryable: z.literal(false) }) }),
+  requestBase.extend({ state: z.literal('waiting_for_reply'), question: questionSchema,
+    assistant: z.never().optional(), error: z.never().optional() }),
 ]);
+const questionResultSchema = z.object({ requestId: uuid, bindingId: uuid,
+  state: z.enum(['queued', 'running', 'waiting_for_reply', 'completed', 'failed', 'cancelled']),
+  question: questionSchema, replayed: z.boolean().optional(),
+});
+const replyInputSchema = z.object({
+  source: z.object({ callSid, itemId, sourceEventId: uuid, revision: z.literal(1), receivedAt: timestamp }).strict(),
+  role: z.literal('user'), text: sourceText, reply: replySchema,
+}).strict();
 const submissionSchema = z.object({
   source: z.object({ callSid, itemId, sourceEventId: uuid, revision: z.literal(1), receivedAt: timestamp, role: z.literal('user') }).strict(),
   text: sourceText,
@@ -322,6 +372,21 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
     const result = parse(requestSchema, value, 'invalid_response');
     same(result.bindingId, bindingId); same(result.requestId, requestId);
     if (submit && typeof result.replayed !== 'boolean') throw new PrimaryApiError('invalid_response');
+    if (result.state === 'waiting_for_reply' && (!['pending', 'expired'].includes(result.question.state)
+      || result.question.runState !== 'waiting_for_reply')) throw new PrimaryApiError('invalid_response');
+    if (result.question) {
+      const known = calls.get(bindingId);
+      if (known) { same(result.question.threadId, known.threadId); same(result.question.agent.id, known.primaryDexterId); }
+      same(result.question.runState, result.state);
+    }
+    return result;
+  };
+  const decodeQuestion = (value: unknown, bindingId: string, requestId: string, questionId: string) => {
+    const result = parse(questionResultSchema, value, 'invalid_response');
+    same(result.bindingId, bindingId); same(result.requestId, requestId); same(result.question.id, questionId);
+    same(result.question.runState, result.state);
+    const known = calls.get(bindingId);
+    if (known) { same(result.question.threadId, known.threadId); same(result.question.agent.id, known.primaryDexterId); }
     return result;
   };
   return {
@@ -366,6 +431,25 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
       const headers = bindingHeaders(bindingId);
       parse(uuid, requestId, 'invalid_request');
       return decodeResult(await request('GET', `/requests/${requestId}`, undefined, headers), bindingId, requestId, false);
+    },
+    async question(bindingId, requestId, questionId) {
+      const headers = bindingHeaders(bindingId);
+      parse(uuid, requestId, 'invalid_request'); parse(uuid, questionId, 'invalid_request');
+      return decodeQuestion(await request('GET', `/requests/${requestId}/questions/${questionId}`, undefined, headers), bindingId, requestId, questionId);
+    },
+    async reply(bindingId, requestId, questionId, input) {
+      const headers = bindingHeaders(bindingId);
+      parse(uuid, requestId, 'invalid_request'); parse(uuid, questionId, 'invalid_request');
+      const parsed = parse(replyInputSchema, input, 'invalid_request');
+      const known = calls.get(bindingId);
+      if (known) same(parsed.source.callSid, known.callSid);
+      const result = decodeQuestion(await request('POST', `/requests/${requestId}/questions/${questionId}/reply`, parsed, headers), bindingId, requestId, questionId);
+      const reply = result.question.reply;
+      if (typeof result.replayed !== 'boolean' || !reply) throw new PrimaryApiError('invalid_response');
+      same(reply.clientReplyId, parsed.reply.clientReplyId); same(reply.questionRevision, parsed.reply.questionRevision);
+      same(reply.answer, parsed.reply.answer);
+      if (reply.text !== parsed.reply.text) throw new PrimaryApiError('identity_mismatch');
+      return result;
     },
     async captureTurn(bindingId, input) {
       const headers = bindingHeaders(bindingId);
