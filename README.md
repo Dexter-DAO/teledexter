@@ -6,9 +6,9 @@ The voice instructions keep replies brief, let you interrupt, and ask Primary fo
 
 ## Current status
 
-Broker release `10c8115` is running at [phone.dexter.cash/broker/health](https://phone.dexter.cash/broker/health), including callback and question continuation. All 274 Broker tests pass. The shared Primary Phone API was deployed in release `d781d4f` on September 22, 2026. The latest GPT-Live preflight was blocked by exhausted credits; a completed call through GPT-Live and Primary has not been demonstrated.
+Broker release `10c8115` is running at [phone.dexter.cash/broker/health](https://phone.dexter.cash/broker/health), including callback and question continuation. All 274 Broker tests pass. The shared Primary Phone API was deployed in release `d781d4f` on September 22, 2026. A compatibility correction for previously linked Phone accounts is being qualified before the first call. The latest GPT-Live preflight was blocked by exhausted credits; a completed call through GPT-Live and Primary has not been demonstrated.
 
-Outbound calls require an allowed destination, account readiness, and a successful audio preflight before dialing. The API admits the account through a verified outbound call. When you call Dexter, the inbound flow offers a callback: press 1, hang up, and Dexter can call the verified number saved to your account. Account access begins on that outbound call. The inbound leg reads no private account information.
+Outbound calls require an allowed destination, account readiness, and a successful audio preflight before dialing. The API admits the account through a verified outbound call. When you call Dexter, the inbound flow offers a callback: press 1, hang up, and Dexter can call the number saved to your account. Account access begins on that outbound call. The inbound leg reads no private account information.
 
 Callback consent expires after five minutes, and repeated callbacks recover the same saved request. When Primary needs an answer during a call, Dexter presents the question and its choices, then sends your answer back to that same request. It can recover an answer after a connection drops and handle another question without starting a second request. Answering an older question from a later callback remains a separate integration task.
 
