@@ -95,16 +95,22 @@ export class BrokerStore {
   update(id: string, patch: Partial<Omit<BrokerCall, 'id' | 'requestId' | 'number' | 'direction' | 'purpose' | 'createdAt'>>): BrokerCall {
     const previous = this.state.calls[id];
     if (!previous) throw new Error('Unknown broker call');
-    if (Object.prototype.hasOwnProperty.call(patch, 'primaryClosed')) {
-      const closed = patch.primaryClosed;
+    // Runtime callers can bypass Omit. Check the same property snapshot that
+    // will be persisted, so accessors cannot change a value after validation.
+    const nextPatch = { ...patch };
+    for (const key of ['id', 'requestId', 'number', 'direction', 'purpose', 'createdAt'] as const) {
+      if (Object.prototype.hasOwnProperty.call(nextPatch, key)
+          && (nextPatch as Partial<BrokerCall>)[key] !== previous[key]) throw new Error('Call identity cannot change');
+    }
+    if (Object.prototype.hasOwnProperty.call(nextPatch, 'primaryClosed')) {
+      const closed = nextPatch.primaryClosed;
       if (!closed || closed.state !== 'closed' || closed.bindingId !== previous.primary?.bindingId || closed.callSid !== previous.callSid
           || (previous.primaryClosed && (closed.bindingId !== previous.primaryClosed.bindingId || closed.callSid !== previous.primaryClosed.callSid)))
         throw new Error('Closed Primary binding cannot change');
     }
-    if (previous.callSid && patch.callSid && previous.callSid !== patch.callSid) throw new Error('Call SID cannot change');
-    if (patch.callSid && Object.values(this.state.calls).some(call => call.id !== id && call.callSid === patch.callSid)) throw new Error('Call SID is already bound');
+    if (previous.callSid && nextPatch.callSid && previous.callSid !== nextPatch.callSid) throw new Error('Call SID cannot change');
+    if (nextPatch.callSid && Object.values(this.state.calls).some(call => call.id !== id && call.callSid === nextPatch.callSid)) throw new Error('Call SID is already bound');
     const rank: Partial<Record<CallStatus, number>> = { prepared: 0, dialing: 1, queued: 2, ringing: 3, 'in-progress': 4 };
-    const nextPatch = { ...patch };
     if (nextPatch.status && (terminalCallStatuses.has(previous.status) || (previous.status !== 'unknown' && ((rank[nextPatch.status] ?? 9) < (rank[previous.status] ?? -1))))) delete nextPatch.status;
     if (nextPatch.transcriptRevision !== undefined && nextPatch.transcriptRevision < (previous.transcriptRevision ?? 0)) { delete nextPatch.transcript; delete nextPatch.transcriptRevision; }
     const call: BrokerCall = { ...previous, ...nextPatch, updatedAt: new Date().toISOString() };
