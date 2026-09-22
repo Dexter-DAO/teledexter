@@ -182,13 +182,6 @@ export function liveResultChunks(text: string): string[] {
   return chunks;
 }
 
-function shortSpokenResult(text: string): string {
-  if (Buffer.byteLength(text) <= LIVE_APPEND_MAX_BYTES) return text;
-  const sentence = text.match(/^\s*[\s\S]*?[.!?](?=\s|$)/u)?.[0]?.trim();
-  if (sentence && Buffer.byteLength(sentence) <= LIVE_APPEND_MAX_BYTES) return sentence;
-  return 'I have the full answer available. Which detail would you like first?';
-}
-
 function delay(ms: number, signal: AbortSignal): Promise<boolean> {
   if (signal.aborted) return Promise.resolve(false);
   return new Promise(resolve => {
@@ -648,65 +641,53 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       } } } });
   });
   const deliver = async (entry: BrokerDelegationRecord, channel: LiveBackendChannel) => {
-    if (channel.signal.aborted) return;
+    if (channel.signal.aborted || boundCall(entry.sessionId).endedAt) return;
     if (entry.status === 'waiting_for_reply' || Object.values(entry.questions ?? {}).some(record => unresolvedReply(record.reply))) {
       await deliverQuestion(entry, channel); return;
     }
+    const lastSpeech = speechTime();
+    if (lastSpeech !== undefined && now() - lastSpeech < stabilityMs && !await stableContext(channel)) return;
+    if (channel.signal.aborted || boundCall(entry.sessionId).endedAt) return;
     const current = channel.getContext();
+    const spokenAt = speechTime();
+    const interrupted = (): 'closed' | 'stale' | undefined => {
+      if (channel.signal.aborted || boundCall(entry.sessionId).endedAt) return 'closed';
+      if (channel.getContext().callerRevision !== current.callerRevision || speechTime() !== spokenAt) return 'stale';
+      return undefined;
+    };
     const reviewedRevision = Math.max(entry.frozenCallerRevision, ...Object.values(entry.questions ?? {})
       .filter(record => record.reply?.status === 'accepted').map(record => record.reply!.callerRevision));
     const changed = current.callerRevision !== reviewedRevision;
     let text: string;
-    if (changed) {
-      const state = terminal(entry.status)
-        ? `The original request ${entry.status === 'completed' ? 'completed' : entry.status === 'failed' ? 'failed' : 'was cancelled'}.`
-        : 'I am still checking the original request.';
-      text = entry.correctionState === 'recorded_not_applied'
-        ? `${state} Your correction has not changed that request.` : state;
-    }
-    else if (entry.status === 'completed') text = entry.primaryResult!.assistant!.text;
-    else if (entry.status === 'failed') text = 'The request failed. Its saved result is available for review.';
+    if (entry.status === 'completed') text = entry.primaryResult!.assistant!.text;
+    else if (entry.status === 'failed') text = 'I could not get an answer to that request.';
     else if (entry.status === 'cancelled') text = 'The request was cancelled.';
     else if (['dispatching', 'dispatch_unknown', 'prepared'].includes(entry.status))
       text = 'I could not confirm the outcome. Please check the request status before trying again.';
     else text = 'Your request is still pending. I can check its status again.';
-    if (entry.deferredTurns?.length) text += ' I also recorded what you said afterward, but have not acted on it. Please state the next request when you are ready.';
+    if (changed) text = `For your earlier request: ${text}`;
     const prefix = `${entry.requestId}_${current.callerRevision}`;
-    if (changed && entry.status === 'completed') {
-      let resultChunks: string[];
-      try { resultChunks = liveResultChunks(entry.primaryResult!.assistant!.text); }
-      catch { resultChunks = []; }
-      if (resultChunks.length) {
-        const provenance = await channel.publish({ id: `${prefix}_original_result_scope`, kind: 'progress',
-          text: 'The following saved result belongs to the original request. It does not answer or apply anything the caller said afterward.',
-          speak: false, expectedCallerRevision: current.callerRevision });
-        if (provenance.status !== 'accepted') { save({ ...load(entry), delivery: provenance.status }); return; }
-        for (const [index, chunk] of resultChunks.entries()) {
-          const delivery = await channel.publish({ id: `${prefix}_original_result_${index}`, kind: 'progress', text: chunk,
-            speak: false, expectedCallerRevision: current.callerRevision });
-          if (delivery.status !== 'accepted') { save({ ...load(entry), delivery: delivery.status }); return; }
-        }
-      }
-    }
     let chunks: string[];
     try { chunks = liveResultChunks(text); }
     catch {
       const outcome = await channel.publish({ id: `${prefix}_format_unavailable`, kind: 'result',
         text: 'I received the result, but cannot read that format accurately over this call. The full result has been saved.',
         expectedCallerRevision: current.callerRevision });
-      save({ ...load(entry), delivery: `format_unsupported:${outcome.status}` });
+      save({ ...load(entry), delivery: `format_unsupported:${interrupted() ?? outcome.status}` });
       return;
     }
-    if (chunks.length > 1) {
-      for (const [index, chunk] of chunks.entries()) {
-        const delivery = await channel.publish({ id: `${prefix}_context_${index}`, kind: 'progress', text: chunk,
-          speak: false, expectedCallerRevision: current.callerRevision });
-        if (delivery.status !== 'accepted') { save({ ...load(entry), delivery: delivery.status }); return; }
-      }
+    // A caller interjection changes the presentation context, not the saved result.
+    // Send every chunk as commentary while preserving the original request scope.
+    save({ ...load(entry), delivery: 'dispatching' });
+    for (const [index, chunk] of chunks.entries()) {
+      const stopped = interrupted();
+      if (stopped) { save({ ...load(entry), delivery: stopped }); return; }
+      const outcome = await channel.publish({ id: `${prefix}_${entry.status}_result_${index}`, kind: 'result',
+        speak: true, text: chunk, expectedCallerRevision: current.callerRevision });
+      const status = interrupted() ?? outcome.status;
+      if (status !== 'accepted') { save({ ...load(entry), delivery: status }); return; }
     }
-    const outcome = await channel.publish({ id: `${prefix}_${entry.status}_result`, kind: 'result',
-      text: shortSpokenResult(text), expectedCallerRevision: current.callerRevision });
-    save({ ...load(entry), delivery: outcome.status });
+    save({ ...load(entry), delivery: 'accepted' });
   };
   const persistCanonical = (sessionId: string, turn: CanonicalTurnRecord) => {
     const call = boundCall(sessionId);
@@ -882,7 +863,9 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
             || Object.values(current.questions ?? {}).some(record => unresolvedReply(record.reply))) return;
         const reviewedRevision = Math.max(current.frozenCallerRevision, ...Object.values(current.questions ?? {})
           .filter(record => record.reply?.status === 'accepted').map(record => record.reply!.callerRevision));
-        if (channel.getContext().callerRevision !== reviewedRevision) return;
+        const revision = channel.getContext().callerRevision;
+        const lastSpeech = speechTime();
+        if (lastSpeech !== undefined && now() - lastSpeech < stabilityMs) return;
         const announceSubmit = immediate && current.status === 'dispatch_unknown' && !notice!.submitAnnounced;
         if (!announceSubmit && (immediate || notice!.progressCount >= 4 || now() - notice!.lastAt < progressIntervalMs
             || now() >= deadline)) return;
@@ -891,8 +874,12 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
             ? 'My connection to your account tools returned an error. I am checking whether your request was saved.'
             : 'I have not confirmed whether your request was saved. I am checking the original request.'
           : ['prepared', 'dispatching', 'dispatch_unknown'].includes(current.status)
-            ? 'I am still checking whether your request was saved.'
-            : 'Your request is still being handled. I am waiting for its result.';
+            ? revision !== reviewedRevision
+              ? 'I am still checking whether your earlier request was saved.'
+              : 'I am still checking whether your request was saved.'
+            : revision !== reviewedRevision
+              ? 'I am still waiting for the result of your earlier request.'
+              : 'Your request is still being handled. I am waiting for its result.';
         if (announceSubmit) notice!.submitAnnounced = true;
         else notice!.progressCount++;
         notice!.lastAt = now();
@@ -900,8 +887,8 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
         // Audio acceptance must not delay the result GET. This continuation only
         // releases an in-memory reservation; it never writes after store close.
         try {
-          void channel.publish({ id: `${current.requestId}_${reviewedRevision}_${announceSubmit ? 'submit_unknown' : `pending_${notice!.progressCount}`}`,
-            kind: 'progress', speak: true, text, expectedCallerRevision: reviewedRevision })
+          void channel.publish({ id: `${current.requestId}_${revision}_${announceSubmit ? 'submit_unknown' : `pending_${notice!.progressCount}`}`,
+            kind: 'progress', speak: true, text, expectedCallerRevision: revision })
             .catch(() => undefined).finally(() => { notice!.inFlight = false; });
         } catch { notice!.inFlight = false; }
       };

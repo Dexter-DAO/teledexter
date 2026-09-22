@@ -9,7 +9,7 @@ import { createPrimaryBackend } from './backend.js';
 import { createCallbackFlow } from './callback.js';
 import { type BrokerConfig, isPhoneNumber } from './config.js';
 import { BrokerStore, type BrokerCall, type CallStatus, terminalCallStatuses } from './store.js';
-import { brokerInstructions, brokerHistory } from './instructions.js';
+import { brokerInstructions, brokerHistory, brokerOpening } from './instructions.js';
 import { probeLive } from './preflight.js';
 import { authorizedControl, callTwiml, fallbackTwiml, inputSpeechEnergy, mediaStart, PlaybackReceipts, safeFailure, streamToken, verifyTwilio, type ProviderCallProof } from './phone.js';
 
@@ -359,9 +359,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
               // continues. Its receipt confirms context injection, not playback.
               queueMicrotask(() => {
                 if (stopping || !live) return;
-                void live.appendInstructions(call.direction === 'outbound'
-                  ? 'Immediately say in English: "Hi, this is Dexter." Explain the call purpose from your initial instructions, then invite the person to speak and pause to listen.'
-                  : 'Immediately say in English: "Hi, this is Dexter. What would you like to do?" Then pause to listen.')
+                void live.appendInstructions(brokerOpening(call.direction))
                   .then(result => { store.update(call.id, { voiceOpening: result }); })
                   .catch(() => { if (!stopping) store.update(call.id, { voiceOpening: { status: 'unconfirmed', reason: 'opening_delivery_failed' } }); });
               });

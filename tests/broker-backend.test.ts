@@ -113,10 +113,20 @@ async function fixture(t: TestContext, overrides: Partial<PrimaryBackendOptions>
 test('waits for stable acoustic caller text and journals one verbatim canonical source before POST', async t => {
   const f = await fixture(t);
   f.add('What is my'); f.speech();
-  const pending = f.backend.delegate(f.request(), f.channel);
-  await wait(1);
-  f.add(' USDC balance?', 1000, 1200); f.speech(1000, 1200);
-  await pending;
+  const subscribe = f.channel.subscribeContext;
+  let captionDelivered = false;
+  f.channel.subscribeContext = listener => {
+    const unsubscribe = subscribe(listener);
+    if (!captionDelivered) queueMicrotask(() => {
+      if (captionDelivered) return;
+      captionDelivered = true;
+      assert.equal(f.posts.length, 0);
+      f.add(' USDC balance?', 1000, 1200); f.speech(1000, 1200);
+    });
+    return unsubscribe;
+  };
+  await f.backend.delegate(f.request(), f.channel);
+  assert.equal(captionDelivered, true);
   assert.equal(f.posts.length, 1); assert.equal(f.posts[0].input.text, 'What is my USDC balance?');
   assert.match(f.posts[0].requestId, /^[a-f0-9-]{36}$/);
   assert.equal(f.posts[0].input.source.role, 'user'); assert.equal(f.posts[0].input.source.revision, 1);
@@ -324,7 +334,7 @@ test('pending status notices are periodic rather than emitted by every result po
   assert.equal(f.posts.length, 1);
 });
 
-for (const change of ['abort', 'caller_revision', 'call_ended'] as const)
+for (const change of ['abort', 'call_ended'] as const)
   test(`blocked recovery suppresses attempted progress after ${change}`, async t => {
     const f = await fixture(t, { progressIntervalMs: 10, maxPollMs: 200 });
     f.add('Read my balance.'); f.speech();
@@ -336,12 +346,64 @@ for (const change of ['abort', 'caller_revision', 'call_ended'] as const)
     try {
       await began;
       if (change === 'abort') f.controller.abort();
-      else if (change === 'caller_revision') { f.add('Wait a moment.', 3000, 3200); f.speech(3000, 3200); }
       else f.store.update(f.call.id, { endedAt: new Date().toISOString() });
       await wait(35);
       assert.deepEqual(f.updates, []);
     } finally { release(); await work; }
     assert.equal(f.posts.length, 1);
+  });
+
+test('an active request continues to report progress after a caller interjection', async t => {
+  const f = await fixture(t, { progressIntervalMs: 10, maxPollMs: 500 });
+  f.add('Read my portfolio.'); f.speech();
+  let entered!: () => void, release!: () => void, noticed!: () => void;
+  const began = new Promise<void>(resolve => { entered = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const notice = new Promise<void>(resolve => { noticed = resolve; });
+  const originalPublish = f.channel.publish;
+  f.channel.publish = async update => {
+    const result = await originalPublish(update);
+    if (update.kind === 'progress' && update.expectedCallerRevision === 2) noticed();
+    return result;
+  };
+  f.behavior.result = async id => { entered(); await gate; return f.completed(id); };
+  const work = f.backend.delegate(f.request(), f.channel);
+  try {
+    await began;
+    f.add('Okay, do you need anything else?', 3000, 3200); f.speech(3000, 3200);
+    await Promise.race([notice, wait(250).then(() => { throw new Error('No progress after interjection'); })]);
+    const update = f.updates.find(value => value.kind === 'progress' && value.expectedCallerRevision === 2)!;
+    assert.equal(update.text, 'I am still waiting for the result of your earlier request.');
+    assert.equal(update.speak, true);
+    assert.equal(f.saved()[0].status, 'queued');
+    assert.equal(f.posts.length, 1);
+  } finally { release(); await work; }
+  assert.equal(f.updates.at(-1)!.text, 'For your earlier request: Your balance is $10.25 USDC.');
+  assert.equal(f.posts[0].input.text, 'Read my portfolio.');
+  assert.equal(f.posts.length, 1);
+});
+
+for (const interjection of ['Okay, do you need anything else?', 'What does repair mean?'])
+  test(`completion after "${interjection}" speaks the original portfolio result`, async t => {
+    const f = await fixture(t); f.add('Read my portfolio.'); f.speech();
+    const answer = 'Your portfolio holds $12,345.67 USDC and 12.345678 shares. The last price was $24.91.';
+    f.result(answer);
+    let entered!: () => void, release!: () => void;
+    const began = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    f.behavior.result = async id => { entered(); await gate; return f.completed(id); };
+    const work = f.backend.delegate(f.request(), f.channel);
+    await began;
+    f.add(interjection, 3000, 3200); f.speech(3000, 3200);
+    release(); await work;
+    const spoken = f.updates.filter(update => update.kind === 'result');
+    assert.equal(spoken.map(update => update.text).join(''), `For your earlier request: ${answer}`);
+    assert.ok(spoken.every(update => update.speak === true && update.expectedCallerRevision === 2));
+    assert.equal(f.saved()[0].result, answer);
+    assert.equal(f.saved()[0].delivery, 'accepted');
+    assert.equal(f.posts.length, 1);
+    assert.equal(f.posts[0].input.text, 'Read my portfolio.');
+    assert.equal(f.captures.length, 0);
   });
 
 test('fast completion and a pending Primary question receive no extra progress chatter', async t => {
@@ -382,7 +444,7 @@ test('late same-span caller correction becomes one source revision and cannot be
   assert.equal(f.captures[0].sourceEventId, f.posts[0].input.source.sourceEventId);
   assert.equal(f.captures[0].text, 'Read the balance of the other wallet.');
   assert.equal(f.saved()[0].correctionState, 'recorded_not_applied');
-  assert.match(f.updates.at(-1)!.text, /correction has not changed/);
+  assert.equal(f.updates.at(-1)!.text, 'For your earlier request: Your balance is $10.25 USDC.');
   await f.backend.delegate(f.request('del_correction'), f.channel);
   assert.equal(f.posts.length, 1);
 });
@@ -409,16 +471,74 @@ test('identity mismatch prevents dispatch and a mismatched response cannot be sp
   assert.ok(!f.updates.some(update => update.text.includes('$10.25')));
 });
 
-test('long results retain every character and exact amounts in bounded context chunks', async t => {
+test('long results speak every character and exact amount in bounded commentary chunks', async t => {
   const f = await fixture(t); f.add('Read my portfolio.'); f.speech();
   const text = 'Your balance is $12,345.67 USDC. ' + 'The portfolio includes 12.345678 shares. '.repeat(35);
+  const publish = f.channel.publish;
+  f.channel.publish = async update => {
+    if (update.kind === 'result') assert.equal(f.saved()[0].delivery, 'dispatching');
+    return publish(update);
+  };
   f.result(text); await f.backend.delegate(f.request(), f.channel);
-  const chunks = f.updates.filter(update => update.kind === 'progress');
+  const chunks = f.updates.filter(update => update.kind === 'result');
   assert.equal(chunks.map(update => update.text).join(''), text);
-  assert.ok(chunks.every(update => Buffer.byteLength(update.text) <= 500 && update.speak === false));
-  assert.equal(f.updates.at(-1)!.text, 'Your balance is $12,345.67 USDC.');
+  assert.ok(chunks.length > 1);
+  assert.ok(chunks.every(update => Buffer.byteLength(update.text) <= 500 && update.speak === true));
+  assert.ok(chunks.some(update => update.text.includes('12.345678')));
   assert.equal(f.saved()[0].result, text);
+  assert.equal(f.saved()[0].delivery, 'accepted');
 });
+
+for (const interjection of [false, true])
+  test(`a failed request without an assistant answer makes no review promise (interjection=${interjection})`, async t => {
+    const f = await fixture(t); f.add('Read my portfolio.'); f.speech();
+    f.behavior.result = async id => {
+      if (interjection) { f.add('Do you have it yet?', 3000, 3200); f.speech(3000, 3200); }
+      return { bindingId, requestId: id, state: 'failed', error: { code: 'primary_run_failed', retryable: false } };
+    };
+    await f.backend.delegate(f.request(), f.channel);
+    assert.equal(f.updates.at(-1)!.text, `${interjection ? 'For your earlier request: ' : ''}I could not get an answer to that request.`);
+    assert.equal(f.updates.at(-1)!.speak, true);
+    assert.equal(f.saved()[0].status, 'failed');
+    assert.equal(f.saved()[0].primaryResult?.error?.code, 'primary_run_failed');
+    assert.equal(f.saved()[0].result, undefined);
+    assert.equal(f.posts.length, 1);
+  });
+
+for (const interruption of ['abort', 'caller_revision', 'acoustic_speech', 'call_ended', 'rejected'] as const)
+  test(`result chunks stop after ${interruption} without losing the saved answer or executing again`, async t => {
+    const f = await fixture(t); f.add('Read my portfolio.'); f.speech();
+    const answer = 'Your portfolio includes 12.345678 shares. '.repeat(20) + 'Total value: $12,345.67.';
+    f.result(answer);
+    const publish = f.channel.publish;
+    let interrupted = false;
+    f.channel.publish = async update => {
+      const outcome = await publish(update);
+      if (update.kind === 'result' && !interrupted) {
+        interrupted = true;
+        if (interruption === 'abort') f.controller.abort();
+        else if (interruption === 'caller_revision') { f.add('Hold on.', 3000, 3200); f.speech(3000, 3200); }
+        else if (interruption === 'acoustic_speech') f.speech(3000, 3200);
+        else if (interruption === 'call_ended') f.store.update(f.call.id, { endedAt: new Date().toISOString() });
+        else return { ...outcome, status: 'rejected' };
+      }
+      return outcome;
+    };
+    await f.backend.delegate(f.request(), f.channel);
+    assert.equal(f.updates.filter(update => update.kind === 'result').length, 1);
+    assert.equal(f.saved()[0].delivery, interruption === 'abort' || interruption === 'call_ended' ? 'closed'
+      : interruption === 'rejected' ? 'rejected' : 'stale');
+    assert.equal(f.saved()[0].status, 'completed');
+    assert.equal(f.saved()[0].result, answer);
+    assert.equal(f.posts.length, 1);
+    if (interruption === 'caller_revision') {
+      const count = f.updates.length;
+      await f.backend.delegate(f.request(), f.channel);
+      assert.equal(f.updates.slice(count).map(update => update.text).join(''), `For your earlier request: ${answer}`);
+      assert.equal(f.saved()[0].delivery, 'accepted');
+      assert.equal(f.posts.length, 1);
+    }
+  });
 
 test('stable transcript alone cannot establish a completed acoustic caller turn', async t => {
   const f = await fixture(t); f.add('Read my balance.');
@@ -562,7 +682,7 @@ test('caller source preserves delta delivery order even when approximate interva
   assert.equal(f.posts[0].input.text, 'Read my balance.');
 });
 
-test('delegation during active work durably records separate speech and explicitly requires a new request', async t => {
+test('delegation during active work records separate speech and delivers the original result without executing the followup', async t => {
   const f = await fixture(t); f.add('Read my balance.'); f.speech();
   let entered!: () => void; const began = new Promise<void>(resolve => { entered = resolve; });
   let release!: () => void; const blocked = new Promise<void>(resolve => { release = resolve; });
@@ -574,7 +694,9 @@ test('delegation during active work durably records separate speech and explicit
   assert.equal(f.saved()[0].deferredTurns?.[0].text, 'Read my last payment.');
   release(); await Promise.all([first, second]);
   assert.equal(f.posts.length, 1);
-  assert.match(f.updates.at(-1)!.text, /recorded what you said afterward/);
+  assert.equal(f.updates.at(-1)!.text, 'For your earlier request: Your balance is $10.25 USDC.');
+  assert.equal(f.updates.at(-1)!.speak, true);
+  assert.equal(f.saved()[0].deferredTurns?.[0].status, 'recorded_not_submitted');
   await f.backend.delegate(f.request('del_repeat_no_new_speech'), f.channel);
   assert.equal(f.posts.length, 1);
   f.add('Please read my last payment now.', 5000, 5200); f.speech(5000, 5200);

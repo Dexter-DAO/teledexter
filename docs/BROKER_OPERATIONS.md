@@ -8,7 +8,9 @@ As of September 22, 2026, the Broker service and shared Phone API are deployed. 
 
 Account functionality is still being repaired. The first Primary request returned HTTP 503, and result recovery returned no saved request. Its outcome remains unknown in the journal. A disposable PostgreSQL test reproduced a defect in the old submission path: a transcript beginning with a space violates the Primary message constraint. The API correction preserves the raw transcript and submits a normalized rendering with explicit memory lineage. The original live exception was not logged, so the reproduction does not establish the exact production exception.
 
-The Broker successor records bounded API error details and speaks promptly when submission is uncertain, followed by periodic progress while checking the original request. It never repeats that submission to obtain a result. Source tests and package checks precede deployment; account execution still needs a successful telephone trial after both corrections are released.
+The submission repair and API diagnostics are deployed. A subsequent telephone call completed an account request with a fetched portfolio result. Broker then suppressed the answer because the caller had spoken again while it ran. Two later requests failed in shared tools. The account read succeeded; useful spoken delivery remains unqualified.
+
+The conversation successor treats the call brief as Dexter's assignment and explains the help in ordinary language. A caller interjection preserves the pending result: once the caller pauses, Broker supplies the answer for speech, including each chunk of a longer result. An interruption during delivery still stops the remaining chunks. The saved result remains available. Failed requests without an answer no longer promise a result to review. These changes require conversation qualification before replacing the deployed Broker.
 
 Use the health endpoint and the operator call journal for the selected code and actual call outcomes. Keep release acceptance and call evidence separate. Broader provider-backed memory recall remains disabled.
 
@@ -142,6 +144,8 @@ Before closing Primary admission, the service marks `primaryClosePending: true` 
 Once pending captures are acknowledged, the service closes the same binding. A failed close leaves `primaryClosePending` set. Maintenance retries pending recovery every 10 seconds while the process accepts work, including records loaded after restart. Explicit `reconcile` also attempts closeout for terminal calls or a pending binding. Inspect `primaryClosePending` and `transcriptCapture` in `status`; an HTTP success from reconciliation can still carry pending work.
 
 `transcriptCapture.state: complete` means no eligible journaled captures remain pending. Its `unsupported` field can still show omitted turns. Caller turns require acoustic completion evidence. Assistant capture requires confirmed playback and session finalization. Interrupted, discarded, or unconfirmed speech stays unqualified; it cannot become proof that the person heard a result.
+
+During a call, GPT-Live transcript deltas are observed fragments. The primary WebSocket has no assistant-turn completion event or audio-to-transcript identifier. Twilio marks acknowledge queued audio, so they cannot qualify a completed assistant transcript on their own. Passing immediate dialogue to Primary is a separate integration still under design; saved account messages do not include every intervening voice exchange.
 
 A call with status `unknown` and no provider SID needs operator investigation of the original dispatch. Preserve the request ID and journal, establish the provider outcome, and resolve that record before attempting another call. Generating a new request ID to bypass uncertainty risks a duplicate call. Do not delete the writer lock while its owning process is alive.
 
