@@ -9,14 +9,17 @@ import type { PrimaryApiClient, PrimaryRequestResult } from '../src/broker/prima
 import type { BrokerLiveConnection, BrokerLiveSessionOptions, LiveSessionClosed, LiveTranscriptSnapshot } from '../src/live/types.js';
 import type { createBrokerServer as ServerFactory } from '../src/broker/server.js';
 import { freshnessEvidence, freshnessMayRelease, freshnessPurpose, freshnessResult, historicalAccountMessages, selectFreshnessScenario } from './live-freshness.js';
+import { fixtureAssignmentReference, matchesFixtureAssignmentReference, followupEvidence, followupMayRelease, followupPurpose, followupResults, selectFollowupScenario,
+  type FixtureCallAssignment, type FollowupDelegation, type FollowupQueueObservation, type FollowupResult, type FollowupSubmission } from './live-followup.js';
+import type { BrokerDelegationRecord } from '../src/broker/backend.js';
 
 // Executes funded Live calls only when an operator runs this script. Twilio,
 // account identity, Primary requests, and playback receipts are local fixtures.
-const usage = 'node --import tsx scripts/qualify-live-phone.mts --module-root /absolute/release --module-variant src|dist --evidence-dir /new/absolute/directory --config-file /absolute/production.env [--scenario freshness] [--input-audio /absolute/caller.pcmu] [--interjection-audio /absolute/interjection.pcmu --call-purpose-file /absolute/purpose.txt]';
+const usage = 'node --import tsx scripts/qualify-live-phone.mts --module-root /absolute/release --module-variant src|dist --evidence-dir /new/absolute/directory --config-file /absolute/production.env [--scenario freshness|followup] [--input-audio /absolute/caller.pcmu] [--followup-audio /absolute/second-task.pcmu] [--interjection-audio /absolute/interjection.pcmu --call-purpose-file /absolute/purpose.txt]';
 const args = new Map<string, string>();
 for (let i = 2; i < process.argv.length; i += 2) {
   const key = process.argv[i];
-  if (!['--module-root', '--module-variant', '--evidence-dir', '--config-file', '--input-audio', '--instructions-file', '--interjection-audio', '--call-purpose-file', '--scenario'].includes(key) || !process.argv[i + 1] || args.has(key)) throw new Error(usage);
+  if (!['--module-root', '--module-variant', '--evidence-dir', '--config-file', '--input-audio', '--instructions-file', '--interjection-audio', '--followup-audio', '--call-purpose-file', '--scenario'].includes(key) || !process.argv[i + 1] || args.has(key)) throw new Error(usage);
   args.set(key, process.argv[i + 1]);
 }
 function absolute(flag: string, required = true) {
@@ -31,15 +34,17 @@ const configFile = absolute('--config-file')!;
 const audioFile = absolute('--input-audio', false);
 const instructionsFile = absolute('--instructions-file', false);
 const interjectionFile = absolute('--interjection-audio', false);
+const followupFile = absolute('--followup-audio', false);
 const callPurposeFile = absolute('--call-purpose-file', false);
 if (interjectionFile && !audioFile) throw new Error('--interjection-audio requires --input-audio');
 if (interjectionFile && instructionsFile) throw new Error('Interjection qualification must use the production voice instructions');
-const freshnessScenario = selectFreshnessScenario(args);
+const followupScenario = selectFollowupScenario(args);
+const freshnessScenario = followupScenario ? false : selectFreshnessScenario(args);
 const conversationScenario = Boolean(interjectionFile);
-const heldResultScenario = conversationScenario || freshnessScenario;
+const heldResultScenario = conversationScenario || freshnessScenario || followupScenario;
 const hardDeadlineMs = heldResultScenario ? 88_000 : 58_000;
 const conversationDeadlineMs = hardDeadlineMs - 18_000;
-let fixtureResult = freshnessScenario ? freshnessResult(new Date().toISOString()) : conversationScenario
+let fixtureResult = followupScenario ? followupResults[0] : freshnessScenario ? freshnessResult(new Date().toISOString()) : conversationScenario
   ? 'Your test portfolio is worth $1,250 in total: $250 in USDC and $1,000 in SOL.'
   : 'Your test phrase is blue lantern.';
 const portfolioFacts = [
@@ -113,6 +118,13 @@ const startedAt = Date.now();
 const events: Record<string, unknown>[] = [];
 const audio: Buffer[] = [];
 const primaryCalls: Record<string, unknown>[] = [];
+const followupSubmissions: FollowupSubmission[] = [];
+const followupReturnedResults: FollowupResult[] = [];
+const providerDelegations: FollowupDelegation[] = [];
+const adapterDelegations: FollowupDelegation[] = [];
+let followupQueue: FollowupQueueObservation | undefined;
+let simulatedCallAssignment: FixtureCallAssignment | undefined;
+let simulatedCallAssignmentRef: ReturnType<typeof fixtureAssignmentReference>;
 const providerCalls: Record<string, unknown>[] = [];
 const connections = new Set<BrokerLiveConnection>();
 const playbackTimers = new Set<ReturnType<typeof setTimeout>>();
@@ -190,6 +202,25 @@ function currentFreshnessEvidence() {
   return freshnessEvidence({ snapshot, atSubmit: firstSubmitSnapshot, atResult: resultReleaseSnapshot,
     submittedText: submissions.length === 1 ? String(submissions[0].text) : undefined });
 }
+function currentFollowupEvidence() {
+  return followupEvidence({ snapshot, submissions: followupSubmissions, results: followupReturnedResults,
+    providerDelegations, adapterDelegations, queue: followupQueue, audioStartedAt: interjectionStartedAt,
+    audioEndedAt: interjectionEndedAt, inputStartMs: interjectionInputStartMs });
+}
+function observeFollowupQueue() {
+  if (!followupScenario || followupQueue || !callId || interjectionStartedAt === undefined) return;
+  const records = Object.values(broker?.store.get(callId)?.delegations ?? {}) as BrokerDelegationRecord[];
+  for (const owner of records) for (const turn of owner.deferredTurns ?? []) {
+    if (turn.status !== 'queued' || !turn.queuedRequest) continue;
+    const queued = turn.queuedRequest;
+    if (!providerDelegations.some(value => value.delegationId === turn.delegationId && value.observedAt >= interjectionStartedAt!)
+        || !adapterDelegations.some(value => value.delegationId === turn.delegationId)) continue;
+    followupQueue = { observedAt: Date.now(), delegationId: turn.delegationId, predecessorRequestId: queued.predecessorRequestId,
+      requestId: queued.requestId, submission: structuredClone(queued.submission) };
+    note({ type: 'fixture.followup_queue_observed', queue: followupQueue });
+    return;
+  }
+}
 function writeEvidence() {
   const call = callId ? broker?.store.get(callId) : broker?.store.list()[0];
   const callerTranscript = snapshot.fragments.filter(x => x.role === 'user').map(x => x.text).join('');
@@ -197,21 +228,27 @@ function writeEvidence() {
   const outputBytes = audio.reduce((n, chunk) => n + chunk.length, 0);
   const submissions = primaryCalls.filter(x => x.method === 'submit');
   const conversation = conversationChecks();
+  const followup = followupScenario ? { ...currentFollowupEvidence(),
+    portfolioCandidates: spokenPortfolioFacts(currentFollowupEvidence().afterFirstResult) } : null;
   const freshness = freshnessScenario ? { ...currentFreshnessEvidence(),
     exactlyOneSubmit: conversation.exactlyOneSubmit, noFollowupAction: conversation.noFollowupAction,
     resultHoldMs: firstSubmitAt !== undefined && resultReleasedAt !== undefined ? resultReleasedAt - firstSubmitAt : null,
   } : null;
-  const callerSubmissionComplete = freshness ? freshness.rawCallerRequestPreserved : conversationScenario ? conversation.originalFirstTurnPreserved : !audioFile || (submissions.length === 1
+  const callerSubmissionComplete = followup ? followup.bothRawTurnsPreserved : freshness ? freshness.rawCallerRequestPreserved : conversationScenario ? conversation.originalFirstTurnPreserved : !audioFile || (submissions.length === 1
     && String(submissions[0].text).trim() === callerTranscript.trim());
   const resultAudioAfterRelease = resultReleasedAt !== undefined && lastAudioAt > resultReleasedAt
     && simulatedPlayedBytes > resultReleaseOutputBytes;
   // Freshness requires semantic review; audio/amount candidates do not certify speech.
-  const returnedResultSpoken = freshnessScenario ? null : conversationScenario ? conversation.resultFactsSpoken : !audioFile || /blue lantern/i.test(assistantTranscript);
+  const returnedResultSpoken = freshnessScenario || followupScenario ? null : conversationScenario ? conversation.resultFactsSpoken : !audioFile || /blue lantern/i.test(assistantTranscript);
+  const followupAudioAfterBothResults = followupReturnedResults.length === 2
+    && lastAudioAt > followupReturnedResults[1].observedAt && simulatedPlayedBytes > followupReturnedResults[1].outputBytes;
   const mechanicalPassed = !failure && !call?.failure && outputBytes > 0 && peakEnergy > 0.01 && assistantTranscript.length > 0
     && closed?.finalized === true && call?.finalized === true && call?.primaryClosePending === false
     && call?.transcriptCapture?.state === 'complete'
     && (!audioFile || callerTranscript.length > 0) && callerSubmissionComplete
-    && (freshnessScenario ? resultAudioAfterRelease && conversation.noFollowupAction && firstSubmitAt !== undefined
+    && (followup ? followup.mechanicalReady && followupAudioAfterBothResults
+      && !primaryCalls.some(value => value.method === 'question' || value.method === 'reply')
+      : freshnessScenario ? resultAudioAfterRelease && conversation.noFollowupAction && firstSubmitAt !== undefined
       && resultReleasedAt !== undefined && resultReleasedAt > firstSubmitAt : returnedResultSpoken)
     && (!conversationScenario || (conversation.exactlyOneSubmit && conversation.noFollowupAction && conversation.laterCallerRevision && conversation.interjectionBeforeResult && conversation.transcriptAcceptance.accepted))
     && greetingAt !== undefined && (!speechStartedAt || greetingAt < speechStartedAt);
@@ -220,15 +257,25 @@ function writeEvidence() {
       ? 'unsupported_account_failure_spoken' : !conversation.transcriptAcceptance.internalBriefKeptPrivate
         ? 'internal_call_brief_spoken' : 'caller_asked_to_supply_account_facts' }
     : null;
-  const passed = freshnessScenario && mechanicalPassed ? null : Boolean(mechanicalPassed);
+  const followupFailure = followup && !followup.mechanicalReady ? { stage: 'followup_acceptance',
+    code: !followup.actualSecondDelegation ? 'followup_delegation_or_queue_unconfirmed'
+      : !followup.exactlyTwoSubmissions ? 'expected_two_task_submissions'
+        : !followup.bothRawTurnsPreserved ? 'raw_caller_sources_changed'
+          : !followup.childAfterParentTerminal ? 'child_before_parent_terminal'
+            : !followup.queuePreserved ? 'frozen_followup_submission_changed' : 'followup_results_incomplete' } : null;
+  const passed = followupScenario || (freshnessScenario && mechanicalPassed) ? null : Boolean(mechanicalPassed);
   const report = {
-    passed, mechanicalPassed: Boolean(mechanicalPassed), semanticReviewRequired: freshnessScenario, stage, failure: failure ?? (call?.failure ? { stage: 'live_session', code: call.failure.code } : conversationFailure),
+    passed, mechanicalPassed: Boolean(mechanicalPassed), semanticReviewRequired: freshnessScenario || followupScenario, stage, failure: failure ?? (call?.failure ? { stage: 'live_session', code: call.failure.code } : conversationFailure ?? followupFailure),
     elapsedMs: Date.now() - startedAt, moduleRoot, moduleVariant,
     scope: { real: ['Broker server', 'Live preflight', 'Live session', 'provider audio and transcripts'],
       simulated: ['Twilio dispatch and callbacks', 'phone playback receipts', 'Primary account and results'],
-      dummyPrimaryResult: fixtureResult, productionAccountAccess: false },
+      dummyPrimaryResult: followupScenario ? followupResults : fixtureResult, productionAccountAccess: false,
+      assignmentFixture: { kind: 'mock_receipt', callAssignment: simulatedCallAssignment ?? null,
+        callAssignmentRef: simulatedCallAssignmentRef ?? null,
+        limitation: 'The deterministic fixture digest is not proof of the API canonical assignment digest.' } },
     preflight, callId, outputBytes, peakEnergy, inputFrames, inputAudioFile: audioFile ?? null, instructionsOverride: instructionsFile ?? null,
-    scenario: freshnessScenario ? 'freshness' : conversationScenario ? 'portfolio_with_interjection' : 'test_phrase', interjectionAudioFile: interjectionFile ?? null,
+    scenario: followupScenario ? 'followup' : freshnessScenario ? 'freshness' : conversationScenario ? 'portfolio_with_interjection' : 'test_phrase', interjectionAudioFile: interjectionFile ?? null,
+    followupAudioFile: followupFile ?? null, followup, followupAudioAfterBothResults,
     callPurposeFile: callPurposeFile ?? null, purposeDigest, hardDeadlineMs,
     speechStartedAt, speechEndedAt, greetingAt, controlledCloseAt, simulatedPlayedBytes, simulatedClearedBytes,
     playbackEvidence: { kind: 'simulated_receipts', assistantPlaybackComplete: call?.transcriptCapture?.assistantPlaybackComplete === true,
@@ -258,7 +305,7 @@ const deadlineTimer = setTimeout(() => {
   broker?.server.closeAllConnections();
   try { broker?.store.close(); } catch {}
   writeEvidence();
-  console.log(JSON.stringify({ passed: false, failure, evidenceDir }));
+  console.log(JSON.stringify({ passed: followupScenario ? null : false, mechanicalPassed: false, failure, evidenceDir }));
   process.exit(1);
 }, hardDeadlineMs);
 
@@ -273,9 +320,11 @@ try {
   if (!selected.OPENAI_API_KEY) throw Object.assign(new Error(), { code: 'missing_openai_key' });
   const callerAudio = audioFile ? fs.readFileSync(audioFile) : undefined;
   if (callerAudio && (!callerAudio.length || callerAudio.length > 120_000)) throw Object.assign(new Error(), { code: 'caller_audio_must_be_raw_8khz_pcmu_under_15_seconds' });
-  const interjectionAudio = interjectionFile ? fs.readFileSync(interjectionFile) : undefined;
+  const secondAudioFile = followupFile ?? interjectionFile;
+  const interjectionAudio = secondAudioFile ? fs.readFileSync(secondAudioFile) : undefined;
   if (interjectionAudio && (!interjectionAudio.length || interjectionAudio.length > 80_000)) throw Object.assign(new Error(), { code: 'interjection_audio_must_be_raw_8khz_pcmu_under_10_seconds' });
-  const purpose = freshnessScenario ? freshnessPurpose : callPurposeFile ? fs.readFileSync(callPurposeFile, 'utf8') : 'This is a brief voice qualification test. Greet the test caller and ask how you can help.';
+  const purpose = freshnessScenario ? freshnessPurpose : callPurposeFile ? fs.readFileSync(callPurposeFile, 'utf8')
+    : followupScenario ? followupPurpose : 'This is a brief voice qualification test. Greet the test caller and ask how you can help.';
   if (!purpose.trim() || purpose.length > 1500) throw Object.assign(new Error(), { code: 'invalid_call_purpose_fixture' });
   purposeDigest = createHash('sha256').update(purpose).digest('hex');
   const requireFromModule = createRequire(path.join(moduleRoot, 'package.json'));
@@ -299,13 +348,26 @@ try {
   const bindingId = randomUUID();
   const context = { primaryDexterId: randomUUID(), threadId: randomUUID(), displayName: 'Qualification owner', messages: freshnessScenario ? structuredClone(historicalAccountMessages) : [] };
   const requests = new Map<string, PrimaryRequestResult>();
+  const fixtureCall = () => ({ bindingId, callSid: sid, state: 'open' as const, context,
+    ...(simulatedCallAssignmentRef ? { callAssignmentRef: structuredClone(simulatedCallAssignmentRef) } : {}) });
+  const observeFollowupResult = (requestId: string, result: PrimaryRequestResult) => {
+    const evidence: FollowupResult = { requestId, result: structuredClone(result), observedAt: Date.now(),
+      snapshot: structuredClone(snapshot), inputOffsetMs: inputFrames * 20, outputBytes: audio.reduce((n, chunk) => n + chunk.length, 0) };
+    followupReturnedResults.push(evidence);
+    note({ type: 'fixture.followup_result_returned', ...evidence });
+  };
   const primary: PrimaryApiClient = {
     async readiness() { primaryCalls.push({ method: 'readiness' }); return { eligible: true, reason: 'ready' }; },
-    async openCall(proof) {
+    async openCall(proof, callAssignment?: FixtureCallAssignment) {
       if (proof.params.CallSid !== sid) throw Object.assign(new Error(), { code: 'fixture_call_mismatch' });
-      primaryCalls.push({ method: 'openCall', bindingId }); return { bindingId, callSid: sid, state: 'open', context };
+      if (callAssignment && (callAssignment.brokerCallId !== callId || callAssignment.assignmentId !== controlRequestId
+          || callAssignment.purpose !== purpose.trim())) throw Object.assign(new Error(), { code: 'fixture_call_assignment_mismatch' });
+      simulatedCallAssignment = callAssignment && structuredClone(callAssignment);
+      simulatedCallAssignmentRef = fixtureAssignmentReference(simulatedCallAssignment);
+      primaryCalls.push({ method: 'openCall', bindingId, callAssignment: simulatedCallAssignment,
+        callAssignmentRef: simulatedCallAssignmentRef }); return fixtureCall();
     },
-    async getContext() { return { bindingId, callSid: sid, state: 'open', context }; },
+    async getContext() { return fixtureCall(); },
     async submit(id, requestId, input) {
       if (id !== bindingId) throw Object.assign(new Error(), { code: 'fixture_binding_mismatch' });
       firstSubmitAt ??= Date.now();
@@ -313,7 +375,27 @@ try {
       firstSubmitSnapshot ??= structuredClone(snapshot);
       firstSubmitInputOffsetMs ??= inputFrames * 20;
       firstSubmitOutputBytes ??= audio.reduce((n, chunk) => n + chunk.length, 0);
-      primaryCalls.push({ method: 'submit', requestId, text: input.text, source: structuredClone(input.source), textDigest: createHash('sha256').update(input.text).digest('hex'), elapsedMs: Date.now() - startedAt, callerRevision: snapshot.callerRevision, inputOffsetMs: inputFrames * 20 });
+      primaryCalls.push({ method: 'submit', requestId, input: structuredClone(input), text: input.text, source: structuredClone(input.source), textDigest: createHash('sha256').update(input.text).digest('hex'), elapsedMs: Date.now() - startedAt, callerRevision: snapshot.callerRevision, inputOffsetMs: inputFrames * 20 });
+      const assignmentRef = (input as typeof input & { callAssignmentRef?: unknown }).callAssignmentRef;
+      if (!matchesFixtureAssignmentReference(assignmentRef, simulatedCallAssignmentRef)) {
+        failure ??= { stage: 'primary_submission', code: 'fixture_call_assignment_ref_mismatch' };
+        throw Object.assign(new Error(), { code: failure.code });
+      }
+      if (followupScenario) {
+        const parent = followupSubmissions[0];
+        const predecessorTerminal = parent !== undefined && requests.get(parent.requestId)?.state === 'completed';
+        followupSubmissions.push({ requestId, input: structuredClone(input), observedAt: Date.now(),
+          snapshot: structuredClone(snapshot), predecessorTerminal });
+        if (followupSubmissions.length > 2 || (parent && (!predecessorTerminal || requestId === parent.requestId))) {
+          failure ??= { stage: 'followup_admission', code: !predecessorTerminal ? 'child_before_parent_terminal' : 'unexpected_followup_submission' };
+          throw Object.assign(new Error(), { code: failure.code });
+        }
+        if (parent) {
+          const result: PrimaryRequestResult = { bindingId, requestId, state: 'completed', assistant: {
+            messageId: randomUUID(), eventId: randomUUID(), sequence: '2', text: followupResults[1] } };
+          requests.set(requestId, result); observeFollowupResult(requestId, result); return result;
+        }
+      }
       if (heldResultScenario) {
         const pending: PrimaryRequestResult = { bindingId, requestId, state: 'running' };
         requests.set(requestId, pending);
@@ -329,7 +411,10 @@ try {
       if (!result) throw Object.assign(new Error(), { code: 'fixture_request_missing' });
       const laterCaller = interjectionStartCallerRevision !== undefined && snapshot.callerRevision > interjectionStartCallerRevision
         && conversationChecks().interjectionTranscript.length > 0;
-      const mayRelease = freshnessScenario
+      observeFollowupQueue();
+      const mayRelease = followupScenario ? followupMayRelease({ now: Date.now(), firstSubmitAt,
+        audioStartedAt: interjectionStartedAt, audioEndedAt: interjectionEndedAt, lastCallerTranscriptAt,
+        queue: followupQueue, providerDelegations, adapterDelegations }) : freshnessScenario
         ? freshnessMayRelease(Date.now(), firstSubmitAt, speechEndedAt, lastCallerTranscriptAt)
         : conversationScenario && interjectionEndedAt !== undefined && laterCaller
           && Date.now() - interjectionEndedAt >= 1800 && Date.now() - lastCallerTranscriptAt >= 1500;
@@ -344,12 +429,14 @@ try {
         result = { bindingId, requestId, state: 'completed', assistant: {
           messageId: randomUUID(), eventId: randomUUID(), sequence: '1', text: fixtureResult } };
         requests.set(requestId, result);
+        if (followupScenario) observeFollowupResult(requestId, result);
         note({ type: 'fixture.primary_result_released', requestId, callerRevision: snapshot.callerRevision, inputOffsetMs: inputFrames * 20, result: structuredClone(result) });
       }
       return result;
     },
     async question() { primaryCalls.push({ method: 'question' }); throw Object.assign(new Error(), { code: 'fixture_question_not_configured' }); },
     async reply() { primaryCalls.push({ method: 'reply' }); throw Object.assign(new Error(), { code: 'fixture_question_not_configured' }); },
+    async reconcile() { primaryCalls.push({ method: 'reconcile' }); throw Object.assign(new Error(), { code: 'fixture_reconciliation_not_configured' }); },
     async captureTurn(_id, input) {
       primaryCalls.push({ method: 'captureTurn', role: input.role, text: input.text });
       return { bindingId, sourceEventId: input.sourceEventId, revision: input.revision, recordId: input.sourceEventId, replayed: false };
@@ -374,6 +461,12 @@ try {
             audioKeys: nested(event.audio), sessionKeys: nested(event.session),
             resolvedAudio: event.type === 'session.started' ? (event.session as Record<string, unknown>)?.audio : undefined,
             deltaType: typeof event.delta, deltaLength: typeof event.delta === 'string' ? event.delta.length : undefined });
+          if (followupScenario && event.type === 'session.delegation.created') {
+            const delegation = event.delegation as { id?: unknown } | undefined;
+            if (typeof delegation?.id === 'string' && !providerDelegations.some(value => value.delegationId === delegation.id)) {
+              providerDelegations.push({ delegationId: delegation.id, observedAt: Date.now(), snapshot: structuredClone(snapshot) });
+            }
+          }
           listener(value);
         }) };
       },
@@ -384,7 +477,13 @@ try {
         return options.onTranscript(value);
       },
       onClosed: value => { closed = value; note({ type: 'live.closed', result: value }); options.onClosed(value); },
-      onEvent: value => { note({ source: 'adapter', ...value }); options.onEvent?.(value); },
+      onEvent: value => {
+        if (followupScenario && value.type === 'live.delegation.started' && typeof value.delegationId === 'string'
+            && !adapterDelegations.some(item => item.delegationId === value.delegationId)) {
+          adapterDelegations.push({ delegationId: value.delegationId, observedAt: Date.now(), snapshot: structuredClone(snapshot) });
+        }
+        note({ source: 'adapter', ...value }); options.onEvent?.(value);
+      },
     }),
   });
   await new Promise<void>(resolve => broker!.server.listen(0, '127.0.0.1', resolve));
@@ -392,7 +491,8 @@ try {
   const post = (route: string, value: unknown) => fetch(base + route, { method: 'POST', signal: AbortSignal.timeout(17_000),
     headers: { authorization: `Bearer ${config.controlToken}`, 'content-type': 'application/json' }, body: JSON.stringify(value) });
   stage = 'outbound_admission';
-  const admission = await post('/internal/broker/calls', { requestId: randomUUID(), purpose });
+  const controlRequestId = randomUUID();
+  const admission = await post('/internal/broker/calls', { requestId: controlRequestId, purpose });
   const admitted = await admission.json() as { call?: { id: string }; error?: string };
   callId = admitted.call?.id ?? broker.store.list()[0]?.id;
   if (admission.status !== 201 || !callId) throw Object.assign(new Error(), { code: broker.store.list()[0]?.failure?.code || 'outbound_admission_failed' });
@@ -459,7 +559,7 @@ try {
         interjectionStartedAt = now;
         interjectionInputStartMs = inputFrames * 20;
         interjectionStartCallerRevision = snapshot.callerRevision;
-        note({ type: 'fixture.interjection_started', callerRevision: snapshot.callerRevision, inputStartMs: interjectionInputStartMs });
+        note({ type: followupScenario ? 'fixture.followup_audio_started' : 'fixture.interjection_started', callerRevision: snapshot.callerRevision, inputStartMs: interjectionInputStartMs });
       }
       if (interjectionStartedAt !== undefined && interjectionOffset < interjectionAudio.length) {
         const end = Math.min(interjectionOffset + 160, interjectionAudio.length);
@@ -473,7 +573,11 @@ try {
     await new Promise(resolve => setTimeout(resolve, 100));
     const quiet = lastAudioAt > 0 && Date.now() - lastAudioAt > 1500;
     const callerDone = !callerAudio || (speechEndedAt !== undefined && Date.now() - speechEndedAt > 5000 && snapshot.callerRevision > 0);
-    const scenarioDone = freshnessScenario ? resultReleasedAt !== undefined && Date.now() - resultReleasedAt > 5000
+    observeFollowupQueue();
+    const secondResult = followupReturnedResults[1];
+    const scenarioDone = followupScenario ? Boolean(secondResult && Date.now() - secondResult.observedAt > 5000
+      && lastAudioAt > secondResult.observedAt && Date.now() - audiblePlaybackUntil > 1500)
+      : freshnessScenario ? resultReleasedAt !== undefined && Date.now() - resultReleasedAt > 5000
       && lastAudioAt > resultReleasedAt && Date.now() - audiblePlaybackUntil > 1500
       : !conversationScenario || (conversationChecks().resultFactsSpoken && Date.now() - audiblePlaybackUntil > 1500);
     if (quiet && callerDone && scenarioDone && peakEnergy > 0.01 && snapshot.fragments.some(x => x.role === 'assistant') && Date.now() - mediaStarted > 5000) break;
