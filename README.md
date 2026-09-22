@@ -6,7 +6,9 @@ The aim is to talk through your portfolio, ask follow-up questions, and request 
 
 This repository contains the voice transport, Twilio calling, and the connection to Primary. It builds on Dexter Phone. The main implementation lives in [src/broker](src/broker) and [src/live](src/live); account execution lives in the shared Dexter API.
 
-The phone preview is being tested through arranged outbound calls. Telephone trials have confirmed two-way conversation and a fetched portfolio result, but Dexter failed to read that answer to the caller. The conversation repair is under qualification. The existing telephone number still reaches legacy Dexter Phone. An inbound callback handler is implemented here; the incoming-call experience remains under review. Automatic opportunity calls are planned, and broader conversation recall awaits activation of the memory provider.
+The phone preview is being tested through arranged outbound calls. The latest trial returned answers from Primary and carried them into the voice conversation. It also exposed remaining problems: the opening reused an older portfolio balance, replies were slow, and a follow-up spoken during another request was saved without being submitted. A fresh, complete portfolio readout remains unqualified.
+
+The existing telephone number still reaches legacy Dexter Phone. An inbound callback handler is implemented here; the incoming-call experience remains under review. Automatic opportunity calls are planned, and broader conversation recall awaits activation of the memory provider.
 
 For development, use Node.js 22 and npm:
 
