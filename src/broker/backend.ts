@@ -58,6 +58,8 @@ export interface BrokerDelegationRecord {
   frozenCallerRevision: number;
   firstSequence: number;
   lastSequence: number;
+  /** Local received-audio clock; independent of Live transcript timestamps. */
+  audioThroughMs?: number;
   completionBasis: 'transcript_stability' | 'speech_and_transcript_stability';
   sourceRevision: number;
   capturedText: string;
@@ -96,6 +98,7 @@ export interface BrokerDeferredTurn {
     bodyDigest: string;
     lastSequence: number;
     completionBasis: 'speech_and_transcript_stability';
+    audioThroughMs?: number;
   };
 }
 
@@ -123,6 +126,7 @@ export interface BrokerQuestionReplyRecord {
   callerRevision: number;
   firstSequence: number;
   lastSequence: number;
+  audioThroughMs?: number;
   refusal?: { origin: 'local_validation' | 'api_non_admission'; code: string; status?: number };
 }
 
@@ -442,25 +446,37 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     return Date.parse(origin);
   };
   const speechTime = () => options.lastCallerSpeechAt?.() ?? lastSpeechAt;
-  const acousticGroups = (snapshot: LiveTranscriptSnapshot, observedAt = now()) => {
-    const grouped = acousticSpans.map(span => ({ span, fragments: [] as LiveTranscriptSnapshot['fragments'], ambiguous: false }));
-    for (const fragments of callerGroups(snapshot)) {
-      // Transcript times are approximate, so associate the complete contiguous
-      // phrase with acoustic evidence. Filtering each word against the acoustic
-      // boundary can truncate a phrase whose last caption is timestamped later.
-      const startMs = Math.min(...fragments.map(fragment => fragment.startMs));
-      const endMs = Math.max(...fragments.map(fragment => fragment.endMs));
-      const matches = grouped.filter(({ span }) => endMs >= span.startMs - 300 && startMs <= span.endMs + 300);
-      if (matches.length === 1) matches[0].fragments.push(...fragments);
-      // Preserve uncertain text in the transcript without combining distinct
-      // acoustic turns or admitting only a convenient subset of the phrase.
-      else for (const match of matches) match.ambiguous = true;
+  const completedCallerGroups = (snapshot: LiveTranscriptSnapshot, observedAt = now()) => {
+    // Captions and delegations share Live's session clock. Input amplitude is
+    // only local activity/silence evidence: clicks and pauses prevent a reliable
+    // one-to-one correspondence between captions and local sound bursts.
+    const latestAudio = acousticSpans.at(-1);
+    if (!latestAudio || observedAt - latestAudio.lastSpeechAt < stabilityMs) return [];
+    const sessionId = currentSession();
+    const grouped = callerGroups(snapshot).map(fragments => {
+      fragments.sort((a, b) => a.sequence - b.sequence);
+      return { fragments, sourceEventId: brokerIdentity('source', options.callId, sessionId, fragments[0].eventId) };
+    });
+    if (grouped.some((group, index) => index > 0 && group.fragments[0].sequence <= grouped[index - 1].fragments[0].sequence)) return [];
+    const matchesAnchor = (sourceEventId: string, firstSequence?: number, lastSequence?: number) => {
+      const group = grouped.find(value => value.sourceEventId === sourceEventId);
+      return !!group && (firstSequence === undefined || group.fragments[0].sequence === firstSequence)
+        && (lastSequence === undefined || group.fragments.some(fragment => fragment.sequence === lastSequence));
+    };
+    // A late caption may extend its source, but cannot split, merge or replace
+    // an already accepted source. Saved requests/replies remain byte-exact.
+    for (const entry of entries(sessionId)) {
+      if (!matchesAnchor(entry.submission.source.sourceEventId, entry.firstSequence, entry.lastSequence)) return [];
+      for (const turn of entry.deferredTurns ?? [])
+        if (!matchesAnchor(turn.sourceEventId, turn.firstSequence, turn.queuedRequest?.lastSequence)) return [];
+      for (const question of Object.values(entry.questions ?? {})) for (const reply of replyAttempts(question))
+        if (!matchesAnchor(reply.input.source.sourceEventId, reply.firstSequence, reply.lastSequence)) return [];
     }
-    return grouped.filter(({ span, fragments, ambiguous }, index) => fragments.length && !ambiguous
-      && (index < acousticSpans.length - 1 || observedAt - span.lastSpeechAt >= stabilityMs))
-      // Timing chooses the source span; delta text itself is appended exactly in
-      // provider delivery order, as required by the Live transcript contract.
-      .map(group => ({ ...group, fragments: group.fragments.sort((a, b) => a.sequence - b.sequence) }));
+    for (const value of Object.values(boundCall(sessionId).canonicalTurns ?? {})) {
+      const turn = value as CanonicalTurnRecord;
+      if (turn.role === 'user' && !matchesAnchor(turn.sourceEventId)) return [];
+    }
+    return grouped;
   };
   const stableContext = (channel: LiveBackendChannel): Promise<LiveTranscriptSnapshot | undefined> => {
     if (channel.signal.aborted) return Promise.resolve(undefined);
@@ -518,6 +534,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
   };
   const accept = async (request: LiveDelegationRequest, channel: LiveBackendChannel): Promise<BrokerDelegationRecord | undefined> => {
     if (request.callId !== options.callId) throw new Error('broker_call_identity_mismatch');
+    const audioThroughMs = acousticSpans.at(-1)?.endMs;
     const before = entries(request.sessionId);
     const replay = before.find(entry => entry.predecessorRequestId && entry.delegationIds.includes(request.delegationId))
       ?? before.find(entry => entry.delegationIds.includes(request.delegationId));
@@ -531,12 +548,16 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       const duplicate = saved.find(entry => entry.predecessorRequestId && entry.delegationIds.includes(request.delegationId))
         ?? saved.find(entry => entry.delegationIds.includes(request.delegationId));
       if (duplicate) return duplicate;
-      const callStartedAt = mediaOrigin(request.sessionId);
-      const latestSourceStart = Math.max(0, ...saved.map(entry => Date.parse(entry.submission.source.receivedAt) - callStartedAt));
-      const candidate = acousticGroups(snapshot).filter(group => {
+      const latestSourceSequence = Math.max(0, ...saved.map(entry => entry.firstSequence));
+      const consumedAudio = Math.max(0, ...saved.flatMap(entry => [entry.audioThroughMs ?? 0,
+        ...entry.deferredTurns?.map(turn => turn.queuedRequest?.audioThroughMs ?? 0) ?? [],
+        ...Object.values(entry.questions ?? {}).flatMap(question => replyAttempts(question).map(reply => reply.audioThroughMs ?? 0))]));
+      const candidate = completedCallerGroups(snapshot).filter(group => {
         const first = group.fragments.reduce((a, b) => a.sequence < b.sequence ? a : b);
         const source = brokerIdentity('source', options.callId, request.sessionId, first.eventId);
-        return first.startMs >= latestSourceStart && !saved.some(entry => entry.submission.source.sourceEventId === source
+        return audioThroughMs !== undefined && audioThroughMs > consumedAudio
+          && Math.max(...group.fragments.map(fragment => fragment.endMs)) <= request.offsetMs
+          && first.sequence >= latestSourceSequence && !saved.some(entry => entry.submission.source.sourceEventId === source
           || entry.deferredTurns?.some(turn => turn.sourceEventId === source)
           || Object.values(entry.questions ?? {}).some(record => replyAttempts(record).some(reply => reply.input.source.sourceEventId === source)));
       }).at(-1);
@@ -589,6 +610,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
           options.store.update(options.callId, { acousticSpans: structuredClone(acousticSpans) });
           const reply: NonNullable<BrokerQuestionRecord['reply']> = { input, inputDigest: digest(input), status: 'prepared',
             callerRevision: snapshot.callerRevision, firstSequence: first.sequence,
+            audioThroughMs,
             lastSequence: Math.max(...fragments!.map(fragment => fragment.sequence)) };
           if (refreshed.reply && refreshed.reply.status !== 'refused') return current;
           current = save({ ...current, questionNotice: undefined, questions: { ...current.questions,
@@ -620,6 +642,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
               turn.queuedRequest = { requestId: brokerIdentity('request', options.callId, request.sessionId, request.delegationId),
                 predecessorRequestId: queuedTurns.at(-1)?.queuedRequest!.requestId ?? current.requestId,
                 submission, bodyDigest: digest(submission), lastSequence: Math.max(...fragments.map(fragment => fragment.sequence)),
+                audioThroughMs,
                 completionBasis: 'speech_and_transcript_stability' };
               options.store.update(options.callId, { acousticSpans: structuredClone(acousticSpans) });
             }
@@ -645,6 +668,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
         delegationIds: [request.delegationId], status: 'prepared', updatedAt: new Date(now()).toISOString(),
         submission: submissionForTurn(request.sessionId, snapshot, fragments),
         frozenCallerRevision: snapshot.callerRevision, firstSequence: first.sequence,
+        audioThroughMs,
         lastSequence: Math.max(...fragments.map(fragment => fragment.sequence)),
         completionBasis: 'speech_and_transcript_stability',
         sourceRevision: 1, capturedText: text,
@@ -688,7 +712,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       let current = load(entry);
       if (channel.signal.aborted || boundCall(entry.sessionId).endedAt) return current;
       if (current.captureState === 'unknown' || current.captureState === 'dispatching') return current;
-      const fragments = acousticGroups(stable).find(group => group.fragments.some(fragment => fragment.sequence === current.firstSequence))?.fragments;
+      const fragments = completedCallerGroups(stable).find(group => group.fragments.some(fragment => fragment.sequence === current.firstSequence))?.fragments;
       if (!fragments) return current;
       const text = fragments.map(fragment => fragment.text).join('');
       if (text === current.capturedText) return current;
@@ -896,6 +920,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       delegationIds: [next.turn.delegationId], status: 'prepared', updatedAt: timestamp,
       submission: structuredClone(frozen.submission), frozenCallerRevision: next.turn.callerRevision,
       firstSequence: next.turn.firstSequence, lastSequence: frozen.lastSequence,
+      ...(frozen.audioThroughMs === undefined ? {} : { audioThroughMs: frozen.audioThroughMs }),
       completionBasis: frozen.completionBasis, sourceRevision: 1, capturedText: next.turn.text,
     };
     // Publish parent disposition and the exact child journal in one durable write.
@@ -1031,8 +1056,8 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       // had finished. Freeze the observation clock at the host's disconnect time.
       const observedAt = call.endedAt ? Math.min(now(), Date.parse(call.endedAt)) : now();
       options.store.update(call.id, { acousticSpans: structuredClone(acousticSpans) });
-      const groups: Array<{ role: 'user' | 'assistant'; fragments: LiveTranscriptSnapshot['fragments']; span?: AcousticSpan }> =
-        acousticGroups(snapshot, observedAt).map(group => ({ role: 'user', fragments: group.fragments, span: group.span }));
+      const groups: Array<{ role: 'user' | 'assistant'; fragments: LiveTranscriptSnapshot['fragments'] }> =
+        completedCallerGroups(snapshot, observedAt).map(group => ({ role: 'user', fragments: group.fragments }));
       const included = new Set(groups.flatMap(group => group.fragments.map(f => f.eventId)));
       if (snapshot.fragments.some(f => f.role === 'user' && !included.has(f.eventId))) unsupported.push('unqualified_caller_turn');
       const assistant = snapshot.fragments.filter(f => f.role === 'assistant');
@@ -1065,7 +1090,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
             itemId: delegated?.submission.source.itemId ?? `live-turn-${sourceEventId}`,
             role: group.role, text, occurredAt: previous?.occurredAt ?? delegated?.submission.source.receivedAt
               ?? new Date(mediaOrigin(sessionId) + first.startMs).toISOString(),
-            state: 'dispatching', ...(group.span ? { acousticSpan: { ...group.span } } : {}),
+            state: 'dispatching', ...(previous?.acousticSpan ? { acousticSpan: { ...previous.acousticSpan } } : {}),
           };
           const persist = (value: CanonicalTurnRecord) => persistCanonical(sessionId, value);
           persist(turn);
@@ -1162,7 +1187,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
             const unsubscribe = channel.subscribeContext(snapshot => {
               if (snapshot.callerRevision > entry!.frozenCallerRevision) {
                 const saved = load(entry!);
-                const original = acousticGroups(snapshot).find(group => group.fragments.some(fragment => fragment.sequence === saved.firstSequence));
+                const original = completedCallerGroups(snapshot).find(group => group.fragments.some(fragment => fragment.sequence === saved.firstSequence));
                 if (original && original.fragments.map(fragment => fragment.text).join('') !== saved.capturedText) {
                   save({ ...saved, laterCallerRevision: snapshot.callerRevision, correctionState: 'recorded_not_applied',
                     lastSequence: Math.max(saved.lastSequence, ...original.fragments.map(f => f.sequence)) });

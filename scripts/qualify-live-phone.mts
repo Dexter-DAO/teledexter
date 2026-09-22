@@ -458,6 +458,7 @@ try {
           const event = value && typeof value === 'object' ? value as Record<string, unknown> : {};
           const nested = (v: unknown) => v && typeof v === 'object' ? Object.keys(v).sort() : [];
           note({ type: 'provider.event_shape', eventType: event.type, keys: Object.keys(event).sort(),
+            offsetMs: typeof event.offset_ms === 'number' ? event.offset_ms : undefined,
             audioKeys: nested(event.audio), sessionKeys: nested(event.session),
             resolvedAudio: event.type === 'session.started' ? (event.session as Record<string, unknown>)?.audio : undefined,
             deltaType: typeof event.delta, deltaLength: typeof event.delta === 'string' ? event.delta.length : undefined });

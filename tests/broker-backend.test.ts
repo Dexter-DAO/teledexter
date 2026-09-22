@@ -111,7 +111,7 @@ async function fixture(t: TestContext, overrides: Partial<PrimaryBackendOptions>
     for (let offset = startMs; offset <= endMs; offset += 5) instance.noteCallerSpeech(Date.now(), offset);
   };
   const request = (delegationId = 'del_1'): LiveDelegationRequest => ({ callId: call.id, sessionId: 'sess_test', delegationId,
-    requestId: `live_${delegationId}`, offsetMs: 1200, transcript: c.channel.getContext() });
+    requestId: `live_${delegationId}`, offsetMs: Math.max(0, ...c.channel.getContext().fragments.map(fragment => fragment.endMs)) + 200, transcript: c.channel.getContext() });
   const saved = () => Object.values(store.get(call.id)!.delegations) as BrokerDelegationRecord[];
   return { ...c, directory, store, call, api, options, backend, speech, request, posts, reads, captures, replies, questionReads, behavior, completed,
     saved, result: (text: string) => { resultText = text; } };
@@ -213,6 +213,80 @@ test('waits for stable acoustic caller text and journals one verbatim canonical 
   assert.equal(f.saved()[0].status, 'completed');
 });
 
+test('recorded Hello delegates the assigned mission across distinct Live and phone audio clocks', async t => {
+  const f = await fixture(t, {}, true);
+  // Retained 14:51 rehearsal: Live caption 10600..10800, local audio 9620..10120.
+  f.add(' Hello', 10600, 10800, 'user', 'recorded_hello'); f.speech(9640, 10120);
+  await f.backend.delegate(f.request('item_EQw7mnC2ABitLPfHNrYAX'), f.channel);
+  assert.equal(f.posts.length, 1);
+  assert.equal(f.posts[0].input.text, ' Hello');
+  assert.deepEqual(f.posts[0].input.callAssignmentRef, f.store.get(f.call.id)!.primary!.callAssignmentRef);
+  assert.equal(f.saved()[0].audioThroughMs, 10120);
+  assert.equal(f.posts[0].input.source.receivedAt, new Date(Date.parse(f.call.createdAt) + 10600).toISOString());
+  const original = structuredClone(f.posts[0]);
+  await f.backend.delegate(f.request('item_EQw7mnC2ABitLPfHNrYAX'), f.channel);
+  assert.equal(f.posts.length, 1); assert.deepEqual(f.posts[0], original);
+});
+
+test('ordered caller turns retain their sources when clock distance changes without a fixed offset', async t => {
+  const f = await fixture(t);
+  f.add('Read my portfolio.', 50, 100); f.speech(8000, 8500);
+  await f.backend.delegate(f.request(), f.channel);
+  f.add('Read my last payment.', 3000, 3400); f.speech(20000, 20500);
+  await f.backend.delegate(f.request('second'), f.channel);
+  assert.deepEqual(f.posts.map(post => post.input.text), ['Read my portfolio.', 'Read my last payment.']);
+  assert.equal(f.saved()[1].audioThroughMs, 20500);
+  assert.equal(f.posts[1].input.source.receivedAt, new Date(Date.parse(f.call.createdAt) + 3000).toISOString());
+  f.store.update(f.call.id, { endedAt: new Date().toISOString() });
+  const restored = createPrimaryBackend(f.options);
+  assert.deepEqual(await restored.captureCompletedTurns(f.channel.getContext(), { sessionFinalized: true, assistantPlaybackComplete: true }),
+    { captured: 0, pending: 0, unsupported: [] });
+});
+
+test('noise without a caption neither submits a task nor prevents later caller speech after restart', async t => {
+  const f = await fixture(t);
+  f.speech(200, 400); // A sound burst without recognized words.
+  f.add('Read my balance.', 10600, 10800); f.speech(9640, 10120);
+  await f.backend.delegate(f.request(), f.channel);
+  assert.equal(f.posts.length, 1);
+  const original = structuredClone(f.saved()[0].submission);
+  f.speech(15000, 15400); f.backend.persistAcousticEvidence();
+  const restored = createPrimaryBackend(f.options);
+  await restored.delegate(f.request(), f.channel);
+  assert.equal(f.posts.length, 1); assert.deepEqual(f.saved()[0].submission, original);
+  f.add('Read my last payment.', 16000, 16300); f.speech(20000, 20400, restored);
+  await restored.delegate(f.request('payment'), f.channel);
+  assert.deepEqual(f.posts.map(post => post.input.text), ['Read my balance.', 'Read my last payment.']);
+  assert.deepEqual(f.saved()[0].submission, original);
+});
+
+test('legacy accepted sources retain original timestamps and exact request bytes when a late caption is captured', async t => {
+  const f = await fixture(t);
+  f.add('Read my balance.'); f.speech(); await f.backend.delegate(f.request(), f.channel);
+  const original = structuredClone(f.saved()[0]); delete original.audioThroughMs;
+  f.store.update(f.call.id, { delegations: { [original.requestId]: original } });
+  f.add(' please.', 1000, 1200);
+  const restored = createPrimaryBackend(f.options);
+  assert.equal((await restored.captureCompletedTurns(f.channel.getContext(), { sessionFinalized: true, assistantPlaybackComplete: true })).captured, 1);
+  assert.equal(f.captures[0].sourceEventId, original.submission.source.sourceEventId);
+  assert.equal(f.captures[0].occurredAt, original.submission.source.receivedAt);
+  assert.equal(f.captures[0].revision, 2);
+  assert.deepEqual(f.saved()[0].submission, original.submission);
+  assert.equal(f.saved()[0].audioThroughMs, undefined);
+  await restored.delegate(f.request(), f.channel); assert.equal(f.posts.length, 1);
+});
+
+test('late captions cannot reorder an accepted source even when caption and acoustic counts match', async t => {
+  const f = await fixture(t);
+  f.add('Read my balance.', 3000, 3200); f.speech(800, 1000);
+  await f.backend.delegate(f.request(), f.channel);
+  const original = structuredClone(f.saved()[0]);
+  f.add('An earlier caption.', 100, 200); f.speech(4000, 4200);
+  const result = await f.backend.captureCompletedTurns(f.channel.getContext(), { sessionFinalized: true, assistantPlaybackComplete: true });
+  assert.equal(result.captured, 0); assert.ok(result.unsupported.includes('unqualified_caller_turn'));
+  assert.deepEqual(f.saved()[0], original);
+});
+
 test('recorded Live phrase includes all six available fragments despite the late caption boundary', async t => {
   const f = await fixture(t);
   for (const fragment of recordedCallerFragments) f.add(fragment.text, fragment.startMs, fragment.endMs, 'user', fragment.eventId);
@@ -272,17 +346,56 @@ test('closeout recovers a late phrase caption on the saved source after the requ
   assert.equal(f.posts.length, 1);
 });
 
-test('a contiguous transcript overlapping two acoustic spans stays whole and unsubmitted', async t => {
+test('a paused caller phrase stays whole across multiple local sound bursts', async t => {
   const f = await fixture(t);
   f.add('Read my balance', 800, 1000); f.speech(800, 1000);
   f.add(' and send it.', 1700, 1900); f.speech(1700, 1900);
   await f.backend.delegate(f.request(), f.channel);
-  assert.equal(f.posts.length, 0);
-  assert.equal(f.channel.getContext().fragments.map(fragment => fragment.text).join(''), 'Read my balance and send it.');
+  assert.equal(f.posts.length, 1);
+  assert.equal(f.posts[0].input.text, 'Read my balance and send it.');
   const result = await f.backend.captureCompletedTurns(f.channel.getContext(), { assistantPlaybackComplete: true, sessionFinalized: true });
-  assert.equal(result.captured, 0);
-  assert.ok(result.unsupported.includes('unqualified_caller_turn'));
+  assert.deepEqual(result, { captured: 0, pending: 0, unsupported: [] });
   assert.equal(f.captures.length, 0);
+});
+
+test('a phrase crossing the delegation frontier is withheld whole rather than truncated', async t => {
+  const f = await fixture(t);
+  f.add('Read my balance', 800, 1000); f.speech(800, 1000);
+  const delegated = f.request();
+  f.add(' and send it.', 1700, 1900); f.speech(1700, 1900);
+  await f.backend.delegate(delegated, f.channel);
+  assert.equal(f.posts.length, 0);
+  await f.backend.delegate(f.request('complete_phrase'), f.channel);
+  assert.equal(f.posts.length, 1); assert.equal(f.posts[0].input.text, 'Read my balance and send it.');
+});
+
+test('late captions cannot merge two already accepted sources', async t => {
+  const f = await fixture(t);
+  f.add('Read my balance.', 800, 1000); f.speech(); await f.backend.delegate(f.request(), f.channel);
+  f.add('Read my payment.', 3000, 3200); f.speech(3000, 3200); await f.backend.delegate(f.request('second'), f.channel);
+  const originals = f.saved().map(entry => structuredClone(entry.submission));
+  f.add(' bridging caption ', 1500, 2400);
+  const captured = await f.backend.captureCompletedTurns(f.channel.getContext(), { assistantPlaybackComplete: true, sessionFinalized: true });
+  assert.equal(captured.captured, 0); assert.ok(captured.unsupported.includes('unqualified_caller_turn'));
+  assert.deepEqual(f.saved().map(entry => entry.submission), originals);
+  assert.equal(f.posts.length, 2);
+});
+
+test('second speech arriving before first admission keeps its own delegated task', async t => {
+  const f = await fixture(t);
+  f.add('Read my balance.', 800, 1000); f.speech();
+  let entered!: () => void; const began = new Promise<void>(resolve => { entered = resolve; });
+  let release!: () => void; const blocked = new Promise<void>(resolve => { release = resolve; });
+  f.behavior.result = async id => { entered(); await blocked; return f.completed(id); };
+  const first = f.backend.delegate(f.request(), f.channel);
+  f.add('Read my last payment.', 3000, 3200); f.speech(3000, 3200);
+  const second = f.backend.delegate(f.request('second'), f.channel);
+  await began; await wait(12);
+  const queued = f.saved()[0].deferredTurns?.[0];
+  assert.equal(queued?.status, 'queued'); assert.equal(queued?.text, 'Read my last payment.');
+  assert.equal(f.saved()[0].audioThroughMs, 1000); assert.equal(queued?.queuedRequest?.audioThroughMs, 3200);
+  release(); await Promise.all([first, second]);
+  assert.deepEqual(f.posts.map(post => post.input.text), ['Read my balance.', 'Read my last payment.']);
 });
 
 test('duplicate and overlapping delegation delivery cannot produce a second submission', async t => {
@@ -800,6 +913,7 @@ test('the interrupted caller request is submitted verbatim after the active resu
   const queued = structuredClone(f.saved()[0].deferredTurns![0]);
   assert.equal(queued.text, followup);
   assert.equal(queued.status, 'queued');
+  assert.equal(queued.queuedRequest!.audioThroughMs, 3200);
   assert.equal(f.posts.length, 1);
   release(); await Promise.all([first, second]);
   assert.equal(f.posts.length, 2);
@@ -808,6 +922,7 @@ test('the interrupted caller request is submitted verbatim after the active resu
   assert.equal(f.posts[1].requestId, queued.queuedRequest!.requestId);
   assert.equal(f.posts[1].input.source.receivedAt, new Date(Date.parse(f.call.createdAt) + 3000).toISOString());
   assert.equal(f.saved()[1].predecessorRequestId, f.posts[0].requestId);
+  assert.equal(f.saved()[1].audioThroughMs, queued.queuedRequest!.audioThroughMs);
   assert.equal(f.posts[0].input.text, 'Read my balance.');
   assert.equal(f.updates.at(-1)!.text, 'Your balance is $10.25 USDC.');
   assert.equal(f.updates.at(-1)!.speak, true);
