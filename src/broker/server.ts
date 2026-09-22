@@ -77,9 +77,11 @@ export function createBrokerServer(options: BrokerServerOptions) {
       // Closing admission first would make an unacknowledged, never-accepted turn
       // impossible to recover. Reconcile the exact journal before closing it.
       const current = store.get(call.id)!;
+      let recovery: ReturnType<typeof createPrimaryBackend> | undefined;
       if (current.callSid && current.liveSessionId) {
-        const recovery = createPrimaryBackend({ callId: current.id, callSid: current.callSid,
+        recovery = createPrimaryBackend({ callId: current.id, callSid: current.callSid,
           bindingId: current.primary!.bindingId, api: primary, store });
+        if (!current.primaryClosed) await recovery.prepareCloseout();
         const flushed = await recovery.flushPendingCaptures();
         let pendingCount = flushed.pending;
         let unsupported = flushed.unsupported;
@@ -91,9 +93,19 @@ export function createBrokerServer(options: BrokerServerOptions) {
         if (current.transcriptCapture) store.update(call.id, { transcriptCapture: {
           ...current.transcriptCapture, state: pendingCount ? 'pending' : 'complete', pending: pendingCount, unsupported,
         } });
-        if (pendingCount) return;
+        if (recovery.closeoutPending()) return;
       }
-      await primary.close(call.primary!.bindingId);
+      let closed = store.get(call.id)!.primaryClosed;
+      if (!closed) {
+        closed = await primary.close(call.primary!.bindingId);
+        if (closed.bindingId !== call.primary!.bindingId || closed.callSid !== call.callSid || closed.state !== 'closed')
+          throw new Error('closed_call_identity_mismatch');
+        store.update(call.id, { primaryClosed: closed });
+      }
+      if (recovery && (await recovery.reconcileClosedRequests(closed)).pending) return;
+      const captured = store.get(call.id)!.transcriptCapture;
+      if (captured) store.update(call.id, { transcriptCapture: { ...captured, state: 'complete', pending: 0,
+        unsupported: captured.unsupported.filter(reason => reason !== 'source_admission_unknown') } });
       store.update(call.id, { primaryClosePending: false });
     })().catch(error => { store.update(call.id, { failure: safeFailure(error) }); })
       .finally(() => closingBindings.delete(call.id));
