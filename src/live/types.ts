@@ -42,6 +42,9 @@ export interface LiveDelivery {
   eventId: string;
   status: 'accepted' | 'rejected' | 'unconfirmed' | 'stale' | 'closed';
   reason?: string;
+  /** Raw input frontier observed synchronously when this append settled. */
+  observedCallerRevision?: number;
+  observedTranscriptSequence?: number;
 }
 
 export interface LiveBackendUpdate {

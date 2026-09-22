@@ -38,6 +38,8 @@ export interface PrimarySubmission {
     role: 'user';
   };
   text: string;
+  relatedPrimaryRequestId?: string;
+  referenceOrigin?: 'broker_status_publication';
 }
 
 export interface PrimaryTurn {
@@ -330,7 +332,8 @@ const replyInputSchema = z.object({
 const submissionSchema = z.object({
   source: z.object({ callSid, itemId, sourceEventId: uuid, revision: z.literal(1), receivedAt: timestamp, role: z.literal('user') }).strict(),
   text: sourceText,
-}).strict();
+  relatedPrimaryRequestId: uuid.optional(), referenceOrigin: z.literal('broker_status_publication').optional(),
+}).strict().refine(value => (value.relatedPrimaryRequestId === undefined) === (value.referenceOrigin === undefined));
 const turnSchema = z.object({
   sourceEventId: uuid, revision, itemId, role: z.enum(['user', 'assistant']), text: sourceText, occurredAt: timestamp,
 }).strict();
@@ -441,10 +444,13 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
       const headers = bindingHeaders(bindingId);
       parse(uuid, requestId, 'invalid_request');
       const parsed = parse(submissionSchema, input, 'invalid_request');
+      if (parsed.relatedPrimaryRequestId === requestId) throw new PrimaryApiError('invalid_request');
+      const reference = parsed.relatedPrimaryRequestId === undefined ? {} : {
+        relatedPrimaryRequestId: parsed.relatedPrimaryRequestId, referenceOrigin: parsed.referenceOrigin };
       const existing = calls.get(bindingId);
       if (existing) same(parsed.source.callSid, existing.callSid);
       const { role, ...source } = parsed.source;
-      return decodeResult(await request('POST', '/requests', { bindingId, source, role, text: parsed.text },
+      return decodeResult(await request('POST', '/requests', { bindingId, source, role, text: parsed.text, ...reference },
         { ...headers, 'Idempotency-Key': requestId }, 202), bindingId, requestId, true);
     },
     async result(bindingId, requestId) {
@@ -456,11 +462,14 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
       const headers = bindingHeaders(bindingId);
       parse(uuid, requestId, 'invalid_request');
       const parsed = parse(submissionSchema, input, 'invalid_request');
+      if (parsed.relatedPrimaryRequestId === requestId) throw new PrimaryApiError('invalid_request');
+      const reference = parsed.relatedPrimaryRequestId === undefined ? {} : {
+        relatedPrimaryRequestId: parsed.relatedPrimaryRequestId, referenceOrigin: parsed.referenceOrigin };
       const known = calls.get(bindingId);
       if (known) same(parsed.source.callSid, known.callSid);
       const { role, ...source } = parsed.source;
       const result = parse(reconciliationSchema, await request('POST', `/requests/${requestId}/reconcile`,
-        { bindingId, role, text: parsed.text, source }, headers), 'invalid_response');
+        { bindingId, role, text: parsed.text, source, ...reference }, headers), 'invalid_response');
       same(result.bindingId, bindingId); same(result.requestId, requestId);
       if (result.outcome === 'admitted') {
         return { ...result, result: decodeResult(result.result, bindingId, result.canonicalRequestId, false) };
