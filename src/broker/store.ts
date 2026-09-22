@@ -12,6 +12,7 @@ export interface BrokerCall {
   primary?: { bindingId: string; name: string | null; context: string };
   liveSessionId?: string; transcript?: unknown; transcriptRevision?: number;
   mediaStartedAt?: string;
+  voiceOpening?: { status: string; eventId?: string; reason?: string };
   finalized?: boolean; failure?: { code: string; message: string };
   canonicalTurns?: Record<string, unknown>;
   acousticSpans?: unknown;

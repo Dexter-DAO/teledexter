@@ -12,6 +12,17 @@ import type { LiveBackendChannel, LiveBackendUpdate, LiveDelegationRequest, Live
 const bindingId = '11111111-1111-5111-a111-111111111111';
 const otherBinding = '22222222-2222-5222-a222-222222222222';
 const wait = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+// Exact caller fragments from the 2026-09-22 minimal-instructions Live trial.
+// The raw acoustic span was 8320..10900; the last word starts at 11400.
+const recordedCallerFragments = [
+  { eventId: 'event_EQr8OSLiWsYCwPQ0LiYKS', text: ' Please', startMs: 9000, endMs: 9200 },
+  { eventId: 'event_EQr8P8mJEuiPd8Y1Ovk6s', text: ' ask', startMs: 9400, endMs: 9600 },
+  { eventId: 'event_EQr8PJcJmdUNNY2so4RY8', text: ' Primary', startMs: 10000, endMs: 10200 },
+  { eventId: 'event_EQr8Q8H2rxyhpLt1MirfO', text: ' for my', startMs: 10400, endMs: 10600 },
+  { eventId: 'event_EQr8QHfHWO6XbHGjMZmmB', text: ' test', startMs: 10800, endMs: 11000 },
+  { eventId: 'event_EQr8RweQWbbV0Skp6fnYS', text: ' phrase', startMs: 11400, endMs: 11600 },
+];
+const recordedCallerText = recordedCallerFragments.map(fragment => fragment.text).join('');
 function context() {
   let snapshot: LiveTranscriptSnapshot = { revision: 0, callerRevision: 0, fragments: [] };
   const listeners = new Set<(snapshot: LiveTranscriptSnapshot) => void>();
@@ -27,10 +38,10 @@ function context() {
     },
     signal: controller.signal,
   };
-  const add = (text: string, startMs = 800, endMs = 1000, role: 'user' | 'assistant' = 'user') => {
+  const add = (text: string, startMs = 800, endMs = 1000, role: 'user' | 'assistant' = 'user', eventId?: string) => {
     snapshot.revision++;
     if (role === 'user') snapshot.callerRevision++;
-    snapshot.fragments.push({ eventId: `event_${snapshot.revision}`, role, text, startMs, endMs, sequence: snapshot.revision });
+    snapshot.fragments.push({ eventId: eventId ?? `event_${snapshot.revision}`, role, text, startMs, endMs, sequence: snapshot.revision });
     for (const listener of listeners) listener(structuredClone(snapshot));
   };
   return { channel, add, updates, controller };
@@ -112,6 +123,78 @@ test('waits for stable acoustic caller text and journals one verbatim canonical 
   assert.match(f.posts[0].input.source.itemId, /^[A-Za-z0-9_-]{1,128}$/);
   assert.equal(f.saved()[0].completionBasis, 'speech_and_transcript_stability');
   assert.equal(f.saved()[0].status, 'completed');
+});
+
+test('recorded Live phrase includes all six available fragments despite the late caption boundary', async t => {
+  const f = await fixture(t);
+  for (const fragment of recordedCallerFragments) f.add(fragment.text, fragment.startMs, fragment.endMs, 'user', fragment.eventId);
+  f.speech(8340, 10900);
+  await f.backend.delegate(f.request(), f.channel);
+  assert.equal(f.posts.length, 1);
+  assert.equal(f.posts[0].input.text, recordedCallerText);
+  assert.equal(f.saved()[0].frozenCallerRevision, 6);
+  assert.equal(f.saved()[0].lastSequence, 6);
+  assert.deepEqual((f.store.get(f.call.id)!.acousticSpans as Array<{ startMs: number; endMs: number }>).map(span => [span.startMs, span.endMs]), [[8320, 10900]]);
+  assert.deepEqual(await f.backend.captureCompletedTurns(f.channel.getContext(), { assistantPlaybackComplete: true, sessionFinalized: true }),
+    { captured: 0, pending: 0, unsupported: [] });
+  assert.equal(f.captures.length, 0);
+});
+
+test('a later caption outside the raw acoustic boundary revises the original source without resubmitting', async t => {
+  const f = await fixture(t);
+  for (const fragment of recordedCallerFragments.slice(0, 5)) f.add(fragment.text, fragment.startMs, fragment.endMs, 'user', fragment.eventId);
+  f.speech(8340, 10900);
+  let entered!: () => void;
+  const began = new Promise<void>(resolve => { entered = resolve; });
+  let release!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  f.behavior.result = async id => { entered(); await pending; return f.completed(id); };
+  const work = f.backend.delegate(f.request(), f.channel);
+  await began;
+  const last = recordedCallerFragments[5];
+  f.add(last.text, last.startMs, last.endMs, 'user', last.eventId);
+  release(); await work;
+  assert.equal(f.posts.length, 1);
+  assert.equal(f.posts[0].input.text, ' Please ask Primary for my test');
+  assert.equal(f.captures.length, 1);
+  assert.equal(f.captures[0].sourceEventId, f.posts[0].input.source.sourceEventId);
+  assert.equal(f.captures[0].revision, 2);
+  assert.equal(f.captures[0].text, recordedCallerText);
+  assert.equal(f.saved()[0].correctionState, 'recorded_not_applied');
+  await f.backend.delegate(f.request('del_repeat'), f.channel);
+  assert.equal(f.posts.length, 1);
+});
+
+test('closeout recovers a late phrase caption on the saved source after the request completed', async t => {
+  const f = await fixture(t);
+  for (const fragment of recordedCallerFragments.slice(0, 5)) f.add(fragment.text, fragment.startMs, fragment.endMs, 'user', fragment.eventId);
+  f.speech(8340, 10900);
+  await f.backend.delegate(f.request(), f.channel);
+  const last = recordedCallerFragments[5];
+  f.add(last.text, last.startMs, last.endMs, 'user', last.eventId);
+  f.store.update(f.call.id, { endedAt: new Date().toISOString() });
+  const restored = createPrimaryBackend(f.options);
+  const proof = { assistantPlaybackComplete: true, sessionFinalized: true };
+  assert.deepEqual(await restored.captureCompletedTurns(f.channel.getContext(), proof), { captured: 1, pending: 0, unsupported: [] });
+  assert.equal(f.captures[0].sourceEventId, f.posts[0].input.source.sourceEventId);
+  assert.equal(f.captures[0].revision, 2);
+  assert.equal(f.captures[0].text, recordedCallerText);
+  assert.equal(f.saved()[0].correctionState, 'recorded_not_applied');
+  assert.deepEqual(await restored.captureCompletedTurns(f.channel.getContext(), proof), { captured: 0, pending: 0, unsupported: [] });
+  assert.equal(f.posts.length, 1);
+});
+
+test('a contiguous transcript overlapping two acoustic spans stays whole and unsubmitted', async t => {
+  const f = await fixture(t);
+  f.add('Read my balance', 800, 1000); f.speech(800, 1000);
+  f.add(' and send it.', 1700, 1900); f.speech(1700, 1900);
+  await f.backend.delegate(f.request(), f.channel);
+  assert.equal(f.posts.length, 0);
+  assert.equal(f.channel.getContext().fragments.map(fragment => fragment.text).join(''), 'Read my balance and send it.');
+  const result = await f.backend.captureCompletedTurns(f.channel.getContext(), { assistantPlaybackComplete: true, sessionFinalized: true });
+  assert.equal(result.captured, 0);
+  assert.ok(result.unsupported.includes('unqualified_caller_turn'));
+  assert.equal(f.captures.length, 0);
 });
 
 test('duplicate and overlapping delegation delivery cannot produce a second submission', async t => {

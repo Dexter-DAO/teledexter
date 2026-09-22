@@ -339,11 +339,16 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
   const speechTime = () => options.lastCallerSpeechAt?.() ?? lastSpeechAt;
   const acousticGroups = (snapshot: LiveTranscriptSnapshot, observedAt = now()) => {
     const grouped = acousticSpans.map(span => ({ span, fragments: [] as LiveTranscriptSnapshot['fragments'], ambiguous: false }));
-    for (const fragment of snapshot.fragments.filter(f => f.role === 'user')) {
-      // Provider timestamps are approximate. Match one acoustic span only; ambiguous
-      // fragments stay unqualified instead of silently crossing source boundaries.
-      const matches = grouped.filter(({ span }) => fragment.endMs >= span.startMs - 300 && fragment.startMs <= span.endMs + 300);
-      if (matches.length === 1) matches[0].fragments.push(fragment);
+    for (const fragments of callerGroups(snapshot)) {
+      // Transcript times are approximate, so associate the complete contiguous
+      // phrase with acoustic evidence. Filtering each word against the acoustic
+      // boundary can truncate a phrase whose last caption is timestamped later.
+      const startMs = Math.min(...fragments.map(fragment => fragment.startMs));
+      const endMs = Math.max(...fragments.map(fragment => fragment.endMs));
+      const matches = grouped.filter(({ span }) => endMs >= span.startMs - 300 && startMs <= span.endMs + 300);
+      if (matches.length === 1) matches[0].fragments.push(...fragments);
+      // Preserve uncertain text in the transcript without combining distinct
+      // acoustic turns or admitting only a convenient subset of the phrase.
       else for (const match of matches) match.ambiguous = true;
     }
     return grouped.filter(({ span, fragments, ambiguous }, index) => fragments.length && !ambiguous

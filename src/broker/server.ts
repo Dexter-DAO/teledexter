@@ -9,7 +9,7 @@ import { createPrimaryBackend } from './backend.js';
 import { createCallbackFlow } from './callback.js';
 import { type BrokerConfig, isPhoneNumber } from './config.js';
 import { BrokerStore, type BrokerCall, type CallStatus, terminalCallStatuses } from './store.js';
-import { brokerInstructions } from './instructions.js';
+import { brokerInstructions, brokerHistory } from './instructions.js';
 import { probeLive } from './preflight.js';
 import { authorizedControl, callTwiml, fallbackTwiml, inputSpeechEnergy, mediaStart, PlaybackReceipts, safeFailure, streamToken, verifyTwilio, type ProviderCallProof } from './phone.js';
 
@@ -34,6 +34,7 @@ const publicCall = (call: BrokerCall) => ({
   recipientLast4: call.number.slice(-4), callSid: call.callSid, status: call.status,
   createdAt: call.createdAt, updatedAt: call.updatedAt, endedAt: call.endedAt,
   primaryConnected: Boolean(call.primary), finalized: call.finalized, failure: call.failure,
+  voiceOpening: call.voiceOpening,
   primaryClosePending: call.primaryClosePending ?? false, transcriptCapture: call.transcriptCapture,
   callback: call.callback,
   metrics: call.metrics, delegationCount: Object.keys(call.delegations).length,
@@ -342,6 +343,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
           backend = createPrimaryBackend({ callId: call.id, callSid: call.callSid!, bindingId: call.primary!.bindingId, api: primary, store, lastCallerSpeechAt: () => lastSpeechAt });
           live = voiceFactory({ apiKey: config.apiKey, callId: call.id, voice: config.voice,
             instructions: brokerInstructions({ direction: call.direction, purpose: call.purpose, name: call.primary!.name, context: call.primary!.context }),
+            history: brokerHistory({ name: call.primary!.name, context: call.primary!.context }),
             backend,
             onAudio(payload) {
               if (stopping || ws.readyState !== WebSocket.OPEN || !streamSid) return;
@@ -351,7 +353,19 @@ export function createBrokerServer(options: BrokerServerOptions) {
               ws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name } }));
             },
             onTranscript(snapshot) { store.update(call.id, { transcript: snapshot, transcriptRevision: snapshot.revision }); },
-            onReady({ sessionId }) { store.update(call.id, { liveSessionId: sessionId }); },
+            onReady({ sessionId }) {
+              store.update(call.id, { liveSessionId: sessionId, voiceOpening: { status: 'pending' } });
+              // Live's documented speak-first command runs while phone audio
+              // continues. Its receipt confirms context injection, not playback.
+              queueMicrotask(() => {
+                if (stopping || !live) return;
+                void live.appendInstructions(call.direction === 'outbound'
+                  ? 'Immediately say in English: "Hi, this is Dexter." Explain the call purpose from your initial instructions, then invite the person to speak and pause to listen.'
+                  : 'Immediately say in English: "Hi, this is Dexter. What would you like to do?" Then pause to listen.')
+                  .then(result => { store.update(call.id, { voiceOpening: result }); })
+                  .catch(() => { if (!stopping) store.update(call.id, { voiceOpening: { status: 'unconfirmed', reason: 'opening_delivery_failed' } }); });
+              });
+            },
             onClosed(result) { store.update(call.id, { finalized: result.finalized, metrics: metrics() }); if (!stopping) void stop(result.finalized ? result.reason : 'voice_unavailable'); },
             onPlaybackClear() {
               receipts.clear();

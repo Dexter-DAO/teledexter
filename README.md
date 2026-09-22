@@ -1,41 +1,28 @@
 # Dexter Broker
 
-Talk with Dexter about your portfolio over the phone. Dexter Broker connects a GPT-Live conversation to your Primary Dexter, the continuing assistant for your account. Primary supplies account information and handles requests under your existing permissions.
+Dexter Broker is a phone interface to your continuing Dexter agent. GPT-Live handles the voice conversation; Primary Dexter, the agent attached to your account, handles account requests through Dexter's shared tools and your existing permissions.
 
-The voice instructions keep replies brief, let you interrupt, and ask Primary for current facts and action results. An interruption stops speech; the assistant checks an action's actual state before reporting that it stopped or completed.
+The aim is to talk through your portfolio, ask follow-up questions, and request actions in the same conversation. Dexter can ask for an answer while handling a request and keep your reply attached to that work. Calls and completed conversation turns are saved with the requests they produced.
 
-## Current status
+This repository contains the voice transport, Twilio calling, and the connection to Primary. It builds on Dexter Phone. The main implementation lives in [src/broker](src/broker) and [src/live](src/live); account execution lives in the shared Dexter API.
 
-Broker release `10c8115` is running at [phone.dexter.cash/broker/health](https://phone.dexter.cash/broker/health), including callback and question continuation. All 274 Broker tests pass. Shared Phone API release `db30057` is deployed with the profile-link and worker-startup corrections. The installed Broker client's account-readiness check passed at 04:22 UTC on September 22, 2026, using the existing linked number. The latest GPT-Live preflight was blocked by exhausted credits; a completed call through GPT-Live and Primary has not been demonstrated.
+The phone preview is being tested through arranged outbound calls. The first call connected to the account but failed before speech. The repaired server now passes recorded-speech checks with GPT-Live; another telephone trial is pending. The existing telephone number still reaches legacy Dexter Phone. An inbound callback handler is implemented here; the incoming-call experience remains under review. Automatic opportunity calls are planned, and broader conversation recall awaits activation of the memory provider.
 
-Outbound calls require an allowed destination, account readiness, and a successful audio preflight before dialing. The API admits the account through a verified outbound call. When you call Dexter, the inbound flow offers a callback: press 1, hang up, and Dexter can call the number saved to your account. Account access begins on that outbound call. The inbound leg reads no private account information.
-
-Callback consent expires after five minutes, and repeated callbacks recover the same saved request. When Primary needs an answer during a call, Dexter presents the question and its choices, then sends your answer back to that same request. It can recover an answer after a connection drops and handle another question without starting a second request. Answering an older question from a later callback remains a separate integration task.
-
-The separate service on `127.0.0.1:3213` is exposed through `/broker/` on `phone.dexter.cash`. Existing Phone runs on port `3212`, and the telephone number still uses its existing inbound routing. See [operations](docs/BROKER_OPERATIONS.md) for release state, configuration, and call recovery, and the [demo procedure](docs/DEMO.md) for the first complete call trial.
-
-## Development
-
-Use Node.js 22 and npm:
+For development, use Node.js 22 and npm:
 
 ```sh
 npm ci
 cp .env.example .env
 ```
 
-Fill the values in `.env`. `BROKER_STATE_DIR` must be an absolute, private directory outside the checkout. The [configuration table](docs/BROKER_OPERATIONS.md#configuration) explains each value.
+Configure Twilio, GPT-Live access, and the Dexter API connection using the [configuration reference](docs/BROKER_OPERATIONS.md#configuration). Set `BROKER_STATE_DIR` to a private absolute directory outside the checkout; it holds call records and transcripts.
 
 ```sh
 npm run typecheck
 npm test
-npm run build
-npm start
+npm run dev
 ```
 
-`npm run dev` runs the broker with TypeScript reloads. `npm start` runs `dist/broker/main.js`. The inherited Phone server remains available through `npm run start:legacy`; the broker deployment uses the compiled broker entrypoint.
+For a compiled build, run `npm run build` followed by `npm start`. The inherited Phone entrypoint is available through `npm run start:legacy`.
 
-The local operator CLI supports `status`, `preflight`, `call`, `end`, and `reconcile`. Preflight creates a billable provider session; `call` can dial a telephone. Read the [controlled call procedure](docs/BROKER_OPERATIONS.md#controlled-call) before using either command.
-
-## Source provenance
-
-The initial source snapshot comes from Dexter-DAO/dexter-phone commit `e80627a4073f7adf325a5ddf9dbb31b259d97d66`. GPT-Live transport work reuses patterns from the fantasy football interviewer at `fbd79dc886c52895dda2a3144977da3e18693c6b`. Credentials and historical repository data are excluded from this repository.
+The [operations guide](docs/BROKER_OPERATIONS.md) covers deployment and call recovery. Its [controlled call procedure](docs/BROKER_OPERATIONS.md#controlled-call) explains the operator CLI; preflight consumes provider credits, and the call command dials a telephone. Use the [demo procedure](docs/DEMO.md) to verify audible conversation and account results together.

@@ -56,7 +56,7 @@ async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; 
       voiceOptions = options;
       queueMicrotask(() => options.onReady({ callId: options.callId, sessionId: 'fixture-live' }));
       return {
-        appendAudio() { calls.audio++; options.onAudio(Buffer.alloc(160, 255).toString('base64'), { eventId: 'audio-1' }); return true; },
+        appendAudio() { calls.audio++; options.onAudio(Buffer.alloc(160, 255).toString('base64'), { deliveryId: 'audio-1' }); return true; },
         async appendContext() { return { eventId: 'c', status: 'accepted' }; },
         async appendInstructions() { return { eventId: 'i', status: 'accepted' }; },
         async interruptPlayback() { return { eventId: 'p', status: 'accepted' }; },
@@ -155,6 +155,7 @@ test('signed outbound answer reaches Primary, then authenticated media exchanges
   assert.equal(f.calls.audio, 1);
   assert.match(f.voiceOptions()!.instructions, /called the person/);
   assert.equal(f.broker.store.get(call.id)!.primary!.bindingId, f.bindingId);
+  assert.equal(f.broker.store.get(call.id)!.voiceOpening!.status, 'accepted');
   ws.close();
   await new Promise<void>(resolve => ws.once('close', () => resolve()));
 });

@@ -83,7 +83,7 @@ export function createBrokerLiveSession(options: BrokerLiveSessionOptions): Brok
   let started = false, ready = false, closing = false, closed = false, playbackBlocked = false;
   let outputAudioDiscarded = false;
   let sessionId: string | undefined, usageSeconds: number | undefined;
-  let commandNumber = 0, transcriptBytes = 0;
+  let commandNumber = 0, audioDeliveryNumber = 0, transcriptBytes = 0;
   let startupAudio: string[] = [], startupAudioBytes = 0;
   const transcript: LiveTranscriptSnapshot = { revision: 0, callerRevision: 0, fragments: [] };
   let persistedTranscript = clone(transcript);
@@ -94,6 +94,7 @@ export function createBrokerLiveSession(options: BrokerLiveSessionOptions): Brok
   const delegations = new Map<string, Delegation>();
   const appends = new Map<string, PendingAppend>();
   const issuedAppends = new Set<string>();
+  const seenErrorEvents = new WeakSet<object>();
   const timers = new Set<ReturnType<typeof setTimeout>>();
   let resolveClosed!: (result: LiveSessionClosed) => void;
   const closedPromise = new Promise<LiveSessionClosed>(resolve => { resolveClosed = resolve; });
@@ -204,8 +205,8 @@ export function createBrokerLiveSession(options: BrokerLiveSessionOptions): Brok
     if (role === 'user') transcript.callerRevision++;
     transcriptEvents.set(fragment.eventId, fragment);
     transcript.fragments.push(fragment);
-    // Transcript timing, not packet arrival time, determines chronology. Preserve arrival sequence too.
-    transcript.fragments.sort((a, b) => a.startMs - b.startMs || a.sequence - b.sequence);
+    // Provider deltas are appended in delivery order. Retain timestamps for
+    // captions and application grouping without rearranging the transcript.
     const snapshot = clone(transcript);
     captureBarrier = captureBarrier.then(async () => {
       await options.onTranscript(clone(snapshot));
@@ -269,6 +270,18 @@ export function createBrokerLiveSession(options: BrokerLiveSessionOptions): Brok
     }).catch(() => emit({ type: 'live.delegation.error', delegationId, requestId, code: 'backend_failed' }));
   };
 
+  const receiveError = (event: Record<string, unknown>) => {
+    if (closed || seenErrorEvents.has(event)) return;
+    seenErrorEvents.add(event);
+    const error = record(event.error);
+    const code = id(error.code) ? error.code : 'provider_error';
+    if (id(error.client_event_id) && appends.has(error.client_event_id)) {
+      settleAppend(error.client_event_id, 'rejected', code);
+    } else if (id(error.client_event_id) && issuedAppends.has(error.client_event_id)) {
+      emit({ type: 'live.append.late_rejection', eventId: error.client_event_id, code });
+    } else fail(code);
+  };
+
   transport.onEvent(value => {
     if (closed) return;
     const event = record(value), type = event.type;
@@ -281,13 +294,7 @@ export function createBrokerLiveSession(options: BrokerLiveSessionOptions): Brok
       return;
     }
     if (type === 'error') {
-      const error = record(event.error);
-      const code = id(error.code) ? error.code : 'provider_error';
-      if (id(error.client_event_id) && appends.has(error.client_event_id)) {
-        settleAppend(error.client_event_id, 'rejected', code);
-      } else if (id(error.client_event_id) && issuedAppends.has(error.client_event_id)) {
-        emit({ type: 'live.append.late_rejection', eventId: error.client_event_id, code });
-      } else fail(code);
+      receiveError(event);
       return;
     }
     if (typeof type === 'string' && /^session\.(thinking|commentary|instructions)\.appended$/.test(type)) {
@@ -307,15 +314,18 @@ export function createBrokerLiveSession(options: BrokerLiveSessionOptions): Brok
       const session = record(event.session);
       if (ready) { if (session.id !== sessionId) fail('started_session_identity_changed'); return; }
       if (!started || !id(session.id) || session.model !== 'gpt-live-1'
-          || record(session.delegation).type !== 'client') { fail('invalid_started_session'); return; }
+          || (session.delegation != null && record(session.delegation).type !== 'client')) { fail('invalid_started_session'); return; }
       sessionId = session.id; ready = true; clearTimer(startupTimer);
       const queued = startupAudio; startupAudio = []; startupAudioBytes = 0;
       for (const audio of queued) if (!send({ type: 'session.input_audio.append', audio })) return;
       try { options.onReady({ callId: options.callId, sessionId }); } catch { fail('ready_observer_failed'); }
     } else if (type === 'session.output_audio.delta') {
-      if (!ready || !id(event.event_id) || audioBytes(event.delta) === undefined) { fail('invalid_output_audio'); return; }
+      if (!ready || audioBytes(event.delta) === undefined) { fail('invalid_output_audio'); return; }
       if (!playbackBlocked) {
-        try { options.onAudio(event.delta as string, { eventId: event.event_id }); } catch { fail('audio_delivery_failed'); }
+        // Primary WebSocket audio has no provider event ID. This connection-local
+        // delivery ID tracks playback order; it cannot identify provider evidence.
+        const deliveryId = `broker_audio_${++audioDeliveryNumber}`;
+        try { options.onAudio(event.delta as string, { deliveryId }); } catch { fail('audio_delivery_failed'); }
       }
     } else if (type === 'session.usage.updated') {
       const seconds = record(event.usage).seconds;
@@ -324,7 +334,13 @@ export function createBrokerLiveSession(options: BrokerLiveSessionOptions): Brok
       if (!ready) fail('delegation_before_ready'); else receiveDelegation(event);
     } else if (type === 'response.event') fail('unexpected_responses_backend');
   });
-  transport.onError(() => fail('provider_connection_error'));
+  transport.onError(error => {
+    // The SDK emits a protocol error twice: as an event, then wrapped in its
+    // error callback. Correlated command rejection remains recoverable on both.
+    const providerEvent = record(record(error).error);
+    if (providerEvent.type === 'error') receiveError(providerEvent);
+    else if (!closed) fail('provider_connection_error');
+  });
   transport.onClose(() => { if (!closed) fail('connection_closed_without_final_usage'); });
   transport.onOpen(start);
   if (transport.isOpen()) queueMicrotask(start);

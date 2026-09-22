@@ -92,8 +92,8 @@ export interface BrokerLiveSessionOptions {
   voice?: string;
   history?: Array<{ role: 'user' | 'assistant' | 'developer'; text: string }>;
   backend: BrokerLiveBackend;
-  /** Output audio has an event ID but no provider timing or audio-done event. */
-  onAudio(base64: string, metadata: { eventId: string }): void;
+  /** Ordered audio deliveries use connection-local IDs, never provider event IDs. */
+  onAudio(base64: string, metadata: { deliveryId: string }): void;
   onTranscript(snapshot: LiveTranscriptSnapshot): void | Promise<void>;
   onReady(metadata: { callId: string; sessionId: string }): void;
   onClosed(result: LiveSessionClosed): void;
