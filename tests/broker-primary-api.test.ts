@@ -420,7 +420,11 @@ test('assignment validation uses exact trimmed purpose and the existing UTF-16 1
   await h.client.openCall(proof, good);
   assert.equal(JSON.parse(String(h.requests[0].init.body)).callAssignment.purpose, good.purpose);
   for (const value of [{ ...good, purpose: good.purpose + 'a' }, { ...assignment, purpose: ' padded ' },
-    { ...assignment, purpose: '' }, { ...assignment, revision: 2 }, { ...assignment, issuer: 'owner' }]) {
+    { ...assignment, purpose: '' }, { ...assignment, purpose: 'Read\u0000portfolio' },
+    { ...assignment, purpose: 'Read\uD800portfolio' }, { ...assignment, purpose: 'Read\uDC00portfolio' },
+    { ...assignment, assignmentId: 'ABCDEFAB-CDEF-4ABC-8ABC-ABCDEFABCDEF' },
+    { ...assignment, brokerCallId: 'ABCDEFAB-CDEF-4ABC-8ABC-ABCDEFABCDEF' },
+    { ...assignment, revision: 2 }, { ...assignment, issuer: 'owner' }]) {
     const { client, requests } = harness([]);
     await assert.rejects(client.openCall(proof, value as typeof assignment), code('invalid_request'));
     assert.equal(requests.length, 0);
@@ -438,13 +442,13 @@ test('question replies reject assignment refs instead of silently treating them 
 
 
 test('registration replays echo the same original control UUID and immutable returned receipt', async () => {
-  const upperId = 'ABCDEFAB-CDEF-4ABC-8ABC-ABCDEFABCDEF';
-  const uppercase = { ...assignment, assignmentId: upperId };
-  const reference = { ...assignmentRef, assignmentId: upperId };
+  const originalId = 'abcdefab-cdef-4abc-8abc-abcdefabcdef';
+  const original = { ...assignment, assignmentId: originalId };
+  const reference = { ...assignmentRef, assignmentId: originalId };
   const response = { ...call, callAssignmentRef: reference };
   const { client, requests } = harness([json(response), json(response)]);
-  assert.deepEqual(await client.openCall(proof, uppercase), response);
-  assert.deepEqual(await client.openCall(proof, uppercase), response);
+  assert.deepEqual(await client.openCall(proof, original), response);
+  assert.deepEqual(await client.openCall(proof, original), response);
   assert.equal(requests[0].init.body, requests[1].init.body);
-  assert.equal(JSON.parse(String(requests[0].init.body)).callAssignment.assignmentId, upperId);
+  assert.equal(JSON.parse(String(requests[0].init.body)).callAssignment.assignmentId, originalId);
 });

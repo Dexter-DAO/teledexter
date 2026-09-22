@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { brokerCallAssignmentSchema, phoneCallAssignmentRefSchema, sameCallAssignmentRef, type BrokerCallAssignment, type PhoneCallAssignmentRef } from './assignment.js';
+import { brokerCallAssignmentSchema, phoneCallAssignmentSchema, retainedPhoneCallAssignmentRefSchema, sameCallAssignmentRef, type BrokerCallAssignment, type PhoneCallAssignmentRef } from './assignment.js';
 import type { BrokerPublicationJournal } from './publications.js';
 import { bindDurableFileParent, durablyReplaceJsonFile, type DurableParentBinding } from '../outbound/DurableFile.js';
 
@@ -42,7 +42,7 @@ function validateAssignment(call: BrokerCall): void {
       || assignment.value.brokerCallId !== call.id || assignment.value.purpose !== call.purpose)) throw new Error('Call assignment identity mismatch');
   const reference = call.primary?.callAssignmentRef;
   if (reference !== undefined) {
-    phoneCallAssignmentRefSchema.parse(reference);
+    retainedPhoneCallAssignmentRefSchema.parse(reference);
     if (!assignment || !call.callSid || reference.assignmentId !== assignment.value.assignmentId
         || reference.revision !== assignment.value.revision) throw new Error('Call assignment reference mismatch');
   }
@@ -111,7 +111,8 @@ export class BrokerStore {
     const call: BrokerCall = { id: randomUUID(), ...input, status: 'prepared', createdAt: now, updatedAt: now, delegations: {} };
     if (origin !== undefined) {
       if (origin !== 'authenticated_broker_control') throw new Error('Invalid call assignment origin');
-      call.callAssignment = { origin, value: { assignmentId: call.requestId, brokerCallId: call.id, revision: 1, purpose: call.purpose } };
+      call.callAssignment = { origin, value: phoneCallAssignmentSchema.parse({ assignmentId: call.requestId,
+        brokerCallId: call.id, revision: 1, purpose: call.purpose }) };
     }
     validateAssignment(call);
     this.persist({ version: 1, calls: { ...this.state.calls, [call.id]: call } });

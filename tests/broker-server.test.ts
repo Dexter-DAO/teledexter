@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import type { PhoneCallAssignment } from '../src/broker/assignment.js';
+import { phoneCallAssignmentSchema, type PhoneCallAssignment } from '../src/broker/assignment.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -12,11 +12,13 @@ import { streamToken } from '../src/broker/phone.js';
 import { brokerOpening } from '../src/broker/instructions.js';
 import { beginBrokerPublication, settleBrokerPublication } from '../src/broker/publications.js';
 import type { BrokerConfig } from '../src/broker/config.js';
+import type { BrokerCall } from '../src/broker/store.js';
 import type { PrimaryApiClient, PrimaryContextMessage } from '../src/broker/primaryApi.js';
 import type { BrokerLiveSessionOptions } from '../src/live/session.js';
 import { factFreshnessScenarios, historicalAccountMessages } from './fixtures/broker-fact-freshness.js';
+import { loadSharedAssignmentParser, sharedAssignmentParserConfigured } from './helpers/shared-assignment-parser.js';
 
-async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; failVoice?: boolean; ambiguousDial?: boolean; deferVoiceReady?: boolean; history?: PrimaryContextMessage[]; assignmentResponse?: 'missing' | 'wrong' } = {}) {
+async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; failVoice?: boolean; ambiguousDial?: boolean; deferVoiceReady?: boolean; history?: PrimaryContextMessage[]; assignmentResponse?: 'missing' | 'wrong'; assignmentParser?: { parse(value: unknown): unknown }; retainedCall?: BrokerCall } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-server-test-'));
   const config: BrokerConfig = { host: '127.0.0.1', port: 3213, publicOrigin: 'https://phone.example.test', stateDir: directory,
     controlToken: 'c'.repeat(40), apiKey: 'fixture-key', model: 'gpt-live-1', voice: 'marin',
@@ -36,6 +38,7 @@ async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; 
       calls.bind++;
       assert.equal(proof.params.CallSid, sid);
       assert.deepEqual(assignment, broker.store.bySid(sid)?.callAssignment?.value);
+      if (overrides.assignmentParser) assert.deepEqual(overrides.assignmentParser.parse(assignment), assignment);
       assert.equal(broker.store.bySid(sid)?.voiceOpening, undefined);
       return { bindingId, callSid: sid, state: 'open',
         ...(assignment && overrides.assignmentResponse !== 'missing' ? { callAssignmentRef: { assignmentId: overrides.assignmentResponse === 'wrong' ? randomUUID() : assignment.assignmentId, revision: 1, digest: 'a'.repeat(64) } } : {}), context: { primaryDexterId: randomUUID(), threadId: randomUUID(), displayName: 'Branch', messages: overrides.history ?? [] } };
@@ -55,6 +58,8 @@ async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; 
     if (overrides.ambiguousDial) throw new Error('Provider response timed out');
     return { sid: broker.store.bySid(sid)?.direction === 'inbound' ? callbackSid : sid, status: 'queued' };
   } });
+  if (overrides.retainedCall) fs.writeFileSync(path.join(directory, 'calls.json'),
+    JSON.stringify({ version: 1, calls: { [overrides.retainedCall.id]: overrides.retainedCall } }, null, 2) + '\n');
   const broker = createBrokerServer({ config, primary, provider: { calls: provider } as unknown as ReturnType<typeof Twilio>,
     probe: async () => {
       calls.preflight++;
@@ -88,6 +93,88 @@ async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; 
     readyVoice: () => { assert.ok(readyVoice); readyVoice(); }, openingCommands,
     setInboundStatus: (status: string) => { inboundStatus = status; } };
 }
+
+async function preCallAssignmentCases(t: test.TestContext, parser: { safeParse(value: unknown): { success: boolean }; parse(value: unknown): unknown }) {
+  const canonicalId = 'abcdefab-cdef-4abc-8abc-abcdefabcdef';
+  const cases = [
+    { name: 'uppercase UUID', requestId: canonicalId.toUpperCase(), purpose: 'Read my portfolio', allowed: false },
+    { name: 'NUL', requestId: canonicalId, purpose: 'Read\u0000portfolio', allowed: false },
+    { name: 'lone high surrogate', requestId: canonicalId, purpose: 'Read\uD800portfolio', allowed: false },
+    { name: 'lone low surrogate', requestId: canonicalId, purpose: 'Read\uDC00portfolio', allowed: false },
+    { name: 'ordinary text', requestId: canonicalId, purpose: 'Read my portfolio', allowed: true },
+    { name: 'trimmed route input', requestId: canonicalId, purpose: '  Read my portfolio  ', allowed: true },
+    { name: 'valid emoji at UTF-16 limit', requestId: canonicalId, purpose: '😀'.repeat(750), allowed: true },
+    { name: 'one UTF-16 unit over limit', requestId: canonicalId, purpose: '😀'.repeat(750) + 'a', allowed: false },
+  ];
+  for (const item of cases) await t.test(item.name, async child => {
+    const f = await fixture(child, { assignmentParser: parser });
+    const input = { requestId: item.requestId, purpose: item.purpose };
+    assert.equal(parser.safeParse({ assignmentId: input.requestId, brokerCallId: canonicalId,
+      revision: 1, purpose: input.purpose.trim() }).success, item.allowed);
+    const response = await f.post('/internal/broker/calls', input);
+    assert.equal(response.status, item.allowed ? 201 : 400);
+    await response.text();
+    if (!item.allowed) {
+      assert.deepEqual(f.broker.store.list(), []);
+      assert.equal(fs.existsSync(path.join(f.config.stateDir, 'calls.json')), false);
+      assert.deepEqual(f.calls, { create: 0, update: 0, preflight: 0, readiness: 0, bind: 0, close: 0, audio: 0, fetch: 0 });
+      return;
+    }
+    const saved = f.broker.store.list()[0];
+    assert.equal(saved.requestId, input.requestId);
+    assert.equal(saved.purpose, input.purpose.trim());
+    assert.deepEqual(parser.parse(saved.callAssignment!.value), saved.callAssignment!.value);
+    const params = { AccountSid: f.config.twilioAccountSid, CallSid: f.sid, From: f.config.from,
+      To: f.config.allowedTo[0], Direction: 'outbound-api', CallStatus: 'in-progress' };
+    const answer = await f.webhook(`/broker/answer/${saved.id}`, params);
+    assert.equal(answer.status, 200);
+    assert.match(await answer.text(), /<Stream/);
+    assert.equal(f.calls.bind, 1);
+    const journal = fs.readFileSync(path.join(f.config.stateDir, 'calls.json'));
+    const replay = await f.post('/internal/broker/calls', input);
+    assert.equal(replay.status, 200);
+    assert.equal((await replay.json() as { replayed: boolean }).replayed, true);
+    assert.deepEqual(fs.readFileSync(path.join(f.config.stateDir, 'calls.json')), journal);
+    assert.equal(f.calls.create, 1);
+    assert.equal(f.calls.preflight, 1);
+    assert.equal(f.calls.readiness, 1);
+  });
+}
+
+test('new call HTTP admission matches registration before reservation or dialing', async t => {
+  await preCallAssignmentCases(t, phoneCallAssignmentSchema);
+});
+
+test('HTTP admission and persisted assignments cross the pinned shared API parser with API Zod 3', {
+  skip: !sharedAssignmentParserConfigured,
+}, async t => {
+  const shared = loadSharedAssignmentParser();
+  t.diagnostic(`API parser blob ${shared.blob}; Zod ${shared.zodVersion}`);
+  await preCallAssignmentCases(t, shared.phoneCallAssignmentSchema);
+});
+
+test('historical uppercase control retry recovers exact saved call without new admission or journal rewrite', async t => {
+  const requestId = 'ABCDEFAB-CDEF-4ABC-8ABC-ABCDEFABCDEF';
+  const id = randomUUID();
+  const purpose = 'Read\u0000portfolio\uD800';
+  const retainedCall: BrokerCall = { id, requestId, direction: 'outbound', purpose,
+    number: '+12025550123', status: 'unknown', createdAt: '2026-09-22T10:00:00.000Z',
+    updatedAt: '2026-09-22T10:00:00.000Z', delegations: {},
+    callAssignment: { origin: 'authenticated_broker_control', value: { assignmentId: requestId,
+      brokerCallId: id, revision: 1, purpose } } };
+  const f = await fixture(t, { retainedCall });
+  const file = path.join(f.config.stateDir, 'calls.json');
+  const original = fs.readFileSync(file);
+  const response = await f.post('/internal/broker/calls', { requestId, purpose });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json() as { replayed: boolean }).replayed, true);
+  assert.deepEqual(f.broker.store.get(id), retainedCall);
+  assert.deepEqual(fs.readFileSync(file), original);
+  assert.deepEqual(f.calls, { create: 0, update: 0, preflight: 0, readiness: 0, bind: 0, close: 0, audio: 0, fetch: 0 });
+  assert.notEqual((await f.post('/internal/broker/calls', { requestId, purpose: 'Different purpose' })).status, 200);
+  assert.deepEqual(fs.readFileSync(file), original);
+  assert.equal(f.calls.create, 0);
+});
 
 test('outbound calls require account eligibility and generated voice before dialing', async t => {
   const f = await fixture(t, { eligibility: false });

@@ -206,3 +206,67 @@ test('assignment reference is required at first binding and immutable through re
   assert.equal(resumed.get(call.id)?.primary?.context, 'Later context');
   assert.equal(resumed.get(call.id)?.primary?.callAssignmentRef?.digest, 'a'.repeat(64));
 });
+
+const previouslyAcceptedAssignments = [
+  { name: 'uppercase request UUID', requestId: '12345678-ABCD-4ABC-8ABC-123456789ABC', purpose: 'Read my portfolio.' },
+  { name: 'NUL in purpose', requestId: '12345678-abcd-4abc-8abc-123456789abc', purpose: 'Read\u0000my portfolio.' },
+  { name: 'unpaired high surrogate in purpose', requestId: '12345678-abcd-4abc-8abc-123456789abc', purpose: 'Read \uD800 portfolio.' },
+  { name: 'unpaired low surrogate in purpose', requestId: '12345678-abcd-4abc-8abc-123456789abc', purpose: 'Read \uDC00 portfolio.' },
+];
+
+for (const historical of previouslyAcceptedAssignments) {
+  test(`new assigned reservation rejects ${historical.name} without changing saved calls`, t => {
+    const { store, directory } = fixture(t);
+    const existing = store.reserve(input(), 'authenticated_broker_control').call;
+    const before = fs.readFileSync(path.join(directory, 'calls.json'), 'utf8');
+    assert.throws(() => store.reserve({ ...input(), requestId: historical.requestId, purpose: historical.purpose },
+      'authenticated_broker_control'), error => error instanceof Error && error.name === 'ZodError');
+    assert.deepEqual(store.list(), [existing]);
+    assert.equal(fs.readFileSync(path.join(directory, 'calls.json'), 'utf8'), before);
+  });
+
+  test(`retained assigned call with ${historical.name} reads and replays exactly through restart`, t => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-store-retained-assignment-'));
+    const file = path.join(directory, 'calls.json');
+    const id = 'ABCDEFAB-CDEF-4ABC-8ABC-ABCDEFABCDEF';
+    const call: BrokerCall = {
+      id, requestId: historical.requestId, direction: 'outbound', purpose: historical.purpose,
+      number: '+12025550123', callSid: 'CA' + '1'.repeat(32), status: 'unknown',
+      createdAt: '2026-09-22T10:00:00.000Z', updatedAt: '2026-09-22T10:00:01.000Z',
+      delegations: {},
+      callAssignment: { origin: 'authenticated_broker_control', value: {
+        assignmentId: historical.requestId, brokerCallId: id, revision: 1, purpose: historical.purpose,
+      } },
+      primary: { bindingId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', name: 'Dexter', context: 'Retained context',
+        callAssignmentRef: { assignmentId: historical.requestId, revision: 1, digest: 'a'.repeat(64) } },
+    };
+    // This represents a journal written by the previous admission schema. New
+    // reservation deliberately cannot create these records with the new parser.
+    const original = JSON.stringify({ version: 1, calls: { [id]: call } }, null, 2) + '\n';
+    fs.writeFileSync(file, original, { mode: 0o600 });
+    let store: BrokerStore | undefined;
+    t.after(() => { store?.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+    store = new BrokerStore(directory);
+    const request = { requestId: call.requestId, direction: call.direction, purpose: call.purpose, number: call.number };
+
+    for (let restart = 0; restart < 2; restart++) {
+      assert.deepEqual(store.get(id), call);
+      assert.deepEqual(store.bySid(call.callSid!), call);
+      assert.deepEqual(store.list(), [call]);
+      assert.deepEqual(store.reserve(request, 'authenticated_broker_control'), { call, existing: true });
+      assert.deepEqual(store.reserve({ ...request, callSid: call.callSid }, 'authenticated_broker_control'), { call, existing: true });
+      assert.equal(fs.readFileSync(file, 'utf8'), original);
+
+      assert.throws(() => store!.reserve({ ...request, purpose: 'Read a different account.' },
+        'authenticated_broker_control'), /identity conflicts/);
+      for (const patch of [
+        { id: id.toLowerCase() }, { requestId: randomUUID() }, { purpose: 'Read a different account.' },
+        { callAssignment: { ...call.callAssignment!, value: { ...call.callAssignment!.value, brokerCallId: id.toLowerCase() } } },
+        { primary: { ...call.primary!, callAssignmentRef: { ...call.primary!.callAssignmentRef!, digest: 'b'.repeat(64) } } },
+      ]) assert.throws(() => store!.update(id, patch as never), /cannot change/);
+      assert.deepEqual(store.get(id), call);
+      assert.equal(fs.readFileSync(file, 'utf8'), original);
+      if (restart === 0) { store.close(); store = new BrokerStore(directory); }
+    }
+  });
+}

@@ -6,6 +6,7 @@ import { createBrokerLiveSession, type BrokerLiveSession, type BrokerLiveSession
 import type { LiveTranscriptSnapshot } from '../live/session.js';
 import { createPrimaryApiClient, type PrimaryApiClient } from './primaryApi.js';
 import { createPrimaryBackend } from './backend.js';
+import { newPhoneCallControlSchema } from './assignment.js';
 import { rejectBrokerPublication } from './publications.js';
 import { createCallbackFlow } from './callback.js';
 import { type BrokerConfig, isPhoneNumber } from './config.js';
@@ -183,6 +184,11 @@ export function createBrokerServer(options: BrokerServerOptions) {
           || Object.keys(input).some(key => !['requestId', 'purpose', 'to'].includes(key))) return json(response, 400, { error: 'invalid_call_request' });
         const to = input.to as string | undefined ?? (config.allowedTo.length === 1 ? config.allowedTo[0] : undefined);
         if (!to || !config.allowedTo.includes(to)) return json(response, 403, { error: 'recipient_not_authorized' });
+        const saved = store.list().find(call => call.requestId === input.requestId);
+        // Historical exact retries recover their original record. New calls
+        // must satisfy the shared API contract before reservation or dialing.
+        if (!saved && !newPhoneCallControlSchema.safeParse({ assignmentId: input.requestId,
+          purpose: input.purpose.trim() }).success) return json(response, 400, { error: 'invalid_call_request' });
         try {
           const result = await requestOutbound({ requestId: input.requestId, purpose: input.purpose.trim(), to, origin: 'authenticated_broker_control' });
           return json(response, result.replayed ? 200 : 201, { replayed: result.replayed, call: publicCall(result.call) });

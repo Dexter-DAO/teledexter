@@ -4,6 +4,8 @@ This source change connects an arranged outbound call to the task Dexter was ask
 
 An authenticated operator call saves its purpose before dialing. Once the answered call is verified, Broker registers that saved assignment with Primary and retains the returned reference. The introduction explains the task. The caller's first response can be an ordinary greeting, a correction, or a refusal; Primary receives the actual words alongside the separately attributed assignment. The shared API records which accepted request first started the assignment, so another greeting does not automatically restart it.
 
+New operator calls require a lowercase request UUID and a purpose of at most 1,500 UTF-16 code units. The route trims surrounding whitespace and rejects NUL and unpaired surrogate characters before saving or dialing. Emoji are supported. Exact retries of older saved calls return their original records without rewriting their IDs or purpose.
+
 Later tasks use new Live delegations. Broker saves each completed caller turn and its request identity before submitting it. While a request is pending, subsequent delegated tasks enter the call's queue. The current result is delivered before the next task is submitted. A lost submission response is recovered through the original request's result lookup. Hanging up leaves unsubmitted queued work saved.
 
 While media remains connected, the result observer continues beyond the initial polling window. It stops when media closes. Questions retain their original presentation and answer association while that observer runs.
