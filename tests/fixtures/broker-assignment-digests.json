@@ -1,0 +1,92 @@
+[
+  {
+    "name": "absent",
+    "bindingId": "11111111-1111-4111-8111-111111111111",
+    "input": {
+      "source": {
+        "callSid": "CA11111111111111111111111111111111",
+        "itemId": "item_caller_1",
+        "sourceEventId": "33333333-3333-4333-8333-333333333333",
+        "revision": 1,
+        "receivedAt": "2026-09-21T21:00:00.000Z",
+        "role": "user"
+      },
+      "text": " Hello.\t"
+    },
+    "rawJson": "{\"bindingId\":\"11111111-1111-4111-8111-111111111111\",\"callSid\":\"CA11111111111111111111111111111111\",\"itemId\":\"item_caller_1\",\"sourceEventId\":\"33333333-3333-4333-8333-333333333333\",\"revision\":1,\"receivedAt\":\"2026-09-21T21:00:00.000Z\",\"role\":\"user\",\"text\":\" Hello.\\t\"}",
+    "rawDigest": "32e446574a52e25b817e9fdf149cc61d929914e06fc25cee11d927577d875269",
+    "renderedJson": "{\"bindingId\":\"11111111-1111-4111-8111-111111111111\",\"callSid\":\"CA11111111111111111111111111111111\",\"itemId\":\"item_caller_1\",\"sourceEventId\":\"33333333-3333-4333-8333-333333333333\",\"revision\":1,\"receivedAt\":\"2026-09-21T21:00:00.000Z\",\"role\":\"user\",\"text\":\" Hello.\\t\",\"primaryRendering\":{\"text\":\"Hello.\",\"projection\":{\"kind\":\"derived\"}}}",
+    "renderedDigest": "c2c2d09ab62eabbacd0094ee55f3f07069f18a029dd7b2ad382b728453ad64b1"
+  },
+  {
+    "name": "publication",
+    "bindingId": "11111111-1111-4111-8111-111111111111",
+    "input": {
+      "source": {
+        "callSid": "CA11111111111111111111111111111111",
+        "itemId": "item_caller_1",
+        "sourceEventId": "33333333-3333-4333-8333-333333333333",
+        "revision": 1,
+        "receivedAt": "2026-09-21T21:00:00.000Z",
+        "role": "user"
+      },
+      "text": " Hello.\t",
+      "relatedPrimaryRequestId": "66666666-6666-4666-8666-666666666666",
+      "referenceOrigin": "broker_status_publication"
+    },
+    "rawJson": "{\"bindingId\":\"11111111-1111-4111-8111-111111111111\",\"callSid\":\"CA11111111111111111111111111111111\",\"itemId\":\"item_caller_1\",\"sourceEventId\":\"33333333-3333-4333-8333-333333333333\",\"revision\":1,\"receivedAt\":\"2026-09-21T21:00:00.000Z\",\"role\":\"user\",\"text\":\" Hello.\\t\",\"relatedPrimaryRequestId\":\"66666666-6666-4666-8666-666666666666\",\"referenceOrigin\":\"broker_status_publication\"}",
+    "rawDigest": "68120e7a04b8280feab1c28530b96950ad415becaa0a7f216cc8353dc5b7d686",
+    "renderedJson": "{\"bindingId\":\"11111111-1111-4111-8111-111111111111\",\"callSid\":\"CA11111111111111111111111111111111\",\"itemId\":\"item_caller_1\",\"sourceEventId\":\"33333333-3333-4333-8333-333333333333\",\"revision\":1,\"receivedAt\":\"2026-09-21T21:00:00.000Z\",\"role\":\"user\",\"text\":\" Hello.\\t\",\"relatedPrimaryRequestId\":\"66666666-6666-4666-8666-666666666666\",\"referenceOrigin\":\"broker_status_publication\",\"primaryRendering\":{\"text\":\"Hello.\",\"projection\":{\"kind\":\"derived\"}}}",
+    "renderedDigest": "5e24b8246db895eef5de020c3b74598b8d948bf0f0e8ecc70e92d1a59eeb27e5"
+  },
+  {
+    "name": "assignment",
+    "bindingId": "11111111-1111-4111-8111-111111111111",
+    "input": {
+      "source": {
+        "callSid": "CA11111111111111111111111111111111",
+        "itemId": "item_caller_1",
+        "sourceEventId": "33333333-3333-4333-8333-333333333333",
+        "revision": 1,
+        "receivedAt": "2026-09-21T21:00:00.000Z",
+        "role": "user"
+      },
+      "text": " Hello.\t",
+      "callAssignmentRef": {
+        "assignmentId": "22222222-2222-4222-8222-222222222222",
+        "revision": 1,
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    "rawJson": "{\"bindingId\":\"11111111-1111-4111-8111-111111111111\",\"callSid\":\"CA11111111111111111111111111111111\",\"itemId\":\"item_caller_1\",\"sourceEventId\":\"33333333-3333-4333-8333-333333333333\",\"revision\":1,\"receivedAt\":\"2026-09-21T21:00:00.000Z\",\"role\":\"user\",\"text\":\" Hello.\\t\",\"callAssignmentRef\":{\"assignmentId\":\"22222222-2222-4222-8222-222222222222\",\"revision\":1,\"digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}",
+    "rawDigest": "01133f7c7ad855dfe5a6a7a5353ac92c01a67511c1e95677dd5f1c662857ac7a",
+    "renderedJson": "{\"bindingId\":\"11111111-1111-4111-8111-111111111111\",\"callSid\":\"CA11111111111111111111111111111111\",\"itemId\":\"item_caller_1\",\"sourceEventId\":\"33333333-3333-4333-8333-333333333333\",\"revision\":1,\"receivedAt\":\"2026-09-21T21:00:00.000Z\",\"role\":\"user\",\"text\":\" Hello.\\t\",\"callAssignmentRef\":{\"assignmentId\":\"22222222-2222-4222-8222-222222222222\",\"revision\":1,\"digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"primaryRendering\":{\"text\":\"Hello.\",\"projection\":{\"kind\":\"derived\"}}}",
+    "renderedDigest": "f5950d8945051cb47fb57f862fdb62a068c79e93e07316a7345368c0d6069544"
+  },
+  {
+    "name": "both",
+    "bindingId": "11111111-1111-4111-8111-111111111111",
+    "input": {
+      "source": {
+        "callSid": "CA11111111111111111111111111111111",
+        "itemId": "item_caller_1",
+        "sourceEventId": "33333333-3333-4333-8333-333333333333",
+        "revision": 1,
+        "receivedAt": "2026-09-21T21:00:00.000Z",
+        "role": "user"
+      },
+      "text": " Hello.\t",
+      "relatedPrimaryRequestId": "66666666-6666-4666-8666-666666666666",
+      "referenceOrigin": "broker_status_publication",
+      "callAssignmentRef": {
+        "assignmentId": "22222222-2222-4222-8222-222222222222",
+        "revision": 1,
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    "rawJson": "{\"bindingId\":\"11111111-1111-4111-8111-111111111111\",\"callSid\":\"CA11111111111111111111111111111111\",\"itemId\":\"item_caller_1\",\"sourceEventId\":\"33333333-3333-4333-8333-333333333333\",\"revision\":1,\"receivedAt\":\"2026-09-21T21:00:00.000Z\",\"role\":\"user\",\"text\":\" Hello.\\t\",\"relatedPrimaryRequestId\":\"66666666-6666-4666-8666-666666666666\",\"referenceOrigin\":\"broker_status_publication\",\"callAssignmentRef\":{\"assignmentId\":\"22222222-2222-4222-8222-222222222222\",\"revision\":1,\"digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}",
+    "rawDigest": "42c169da063f625fbf208cb91f32b6e193b72ef1592529cf451b67c484053eb5",
+    "renderedJson": "{\"bindingId\":\"11111111-1111-4111-8111-111111111111\",\"callSid\":\"CA11111111111111111111111111111111\",\"itemId\":\"item_caller_1\",\"sourceEventId\":\"33333333-3333-4333-8333-333333333333\",\"revision\":1,\"receivedAt\":\"2026-09-21T21:00:00.000Z\",\"role\":\"user\",\"text\":\" Hello.\\t\",\"relatedPrimaryRequestId\":\"66666666-6666-4666-8666-666666666666\",\"referenceOrigin\":\"broker_status_publication\",\"callAssignmentRef\":{\"assignmentId\":\"22222222-2222-4222-8222-222222222222\",\"revision\":1,\"digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"primaryRendering\":{\"text\":\"Hello.\",\"projection\":{\"kind\":\"derived\"}}}",
+    "renderedDigest": "a9f2fcbcbe576998738f9e7f011ba07d5b96e8a4d5121b5f37ef614d597a6255"
+  }
+]

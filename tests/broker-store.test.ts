@@ -149,3 +149,60 @@ for (const callSid of ['', 'not-a-provider-id', null, 1] as const) {
     assert.equal(fs.readFileSync(path.join(directory, 'calls.json'), 'utf8'), before);
   });
 }
+
+test('authenticated control assignment is fixed at reservation, bound to its call, and survives restart', t => {
+  const { store, directory } = fixture(t);
+  const request = { ...input(), purpose: 'Read my current portfolio.' };
+  const call = store.reserve(request, 'authenticated_broker_control').call;
+  const assignment = { origin: 'authenticated_broker_control', value: {
+    assignmentId: request.requestId, brokerCallId: call.id, revision: 1, purpose: request.purpose,
+  } };
+  assert.deepEqual(call.callAssignment, assignment);
+  assert.equal(store.reserve(request, 'authenticated_broker_control').call.id, call.id);
+  for (const replacement of [undefined, { ...assignment, origin: 'caller' },
+    { ...assignment, value: { ...assignment.value, purpose: 'Trade now' } },
+    { ...assignment, value: { ...assignment.value, brokerCallId: randomUUID() } }]) {
+    const before = fs.readFileSync(path.join(directory, 'calls.json'), 'utf8');
+    assert.throws(() => store.update(call.id, { callAssignment: replacement, status: 'completed' } as never));
+    assert.equal(fs.readFileSync(path.join(directory, 'calls.json'), 'utf8'), before);
+  }
+  assert.deepEqual(store.update(call.id, { callAssignment: assignment } as never).callAssignment, assignment);
+  store.close();
+  const resumed = new BrokerStore(directory); t.after(() => resumed.close());
+  assert.deepEqual(resumed.get(call.id)?.callAssignment, assignment);
+});
+
+test('legacy and callback reservations never acquire a control assignment on replay or update', t => {
+  const { store } = fixture(t);
+  const request = input();
+  const call = store.reserve(request).call;
+  assert.equal(store.reserve(request, 'authenticated_broker_control').call.callAssignment, undefined);
+  assert.throws(() => store.update(call.id, { callAssignment: { origin: 'authenticated_broker_control',
+    value: { assignmentId: request.requestId, brokerCallId: call.id, revision: 1, purpose: request.purpose } } } as never));
+  assert.throws(() => store.reserve({ ...input(), direction: 'inbound' }, 'authenticated_broker_control'));
+  assert.throws(() => store.reserve({ ...input(), callAssignment: { origin: 'authenticated_broker_control', value: {} } } as never), /control reservation/);
+});
+
+test('assignment reference is required at first binding and immutable through restart, with mutable context', t => {
+  const { store, directory } = fixture(t);
+  const call = store.reserve(input(), 'authenticated_broker_control').call;
+  store.update(call.id, { callSid: 'CA' + '1'.repeat(32) });
+  const reference = { assignmentId: call.requestId, revision: 1 as const, digest: 'a'.repeat(64) };
+  const primary = { bindingId: randomUUID(), name: 'Dexter', context: '', callAssignmentRef: reference };
+  const before = fs.readFileSync(path.join(directory, 'calls.json'), 'utf8');
+  assert.throws(() => store.update(call.id, { primary: { ...primary, callAssignmentRef: undefined } }));
+  assert.throws(() => store.update(call.id, { primary: { ...primary, callAssignmentRef: { ...reference, assignmentId: randomUUID() } } }));
+  assert.equal(fs.readFileSync(path.join(directory, 'calls.json'), 'utf8'), before);
+  store.update(call.id, { primary });
+  reference.digest = 'b'.repeat(64); // Caller mutation cannot edit the saved receipt.
+  const bound = store.get(call.id)!;
+  assert.equal(bound.primary?.callAssignmentRef?.digest, 'a'.repeat(64));
+  for (const patch of [undefined, { ...bound.primary!, bindingId: randomUUID() },
+    { ...bound.primary!, callAssignmentRef: undefined }, { ...bound.primary!, callAssignmentRef: reference }]) {
+    assert.throws(() => store.update(call.id, { primary: patch }));
+  }
+  store.update(call.id, { primary: { ...bound.primary!, context: 'Later context' } });
+  store.close(); const resumed = new BrokerStore(directory); t.after(() => resumed.close());
+  assert.equal(resumed.get(call.id)?.primary?.context, 'Later context');
+  assert.equal(resumed.get(call.id)?.primary?.callAssignmentRef?.digest, 'a'.repeat(64));
+});

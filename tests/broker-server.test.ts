@@ -15,7 +15,7 @@ import type { PrimaryApiClient, PrimaryContextMessage } from '../src/broker/prim
 import type { BrokerLiveSessionOptions } from '../src/live/session.js';
 import { factFreshnessScenarios, historicalAccountMessages } from './fixtures/broker-fact-freshness.js';
 
-async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; failVoice?: boolean; ambiguousDial?: boolean; deferVoiceReady?: boolean; history?: PrimaryContextMessage[] } = {}) {
+async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; failVoice?: boolean; ambiguousDial?: boolean; deferVoiceReady?: boolean; history?: PrimaryContextMessage[]; assignmentResponse?: 'missing' | 'wrong' } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-server-test-'));
   const config: BrokerConfig = { host: '127.0.0.1', port: 3213, publicOrigin: 'https://phone.example.test', stateDir: directory,
     controlToken: 'c'.repeat(40), apiKey: 'fixture-key', model: 'gpt-live-1', voice: 'marin',
@@ -31,10 +31,13 @@ async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; 
   const openingCommands: string[] = [];
   const primary = {
     async readiness() { calls.readiness++; return { eligible: overrides.eligibility !== false, reason: overrides.eligibility === false ? 'authority_unavailable' : 'ready' }; },
-    async openCall(proof: { params: Record<string, string> }) {
+    async openCall(proof: { params: Record<string, string> }, assignment?: PhoneCallAssignment) {
       calls.bind++;
       assert.equal(proof.params.CallSid, sid);
-      return { bindingId, callSid: sid, state: 'open', context: { primaryDexterId: randomUUID(), threadId: randomUUID(), displayName: 'Branch', messages: overrides.history ?? [] } };
+      assert.deepEqual(assignment, broker.store.bySid(sid)?.callAssignment?.value);
+      assert.equal(broker.store.bySid(sid)?.voiceOpening, undefined);
+      return { bindingId, callSid: sid, state: 'open',
+        ...(assignment && overrides.assignmentResponse !== 'missing' ? { callAssignmentRef: { assignmentId: overrides.assignmentResponse === 'wrong' ? randomUUID() : assignment.assignmentId, revision: 1, digest: 'a'.repeat(64) } } : {}), context: { primaryDexterId: randomUUID(), threadId: randomUUID(), displayName: 'Branch', messages: overrides.history ?? [] } };
     },
     async close() { calls.close++; return { bindingId, callSid: sid, state: 'closed' }; },
   } as unknown as PrimaryApiClient;
@@ -165,11 +168,13 @@ test('signed outbound answer preserves the repair brief and speaks its role-awar
   assert.equal(f.broker.store.get(call.id)!.voiceOpening, undefined);
   f.readyVoice();
   await new Promise(resolve => setImmediate(resolve));
-  assert.deepEqual(f.openingCommands, [brokerOpening('outbound')]);
+  assert.deepEqual(f.openingCommands, [brokerOpening('outbound', true)]);
   assert.doesNotMatch(f.openingCommands[0], /verify|Primary|Branch/);
   assert.match(f.voiceOptions()!.instructions, /called the person/);
   assert.ok(f.voiceOptions()!.instructions.includes(`Internal call brief (an assignment for you): ${JSON.stringify(purpose)}`));
   assert.equal(f.broker.store.get(call.id)!.purpose, purpose);
+  assert.deepEqual(call.callAssignment, { origin: 'authenticated_broker_control', value: { assignmentId: call.requestId, brokerCallId: call.id, revision: 1, purpose } });
+  assert.equal(f.broker.store.get(call.id)!.primary!.callAssignmentRef!.assignmentId, call.requestId);
   assert.equal(f.broker.store.get(call.id)!.primary!.bindingId, f.bindingId);
   assert.equal(f.broker.store.get(call.id)!.voiceOpening!.status, 'accepted');
   // Exercise the actual openCall -> persisted context -> Live options path.
@@ -236,6 +241,7 @@ for (const eligibility of [true, false]) {
     assert.equal(f.calls.preflight, eligibility ? 1 : 0);
     assert.equal(f.calls.create, eligibility ? 1 : 0);
     assert.equal(f.calls.bind, 0);
+    for (const call of f.broker.store.list()) assert.equal(call.callAssignment, undefined, 'callback is not operator control provenance');
     const replay = await (await f.webhook(route, { ...params, Digits: '1' })).text();
     assert.equal(replay, consentBody);
     maintenance(); await new Promise(resolve => setImmediate(resolve));
@@ -243,3 +249,28 @@ for (const eligibility of [true, false]) {
     assert.equal(f.calls.readiness, 1);
   });
 }
+
+for (const assignmentResponse of ['missing', 'wrong'] as const) {
+  test(`an assigned call cannot open its media without its exact returned reference (${assignmentResponse})`, async t => {
+    const f = await fixture(t, { assignmentResponse });
+    assert.equal((await f.post('/internal/broker/calls', { requestId: randomUUID(), purpose: ' Read the current portfolio. ' })).status, 201);
+    const call = f.broker.store.list()[0];
+    assert.equal(call.callAssignment?.value.purpose, 'Read the current portfolio.');
+    const params = { AccountSid: f.config.twilioAccountSid, CallSid: f.sid, From: f.config.from,
+      To: f.config.allowedTo[0], Direction: 'outbound-api', CallStatus: 'in-progress' };
+    const response = await f.webhook(`/broker/answer/${call.id}`, params);
+    assert.doesNotMatch(await response.text(), /<Stream/);
+    assert.equal(f.broker.store.get(call.id)?.primary, undefined);
+    assert.deepEqual(f.openingCommands, []);
+  });
+}
+
+test('caller cannot inject assignment provenance through unauthenticated or extra control fields', async t => {
+  const f = await fixture(t);
+  const input = { requestId: randomUUID(), purpose: 'Read my portfolio.' };
+  const response = await fetch(f.base + '/internal/broker/calls', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(input) });
+  assert.equal(response.status, 401);
+  assert.equal((await f.post('/internal/broker/calls', { ...input, callAssignment: { origin: 'owner' } })).status, 400);
+  assert.equal(f.broker.store.list().length, 0);
+  assert.equal(f.calls.create, 0);
+});
