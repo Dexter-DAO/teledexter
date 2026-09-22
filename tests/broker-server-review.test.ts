@@ -9,6 +9,7 @@ import { WebSocket } from 'ws';
 import { createBrokerServer } from '../src/broker/server.js';
 import { streamToken } from '../src/broker/phone.js';
 import type { BrokerConfig } from '../src/broker/config.js';
+import type { PhoneCallAssignment } from '../src/broker/assignment.js';
 import type { PrimaryApiClient, PrimaryProviderProof, PrimaryTurn, PrimarySubmission } from '../src/broker/primaryApi.js';
 import type { BrokerLiveSessionOptions, LiveTranscriptSnapshot, LiveBackendChannel } from '../src/live/session.js';
 
@@ -64,10 +65,13 @@ async function fixture(t: test.TestContext, controls: Controls = {}) {
   let voiceFailed = false;
   const primary = {
     async readiness() { return { eligible: true, reason: 'ready' }; },
-    async openCall(proof: PrimaryProviderProof) {
+    async openCall(proof: PrimaryProviderProof, assignment?: PhoneCallAssignment) {
       proofs.push(proof); bindStarted.resolve();
       await controls.bindGate?.promise;
-      return { bindingId, callSid: sid, state: 'open', context: { primaryDexterId, threadId, displayName: 'Dexter', messages: [] } };
+      return { bindingId, callSid: sid, state: 'open', context: { primaryDexterId, threadId, displayName: 'Dexter', messages: [] },
+        ...(assignment === undefined ? {} : { callAssignmentRef: {
+          assignmentId: assignment.assignmentId, revision: assignment.revision, digest: 'd'.repeat(64),
+        } }) };
     },
     async close(id: string) {
       closures.push(id);

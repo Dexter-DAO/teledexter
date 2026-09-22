@@ -5,6 +5,7 @@ import type { PrimaryApiClient, PrimaryApiErrorCode, PrimaryClosedCall, PrimaryQ
 import { PrimaryApiError } from './primaryApi.js';
 import { terminalCallStatuses, type BrokerCall, type BrokerStore } from './store.js';
 import { beginBrokerPublication, settleBrokerPublication, selectBrokerPublicationReference } from './publications.js';
+import { phoneCallAssignmentRefSchema } from './assignment.js';
 import type { LiveBackendUpdate, LiveDelivery } from '../live/types.js';
 import { acknowledgedTurn, originalTurn, turnBodyDigest, validateNonAdmissionProof, type AcknowledgedTurnReceipt } from './reconciliation.js';
 
@@ -18,6 +19,8 @@ export interface PrimaryBackendOptions {
   maxWaitMs?: number;
   pollIntervalMs?: number;
   maxPollMs?: number;
+  /** Live media owns cancellation; keep observing accepted work until the call ends. */
+  watchUntilCallEnds?: boolean;
   progressIntervalMs?: number;
   now?: () => number;
   lastCallerSpeechAt?: () => number | undefined;
@@ -423,9 +426,10 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     } else if (unresolvedReply(reply)) current = { ...current, questionNotice: 'reply_unknown' };
     return save(current);
   };
-  const recoverReplies = async (entry: BrokerDelegationRecord) => {
+  const recoverReplies = async (entry: BrokerDelegationRecord, stopped?: () => boolean) => {
     let current = load(entry);
     for (const [questionId, record] of Object.entries(current.questions ?? {})) {
+      if (stopped?.()) break;
       if (!unresolvedReply(record.reply)) continue;
       try { current = applyReplyObservation(current, questionId, await options.api.question(options.bindingId, current.requestId, questionId)); }
       catch { current = save({ ...load(current), questionNotice: 'reply_unknown' }); }
@@ -495,11 +499,22 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     fragments: LiveTranscriptSnapshot['fragments']): PrimarySubmission => {
     const first = fragments.reduce((a, b) => a.sequence < b.sequence ? a : b);
     const sourceEventId = brokerIdentity('source', options.callId, sessionId, first.eventId);
+    const call = boundCall(sessionId);
+    const assignment = call.callAssignment;
+    const assignmentRef = call.primary?.callAssignmentRef;
+    if ((assignment === undefined) !== (assignmentRef === undefined)
+        || (assignment && (assignment.origin !== 'authenticated_broker_control'
+          || assignment.value.assignmentId !== call.requestId || assignment.value.brokerCallId !== call.id
+          || assignment.value.purpose !== call.purpose || assignment.value.revision !== 1
+          || assignmentRef!.assignmentId !== assignment.value.assignmentId || assignmentRef!.revision !== 1)))
+      throw new Error('call_assignment_binding_mismatch');
+    const frozenAssignmentRef = assignmentRef === undefined ? undefined : phoneCallAssignmentRefSchema.parse(assignmentRef);
     return { source: { callSid: options.callSid, itemId: `live-turn-${sourceEventId}`, sourceEventId,
       revision: 1, receivedAt: new Date(mediaOrigin(sessionId) + first.startMs).toISOString(), role: 'user' },
     text: fragments.map(fragment => fragment.text).join(''),
-    ...selectBrokerPublicationReference(boundCall(sessionId), { callId: options.callId, callSid: options.callSid,
-      bindingId: options.bindingId, sessionId }, snapshot, first.sequence) };
+    ...selectBrokerPublicationReference(call, { callId: options.callId, callSid: options.callSid,
+      bindingId: options.bindingId, sessionId }, snapshot, first.sequence),
+    ...(frozenAssignmentRef === undefined ? {} : { callAssignmentRef: frozenAssignmentRef }) };
   };
   const accept = async (request: LiveDelegationRequest, channel: LiveBackendChannel): Promise<BrokerDelegationRecord | undefined> => {
     if (request.callId !== options.callId) throw new Error('broker_call_identity_mismatch');
@@ -1158,14 +1173,24 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
               while (!channel.signal.aborted) {
                 entry = load(entry);
                 if (Object.values(entry.questions ?? {}).some(record => unresolvedReply(record.reply)))
-                  entry = await locked(() => recoverReplies(entry!));
+                  entry = await locked(() => recoverReplies(entry!,
+                    () => channel.signal.aborted || Boolean(boundCall(entry!.sessionId).endedAt)));
+                if (channel.signal.aborted || boundCall(entry.sessionId).endedAt) return;
                 if (!terminal(entry.status)) {
                   try { entry = applyResult(entry, await options.api.result(options.bindingId, resultRequestId(entry))); }
                   catch (error) { entry = recordReadError(entry, error); /* GET errors never authorize another POST. */ }
                 }
                 entry = await captureRevision(entry, channel);
                 if (channel.signal.aborted) return;
-                if (terminal(entry.status) || entry.status === 'waiting_for_reply' || now() >= deadline) break;
+                if (terminal(entry.status)) break;
+                if (entry.status === 'waiting_for_reply') {
+                  if (!options.watchUntilCallEnds) break;
+                  const questionRecord = entry.currentQuestionId ? entry.questions?.[entry.currentQuestionId] : undefined;
+                  if (!questionRecord?.presentation || entry.questionNotice
+                      || Object.values(entry.questions ?? {}).some(record => unresolvedReply(record.reply)))
+                    await deliver(load(entry), channel);
+                }
+                if (now() >= deadline && !options.watchUntilCallEnds) break;
                 if (!(await delay(pollIntervalMs, channel.signal))) return;
               }
               await deliver(load(entry), channel);

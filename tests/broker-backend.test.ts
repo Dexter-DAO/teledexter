@@ -50,12 +50,16 @@ function context() {
   return { channel, add, updates, controller };
 }
 
-async function fixture(t: TestContext, overrides: Partial<PrimaryBackendOptions> = {}) {
+async function fixture(t: TestContext, overrides: Partial<PrimaryBackendOptions> = {}, assigned = false) {
   const directory = await mkdtemp(path.join(tmpdir(), 'broker-backend-'));
   const store = new BrokerStore(directory);
   t.after(async () => { store.close(); await rm(directory, { recursive: true, force: true }); });
-  const call = store.reserve({ requestId: 'test-call', number: '+15550000001', direction: 'inbound', purpose: 'test', callSid: 'CA_test' }).call;
-  store.update(call.id, { primary: { bindingId, name: null, context: '' }, liveSessionId: 'sess_test', mediaStartedAt: call.createdAt });
+  const call = store.reserve({ requestId: assigned ? 'abababab-abab-5bab-abab-abababababab' : 'test-call',
+    number: '+15550000001', direction: assigned ? 'outbound' : 'inbound', purpose: 'test', callSid: 'CA_test' },
+  assigned ? 'authenticated_broker_control' : undefined).call;
+  store.update(call.id, { primary: { bindingId, name: null, context: '', ...(assigned ? { callAssignmentRef: {
+    assignmentId: call.requestId, revision: 1 as const, digest: 'a'.repeat(64),
+  } } : {}) }, liveSessionId: 'sess_test', mediaStartedAt: call.createdAt });
   const c = context();
   const posts: Array<{ bindingId: string; requestId: string; input: PrimarySubmission }> = [];
   const reads: string[] = [];
@@ -890,6 +894,92 @@ test('queued follow-up freezes its accepted publication before promotion and unk
   assert.equal(recovered.status, 'completed');
 });
 
+test('live call observes a slow predecessor beyond the initial window and drains its queued task', async t => {
+  const f = await fixture(t, { maxPollMs: 15, watchUntilCallEnds: true });
+  let ready = false;
+  f.behavior.result = async id => ready || id !== f.posts[0].requestId
+    ? f.completed(id) : { bindingId, requestId: id, state: 'running' };
+  f.add('Read my portfolio.'); f.speech();
+  const first = f.backend.delegate(f.request(), f.channel);
+  await until(() => f.posts.length === 1);
+  f.add('Then read my last payment.', 3000, 3200); f.speech(3000, 3200);
+  const second = f.backend.delegate(f.request('slow_followup'), f.channel);
+  await until(() => f.saved()[0].deferredTurns?.length === 1);
+  await wait(45);
+  const previousReads = f.reads.length;
+  await wait(20);
+  assert.ok(f.reads.length > previousReads, 'GET observation must continue while the call remains open');
+  assert.equal(f.posts.length, 1);
+  ready = true;
+  await Promise.all([first, second]);
+  assert.equal(f.posts.length, 2);
+  assert.equal(f.posts[1].input.text, 'Then read my last payment.');
+  assert.deepEqual(f.saved().map(entry => entry.status), ['completed', 'completed']);
+});
+
+test('live call observer stops on media abort and never dispatches the remaining queue', async t => {
+  const f = await fixture(t, { maxPollMs: 10, watchUntilCallEnds: true });
+  f.behavior.result = async id => ({ bindingId, requestId: id, state: 'running' });
+  f.add('Read my portfolio.'); f.speech();
+  const first = f.backend.delegate(f.request(), f.channel);
+  await until(() => f.posts.length === 1);
+  f.add('Read my last payment.', 3000, 3200); f.speech(3000, 3200);
+  const second = f.backend.delegate(f.request('abort_followup'), f.channel);
+  await until(() => f.saved()[0].deferredTurns?.length === 1);
+  await wait(30);
+  f.controller.abort();
+  await Promise.all([first, second]);
+  const reads = f.reads.length;
+  await wait(20);
+  assert.equal(f.reads.length, reads);
+  assert.equal(f.posts.length, 1);
+  assert.equal(f.saved()[0].deferredTurns![0].status, 'queued');
+});
+
+test('assigned call freezes its reference alongside the queued publication and preserves raw speech', async t => {
+  const f = await fixture(t, { maxPollMs: 40, progressIntervalMs: 5 }, true);
+  let release!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  f.behavior.result = async id => {
+    if (id === f.posts[0].requestId) await blocked;
+    return f.completed(id);
+  };
+  f.add(' Hello.\t'); f.speech();
+  const first = f.backend.delegate(f.request(), f.channel);
+  await until(() => Boolean(f.store.get(f.call.id)!.publications?.records.some(record => record.outcome?.status === 'accepted')));
+  const assignmentRef = f.store.get(f.call.id)!.primary!.callAssignmentRef;
+  assert.deepEqual(f.posts[0].input.callAssignmentRef, assignmentRef);
+  assert.equal(f.posts[0].input.text, ' Hello.\t');
+  f.add(' Then review it.', 3000, 3200); f.speech(3000, 3200);
+  const second = f.backend.delegate(f.request('assigned_followup'), f.channel);
+  await until(() => f.saved()[0].deferredTurns?.length === 1);
+  const queued = structuredClone(f.saved()[0].deferredTurns![0].queuedRequest!.submission);
+  assert.deepEqual(queued.callAssignmentRef, assignmentRef);
+  assert.equal(queued.relatedPrimaryRequestId, f.posts[0].requestId);
+  assert.equal(queued.referenceOrigin, 'broker_status_publication');
+  assert.equal(queued.text, ' Then review it.');
+  release(); await Promise.all([first, second]);
+  assert.equal(f.posts.length, 2);
+  assert.deepEqual(f.posts[1].input, queued);
+  assert.equal('purpose' in f.posts[0].input, false);
+});
+
+test('a known assignment without its bound registration reference refuses before caller submission', async t => {
+  const f = await fixture(t, {}, true);
+  const backend = createPrimaryBackend({ ...f.options, store: {
+    get: id => {
+      const call = f.store.get(id)!;
+      delete call.primary!.callAssignmentRef;
+      return call;
+    },
+    update: f.store.update.bind(f.store),
+  } });
+  f.add('Hello.'); f.speech(800, 1000, backend);
+  await assert.rejects(backend.delegate(f.request(), f.channel), /call_assignment_binding_mismatch/);
+  assert.equal(f.posts.length, 0);
+  assert.equal(f.saved().length, 0);
+});
+
 test('multiple completed deferred turns retain FIFO source order and predecessor identities', async t => {
   const f = await blockedQueueFixture(t);
   f.add(' Read the payment before that. ', 5000, 5200); f.speech(5000, 5200);
@@ -1083,6 +1173,33 @@ test('a presented question takes a literal reply on the original run and capture
   assert.equal(f.posts.length, 1); assert.equal(f.replies.length, 1);
 });
 
+test('live observer keeps the original question presentation while caller speech is awaiting admission', async t => {
+  const f = await fixture(t, { maxPollMs: 10, watchUntilCallEnds: true });
+  let current = question();
+  f.behavior.result = async id => current.state === 'pending' ? waiting(id, current) : f.completed(id);
+  f.behavior.question = async id => questionResult(id, current);
+  f.behavior.reply = async (id, _questionId, input) => {
+    current = answered(current, input);
+    return { ...questionResult(id, current), replayed: false };
+  };
+  f.add('Please buy $10.25 of this stock.'); f.speech();
+  const first = f.backend.delegate(f.request(), f.channel);
+  await until(() => Boolean(f.saved()[0]?.questions?.[firstQuestionId].presentation));
+  const presentation = structuredClone(f.saved()[0].questions![firstQuestionId].presentation!);
+  const prompts = f.updates.length;
+  f.add('Yes.', 3000, 3200); f.speech(3000, 3200);
+  await wait(30);
+  assert.deepEqual(f.saved()[0].questions![firstQuestionId].presentation, presentation);
+  assert.equal(f.updates.length, prompts, 'polling must not re-present the question against the answer frontier');
+  const reply = f.backend.delegate(f.request('live_answer'), f.channel);
+  await Promise.all([first, reply]);
+  assert.equal(f.posts.length, 1);
+  assert.equal(f.replies.length, 1);
+  assert.equal(f.replies[0].requestId, f.posts[0].requestId);
+  assert.equal(f.replies[0].input.reply.answer, 'yes');
+  assert.equal(f.saved()[0].status, 'completed');
+});
+
 test('a queued second task waits for a same-run question answer and follows the original terminal result', async t => {
   const f = await fixture(t);
   let current = question();
@@ -1171,6 +1288,28 @@ test('a lost reply response is recovered through the exact old question after a 
   assert.equal(f.replies.length, 1); assert.equal(f.posts.length, 1);
   assert.ok(f.questionReads.every(read => read.questionId === firstQuestionId));
   assert.ok(f.questionReads.every(read => read.requestId === f.posts[0].requestId));
+});
+
+test('media abort during question recovery prevents a new result GET after that recovery settles', async t => {
+  const f = await waitingFixture(t);
+  f.behavior.reply = async () => { throw new PrimaryApiError('request_timeout'); };
+  f.behavior.question = async id => questionResult(id, f.currentQuestion());
+  f.add('Yes.', 3000, 3200); f.speech(3000, 3200);
+  await f.backend.delegate(f.request('unconfirmed_answer'), f.channel);
+  assert.equal(f.saved()[0].questions![firstQuestionId].reply!.status, 'unknown');
+  let entered = false;
+  let release!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  f.behavior.question = async id => { entered = true; await blocked; return questionResult(id, f.currentQuestion()); };
+  const resumed = createPrimaryBackend({ ...f.options, watchUntilCallEnds: true })
+    .delegate(f.request('unconfirmed_answer'), f.channel);
+  await until(() => entered);
+  const reads = f.reads.length;
+  f.controller.abort(); release();
+  await resumed;
+  assert.equal(f.reads.length, reads);
+  assert.equal(f.posts.length, 1);
+  assert.equal(f.replies.length, 1);
 });
 
 test('two sequential questions use separate reply identities and one original Primary run', async t => {

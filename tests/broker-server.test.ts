@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import type { PhoneCallAssignment } from '../src/broker/assignment.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';

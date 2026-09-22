@@ -36,11 +36,12 @@ const sameCall = (call: BrokerCall, identity: BrokerPublicationIdentity) => call
 const journal = (call: BrokerCall): BrokerPublicationJournal => call.publications ?? { records: [], rejections: [] };
 
 function requestMatches(call: BrokerCall, identity: BrokerPublicationIdentity, requestId: string): boolean {
-  const entry = call.delegations[requestId] as undefined | {
-    requestId: string; callId: string; callSid: string; bindingId: string; sessionId: string; status: string;
+  const entry = call.delegations[requestId] as undefined | (BrokerCall['delegations'][string] & Partial<BrokerPublicationIdentity> & {
     primaryResult?: { requestId: string; bindingId: string; state: string };
-  };
-  return Boolean(entry && uuid.test(requestId) && entry.requestId === requestId && sameCall(call, entry)
+  });
+  return Boolean(entry && uuid.test(requestId) && entry.requestId === requestId
+    && entry.callId === call.id && entry.callSid === call.callSid && entry.bindingId === call.primary?.bindingId
+    && entry.sessionId === call.liveSessionId
     && entry.sessionId === identity.sessionId && admitted.has(entry.status)
     && entry.primaryResult?.requestId === requestId && entry.primaryResult.bindingId === identity.bindingId
     && entry.primaryResult.state === entry.status);
