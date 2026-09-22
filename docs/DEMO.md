@@ -4,7 +4,7 @@ The first useful demonstration is a phone conversation with Branch's existing Pr
 
 ## Release prerequisites
 
-The broker service, including callback and question handling, is running through the public /broker/ route. Shared API release `d781d4f` is deployed with Phone ingress and question hooks; its compatibility correction for existing Phone links still needs qualification and release. Restored GPT-Live credits and a successful audio preflight are also required for the combined call trial. Inbound number routing remains unchanged. A passing local test or health endpoint does not satisfy these steps. Use the accepted broker/API releases and the [controlled-call procedure](BROKER_OPERATIONS.md#controlled-call); retain their release receipts with the trial evidence.
+The broker service, including callback and question handling, is running through the public /broker/ route. Shared API release `aaa9069` includes the existing Phone-link correction. The next correction must allow a fresh accepting Primary worker to handle the first call without requiring past model and tool success. Restored GPT-Live credits and a successful audio preflight are also required for the combined call trial. Inbound number routing remains unchanged. A passing local test or health endpoint does not satisfy these steps. Use the accepted broker/API releases and the [controlled-call procedure](BROKER_OPERATIONS.md#controlled-call); retain their release receipts with the trial evidence.
 
 ## First conversation
 
