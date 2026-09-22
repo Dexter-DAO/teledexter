@@ -4,13 +4,13 @@ The broker connects Twilio telephone audio to GPT-Live and delegates account wor
 
 ## Release state
 
-As of September 22, 2026, the initial `fb3553f` service is running on port `3213`. Its public `/broker/health` route passed acceptance at 00:14 UTC. Callback and question continuation are qualified in the source successor and await its release. The most recent GPT-Live preflight was blocked by exhausted credits. There is no completed call proving the combined GPT-Live and Primary path; the existing number has not been rerouted to the broker.
+As of September 22, 2026, release `10c8115` is running on port `3213` with callback and question continuation. Its upgrade passed acceptance at 01:00 UTC, including the actual running code paths, preserved journal, public health route, and stability through a maintenance interval. All 274 Broker tests, source TypeScript checks, and the exact package build pass. The shared Primary Phone API still awaits release. The most recent GPT-Live preflight was blocked by exhausted credits; there is no completed call proving the combined path, and the existing number has not been rerouted to the broker.
 
 Angel applied the nginx location for `/broker/` after Wallet acceptance. The existing service on port `3212` and the Twilio number's current inbound configuration remain in place. Record the exact source, installed package, running process, provider configuration, and completed call when each is verified.
 
 The Primary ingress must be released independently. Its current admission contract permits verified outbound calls. It rejects inbound account binding with `caller_possession_required`, because caller ID alone does not establish possession. The inbound handler therefore offers a callback without opening Primary, reading account data, or starting GPT-Live. The outbound leg establishes possession of the current saved destination.
 
-The successor accepts `queued`, `running`, `waiting_for_reply`, `completed`, `failed`, and `cancelled`. A waiting result carries its saved question. Completion requires the identified terminal assistant output; an earlier question is not a completed result. Hangup ends voice delivery and closes admission after source recovery; it does not cancel work already accepted by Primary. Later transcript corrections are recorded as source revisions and do not retroactively change an admitted action.
+The client accepts `queued`, `running`, `waiting_for_reply`, `completed`, `failed`, and `cancelled`. A waiting result carries its saved question. Completion requires the identified terminal assistant output; an earlier question is not a completed result. Hangup ends voice delivery and closes admission after source recovery; it does not cancel work already accepted by Primary. Later transcript corrections are recorded as source revisions and do not retroactively change an admitted action.
 
 ## Questions during a call
 
@@ -69,6 +69,8 @@ pm2 start "$BROKER_RELEASE_DIR/deploy/ecosystem.config.cjs" --only dexter-broker
 ```
 
 Use this command only when applying the reviewed deployment. The configuration starts one forked process and gives shutdown 65 seconds; the application has a 60-second shutdown deadline. The journal permits one writer, so upgrades require the previous broker process to stop before the replacement starts. Avoid a rolling overlap against the same state directory. A rollback selects the previous immutable release and retains the same journal; verify journal compatibility first.
+
+On this host, PM2 6.0.5 retains an existing process's normalized script and working-directory paths during `startOrRestart`. For an upgrade to another release directory, verify and stop the exact broker process, confirm its exit and writer release, then remove only its stopped PM2 definition before starting the new configuration. Check the new process's actual paths and code hashes along with health. Record the newly allocated PM2 ID for shared release coordination.
 
 The initial `fb3553f` release can read the journal's JSON shape but cannot recover the successor's pending callbacks or question replies. After the successor handles that work, use a release that understands those records for recovery. Preserve the current journal; restoring an earlier snapshot could erase evidence of an accepted answer or an outbound call.
 
