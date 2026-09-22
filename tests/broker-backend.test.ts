@@ -852,6 +852,44 @@ test('concurrent duplicate delegates drain one frozen child in the shared call w
   assert.equal(f.updates.filter(update => update.kind === 'result').length, 2);
 });
 
+test('queued follow-up freezes its accepted publication before promotion and unknown recovery', async t => {
+  const f = await fixture(t, { maxPollMs: 40, progressIntervalMs: 5 });
+  let release!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  f.behavior.result = async id => {
+    if (id === f.posts[0].requestId) { await blocked; return f.completed(id); }
+    throw new PrimaryApiError('request_timeout');
+  };
+  f.add(' Read my portfolio.'); f.speech();
+  const first = f.backend.delegate(f.request(), f.channel);
+  await until(() => Boolean(f.store.get(f.call.id)!.publications?.records.some(record => record.outcome?.status === 'accepted')));
+  const originalRequestId = f.posts[0].requestId;
+  f.add(' Then review it.\t', 3000, 3200); f.speech(3000, 3200);
+  const second = f.backend.delegate(f.request('queued_review'), f.channel);
+  await until(() => f.saved()[0].deferredTurns?.length === 1);
+  const queued = structuredClone(f.saved()[0].deferredTurns![0].queuedRequest!);
+  assert.equal(queued.submission.relatedPrimaryRequestId, originalRequestId);
+  assert.equal(queued.submission.referenceOrigin, 'broker_status_publication');
+  assert.equal(queued.submission.text, ' Then review it.\t');
+  assert.equal(f.posts.length, 1);
+  const publication = f.store.get(f.call.id)!.publications!.records.find(record => record.outcome?.status === 'accepted')!;
+  rejectBrokerPublication(f.store, publication, publication.outcome!.eventId, 'late_rejection');
+  f.behavior.submit = async () => { throw new PrimaryApiError('request_timeout'); };
+  release(); await Promise.all([first, second]);
+  assert.equal(f.posts.length, 2);
+  assert.deepEqual(f.posts[1].input, queued.submission, 'promotion must use the original caller frontier');
+  assert.equal(f.posts[1].requestId, queued.requestId);
+  assert.equal(f.saved()[1].status, 'dispatch_unknown');
+  f.store.close();
+  const restored = new BrokerStore(f.directory); t.after(() => restored.close());
+  f.behavior.result = async id => f.completed(id);
+  await createPrimaryBackend({ ...f.options, store: restored }).delegate(f.request('queued_review'), f.channel);
+  assert.equal(f.posts.length, 2, 'recovery must not resubmit the queued source');
+  const recovered = restored.get(f.call.id)!.delegations[queued.requestId] as BrokerDelegationRecord;
+  assert.deepEqual(recovered.submission, queued.submission);
+  assert.equal(recovered.status, 'completed');
+});
+
 test('multiple completed deferred turns retain FIFO source order and predecessor identities', async t => {
   const f = await blockedQueueFixture(t);
   f.add(' Read the payment before that. ', 5000, 5200); f.speech(5000, 5200);
