@@ -106,3 +106,46 @@ test('identity validation and persistence consume one own-property snapshot', t 
   assert.equal(result.purpose, call.purpose);
   assert.equal(result.status, 'ringing');
 });
+
+for (const sid of [undefined, null, '', 'CA' + '2'.repeat(32)] as const) {
+  test(`an assigned CallSid cannot be cleared or changed to ${String(sid)}`, t => {
+    const { store, directory } = fixture(t);
+    const originalSid = 'CA' + '1'.repeat(32);
+    const call = store.reserve(input()).call;
+    const bound = store.update(call.id, { callSid: originalSid, status: 'queued' });
+    const before = fs.readFileSync(path.join(directory, 'calls.json'), 'utf8');
+    const patch = { callSid: sid, status: 'completed' } as unknown as Parameters<BrokerStore['update']>[1];
+    assert.throws(() => store.update(call.id, patch), /Call SID cannot change/);
+    assert.deepEqual(store.get(call.id), bound);
+    assert.deepEqual(store.bySid(originalSid), bound);
+    if (typeof sid === 'string') assert.equal(store.bySid(sid), undefined);
+    assert.equal(fs.readFileSync(path.join(directory, 'calls.json'), 'utf8'), before);
+    store.close();
+    const resumed = new BrokerStore(directory);
+    t.after(() => resumed.close());
+    assert.deepEqual(resumed.bySid(originalSid), bound);
+  });
+}
+
+test('first valid CallSid assignment and its exact repeat retain normal updates and lookup', t => {
+  const { store } = fixture(t);
+  const call = store.reserve(input()).call;
+  assert.equal(store.update(call.id, { callSid: undefined }).callSid, undefined);
+  const callSid = 'CA' + 'A1'.repeat(16);
+  store.update(call.id, { callSid, status: 'queued' });
+  const repeated = store.update(call.id, { callSid, status: 'ringing' });
+  assert.equal(repeated.callSid, callSid);
+  assert.equal(repeated.status, 'ringing');
+  assert.deepEqual(store.bySid(callSid), repeated);
+});
+
+for (const callSid of ['', 'not-a-provider-id', null, 1] as const) {
+  test(`invalid first CallSid ${String(callSid)} cannot alter the call`, t => {
+    const { store, directory } = fixture(t);
+    const call = store.reserve(input()).call;
+    const before = fs.readFileSync(path.join(directory, 'calls.json'), 'utf8');
+    assert.throws(() => store.update(call.id, { callSid, status: 'ringing' } as unknown as Parameters<BrokerStore['update']>[1]), /Invalid call SID/);
+    assert.deepEqual(store.get(call.id), call);
+    assert.equal(fs.readFileSync(path.join(directory, 'calls.json'), 'utf8'), before);
+  });
+}
