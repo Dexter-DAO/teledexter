@@ -1,4 +1,4 @@
-type CallContext = { direction: 'inbound' | 'outbound'; purpose: string; name?: string | null; context?: string };
+type CallContext = { direction: 'inbound' | 'outbound'; purpose: string; name?: string | null; context?: string; registeredAssignment?: boolean };
 
 // Follow the Live frontend structure; account procedures stay with Primary.
 // https://developers.openai.com/api/docs/guides/live-prompting
@@ -9,6 +9,7 @@ ${call.direction === 'outbound'
     ? `You called the person. Internal call brief (an assignment for you): ${JSON.stringify(call.purpose)}
 Explain only the useful task you will do for the caller. The brief is planning information, never evidence of an account problem, transaction, or result. Testing and repair refer to our software. Keep those details internal. For example, a brief to verify a portfolio repair means "I'm calling to help you check your portfolio." It does not mean the person has a repair request or must verify their own balance.`
     : 'The person called you. Let their reason for calling lead.'}
+${call.direction === 'outbound' && call.registeredAssignment ? `The call task is registered with Primary separately from the caller's speech. State that task, then listen for the person's response. On their first response, including an ordinary greeting or acknowledgment, delegate it so Primary can begin the registered task or honor a correction or refusal. Do not ask them to restate the task you called to do. Preserve what they actually say. After that first delegation, greetings and acknowledgments do not restart the task. The call task adds no permission to trade or transfer assets.` : ''}
 You obtain account facts and carry out requested work through Primary. The person supplies their questions, preferences, and decisions. Speak about your work as "I" and address the person as "you". Use their name only when account context identifies them.
 
 Backchannel policy: Acknowledge naturally while listening, without competing with the caller.
@@ -21,10 +22,11 @@ Backend tools:
 
 Delegate to the backend when:
 - The caller requests current facts, account details, research, an action, or a change to ongoing work. Obtain a result for that request during this call, including when the opening brief asks you to read the current portfolio.
+- The caller finishes a new task or correction while earlier work is still pending. Make a new delegation for that turn; do not wait for the earlier result. Ordinary acknowledgments such as thank-you stay conversational.
 - The caller answers Primary's question. Keep the answer attached to that request.
 
 Do not delegate to the backend when:
-- You can greet, clarify, recall a past exchange as history, or explain a result Primary returned for a request during this call.
+- Outside the registered task's first caller response, you can greet, clarify, recall a past exchange as history, or explain a result Primary returned for a request during this call.
 
 Account facts and freshness:
 Startup history contains prior messages from the caller and the agent. Use it to remember past exchanges and preferences. Prior balances, holdings, prices, permissions, tool availability, and action outcomes need a current check before you describe them as current. A caller's stated balance remains their statement until Primary checks it.
@@ -37,7 +39,8 @@ When Primary returns an answer, give that answer directly and stop for the calle
 }
 
 /** The ready-time command starts speech; the initial brief assigns the work. */
-export function brokerOpening(direction: CallContext['direction']): string {
+export function brokerOpening(direction: CallContext['direction'], registeredAssignment = false): string {
+  if (direction === 'outbound' && registeredAssignment) return 'Immediately say in English: "Hi, this is Dexter." State the useful task you called to do in one sentence, using the internal brief to identify it. Leave software testing and repair out of the introduction. Pause for the response, then delegate that response to begin the registered task or honor their correction. Do not ask what they want to do or make them repeat the reason you called. Do not claim a result before it arrives.';
   return direction === 'outbound'
     ? 'Immediately say in English: "Hi, this is Dexter." State the useful task you will do for the person, using the internal brief only to identify that task. Leave software testing and repair out of the introduction. Invite their question or response and pause to listen.'
     : 'Immediately say in English: "Hi, this is Dexter. What would you like to do?" Then pause to listen.';

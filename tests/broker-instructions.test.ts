@@ -90,3 +90,19 @@ test('catalog and field answers retain their actual search and evidence limits',
   assert.match(instructions, /missing field.*does not establish that no tool can obtain it/);
   assert.match(instructions, /Preserve those limits even if Primary's summary overstates them/);
 });
+
+test('registered call opening starts its assigned work from the real first response without another task interview', () => {
+  const call = { direction: 'outbound' as const, purpose: 'Read the current portfolio.', registeredAssignment: true };
+  const instructions = brokerInstructions(call);
+  const opening = brokerOpening('outbound', true);
+  assert.match(instructions, /task is registered with Primary separately from the caller's speech/);
+  assert.match(instructions, /first response, including an ordinary greeting or acknowledgment, delegate it/);
+  assert.match(instructions, /Preserve what they actually say/);
+  assert.match(instructions, /greetings and acknowledgments do not restart the task/);
+  assert.match(opening, /State the useful task you called to do in one sentence/);
+  assert.doesNotMatch(opening, /Invite their question|What would you like/);
+  assert.match(instructions, /finishes a new task or correction while earlier work is still pending/);
+  assert.match(instructions, /Ordinary acknowledgments such as thank-you stay conversational/);
+  assert.doesNotMatch(brokerInstructions({ ...call, registeredAssignment: false }), /task is registered with Primary/);
+  assert.equal(brokerOpening('inbound', true), brokerOpening('inbound'));
+});

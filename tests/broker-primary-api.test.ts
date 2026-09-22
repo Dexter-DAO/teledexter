@@ -357,3 +357,94 @@ test('reply validation refuses oversized, contradictory and caller-supplied extr
   await assert.rejects(client.reply(bindingId, requestId, questionId, { ...replyInput, owner: 'another-owner' } as typeof replyInput), code('invalid_request'));
   assert.equal(requests.length, 0);
 });
+
+const assignment = { assignmentId: requestId, brokerCallId: sourceEventId, revision: 1 as const, purpose: 'Read the current portfolio.' };
+const assignmentRef = { assignmentId: requestId, revision: 1 as const, digest: 'a'.repeat(64) };
+const assignedCall = { ...call, callAssignmentRef: assignmentRef };
+
+test('call assignment registers separately and exact reference accompanies raw submission and reconciliation', async () => {
+  const input = { ...submission, text: ' Hello. ', callAssignmentRef: assignmentRef,
+    relatedPrimaryRequestId: messageId, referenceOrigin: 'broker_status_publication' as const };
+  const turn = originalTurn(input);
+  const nonAdmission = { schemaVersion: 1, kind: 'phone_closed_call_non_admission', callSid,
+    source: { itemId: input.source.itemId, sourceEventId, revision: 1, receivedAt: when },
+    rawSubmissionDigest: rawSubmissionDigest(bindingId, input),
+    turn: { recordId: sourceEventId, revisionRecordId: eventId, bodyDigest: turnBodyDigest(turn) }, closedAt: when };
+  const { client, requests } = harness([json(assignedCall), json({ ...completed, replayed: false }, 202),
+    json({ outcome: 'not_admitted', bindingId, requestId, proof: nonAdmission })]);
+  const opened = await client.openCall(proof, assignment);
+  // The caller cannot mutate the client's remembered immutable receipt.
+  opened.callAssignmentRef!.digest = 'b'.repeat(64);
+  await client.submit(bindingId, requestId, input);
+  await client.reconcile(bindingId, requestId, input);
+  assert.deepEqual(JSON.parse(String(requests[0].init.body)), { providerProof: proof, callAssignment: assignment });
+  for (const request of requests.slice(1)) {
+    const body = JSON.parse(String(request.init.body));
+    assert.deepEqual(body.callAssignmentRef, assignmentRef);
+    assert.equal(body.text, ' Hello. ');
+    assert.equal(body.relatedPrimaryRequestId, messageId);
+    assert.equal(body.purpose, undefined);
+    assert.equal(body.callAssignment, undefined);
+  }
+  assert.equal(turn.text, ' Hello. ');
+  assert.equal(turnBodyDigest(turn), turnBodyDigest(originalTurn({ ...submission, text: input.text })));
+});
+
+test('registration and remembered context cannot lose or change an assignment reference', async () => {
+  for (const response of [call, { ...assignedCall, callAssignmentRef: { ...assignmentRef, assignmentId: messageId } },
+    { ...assignedCall, callAssignmentRef: { ...assignmentRef, revision: 2 } }]) {
+    await assert.rejects(harness([json(response)]).client.openCall(proof, assignment), error => error instanceof PrimaryApiError);
+  }
+  await assert.rejects(harness([json(assignedCall)]).client.openCall(proof), code('identity_mismatch'));
+  const contextRefresh = harness([json(assignedCall), json(call)]);
+  await contextRefresh.client.openCall(proof, assignment);
+  assert.deepEqual((await contextRefresh.client.getContext(bindingId)).callAssignmentRef, assignmentRef, 'GET context omission preserves existing registration receipt');
+  for (const response of [{ ...assignedCall, callAssignmentRef: { ...assignmentRef, digest: 'b'.repeat(64) } }]) {
+    const { client } = harness([json(assignedCall), json(response)]);
+    await client.openCall(proof, assignment);
+    await assert.rejects(client.getContext(bindingId), code('identity_mismatch'));
+  }
+  const { client, requests } = harness([json(assignedCall)]);
+  await client.openCall(proof, assignment);
+  for (const input of [submission, { ...submission, callAssignmentRef: { ...assignmentRef, digest: 'b'.repeat(64) } }]) {
+    await assert.rejects(client.submit(bindingId, requestId, input), code('identity_mismatch'));
+    await assert.rejects(client.reconcile(bindingId, requestId, input), code('identity_mismatch'));
+  }
+  assert.equal(requests.length, 1);
+});
+
+test('assignment validation uses exact trimmed purpose and the existing UTF-16 1500 limit', async () => {
+  const good = { ...assignment, purpose: '😀'.repeat(750) };
+  assert.equal(good.purpose.length, 1500);
+  const h = harness([json(assignedCall)]);
+  await h.client.openCall(proof, good);
+  assert.equal(JSON.parse(String(h.requests[0].init.body)).callAssignment.purpose, good.purpose);
+  for (const value of [{ ...good, purpose: good.purpose + 'a' }, { ...assignment, purpose: ' padded ' },
+    { ...assignment, purpose: '' }, { ...assignment, revision: 2 }, { ...assignment, issuer: 'owner' }]) {
+    const { client, requests } = harness([]);
+    await assert.rejects(client.openCall(proof, value as typeof assignment), code('invalid_request'));
+    assert.equal(requests.length, 0);
+  }
+});
+
+test('question replies reject assignment refs instead of silently treating them as new missions', async () => {
+  const { client, requests } = harness([]);
+  const { role, ...source } = submission.source;
+  await assert.rejects(client.reply(bindingId, requestId, messageId, { source, role, text: 'Yes',
+    reply: { questionRevision: 1, clientReplyId: eventId, answer: 'yes', text: null },
+    callAssignmentRef: assignmentRef } as never), code('invalid_request'));
+  assert.equal(requests.length, 0);
+});
+
+
+test('registration replays echo the same original control UUID and immutable returned receipt', async () => {
+  const upperId = 'ABCDEFAB-CDEF-4ABC-8ABC-ABCDEFABCDEF';
+  const uppercase = { ...assignment, assignmentId: upperId };
+  const reference = { ...assignmentRef, assignmentId: upperId };
+  const response = { ...call, callAssignmentRef: reference };
+  const { client, requests } = harness([json(response), json(response)]);
+  assert.deepEqual(await client.openCall(proof, uppercase), response);
+  assert.deepEqual(await client.openCall(proof, uppercase), response);
+  assert.equal(requests[0].init.body, requests[1].init.body);
+  assert.equal(JSON.parse(String(requests[0].init.body)).callAssignment.assignmentId, upperId);
+});
