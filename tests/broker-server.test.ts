@@ -10,10 +10,11 @@ import { createBrokerServer } from '../src/broker/server.js';
 import { streamToken } from '../src/broker/phone.js';
 import { brokerOpening } from '../src/broker/instructions.js';
 import type { BrokerConfig } from '../src/broker/config.js';
-import type { PrimaryApiClient } from '../src/broker/primaryApi.js';
+import type { PrimaryApiClient, PrimaryContextMessage } from '../src/broker/primaryApi.js';
 import type { BrokerLiveSessionOptions } from '../src/live/session.js';
+import { factFreshnessScenarios, historicalAccountMessages } from './fixtures/broker-fact-freshness.js';
 
-async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; failVoice?: boolean; ambiguousDial?: boolean; deferVoiceReady?: boolean } = {}) {
+async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; failVoice?: boolean; ambiguousDial?: boolean; deferVoiceReady?: boolean; history?: PrimaryContextMessage[] } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-server-test-'));
   const config: BrokerConfig = { host: '127.0.0.1', port: 3213, publicOrigin: 'https://phone.example.test', stateDir: directory,
     controlToken: 'c'.repeat(40), apiKey: 'fixture-key', model: 'gpt-live-1', voice: 'marin',
@@ -32,7 +33,7 @@ async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; 
     async openCall(proof: { params: Record<string, string> }) {
       calls.bind++;
       assert.equal(proof.params.CallSid, sid);
-      return { bindingId, callSid: sid, state: 'open', context: { primaryDexterId: randomUUID(), threadId: randomUUID(), displayName: 'Branch', messages: [] } };
+      return { bindingId, callSid: sid, state: 'open', context: { primaryDexterId: randomUUID(), threadId: randomUUID(), displayName: 'Branch', messages: overrides.history ?? [] } };
     },
     async close() { calls.close++; return { bindingId, callSid: sid, state: 'closed' }; },
   } as unknown as PrimaryApiClient;
@@ -137,7 +138,7 @@ test('signed inbound call offers callback without account reads, voice preflight
 });
 
 test('signed outbound answer preserves the repair brief and speaks its role-aware opening only after Live is ready', async t => {
-  const f = await fixture(t, { deferVoiceReady: true });
+  const f = await fixture(t, { deferVoiceReady: true, history: historicalAccountMessages });
   const purpose = 'Verify the account request repair with Branch: answer one current portfolio question through Primary Dexter, then discuss his feedback. Explain any returned failure plainly.';
   assert.equal((await f.post('/internal/broker/calls', { requestId: randomUUID(), purpose })).status, 201);
   const call = f.broker.store.list()[0];
@@ -170,6 +171,18 @@ test('signed outbound answer preserves the repair brief and speaks its role-awar
   assert.equal(f.broker.store.get(call.id)!.purpose, purpose);
   assert.equal(f.broker.store.get(call.id)!.primary!.bindingId, f.bindingId);
   assert.equal(f.broker.store.get(call.id)!.voiceOpening!.status, 'accepted');
+  // Exercise the actual openCall -> persisted context -> Live options path.
+  // A voiceFactory fixture cannot establish how the model will speak these facts.
+  const history = f.voiceOptions()!.history!;
+  assert.equal(history.length, 1);
+  const prior = JSON.parse(history[0].text.split('\n')[1]);
+  assert.equal(prior.source, 'prior_primary_conversation');
+  assert.equal(prior.freshness, 'historical_unverified');
+  assert.equal(prior.observationTime, null);
+  assert.equal(prior.context, historicalAccountMessages.map(message => `${message.role}: ${message.text}`).join('\n'));
+  assert.ok(prior.context.includes('$41.53'));
+  assert.ok(!history[0].text.includes(factFreshnessScenarios.currentPortfolio.backendText));
+  assert.match(f.voiceOptions()!.instructions, /Obtain a result for that request during this call/);
   ws.close();
   await new Promise<void>(resolve => ws.once('close', () => resolve()));
 });
