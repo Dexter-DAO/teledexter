@@ -1,5 +1,6 @@
 import { createHmac } from 'node:crypto';
 import { z } from 'zod';
+import { rawSubmissionDigest, turnBodyDigest, type PhoneNonAdmissionProof } from './reconciliation.js';
 
 export interface PrimaryProviderProof {
   url: string;
@@ -111,7 +112,13 @@ export interface PrimaryTurnReceipt {
   revision: number;
   recordId: string;
   replayed: boolean;
+  revisionRecordId?: string;
+  bodyDigest?: string;
 }
+
+export type PrimaryReconciliation =
+  | { outcome: 'admitted'; requestId: string; bindingId: string; canonicalRequestId: string; result: PrimaryResult }
+  | { outcome: 'not_admitted'; requestId: string; bindingId: string; proof: PhoneNonAdmissionProof };
 
 export interface PrimaryClosedCall {
   bindingId: string;
@@ -125,6 +132,7 @@ export interface PrimaryApiClient {
   getContext(bindingId: string): Promise<PrimaryCall>;
   submit(bindingId: string, requestId: string, input: PrimarySubmission): Promise<PrimaryRequestResult>;
   result(bindingId: string, requestId: string): Promise<PrimaryRequestResult>;
+  reconcile(bindingId: string, requestId: string, input: PrimarySubmission): Promise<PrimaryReconciliation>;
   question(bindingId: string, requestId: string, questionId: string): Promise<PrimaryQuestionResult>;
   reply(bindingId: string, requestId: string, questionId: string, input: PrimaryReplyInput): Promise<PrimaryQuestionResult>;
   captureTurn(bindingId: string, input: PrimaryTurn): Promise<PrimaryTurnReceipt>;
@@ -326,7 +334,19 @@ const submissionSchema = z.object({
 const turnSchema = z.object({
   sourceEventId: uuid, revision, itemId, role: z.enum(['user', 'assistant']), text: sourceText, occurredAt: timestamp,
 }).strict();
-const turnReceiptSchema = z.object({ bindingId: uuid, sourceEventId: uuid, revision, recordId: uuid, replayed: z.boolean() });
+const sha256 = z.string().regex(/^[0-9a-f]{64}$/);
+const turnReceiptSchema = z.object({ bindingId: uuid, sourceEventId: uuid, revision, recordId: uuid, replayed: z.boolean(),
+  revisionRecordId: uuid.optional(), bodyDigest: sha256.optional(),
+}).refine(value => (value.revisionRecordId === undefined) === (value.bodyDigest === undefined));
+const reconciliationSchema = z.discriminatedUnion('outcome', [
+  z.object({ outcome: z.literal('admitted'), requestId: uuid, bindingId: uuid, canonicalRequestId: uuid, result: requestSchema }).strict(),
+  z.object({ outcome: z.literal('not_admitted'), requestId: uuid, bindingId: uuid, proof: z.object({
+    schemaVersion: z.literal(1), kind: z.literal('phone_closed_call_non_admission'), callSid,
+    source: z.object({ itemId, sourceEventId: uuid, revision: z.literal(1), receivedAt: timestamp }).strict(),
+    rawSubmissionDigest: sha256,
+    turn: z.object({ recordId: uuid, revisionRecordId: uuid, bodyDigest: sha256 }).strict(), closedAt: timestamp,
+  }).strict() }).strict(),
+]);
 const closedSchema = z.object({ bindingId: uuid, callSid, state: z.literal('closed') });
 const readinessSchema = z.object({
   eligible: z.boolean(),
@@ -432,6 +452,28 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
       parse(uuid, requestId, 'invalid_request');
       return decodeResult(await request('GET', `/requests/${requestId}`, undefined, headers), bindingId, requestId, false);
     },
+    async reconcile(bindingId, requestId, input) {
+      const headers = bindingHeaders(bindingId);
+      parse(uuid, requestId, 'invalid_request');
+      const parsed = parse(submissionSchema, input, 'invalid_request');
+      const known = calls.get(bindingId);
+      if (known) same(parsed.source.callSid, known.callSid);
+      const { role, ...source } = parsed.source;
+      const result = parse(reconciliationSchema, await request('POST', `/requests/${requestId}/reconcile`,
+        { bindingId, role, text: parsed.text, source }, headers), 'invalid_response');
+      same(result.bindingId, bindingId); same(result.requestId, requestId);
+      if (result.outcome === 'admitted') {
+        return { ...result, result: decodeResult(result.result, bindingId, result.canonicalRequestId, false) };
+      }
+      same(result.proof.callSid, parsed.source.callSid);
+      for (const key of ['itemId', 'sourceEventId', 'revision', 'receivedAt'] as const) same(result.proof.source[key], parsed.source[key]);
+      same(result.proof.rawSubmissionDigest, rawSubmissionDigest(bindingId, parsed));
+      same(result.proof.turn.recordId, parsed.source.sourceEventId);
+      same(result.proof.turn.bodyDigest, turnBodyDigest({ sourceEventId: source.sourceEventId, revision: 1,
+        itemId: source.itemId, role, text: parsed.text, occurredAt: source.receivedAt }));
+      if (new Date(result.proof.closedAt).toISOString() !== result.proof.closedAt) throw new PrimaryApiError('invalid_response');
+      return result;
+    },
     async question(bindingId, requestId, questionId) {
       const headers = bindingHeaders(bindingId);
       parse(uuid, requestId, 'invalid_request'); parse(uuid, questionId, 'invalid_request');
@@ -457,6 +499,7 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
       const receipt = parse(turnReceiptSchema, await request('POST', `/calls/${bindingId}/turns`, turn, headers), 'invalid_response');
       same(receipt.bindingId, bindingId); same(receipt.sourceEventId, turn.sourceEventId); same(receipt.revision, turn.revision);
       same(receipt.recordId, turn.sourceEventId);
+      if (receipt.bodyDigest !== undefined) same(receipt.bodyDigest, turnBodyDigest(turn));
       return receipt;
     },
     async close(bindingId) {

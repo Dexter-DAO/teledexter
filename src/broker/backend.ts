@@ -1,15 +1,16 @@
 import { createHash } from 'node:crypto';
 import type { BrokerLiveBackend, LiveBackendChannel, LiveDelegationRequest, LiveTranscriptSnapshot } from '../live/session.js';
 import { LIVE_APPEND_MAX_BYTES } from '../live/session.js';
-import type { PrimaryApiClient, PrimaryApiErrorCode, PrimaryQuestion, PrimaryQuestionResult, PrimaryReplyInput, PrimaryResult, PrimarySubmission, PrimaryTurn } from './primaryApi.js';
+import type { PrimaryApiClient, PrimaryApiErrorCode, PrimaryClosedCall, PrimaryQuestion, PrimaryQuestionResult, PrimaryReconciliation, PrimaryReplyInput, PrimaryResult, PrimarySubmission, PrimaryTurn } from './primaryApi.js';
 import { PrimaryApiError } from './primaryApi.js';
-import type { BrokerCall, BrokerStore } from './store.js';
+import { terminalCallStatuses, type BrokerCall, type BrokerStore } from './store.js';
+import { acknowledgedTurn, originalTurn, turnBodyDigest, validateNonAdmissionProof, type AcknowledgedTurnReceipt } from './reconciliation.js';
 
 export interface PrimaryBackendOptions {
   callId: string;
   callSid: string;
   bindingId: string;
-  api: Pick<PrimaryApiClient, 'submit' | 'result' | 'captureTurn' | 'question' | 'reply'>;
+  api: Pick<PrimaryApiClient, 'submit' | 'result' | 'captureTurn' | 'question' | 'reply'> & Partial<Pick<PrimaryApiClient, 'reconcile'>>;
   store: Pick<BrokerStore, 'get' | 'update'>;
   stabilityMs?: number;
   maxWaitMs?: number;
@@ -31,6 +32,11 @@ export interface PrimaryBackend extends BrokerLiveBackend {
   }>;
   /** Reconcile uncertain admission with GET, then replay only exact journalled captures. */
   flushPendingCaptures(): Promise<{ pending: number; unsupported: string[] }>;
+  /** Capture the original source before closing admission for a finalized call. */
+  prepareCloseout(): Promise<void>;
+  /** Unresolved admission may cross the close fence only with an exact capture acknowledgement. */
+  closeoutPending(): number;
+  reconcileClosedRequests(closed: PrimaryClosedCall): Promise<{ pending: number }>;
 }
 
 export interface BrokerDelegationRecord {
@@ -41,7 +47,7 @@ export interface BrokerDelegationRecord {
   bindingId: string;
   sessionId: string;
   delegationIds: string[];
-  status: 'prepared' | 'dispatching' | 'dispatch_unknown' | 'queued' | 'running' | 'waiting_for_reply' | 'completed' | 'failed' | 'cancelled';
+  status: 'prepared' | 'dispatching' | 'dispatch_unknown' | 'queued' | 'running' | 'waiting_for_reply' | 'completed' | 'failed' | 'cancelled' | 'not_admitted';
   updatedAt: string;
   submission: PrimarySubmission;
   frozenCallerRevision: number;
@@ -59,6 +65,9 @@ export interface BrokerDelegationRecord {
   delivery?: string;
   submitError?: PrimaryApiDiagnostic;
   lastResultReadError?: PrimaryApiDiagnostic;
+  originalCapture?: { turn: PrimaryTurn; state: 'dispatching' | 'unknown' | 'accepted'; receipt?: AcknowledgedTurnReceipt };
+  reconciliation?: PrimaryReconciliation;
+  reconciliationError?: PrimaryApiDiagnostic;
   questions?: Record<string, BrokerQuestionRecord>;
   currentQuestionId?: string;
   questionNotice?: 'answer_too_long' | 'reply_unknown' | 'reply_refused' | 'question_unavailable' | 'answered_elsewhere';
@@ -93,7 +102,8 @@ export interface BrokerQuestionReplyRecord {
   refusal?: { origin: 'local_validation' | 'api_non_admission'; code: string; status?: number };
 }
 
-const terminal = (state: string) => ['completed', 'failed', 'cancelled'].includes(state);
+const terminal = (state: string) => ['completed', 'failed', 'cancelled', 'not_admitted'].includes(state);
+const admissionUnknown = (state: string) => ['prepared', 'dispatching', 'dispatch_unknown'].includes(state);
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const unresolvedReply = (reply: BrokerQuestionRecord['reply']) => reply && ['prepared', 'dispatching', 'unknown'].includes(reply.status);
@@ -242,7 +252,9 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       if (entry.version !== 1 || !uuidPattern.test(entry.requestId) || entry.callId !== options.callId
           || entry.callSid !== options.callSid || entry.bindingId !== options.bindingId
           || !Array.isArray(entry.delegationIds) || !entry.submission?.source
-          || !uuidPattern.test(entry.submission.source.sourceEventId)) throw new Error('invalid_saved_delegation');
+          || !uuidPattern.test(entry.submission.source.sourceEventId)
+          || entry.submission.source.callSid !== options.callSid || entry.submission.source.revision !== 1
+          || entry.submission.source.role !== 'user') throw new Error('invalid_saved_delegation');
       for (const [questionId, record] of Object.entries(entry.questions ?? {})) {
         if (record.question.id !== questionId || record.identityDigest !== questionIdentity(record.question))
           throw new Error('invalid_saved_question');
@@ -252,6 +264,25 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
             || !uuidPattern.test(reply.input.reply.clientReplyId) || !uuidPattern.test(reply.input.source.sourceEventId))
           throw new Error('invalid_saved_reply');
       }
+      if (entry.originalCapture) {
+        if (turnBodyDigest(entry.originalCapture.turn) !== turnBodyDigest(originalTurn(entry.submission)))
+          throw new Error('original_capture_changed');
+        if (entry.originalCapture.state === 'accepted')
+          acknowledgedTurn(options.bindingId, originalTurn(entry.submission), entry.originalCapture.receipt!);
+      }
+      if (entry.reconciliation) {
+        const reconciliation = entry.reconciliation;
+        if (reconciliation.requestId !== entry.requestId || reconciliation.bindingId !== options.bindingId)
+          throw new Error('invalid_saved_reconciliation');
+        if (reconciliation.outcome === 'admitted') {
+          if (!uuidPattern.test(reconciliation.canonicalRequestId) || reconciliation.result.requestId !== reconciliation.canonicalRequestId
+              || reconciliation.result.bindingId !== options.bindingId) throw new Error('invalid_saved_reconciliation');
+        } else {
+          const closed = boundCall(sessionId).primaryClosed;
+          if (!closed || !entry.originalCapture?.receipt || entry.status !== 'not_admitted') throw new Error('invalid_saved_reconciliation');
+          validateNonAdmissionProof(options.bindingId, entry.submission, entry.originalCapture.receipt, closed, reconciliation.proof);
+        }
+      } else if (entry.status === 'not_admitted') throw new Error('missing_non_admission_proof');
       return entry;
     }).filter(entry => entry.sessionId === sessionId);
   };
@@ -538,8 +569,9 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       return entry;
     });
   };
-  const applyResult = (entry: BrokerDelegationRecord, result: PrimaryResult): BrokerDelegationRecord => {
-    if (result.bindingId !== options.bindingId || result.requestId !== entry.requestId)
+  const applyResult = (entry: BrokerDelegationRecord, result: PrimaryResult,
+    reconciliation?: Extract<PrimaryReconciliation, { outcome: 'admitted' }>): BrokerDelegationRecord => {
+    if (result.bindingId !== options.bindingId || result.requestId !== (reconciliation?.canonicalRequestId ?? resultRequestId(entry)))
       throw new Error('primary_result_identity_mismatch');
     if (!['queued', 'running', 'waiting_for_reply', 'completed', 'failed', 'cancelled'].includes(result.state)
         || (result.state === 'completed' && !result.assistant?.text?.trim())) throw new Error('invalid_primary_result');
@@ -551,6 +583,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     if (result.question) current = observeQuestion(current, result.question);
     if (result.state === 'waiting_for_reply' && !result.question) throw new Error('invalid_primary_result');
     return save({ ...current, status: result.state, primaryResult: structuredClone(result),
+      ...(reconciliation ? { reconciliation: structuredClone(reconciliation) } : {}),
       ...(result.question ? { currentQuestionId: result.question.id } : {}),
       ...(result.assistant ? { result: result.assistant.text } : {}) });
   };
@@ -707,6 +740,19 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       + delegated.reduce((count, entry) => count + Object.values(entry.questions ?? {}).filter(record => unresolvedReply(record.reply)).length, 0)
       + Object.values(boundCall(sessionId).canonicalTurns ?? {}).filter(value => (value as CanonicalTurnRecord).state !== 'captured').length;
   };
+  const resultRequestId = (entry: BrokerDelegationRecord) => entry.reconciliation?.outcome === 'admitted'
+    ? entry.reconciliation.canonicalRequestId : entry.requestId;
+  const eligibleForClosedRecovery = (sessionId: string) => {
+    const call = boundCall(sessionId);
+    return !!call.endedAt && terminalCallStatuses.has(call.status) && call.transcriptCapture?.sessionFinalized === true;
+  };
+  const originalAcknowledged = (entry: BrokerDelegationRecord): boolean => {
+    if (entry.originalCapture?.state !== 'accepted' || !entry.originalCapture.receipt) return false;
+    acknowledgedTurn(options.bindingId, originalTurn(entry.submission), entry.originalCapture.receipt);
+    return true;
+  };
+  const sourceReady = (entry: BrokerDelegationRecord) => !admissionUnknown(entry.status)
+    || (eligibleForClosedRecovery(entry.sessionId) && originalAcknowledged(entry));
   const currentSession = () => {
     const sessionId = options.store.get(options.callId)?.liveSessionId;
     if (!sessionId) throw new Error('missing_live_session');
@@ -714,6 +760,58 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     return sessionId;
   };
   return {
+    async prepareCloseout() {
+      const sessionId = currentSession();
+      if (!eligibleForClosedRecovery(sessionId) || !options.api.reconcile) return;
+      await locked(async () => {
+        for (let entry of entries(sessionId)) {
+          if (!admissionUnknown(entry.status)) continue;
+          try { applyResult(entry, await options.api.result(options.bindingId, resultRequestId(entry))); continue; }
+          catch (error) { recordReadError(entry, error); }
+          entry = load(entry);
+          if (originalAcknowledged(entry)) continue;
+          const turn = originalTurn(entry.submission);
+          entry = save({ ...entry, originalCapture: { turn, state: 'dispatching' } });
+          try {
+            const receipt = acknowledgedTurn(options.bindingId, turn, await options.api.captureTurn(options.bindingId, structuredClone(turn)));
+            save({ ...load(entry), originalCapture: { turn, state: 'accepted', receipt } });
+          } catch { save({ ...load(entry), originalCapture: { turn, state: 'unknown' } }); }
+        }
+      });
+    },
+    closeoutPending() {
+      const sessionId = currentSession();
+      return pendingCount(sessionId) - entries(sessionId).filter(entry => admissionUnknown(entry.status)
+        && !!options.api.reconcile && sourceReady(entry)).length;
+    },
+    async reconcileClosedRequests(closed) {
+      const sessionId = currentSession();
+      const savedClosed = boundCall(sessionId).primaryClosed;
+      if (closed.bindingId !== options.bindingId || closed.callSid !== options.callSid || closed.state !== 'closed'
+          || savedClosed?.bindingId !== closed.bindingId || savedClosed.callSid !== closed.callSid
+          || savedClosed.state !== 'closed') throw new Error('closed_call_identity_mismatch');
+      await locked(async () => {
+        for (let entry of entries(sessionId)) {
+          if (!admissionUnknown(entry.status)) continue;
+          if (!eligibleForClosedRecovery(sessionId) || !originalAcknowledged(entry) || !options.api.reconcile) continue;
+          try {
+            const reconciliation = await options.api.reconcile(options.bindingId, entry.requestId, structuredClone(entry.submission));
+            if (reconciliation.bindingId !== options.bindingId || reconciliation.requestId !== entry.requestId)
+              throw new Error('reconciliation_identity_mismatch');
+            if (reconciliation.outcome === 'admitted') {
+              if (!uuidPattern.test(reconciliation.canonicalRequestId) || reconciliation.result.requestId !== reconciliation.canonicalRequestId)
+                throw new Error('reconciliation_identity_mismatch');
+              // Read identity and actual result commit together; the original submission stays untouched.
+              applyResult(entry, reconciliation.result, reconciliation);
+            } else {
+              validateNonAdmissionProof(options.bindingId, entry.submission, entry.originalCapture!.receipt!, closed, reconciliation.proof);
+              save({ ...load(entry), status: 'not_admitted', reconciliation: structuredClone(reconciliation) });
+            }
+          } catch (error) { save({ ...load(entry), reconciliationError: diagnostic(error) }); }
+        }
+      });
+      return { pending: pendingCount(sessionId) };
+    },
     persistAcousticEvidence() {
       const sessionId = currentSession();
       options.store.update(boundCall(sessionId).id, { acousticSpans: structuredClone(acousticSpans) });
@@ -738,8 +836,8 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
         const unsupported: string[] = [];
         for (let entry of entries(sessionId)) {
           if (['prepared', 'dispatching', 'dispatch_unknown'].includes(entry.status)) {
-            try { entry = applyResult(entry, await options.api.result(options.bindingId, entry.requestId)); }
-            catch (error) { recordReadError(entry, error); unsupported.push('source_admission_unknown'); continue; }
+            try { entry = applyResult(entry, await options.api.result(options.bindingId, resultRequestId(entry))); }
+            catch (error) { recordReadError(entry, error); unsupported.push('source_admission_unknown'); if (!sourceReady(entry)) continue; }
           }
           entry = await recoverReplies(entry);
           if (Object.values(entry.questions ?? {}).some(record => unresolvedReply(record.reply))) unsupported.push('reply_outcome_unknown');
@@ -761,7 +859,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
             const delegated = entries(sessionId).find(entry => entry.submission.source.sourceEventId === turn.sourceEventId);
             const reply = knownReply(sessionId, turn.sourceEventId);
             if (unresolvedReply(reply?.reply)) { unsupported.push('reply_outcome_unknown'); continue; }
-            if (delegated?.pendingCapture || (delegated && ['prepared', 'dispatching', 'dispatch_unknown'].includes(delegated.status))) {
+            if (delegated?.pendingCapture || (delegated && !sourceReady(delegated))) {
               unsupported.push('source_admission_unknown'); continue;
             }
             const receipt = await options.api.captureTurn(options.bindingId, payload);
@@ -808,7 +906,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
           const delegated = entries(sessionId).find(entry => entry.submission.source.sourceEventId === sourceEventId);
           const reply = knownReply(sessionId, sourceEventId);
           if (unresolvedReply(reply?.reply)) return 'reply_outcome_unknown';
-          if (delegated && ['prepared', 'dispatching', 'dispatch_unknown'].includes(delegated.status)) return 'source_admission_unknown';
+          if (delegated && !sourceReady(delegated)) return 'source_admission_unknown';
           if (delegated?.pendingCapture) return 'capture_outcome_unknown';
           const previous = current.canonicalTurns?.[sourceEventId] as CanonicalTurnRecord | undefined;
           if (previous && previous.state !== 'captured') return 'capture_outcome_unknown';
@@ -913,7 +1011,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
           if (Object.values(entry.questions ?? {}).some(record => unresolvedReply(record.reply)))
             entry = await locked(() => recoverReplies(entry!));
           if (!terminal(entry.status)) {
-            try { entry = applyResult(entry, await options.api.result(options.bindingId, entry.requestId)); }
+            try { entry = applyResult(entry, await options.api.result(options.bindingId, resultRequestId(entry))); }
             catch (error) { entry = recordReadError(entry, error); /* GET errors never authorize another POST. */ }
           }
           entry = await captureRevision(entry, channel);

@@ -17,6 +17,7 @@ export interface BrokerCall {
   canonicalTurns?: Record<string, unknown>;
   acousticSpans?: unknown;
   primaryClosePending?: boolean;
+  primaryClosed?: { bindingId: string; callSid: string; state: 'closed' };
   callback?: { requestId: string; consentedAt: string; state: 'requested' | 'started' | 'unavailable' };
   transcriptCapture?: {
     state: 'pending' | 'complete';
@@ -94,6 +95,12 @@ export class BrokerStore {
   update(id: string, patch: Partial<Omit<BrokerCall, 'id' | 'requestId' | 'number' | 'direction' | 'purpose' | 'createdAt'>>): BrokerCall {
     const previous = this.state.calls[id];
     if (!previous) throw new Error('Unknown broker call');
+    if (Object.prototype.hasOwnProperty.call(patch, 'primaryClosed')) {
+      const closed = patch.primaryClosed;
+      if (!closed || closed.state !== 'closed' || closed.bindingId !== previous.primary?.bindingId || closed.callSid !== previous.callSid
+          || (previous.primaryClosed && (closed.bindingId !== previous.primaryClosed.bindingId || closed.callSid !== previous.primaryClosed.callSid)))
+        throw new Error('Closed Primary binding cannot change');
+    }
     if (previous.callSid && patch.callSid && previous.callSid !== patch.callSid) throw new Error('Call SID cannot change');
     if (patch.callSid && Object.values(this.state.calls).some(call => call.id !== id && call.callSid === patch.callSid)) throw new Error('Call SID is already bound');
     const rank: Partial<Record<CallStatus, number>> = { prepared: 0, dialing: 1, queued: 2, ringing: 3, 'in-progress': 4 };

@@ -7,6 +7,7 @@ import { BrokerStore } from '../src/broker/store.js';
 import { createPrimaryBackend, literalPhoneAnswer, type PrimaryBackendOptions, type BrokerDelegationRecord } from '../src/broker/backend.js';
 import type { PrimaryQuestion, PrimaryQuestionResult, PrimaryReplyInput, PrimaryResult, PrimarySubmission, PrimaryTurn } from '../src/broker/primaryApi.js';
 import { PrimaryApiError } from '../src/broker/primaryApi.js';
+import { turnBodyDigest } from '../src/broker/reconciliation.js';
 import type { LiveBackendChannel, LiveBackendUpdate, LiveDelegationRequest, LiveTranscriptSnapshot } from '../src/live/session.js';
 
 const bindingId = '11111111-1111-5111-a111-111111111111';
@@ -642,6 +643,33 @@ test('unresolved admission keeps closeout pending and recovery only reads the or
   assert.ok(f.reads.every(id => id === f.posts[0].requestId));
 });
 
+test('finalized unknown submission captures original raw source before qualified later transcript revisions', async t => {
+  const f = await fixture(t, { maxPollMs: 10 }); f.add(' Read my'); f.speech();
+  f.behavior.submit = async () => { throw new Error('submit timeout'); };
+  f.behavior.result = async () => { throw new Error('not found yet'); };
+  await f.backend.delegate(f.request(), f.channel);
+  const original = structuredClone(f.saved()[0].submission);
+  f.add(' balance.', 1000, 1200); f.speech(1000, 1200);
+  await wait(8);
+  f.backend.persistAcousticEvidence();
+  const proof = { assistantPlaybackComplete: false, sessionFinalized: true };
+  f.store.update(f.call.id, { status: 'completed', endedAt: new Date().toISOString(), finalized: true,
+    transcriptCapture: { state: 'pending', pending: 1, unsupported: [], ...proof } });
+  f.api.reconcile = async () => { throw new Error('not yet closed'); };
+  const ordinaryCapture = f.api.captureTurn;
+  f.api.captureTurn = async (binding, turn) => ({ ...await ordinaryCapture(binding, turn),
+    revisionRecordId: '77777777-7777-4777-8777-777777777777', bodyDigest: turnBodyDigest(turn) });
+  const restored = createPrimaryBackend(f.options);
+  await restored.prepareCloseout();
+  const captured = await restored.captureCompletedTurns(f.channel.getContext(), proof);
+  assert.equal(captured.captured, 1);
+  assert.equal(restored.closeoutPending(), 0);
+  assert.deepEqual(f.captures.map(turn => [turn.revision, turn.text]), [[1, ' Read my'], [2, ' Read my balance.']]);
+  assert.deepEqual(f.saved()[0].submission, original);
+  assert.equal(f.saved()[0].originalCapture?.turn.text, ' Read my');
+  assert.equal(f.posts.length, 1);
+});
+
 test('a separate caller turn during a running request remains available after completion', async t => {
   const f = await fixture(t); f.add('Read my balance.'); f.speech();
   let entered!: () => void; const began = new Promise<void>(resolve => { entered = resolve; });
@@ -885,11 +913,13 @@ test('reply recovery stays pending across call end until the exact client reply 
   f.store.update(f.call.id, { endedAt: new Date().toISOString() });
   const restored = createPrimaryBackend(f.options);
   assert.deepEqual(await restored.flushPendingCaptures(), { pending: 1, unsupported: ['reply_outcome_unknown'] });
+  assert.equal(restored.closeoutPending(), 1);
   const capture = await restored.captureCompletedTurns(f.channel.getContext(), { assistantPlaybackComplete: true, sessionFinalized: true });
   assert.equal(capture.pending, 1); assert.ok(capture.unsupported.includes('reply_outcome_unknown'));
   assert.equal(f.captures.length, 0);
   accepted = answered(original, input);
   assert.deepEqual(await restored.flushPendingCaptures(), { pending: 0, unsupported: [] });
+  assert.equal(restored.closeoutPending(), 0);
   assert.equal(f.saved()[0].questions![firstQuestionId].reply!.status, 'accepted');
   assert.equal(f.store.get(f.call.id)!.canonicalTurns![input.source.sourceEventId] &&
     (f.store.get(f.call.id)!.canonicalTurns![input.source.sourceEventId] as { text: string }).text, 'Yes.');
