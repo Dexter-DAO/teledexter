@@ -4,11 +4,13 @@ The first useful demonstration is a phone conversation with Branch's existing Pr
 
 ## Release prerequisites
 
-The broker service, including callback and question handling, is running through the public /broker/ route. Shared API release `db30057` includes the Phone-link and worker-startup corrections. The installed Broker client's account-readiness check passed at 04:22 UTC on September 22, 2026. Restored GPT-Live credits and a successful audio preflight are required for the combined call trial. Inbound number routing remains unchanged. The readiness result proves pre-call account eligibility; voice and completed-call qualification remain outstanding. Use the accepted broker/API releases and the [controlled-call procedure](BROKER_OPERATIONS.md#controlled-call); retain their release receipts with the trial evidence.
+The broker service runs through the public `/broker/` route. On September 22, telephone trials carried two-way conversation, and shared API release `e8d7c0f8` accepted an account request that returned a fetched portfolio result. Broker `5bb987` failed to read that result to the caller after an interjection. The conversation repair must pass its full voice rehearsal before another arranged telephone trial. Inbound number routing remains unchanged. Use the accepted broker/API releases and the [controlled-call procedure](BROKER_OPERATIONS.md#controlled-call); retain their release receipts with the trial evidence.
 
 ## First conversation
 
 Place the already-authorized outbound test call to Branch's current linked number. Save its request ID before dispatch. Let Dexter introduce the purpose, then speak naturally: ask what is in the portfolio, listen to the answer, and ask a follow-up about something it actually returned. Judge the pace, pauses, interruptions, and whether the follow-up preserves context. Compare the spoken account facts with the identified Primary tool result and terminal assistant output.
+
+Write the call purpose as help Dexter will provide, such as "Read the caller's current portfolio and discuss their questions." Keep internal repair instructions out of that brief. Dexter must retrieve the balance rather than ask the caller to supply it. Include a natural interjection while the request runs and confirm the returned answer is still spoken afterward. A provider acknowledgment or audio byte count alone does not prove this.
 
 Exercise a saved question using a read-only preference, such as a concise portfolio overview versus position detail. Confirm that Primary saved the question, then answer on the phone and let the work finish. Keep the question ID, reply ID, and run ID before and after the answer. The answer must resume the same run. A question improvised only by the voice model does not qualify this step. If the saved question expires, Dexter should explain that state without claiming the answer was accepted.
 

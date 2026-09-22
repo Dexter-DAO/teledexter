@@ -5,6 +5,7 @@ import {
   createPrimaryApiClient, PrimaryApiError,
   type PrimaryApiOptions, type PrimaryProviderProof, type PrimarySubmission,
 } from '../src/broker/primaryApi.js';
+import { originalTurn, rawSubmissionDigest, turnBodyDigest } from '../src/broker/reconciliation.js';
 
 const bindingId = '11111111-1111-4111-8111-111111111111';
 const requestId = '22222222-2222-4222-8222-222222222222';
@@ -27,6 +28,36 @@ const proof: PrimaryProviderProof = {
 const submission: PrimarySubmission = { source: {
   callSid, itemId: 'item_caller_1', sourceEventId, revision: 1, receivedAt: when, role: 'user',
 }, text: 'Tell me my current portfolio.' };
+
+test('reconciliation sends exact original body without Idempotency-Key and validates stable capture/proof digests', async () => {
+  const raw = { ...submission, text: ' Original speech\t' };
+  const turn = originalTurn(raw);
+  const receipt = { bindingId, sourceEventId, revision: 1, recordId: sourceEventId, replayed: true,
+    revisionRecordId: messageId, bodyDigest: turnBodyDigest(turn) };
+  const proof = { schemaVersion: 1, kind: 'phone_closed_call_non_admission', callSid,
+    source: { itemId: raw.source.itemId, sourceEventId, revision: 1, receivedAt: when },
+    rawSubmissionDigest: rawSubmissionDigest(bindingId, raw),
+    turn: { recordId: sourceEventId, revisionRecordId: messageId, bodyDigest: receipt.bodyDigest }, closedAt: when };
+  const response = { outcome: 'not_admitted', bindingId, requestId, proof };
+  const { client, requests } = harness([json(receipt), json(response)]);
+  assert.deepEqual(await client.captureTurn(bindingId, turn), receipt);
+  assert.deepEqual(await client.reconcile(bindingId, requestId, raw), response);
+  assert.equal(requests[1].url, `https://api.example.test/internal/primary-dexter/channels/phone/requests/${requestId}/reconcile`);
+  assert.equal(new Headers(requests[1].init.headers).get('Idempotency-Key'), null);
+  assert.deepEqual(JSON.parse(String(requests[1].init.body)), { bindingId, role: 'user', text: raw.text,
+    source: { callSid, itemId: raw.source.itemId, sourceEventId, revision: 1, receivedAt: when } });
+  await assert.rejects(harness([json({ ...response, proof: { ...proof, rawSubmissionDigest: 'a'.repeat(64) } })])
+    .client.reconcile(bindingId, requestId, raw), code('identity_mismatch'));
+  await assert.rejects(harness([json({ ...receipt, bodyDigest: 'a'.repeat(64) })]).client.captureTurn(bindingId, turn), code('identity_mismatch'));
+});
+
+test('admitted reconciliation retains original envelope and validates the canonical result identity', async () => {
+  const response = { outcome: 'admitted', bindingId, requestId, canonicalRequestId: messageId,
+    result: { ...completed, requestId: messageId } };
+  assert.deepEqual(await harness([json(response)]).client.reconcile(bindingId, requestId, submission), response);
+  await assert.rejects(harness([json({ ...response, result: completed })]).client.reconcile(bindingId, requestId, submission), code('identity_mismatch'));
+  await assert.rejects(harness([json({ ...response, requestId: eventId })]).client.reconcile(bindingId, requestId, submission), code('identity_mismatch'));
+});
 
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
 const code = (expected: string) => (error: unknown) => error instanceof PrimaryApiError && error.code === expected;

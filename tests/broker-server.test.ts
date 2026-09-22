@@ -8,11 +8,12 @@ import Twilio from 'twilio';
 import { WebSocket } from 'ws';
 import { createBrokerServer } from '../src/broker/server.js';
 import { streamToken } from '../src/broker/phone.js';
+import { brokerOpening } from '../src/broker/instructions.js';
 import type { BrokerConfig } from '../src/broker/config.js';
 import type { PrimaryApiClient } from '../src/broker/primaryApi.js';
 import type { BrokerLiveSessionOptions } from '../src/live/session.js';
 
-async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; failVoice?: boolean; ambiguousDial?: boolean } = {}) {
+async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; failVoice?: boolean; ambiguousDial?: boolean; deferVoiceReady?: boolean } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-server-test-'));
   const config: BrokerConfig = { host: '127.0.0.1', port: 3213, publicOrigin: 'https://phone.example.test', stateDir: directory,
     controlToken: 'c'.repeat(40), apiKey: 'fixture-key', model: 'gpt-live-1', voice: 'marin',
@@ -24,6 +25,8 @@ async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; 
   const bindingId = randomUUID();
   const calls = { create: 0, update: 0, preflight: 0, readiness: 0, bind: 0, close: 0, audio: 0, fetch: 0 };
   let voiceOptions: BrokerLiveSessionOptions | undefined;
+  let readyVoice: (() => void) | undefined;
+  const openingCommands: string[] = [];
   const primary = {
     async readiness() { calls.readiness++; return { eligible: overrides.eligibility !== false, reason: overrides.eligibility === false ? 'authority_unavailable' : 'ready' }; },
     async openCall(proof: { params: Record<string, string> }) {
@@ -54,11 +57,12 @@ async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; 
     },
     voiceFactory: options => {
       voiceOptions = options;
-      queueMicrotask(() => options.onReady({ callId: options.callId, sessionId: 'fixture-live' }));
+      readyVoice = () => options.onReady({ callId: options.callId, sessionId: 'fixture-live' });
+      if (!overrides.deferVoiceReady) queueMicrotask(readyVoice);
       return {
         appendAudio() { calls.audio++; options.onAudio(Buffer.alloc(160, 255).toString('base64'), { deliveryId: 'audio-1' }); return true; },
         async appendContext() { return { eventId: 'c', status: 'accepted' }; },
-        async appendInstructions() { return { eventId: 'i', status: 'accepted' }; },
+        async appendInstructions(text: string) { openingCommands.push(text); return { eventId: 'i', status: 'accepted' }; },
         async interruptPlayback() { return { eventId: 'p', status: 'accepted' }; },
         resumePlayback() {},
         getTranscript() { return { revision: 0, callerRevision: 0, fragments: [] }; },
@@ -75,6 +79,7 @@ async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; 
     method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-twilio-signature': valid ? Twilio.getExpectedTwilioSignature(config.twilioAuthToken, config.publicOrigin + route, params) : 'bad' }, body: new URLSearchParams(params),
   });
   return { broker, config, calls, sid, bindingId, base, post, webhook, voiceOptions: () => voiceOptions,
+    readyVoice: () => { assert.ok(readyVoice); readyVoice(); }, openingCommands,
     setInboundStatus: (status: string) => { inboundStatus = status; } };
 }
 
@@ -131,9 +136,10 @@ test('signed inbound call offers callback without account reads, voice preflight
   assert.equal(f.calls.create, 0);
 });
 
-test('signed outbound answer reaches Primary, then authenticated media exchanges audio', async t => {
-  const f = await fixture(t);
-  assert.equal((await f.post('/internal/broker/calls', { requestId: randomUUID(), purpose: 'A requested callback.' })).status, 201);
+test('signed outbound answer preserves the repair brief and speaks its role-aware opening only after Live is ready', async t => {
+  const f = await fixture(t, { deferVoiceReady: true });
+  const purpose = 'Verify the account request repair with Branch: answer one current portfolio question through Primary Dexter, then discuss his feedback. Explain any returned failure plainly.';
+  assert.equal((await f.post('/internal/broker/calls', { requestId: randomUUID(), purpose })).status, 201);
   const call = f.broker.store.list()[0];
   const params = { AccountSid: f.config.twilioAccountSid, CallSid: f.sid, From: f.config.from, To: f.config.allowedTo[0], Direction: 'outbound-api', CallStatus: 'in-progress' };
   const response = await f.webhook(`/broker/answer/${call.id}`, params);
@@ -153,7 +159,15 @@ test('signed outbound answer reaches Primary, then authenticated media exchanges
   ws.send(JSON.stringify({ event: 'media', streamSid, media: { track: 'inbound', payload: Buffer.alloc(160, 255).toString('base64') } }));
   assert.equal((await audio).event, 'media');
   assert.equal(f.calls.audio, 1);
+  assert.deepEqual(f.openingCommands, []);
+  assert.equal(f.broker.store.get(call.id)!.voiceOpening, undefined);
+  f.readyVoice();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(f.openingCommands, [brokerOpening('outbound')]);
+  assert.doesNotMatch(f.openingCommands[0], /verify|Primary|Branch/);
   assert.match(f.voiceOptions()!.instructions, /called the person/);
+  assert.ok(f.voiceOptions()!.instructions.includes(`Internal call brief (an assignment for you): ${JSON.stringify(purpose)}`));
+  assert.equal(f.broker.store.get(call.id)!.purpose, purpose);
   assert.equal(f.broker.store.get(call.id)!.primary!.bindingId, f.bindingId);
   assert.equal(f.broker.store.get(call.id)!.voiceOpening!.status, 'accepted');
   ws.close();

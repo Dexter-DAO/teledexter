@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { WebSocket as Socket } from 'ws';
 import type { BrokerConfig } from '../src/broker/config.js';
 import type { PrimaryApiClient, PrimaryRequestResult } from '../src/broker/primaryApi.js';
@@ -11,11 +11,11 @@ import type { createBrokerServer as ServerFactory } from '../src/broker/server.j
 
 // Executes funded Live calls only when an operator runs this script. Twilio,
 // account identity, Primary requests, and playback receipts are local fixtures.
-const usage = 'node --import tsx scripts/qualify-live-phone.mts --module-root /absolute/release --evidence-dir /new/absolute/directory --config-file /absolute/production.env [--input-audio /absolute/caller.pcmu]';
+const usage = 'node --import tsx scripts/qualify-live-phone.mts --module-root /absolute/release --module-variant src|dist --evidence-dir /new/absolute/directory --config-file /absolute/production.env [--input-audio /absolute/caller.pcmu] [--interjection-audio /absolute/interjection.pcmu --call-purpose-file /absolute/purpose.txt]';
 const args = new Map<string, string>();
 for (let i = 2; i < process.argv.length; i += 2) {
   const key = process.argv[i];
-  if (!['--module-root', '--module-variant', '--evidence-dir', '--config-file', '--input-audio', '--instructions-file'].includes(key) || !process.argv[i + 1] || args.has(key)) throw new Error(usage);
+  if (!['--module-root', '--module-variant', '--evidence-dir', '--config-file', '--input-audio', '--instructions-file', '--interjection-audio', '--call-purpose-file'].includes(key) || !process.argv[i + 1] || args.has(key)) throw new Error(usage);
   args.set(key, process.argv[i + 1]);
 }
 function absolute(flag: string, required = true) {
@@ -29,6 +29,72 @@ const evidenceDir = absolute('--evidence-dir')!;
 const configFile = absolute('--config-file')!;
 const audioFile = absolute('--input-audio', false);
 const instructionsFile = absolute('--instructions-file', false);
+const interjectionFile = absolute('--interjection-audio', false);
+const callPurposeFile = absolute('--call-purpose-file', false);
+if (interjectionFile && !audioFile) throw new Error('--interjection-audio requires --input-audio');
+if (interjectionFile && instructionsFile) throw new Error('Interjection qualification must use the production voice instructions');
+const conversationScenario = Boolean(interjectionFile);
+const hardDeadlineMs = conversationScenario ? 88_000 : 58_000;
+const conversationDeadlineMs = hardDeadlineMs - 18_000;
+const fixtureResult = conversationScenario
+  ? 'Your test portfolio is worth $1,250 in total: $250 in USDC and $1,000 in SOL.'
+  : 'Your test phrase is blue lantern.';
+const portfolioFacts = [
+  { label: 'portfolio total', amountUsd: 1250, labelPattern: /\b(?:portfolio|total|overall)\b/ },
+  { label: 'USDC', amountUsd: 250, labelPattern: /\busdc\b/ },
+  { label: 'SOL', amountUsd: 1000, labelPattern: /\b(?:sol|solana)\b/ },
+];
+function spokenPortfolioFacts(text: string) {
+  // Consume the whole amount before checking smaller values: neither “1,250”
+  // nor “one thousand two hundred fifty” also proves the separate holdings.
+  const normalized = text.toLowerCase().replace(/-/g, ' ')
+    .replace(/\b(?:one thousand(?: and)? two hundred(?: and)? fifty|twelve hundred(?: and)? fifty)\b/g, 'amount_1250')
+    .replace(/\b(?:one thousand|a thousand)\b/g, 'amount_1000')
+    .replace(/\btwo hundred(?: and)? fifty\b/g, 'amount_250')
+    .replace(/\b\d[\d,]*(?:\.\d+)?\b/g, value => `amount_${Number(value.replace(/,/g, ''))}`);
+  let clauses = normalized.split(/[,;.!?]|\band\b/);
+  const totalConfirmed = clauses.some(clause => /\b(?:portfolio|total|overall)\b/.test(clause) && /\bamount_1250\b/.test(clause));
+  const solConfirmed = clauses.some(clause => /\b(?:sol|solana)\b/.test(clause) && /\bamount_1000\b/.test(clause));
+  const explicitSmallAmount = /\bcents?\b|\b2[.,]50\b|\btwo (?:dollars? (?:and )?fifty|point five(?: zero)?)\b/i.test(text);
+  // In this fixture, 1,250 total minus 1,000 in SOL establishes 250 in USDC.
+  // Accept colloquial “two fifty” only with that context and a direct USDC link.
+  if (totalConfirmed && solConfirmed && !explicitSmallAmount) clauses = clauses.map(clause =>
+    /\btwo fifty(?: dollars?)? (?:in|of|worth of) usdc\b|\busdc(?: balance| holdings?| value)? (?:is|are|at|worth|is worth) two fifty\b|\busdc\s*:\s*two fifty\b/.test(clause)
+      ? clause.replace(/\btwo fifty\b/g, 'amount_250') : clause);
+  return portfolioFacts.map(({ label, amountUsd, labelPattern }) => ({
+    label, amountUsd,
+    spoken: clauses.some(clause => labelPattern.test(clause) && new RegExp(`\\bamount_${amountUsd}\\b`).test(clause)),
+  }));
+}
+function assessConversationTranscript(assistantText: string) {
+  const evidence = (patterns: RegExp[]) => patterns.flatMap(pattern => {
+    const match = pattern.exec(assistantText);
+    return match ? [assistantText.slice(Math.max(0, match.index - 45), match.index + match[0].length + 85).trim()] : [];
+  });
+  const internalBriefEvidence = evidence([
+    /\b(?:repair|implementation|debug(?:ging)?|regression|reconciliation|deployment|backend|API|runtime)\b/i,
+    /\b(?:Primary Dexter|test harness|test procedure|verification procedure)\b/i,
+  ]);
+  // This scenario has one successful fixture result and no failed account work.
+  const unsupportedFailureEvidence = evidence([
+    /\b(?:failed|failure|rejected|unsuccessful|broken)\b/i,
+    /\bneeds?\s+(?:a\s+)?(?:fix|repair)\b/i,
+    /\b(?:could(?:n['’]?t| not)|did(?:n['’]?t| not)|unable to|cannot|can['’]?t)\s+(?:go through|complete|process|submit|execute|perform)\b/i,
+  ]);
+  const callerFactQuizEvidence = evidence([
+    /\b(?:can|could|would|will)\s+you\s+(?:please\s+)?(?:tell|give|read|state|confirm|check|verify|look up)\b[^.!?]{0,100}\b(?:balance|holdings|portfolio|USDC|SOL)\b/i,
+    /(?:^|[.!?])\s*(?:please\s+)?(?:tell|give|read(?: out)?|state|confirm|check|verify|look up)\s+(?:me\s+)?(?:your|the|what|how much)\b[^.!?]{0,100}\b(?:balance|holdings|portfolio|USDC|SOL)\b/i,
+    /\bwhat(?:['’]s| is| are)\s+(?:your|the)\s+(?:current\s+)?(?:balance|holdings|portfolio(?:\s+(?:value|total|holdings))?)(?!\s+(?:question|request))\b/i,
+    /\bhow\s+much\s+(?:USDC\s+|SOL\s+)?(?:do|are)\s+you\s+(?:currently\s+)?(?:have|hold|holding)\b/i,
+  ]);
+  return {
+    internalBriefEvidence, unsupportedFailureEvidence, callerFactQuizEvidence,
+    internalBriefKeptPrivate: internalBriefEvidence.length === 0,
+    successfulResultDescribedAccurately: unsupportedFailureEvidence.length === 0,
+    agentKeepsAccountLookupResponsibility: callerFactQuizEvidence.length === 0,
+    accepted: internalBriefEvidence.length === 0 && unsupportedFailureEvidence.length === 0 && callerFactQuizEvidence.length === 0,
+  };
+}
 const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 for (const root of [moduleRoot, sourceRoot]) {
   const relative = path.relative(root, evidenceDir);
@@ -65,6 +131,20 @@ let simulatedClearedBytes = 0;
 let speechOffset = 0;
 let speechStartedAt: number | undefined;
 let speechEndedAt: number | undefined;
+let interjectionOffset = 0;
+let interjectionStartedAt: number | undefined;
+let interjectionEndedAt: number | undefined;
+let interjectionInputStartMs: number | undefined;
+let firstSubmitAt: number | undefined;
+let firstSubmitCallerRevision: number | undefined;
+let interjectionStartCallerRevision: number | undefined;
+let lastCallerTranscriptAt = 0;
+let resultReleasedAt: number | undefined;
+let resultReleaseTranscriptRevision: number | undefined;
+let resultCallerRevision: number | undefined;
+let resultReleaseOutputBytes = 0;
+let audiblePlaybackUntil = 0;
+let purposeDigest: string | undefined;
 let greetingAt: number | undefined;
 let controlledCloseAt: number | undefined;
 let peakEnergy = 0;
@@ -74,28 +154,65 @@ const code = (error: unknown) => {
   return typeof candidate === 'string' && /^[a-zA-Z0-9_:-]{1,100}$/.test(candidate) ? candidate : 'qualification_error';
 };
 const note = (value: Record<string, unknown>) => { events.push({ elapsedMs: Date.now() - startedAt, ...value }); };
+function conversationChecks() {
+  const submissions = primaryCalls.filter(x => x.method === 'submit');
+  const originalFirstTurn = snapshot.fragments.filter(x => x.role === 'user'
+    && (interjectionInputStartMs === undefined || x.startMs < interjectionInputStartMs)).map(x => x.text).join('');
+  const interjectionTranscript = snapshot.fragments.filter(x => x.role === 'user'
+    && interjectionInputStartMs !== undefined && x.startMs >= interjectionInputStartMs).map(x => x.text).join('');
+  const resultTranscript = snapshot.fragments.filter(x => x.role === 'assistant'
+    && resultReleaseTranscriptRevision !== undefined && x.sequence > resultReleaseTranscriptRevision).map(x => x.text).join('');
+  const facts = spokenPortfolioFacts(resultTranscript);
+  const transcriptAcceptance = assessConversationTranscript(snapshot.fragments.filter(x => x.role === 'assistant').map(x => x.text).join(''));
+  return {
+    originalFirstTurn, interjectionTranscript, resultTranscript, facts, transcriptAcceptance,
+    exactlyOneSubmit: submissions.length === 1,
+    noFollowupAction: submissions.length === 1 && !primaryCalls.some(x => x.method === 'question' || x.method === 'reply'),
+    originalFirstTurnPreserved: submissions.length === 1 && originalFirstTurn.length > 0 && String(submissions[0].text).trim() === originalFirstTurn.trim(),
+    laterCallerRevision: firstSubmitCallerRevision !== undefined && interjectionStartCallerRevision !== undefined
+      && resultCallerRevision !== undefined && resultCallerRevision > firstSubmitCallerRevision && resultCallerRevision > interjectionStartCallerRevision,
+    interjectionBeforeResult: firstSubmitAt !== undefined && interjectionStartedAt !== undefined && interjectionEndedAt !== undefined
+      && resultReleasedAt !== undefined && firstSubmitAt < interjectionStartedAt && interjectionEndedAt < resultReleasedAt && interjectionTranscript.length > 0,
+    resultFactsSpoken: resultReleasedAt !== undefined && facts.every(fact => fact.spoken)
+      && lastAudioAt > resultReleasedAt && simulatedPlayedBytes > resultReleaseOutputBytes,
+  };
+}
 function writeEvidence() {
   const call = callId ? broker?.store.get(callId) : broker?.store.list()[0];
   const callerTranscript = snapshot.fragments.filter(x => x.role === 'user').map(x => x.text).join('');
   const assistantTranscript = snapshot.fragments.filter(x => x.role === 'assistant').map(x => x.text).join('');
   const outputBytes = audio.reduce((n, chunk) => n + chunk.length, 0);
   const submissions = primaryCalls.filter(x => x.method === 'submit');
-  const callerSubmissionComplete = !audioFile || (submissions.length === 1
+  const conversation = conversationChecks();
+  const callerSubmissionComplete = conversationScenario ? conversation.originalFirstTurnPreserved : !audioFile || (submissions.length === 1
     && String(submissions[0].text).trim() === callerTranscript.trim());
-  const returnedResultSpoken = !audioFile || /blue lantern/i.test(assistantTranscript);
+  const returnedResultSpoken = conversationScenario ? conversation.resultFactsSpoken : !audioFile || /blue lantern/i.test(assistantTranscript);
   const passed = !failure && !call?.failure && outputBytes > 0 && peakEnergy > 0.01 && assistantTranscript.length > 0
     && closed?.finalized === true && call?.finalized === true && call?.primaryClosePending === false
     && call?.transcriptCapture?.state === 'complete'
     && (!audioFile || callerTranscript.length > 0) && callerSubmissionComplete && returnedResultSpoken
+    && (!conversationScenario || (conversation.exactlyOneSubmit && conversation.noFollowupAction && conversation.laterCallerRevision && conversation.interjectionBeforeResult && conversation.transcriptAcceptance.accepted))
     && greetingAt !== undefined && (!speechStartedAt || greetingAt < speechStartedAt);
+  const conversationFailure = conversationScenario && !conversation.transcriptAcceptance.accepted
+    ? { stage: 'conversation_acceptance', code: !conversation.transcriptAcceptance.successfulResultDescribedAccurately
+      ? 'unsupported_account_failure_spoken' : !conversation.transcriptAcceptance.internalBriefKeptPrivate
+        ? 'internal_call_brief_spoken' : 'caller_asked_to_supply_account_facts' }
+    : null;
   const report = {
-    passed, stage, failure: failure ?? (call?.failure ? { stage: 'live_session', code: call.failure.code } : null),
+    passed, stage, failure: failure ?? (call?.failure ? { stage: 'live_session', code: call.failure.code } : conversationFailure),
     elapsedMs: Date.now() - startedAt, moduleRoot, moduleVariant,
     scope: { real: ['Broker server', 'Live preflight', 'Live session', 'provider audio and transcripts'],
       simulated: ['Twilio dispatch and callbacks', 'phone playback receipts', 'Primary account and results'],
-      dummyPrimaryResult: 'Your test phrase is blue lantern.', productionAccountAccess: false },
+      dummyPrimaryResult: fixtureResult, productionAccountAccess: false },
     preflight, callId, outputBytes, peakEnergy, inputFrames, inputAudioFile: audioFile ?? null, instructionsOverride: instructionsFile ?? null,
+    scenario: conversationScenario ? 'portfolio_with_interjection' : 'test_phrase', interjectionAudioFile: interjectionFile ?? null,
+    callPurposeFile: callPurposeFile ?? null, purposeDigest, hardDeadlineMs,
     speechStartedAt, speechEndedAt, greetingAt, controlledCloseAt, simulatedPlayedBytes, simulatedClearedBytes,
+    playbackEvidence: { kind: 'simulated_receipts', assistantPlaybackComplete: call?.transcriptCapture?.assistantPlaybackComplete === true,
+      lastAudiblePlaybackUntil: audiblePlaybackUntil, playbackQueueUntil: playbackUntil,
+      limitation: 'Transcript facts and paced simulated receipts establish the result check. Complete assistant capture additionally requires assistantPlaybackComplete; close-time discarded audio remains unconfirmed.' },
+    firstSubmitAt, firstSubmitCallerRevision, interjectionStartedAt, interjectionEndedAt, interjectionInputStartMs,
+    interjectionStartCallerRevision, resultReleasedAt, resultCallerRevision, conversation: conversationScenario ? conversation : null,
     callerTranscript, assistantTranscript, callerSubmissionComplete, returnedResultSpoken, closed, call, primaryCalls, providerCalls,
     baselineInvalidOutputAudio: call?.failure?.code === 'invalid_output_audio' && outputBytes === 0,
   };
@@ -120,7 +237,7 @@ const deadlineTimer = setTimeout(() => {
   writeEvidence();
   console.log(JSON.stringify({ passed: false, failure, evidenceDir }));
   process.exit(1);
-}, 58_000);
+}, hardDeadlineMs);
 
 try {
   // Whitelist three values; never source production.env or import its account,
@@ -133,6 +250,11 @@ try {
   if (!selected.OPENAI_API_KEY) throw Object.assign(new Error(), { code: 'missing_openai_key' });
   const callerAudio = audioFile ? fs.readFileSync(audioFile) : undefined;
   if (callerAudio && (!callerAudio.length || callerAudio.length > 120_000)) throw Object.assign(new Error(), { code: 'caller_audio_must_be_raw_8khz_pcmu_under_15_seconds' });
+  const interjectionAudio = interjectionFile ? fs.readFileSync(interjectionFile) : undefined;
+  if (interjectionAudio && (!interjectionAudio.length || interjectionAudio.length > 80_000)) throw Object.assign(new Error(), { code: 'interjection_audio_must_be_raw_8khz_pcmu_under_10_seconds' });
+  const purpose = callPurposeFile ? fs.readFileSync(callPurposeFile, 'utf8') : 'This is a brief voice qualification test. Greet the test caller and ask how you can help.';
+  if (!purpose.trim() || purpose.length > 1500) throw Object.assign(new Error(), { code: 'invalid_call_purpose_fixture' });
+  purposeDigest = createHash('sha256').update(purpose).digest('hex');
   const requireFromModule = createRequire(path.join(moduleRoot, 'package.json'));
   const Twilio = requireFromModule('twilio') as typeof import('twilio');
   const { WebSocket } = requireFromModule('ws') as typeof import('ws');
@@ -149,7 +271,7 @@ try {
     model: selected.BROKER_LIVE_MODEL || 'gpt-live-1', voice: selected.BROKER_LIVE_VOICE || 'marin',
     twilioAccountSid: `AC${'1'.repeat(32)}`, twilioAuthToken: 'qualification-twilio-dummy-secret',
     from: '+12025550100', allowedTo: ['+12025550123'], apiBaseUrl: 'http://127.0.0.1:1',
-    phoneServiceSecret: 'qualification-primary-'.repeat(3), maxCallSeconds: 45 };
+    phoneServiceSecret: 'qualification-primary-'.repeat(3), maxCallSeconds: conversationScenario ? 75 : 45 };
   const sid = `CA${'2'.repeat(32)}`;
   const bindingId = randomUUID();
   const context = { primaryDexterId: randomUUID(), threadId: randomUUID(), displayName: 'Qualification owner', messages: [] };
@@ -163,22 +285,42 @@ try {
     async getContext() { return { bindingId, callSid: sid, state: 'open', context }; },
     async submit(id, requestId, input) {
       if (id !== bindingId) throw Object.assign(new Error(), { code: 'fixture_binding_mismatch' });
-      primaryCalls.push({ method: 'submit', requestId, text: input.text });
+      firstSubmitAt ??= Date.now();
+      firstSubmitCallerRevision ??= snapshot.callerRevision;
+      primaryCalls.push({ method: 'submit', requestId, text: input.text, elapsedMs: Date.now() - startedAt, callerRevision: snapshot.callerRevision });
+      if (conversationScenario) {
+        const pending: PrimaryRequestResult = { bindingId, requestId, state: 'running' };
+        requests.set(requestId, pending);
+        return pending;
+      }
       const result: PrimaryRequestResult = { bindingId, requestId, state: 'completed', assistant: {
-        messageId: randomUUID(), eventId: randomUUID(), sequence: '1', text: 'Your test phrase is blue lantern.' } };
+        messageId: randomUUID(), eventId: randomUUID(), sequence: '1', text: fixtureResult } };
       requests.set(requestId, result); return result;
     },
     async result(_id, requestId) {
       primaryCalls.push({ method: 'result', requestId });
-      const result = requests.get(requestId);
+      let result = requests.get(requestId);
       if (!result) throw Object.assign(new Error(), { code: 'fixture_request_missing' });
+      const laterCaller = interjectionStartCallerRevision !== undefined && snapshot.callerRevision > interjectionStartCallerRevision
+        && conversationChecks().interjectionTranscript.length > 0;
+      if (conversationScenario && result.state === 'running' && interjectionEndedAt !== undefined && laterCaller
+        && Date.now() - interjectionEndedAt >= 1800 && Date.now() - lastCallerTranscriptAt >= 1500) {
+        resultReleasedAt ??= Date.now();
+        resultReleaseTranscriptRevision ??= snapshot.revision;
+        resultCallerRevision ??= snapshot.callerRevision;
+        resultReleaseOutputBytes = audio.reduce((n, chunk) => n + chunk.length, 0);
+        result = { bindingId, requestId, state: 'completed', assistant: {
+          messageId: randomUUID(), eventId: randomUUID(), sequence: '1', text: fixtureResult } };
+        requests.set(requestId, result);
+        note({ type: 'fixture.primary_result_released', requestId, callerRevision: snapshot.callerRevision });
+      }
       return result;
     },
-    async question() { throw Object.assign(new Error(), { code: 'fixture_question_not_configured' }); },
-    async reply() { throw Object.assign(new Error(), { code: 'fixture_question_not_configured' }); },
+    async question() { primaryCalls.push({ method: 'question' }); throw Object.assign(new Error(), { code: 'fixture_question_not_configured' }); },
+    async reply() { primaryCalls.push({ method: 'reply' }); throw Object.assign(new Error(), { code: 'fixture_question_not_configured' }); },
     async captureTurn(_id, input) {
       primaryCalls.push({ method: 'captureTurn', role: input.role, text: input.text });
-      return { bindingId, sourceEventId: input.sourceEventId, revision: input.revision, recordId: randomUUID(), replayed: false };
+      return { bindingId, sourceEventId: input.sourceEventId, revision: input.revision, recordId: input.sourceEventId, replayed: false };
     },
     async close() { primaryCalls.push({ method: 'close', bindingId }); return { bindingId, callSid: sid, state: 'closed' }; },
   };
@@ -204,6 +346,7 @@ try {
         }) };
       },
       onTranscript: value => {
+        if (value.callerRevision > snapshot.callerRevision) lastCallerTranscriptAt = Date.now();
         snapshot = value;
         if (greetingAt === undefined && /dexter/i.test(value.fragments.filter(f => f.role === 'assistant').map(f => f.text).join(''))) greetingAt = Date.now();
         return options.onTranscript(value);
@@ -217,7 +360,7 @@ try {
   const post = (route: string, value: unknown) => fetch(base + route, { method: 'POST', signal: AbortSignal.timeout(17_000),
     headers: { authorization: `Bearer ${config.controlToken}`, 'content-type': 'application/json' }, body: JSON.stringify(value) });
   stage = 'outbound_admission';
-  const admission = await post('/internal/broker/calls', { requestId: randomUUID(), purpose: 'This is a brief voice qualification test. Greet the test caller and ask how you can help.' });
+  const admission = await post('/internal/broker/calls', { requestId: randomUUID(), purpose });
   const admitted = await admission.json() as { call?: { id: string }; error?: string };
   callId = admitted.call?.id ?? broker.store.list()[0]?.id;
   if (admission.status !== 201 || !callId) throw Object.assign(new Error(), { code: broker.store.list()[0]?.failure?.code || 'outbound_admission_failed' });
@@ -245,6 +388,7 @@ try {
       peakEnergy = Math.max(peakEnergy, energy);
       pendingMarkBytes += bytes.length;
       playbackUntil = Math.max(Date.now(), playbackUntil) + bytes.length / 8;
+      if (energy > 0.01) audiblePlaybackUntil = playbackUntil;
     } else if (frame.event === 'mark') {
       const bytes = pendingMarkBytes; pendingMarkBytes = 0;
       const timer = setTimeout(() => {
@@ -278,19 +422,32 @@ try {
       const end = Math.min(speechOffset + 160, callerAudio.length);
       callerAudio.copy(bytes, 0, speechOffset, end); speechOffset = end;
       if (speechOffset === callerAudio.length) speechEndedAt = now;
+    } else if (interjectionAudio && firstSubmitAt !== undefined && speechEndedAt !== undefined) {
+      if (interjectionStartedAt === undefined && now > firstSubmitAt + 500 && now > speechEndedAt + 1500 && quiet) {
+        interjectionStartedAt = now;
+        interjectionInputStartMs = inputFrames * 20;
+        interjectionStartCallerRevision = snapshot.callerRevision;
+        note({ type: 'fixture.interjection_started', callerRevision: snapshot.callerRevision, inputStartMs: interjectionInputStartMs });
+      }
+      if (interjectionStartedAt !== undefined && interjectionOffset < interjectionAudio.length) {
+        const end = Math.min(interjectionOffset + 160, interjectionAudio.length);
+        interjectionAudio.copy(bytes, 0, interjectionOffset, end); interjectionOffset = end;
+        if (interjectionOffset === interjectionAudio.length) interjectionEndedAt = now;
+      }
     }
     socket.send(JSON.stringify({ event: 'media', streamSid, media: { track: 'inbound', chunk: String(++inputFrames), timestamp: String((inputFrames - 1) * 20), payload: bytes.toString('base64') } }));
   }, 20);
-  while (!closed && Date.now() - startedAt < 40_000) {
+  while (!closed && Date.now() - startedAt < conversationDeadlineMs) {
     await new Promise(resolve => setTimeout(resolve, 100));
     const quiet = lastAudioAt > 0 && Date.now() - lastAudioAt > 1500;
     const callerDone = !callerAudio || (speechEndedAt !== undefined && Date.now() - speechEndedAt > 5000 && snapshot.callerRevision > 0);
-    if (quiet && callerDone && peakEnergy > 0.01 && snapshot.fragments.some(x => x.role === 'assistant') && Date.now() - mediaStarted > 5000) break;
+    const scenarioDone = !conversationScenario || (conversationChecks().resultFactsSpoken && Date.now() - audiblePlaybackUntil > 1500);
+    if (quiet && callerDone && scenarioDone && peakEnergy > 0.01 && snapshot.fragments.some(x => x.role === 'assistant') && Date.now() - mediaStarted > 5000) break;
   }
   stage = 'controlled_close';
   controlledCloseAt = Date.now();
   if (!closed) await post('/internal/broker/end', { id: callId }).then(response => response.arrayBuffer());
-  while (broker.store.get(callId)?.primaryClosePending && Date.now() - startedAt < 56_000) await new Promise(resolve => setTimeout(resolve, 50));
+  while (broker.store.get(callId)?.primaryClosePending && Date.now() - startedAt < hardDeadlineMs - 2000) await new Promise(resolve => setTimeout(resolve, 50));
   stage = 'complete';
   completed = true;
 } catch (error) {
