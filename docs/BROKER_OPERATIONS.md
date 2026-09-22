@@ -4,9 +4,11 @@ The broker connects Twilio telephone audio to GPT-Live and delegates account wor
 
 ## Release state
 
-As of September 22, 2026, the Broker service and shared Phone API are deployed. OpenAI credits are available. The first outbound telephone trial reached the linked account, then failed before speech because the adapter incorrectly required an event ID on Live audio chunks.
+As of September 22, 2026, the Broker service and shared Phone API are deployed. OpenAI credits are available. The first outbound telephone trial failed before speech because the adapter incorrectly required an event ID on Live audio chunks. That protocol repair is deployed; the next telephone trial carried two-way conversation and reached the linked account.
 
-The protocol repair accepts the documented audio shape, handles the SDK's duplicate error notification, preserves complete caller phrases despite approximate transcript timestamps, and separates the voice prompt from account history. An integrated check with the actual server and GPT-Live has exercised the opening, recorded caller speech, complete request submission, spoken result, and final session closure. Twilio and Primary account responses were fixtures in that check. Deployment and the next actual telephone trial remain pending; this evidence does not establish financial execution or conversation quality on a telephone.
+Account functionality is still being repaired. The first Primary request returned HTTP 503, and result recovery returned no saved request. Its outcome remains unknown in the journal. A disposable PostgreSQL test reproduced a defect in the old submission path: a transcript beginning with a space violates the Primary message constraint. The API correction preserves the raw transcript and submits a normalized rendering with explicit memory lineage. The original live exception was not logged, so the reproduction does not establish the exact production exception.
+
+The Broker successor records bounded API error details and speaks promptly when submission is uncertain, followed by periodic progress while checking the original request. It never repeats that submission to obtain a result. Source tests and package checks precede deployment; account execution still needs a successful telephone trial after both corrections are released.
 
 Use the health endpoint and the operator call journal for the selected code and actual call outcomes. Keep release acceptance and call evidence separate. Broader provider-backed memory recall remains disabled.
 

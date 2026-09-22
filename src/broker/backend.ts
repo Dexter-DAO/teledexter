@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { BrokerLiveBackend, LiveBackendChannel, LiveDelegationRequest, LiveTranscriptSnapshot } from '../live/session.js';
 import { LIVE_APPEND_MAX_BYTES } from '../live/session.js';
-import type { PrimaryApiClient, PrimaryQuestion, PrimaryQuestionResult, PrimaryReplyInput, PrimaryResult, PrimarySubmission, PrimaryTurn } from './primaryApi.js';
+import type { PrimaryApiClient, PrimaryApiErrorCode, PrimaryQuestion, PrimaryQuestionResult, PrimaryReplyInput, PrimaryResult, PrimarySubmission, PrimaryTurn } from './primaryApi.js';
 import { PrimaryApiError } from './primaryApi.js';
 import type { BrokerCall, BrokerStore } from './store.js';
 
@@ -15,6 +15,7 @@ export interface PrimaryBackendOptions {
   maxWaitMs?: number;
   pollIntervalMs?: number;
   maxPollMs?: number;
+  progressIntervalMs?: number;
   now?: () => number;
   lastCallerSpeechAt?: () => number | undefined;
   mediaStartedAt?: string;
@@ -56,11 +57,21 @@ export interface BrokerDelegationRecord {
   primaryResult?: PrimaryResult;
   result?: string;
   delivery?: string;
+  submitError?: PrimaryApiDiagnostic;
+  lastResultReadError?: PrimaryApiDiagnostic;
   questions?: Record<string, BrokerQuestionRecord>;
   currentQuestionId?: string;
   questionNotice?: 'answer_too_long' | 'reply_unknown' | 'reply_refused' | 'question_unavailable' | 'answered_elsewhere';
   deferredTurns?: Array<{ delegationId: string; sourceEventId: string; text: string; firstSequence: number;
     callerRevision: number; status: 'recorded_not_submitted' }>;
+}
+
+export interface PrimaryApiDiagnostic {
+  code: PrimaryApiErrorCode;
+  status?: number;
+  remoteCode?: string;
+  retryable?: boolean;
+  observedAt: string;
 }
 
 export interface BrokerQuestionRecord {
@@ -130,6 +141,11 @@ interface CanonicalTurnRecord extends PrimaryTurn {
 // A closeout backend can coexist briefly with the detached voice backend. Both
 // must serialize the same call journal and capture submissions.
 const storeAdmissions = new WeakMap<object, Map<string, Promise<void>>>();
+// Concurrent Live delegations can observe the same saved request. Share notice
+// reservations without changing its admission or transcript journal.
+const storeNotices = new WeakMap<object, Map<string, {
+  submitAnnounced: boolean; progressCount: number; lastAt: number; inFlight: boolean;
+}>>();
 
 /** Timestamp grouping is application presentation state, not a provider turn-complete event. */
 function callerGroups(snapshot: LiveTranscriptSnapshot) {
@@ -194,6 +210,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
   const maxWaitMs = positive(options.maxWaitMs, 30_000, 60_000);
   const pollIntervalMs = positive(options.pollIntervalMs, 750, 10_000);
   const maxPollMs = positive(options.maxPollMs, 90_000, 300_000);
+  const progressIntervalMs = positive(options.progressIntervalMs, 18_000, 60_000);
   if (maxWaitMs < stabilityMs || !options.callId || !options.callSid || !uuidPattern.test(options.bindingId))
     throw new Error('invalid_backend_configuration');
   let lastSpeechAt: number | undefined;
@@ -206,6 +223,8 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
   const speechListeners = new Set<() => void>();
   let admissions = storeAdmissions.get(options.store);
   if (!admissions) { admissions = new Map(); storeAdmissions.set(options.store, admissions); }
+  let notices = storeNotices.get(options.store);
+  if (!notices) { notices = new Map(); storeNotices.set(options.store, notices); }
   const locked = async <T>(fn: () => Promise<T>): Promise<T> => {
     const previous = admissions!.get(options.callId) ?? Promise.resolve();
     let release!: () => void;
@@ -243,9 +262,13 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       return entry;
     }).filter(entry => entry.sessionId === sessionId);
   };
-  const save = (entry: BrokerDelegationRecord): BrokerDelegationRecord => {
+  const save = (entry: BrokerDelegationRecord,
+    apiErrors: Pick<BrokerDelegationRecord, 'submitError' | 'lastResultReadError'> = {}): BrokerDelegationRecord => {
     const call = boundCall(entry.sessionId);
-    const next = { ...entry, updatedAt: new Date(now()).toISOString() };
+    const previous = call.delegations[entry.requestId] as BrokerDelegationRecord | undefined;
+    const next = { ...entry, updatedAt: new Date(now()).toISOString(),
+      submitError: previous?.submitError ?? apiErrors.submitError,
+      lastResultReadError: apiErrors.lastResultReadError ?? previous?.lastResultReadError };
     const canonicalTurns = { ...call.canonicalTurns };
     // Refusal proves that reply admission did not capture this turn. Freeze its
     // original source/text atomically with the refusal, before STT can revise it.
@@ -266,6 +289,13 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     return next;
   };
   const load = (entry: BrokerDelegationRecord) => entries(entry.sessionId).find(value => value.requestId === entry.requestId)!;
+  const diagnostic = (error: unknown): PrimaryApiDiagnostic | undefined => error instanceof PrimaryApiError
+    ? { code: error.code, ...(error.status === undefined ? {} : { status: error.status }),
+      ...(error.remoteCode === undefined ? {} : { remoteCode: error.remoteCode }),
+      ...(error.retryable === undefined ? {} : { retryable: error.retryable }), observedAt: new Date(now()).toISOString() }
+    : undefined;
+  const recordReadError = (entry: BrokerDelegationRecord, error: unknown) =>
+    save(load(entry), { lastResultReadError: diagnostic(error) });
   const knownReply = (sessionId: string, sourceEventId: string) => {
     for (const entry of entries(sessionId)) for (const [questionId, record] of Object.entries(entry.questions ?? {})) {
       const reply = replyAttempts(record).find(attempt => attempt.input.source.sourceEventId === sourceEventId);
@@ -508,9 +538,9 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       try {
         const result = await options.api.submit(options.bindingId, entry.requestId, structuredClone(entry.submission));
         entry = applyResult(entry, result);
-      } catch {
+      } catch (error) {
         // The server may have admitted the run. Only GET by this request ID may follow.
-        entry = save({ ...entry, status: 'dispatch_unknown' });
+        entry = save({ ...load(entry), status: 'dispatch_unknown' }, { submitError: diagnostic(error) });
       }
       return entry;
     });
@@ -728,7 +758,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
         for (let entry of entries(sessionId)) {
           if (['prepared', 'dispatching', 'dispatch_unknown'].includes(entry.status)) {
             try { entry = applyResult(entry, await options.api.result(options.bindingId, entry.requestId)); }
-            catch { unsupported.push('source_admission_unknown'); continue; }
+            catch (error) { recordReadError(entry, error); unsupported.push('source_admission_unknown'); continue; }
           }
           entry = await recoverReplies(entry);
           if (Object.values(entry.questions ?? {}).some(record => unresolvedReply(record.reply))) unsupported.push('reply_outcome_unknown');
@@ -839,6 +869,45 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
         return;
       }
       const deadline = now() + maxPollMs;
+      const noticeKey = `${options.callId}:${entry.requestId}`;
+      let notice = notices!.get(noticeKey);
+      if (!notice) {
+        notice = { submitAnnounced: false, progressCount: 0, lastAt: now(), inFlight: false };
+        notices!.set(noticeKey, notice);
+      }
+      const publishStatus = (immediate: boolean) => {
+        if (channel.signal.aborted || options.store.get(options.callId)?.endedAt || notice!.inFlight) return;
+        const current = load(entry!);
+        if (terminal(current.status) || current.status === 'waiting_for_reply'
+            || Object.values(current.questions ?? {}).some(record => unresolvedReply(record.reply))) return;
+        const reviewedRevision = Math.max(current.frozenCallerRevision, ...Object.values(current.questions ?? {})
+          .filter(record => record.reply?.status === 'accepted').map(record => record.reply!.callerRevision));
+        if (channel.getContext().callerRevision !== reviewedRevision) return;
+        const announceSubmit = immediate && current.status === 'dispatch_unknown' && !notice!.submitAnnounced;
+        if (!announceSubmit && (immediate || notice!.progressCount >= 4 || now() - notice!.lastAt < progressIntervalMs
+            || now() >= deadline)) return;
+        const text = announceSubmit
+          ? current.submitError?.code === 'http_error'
+            ? 'My connection to your account tools returned an error. I am checking whether your request was saved.'
+            : 'I have not confirmed whether your request was saved. I am checking the original request.'
+          : ['prepared', 'dispatching', 'dispatch_unknown'].includes(current.status)
+            ? 'I am still checking whether your request was saved.'
+            : 'Your request is still being handled. I am waiting for its result.';
+        if (announceSubmit) notice!.submitAnnounced = true;
+        else notice!.progressCount++;
+        notice!.lastAt = now();
+        notice!.inFlight = true;
+        // Audio acceptance must not delay the result GET. This continuation only
+        // releases an in-memory reservation; it never writes after store close.
+        try {
+          void channel.publish({ id: `${current.requestId}_${reviewedRevision}_${announceSubmit ? 'submit_unknown' : `pending_${notice!.progressCount}`}`,
+            kind: 'progress', speak: true, text, expectedCallerRevision: reviewedRevision })
+            .catch(() => undefined).finally(() => { notice!.inFlight = false; });
+        } catch { notice!.inFlight = false; }
+      };
+      publishStatus(true);
+      const progressTimer = setInterval(() => publishStatus(false), progressIntervalMs);
+      progressTimer.unref();
       // Preserve caller changes in the local journal immediately. Only stable snapshots
       // go to the source-revision API; revisions never create another run here.
       const unsubscribe = channel.subscribeContext(snapshot => {
@@ -858,7 +927,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
             entry = await locked(() => recoverReplies(entry!));
           if (!terminal(entry.status)) {
             try { entry = applyResult(entry, await options.api.result(options.bindingId, entry.requestId)); }
-            catch { /* An absent or unreadable result does not justify another POST. */ }
+            catch (error) { entry = recordReadError(entry, error); /* GET errors never authorize another POST. */ }
           }
           entry = await captureRevision(entry, channel);
           if (channel.signal.aborted) return;
@@ -866,7 +935,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
           if (!(await delay(pollIntervalMs, channel.signal))) return;
         }
         await deliver(load(entry), channel);
-      } finally { unsubscribe(); }
+      } finally { clearInterval(progressTimer); unsubscribe(); }
     },
   };
 }

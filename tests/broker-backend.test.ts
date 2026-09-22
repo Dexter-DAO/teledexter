@@ -213,6 +213,147 @@ test('an uncertain POST is reconciled using GET of the original request, never r
   assert.equal(f.saved()[0].status, 'completed');
 });
 
+for (const error of [
+  new PrimaryApiError('http_error', 503, { code: 'primary_unavailable', retryable: true }),
+  new PrimaryApiError('http_error', 504, { code: 'upstream_timeout', retryable: true }),
+  new PrimaryApiError('invalid_response', 202),
+  new PrimaryApiError('request_timeout'),
+]) test(`submit ${error.status ?? error.code} is explained before blocked recovery and remains GET-only`, async t => {
+  const f = await fixture(t); f.add('Read my balance.'); f.speech();
+  Object.assign(error, { message: 'PRIVATE_RAW_ERROR', body: 'PRIVATE_BODY', stack: 'PRIVATE_STACK' });
+  f.behavior.submit = async () => { throw error; };
+  let entered!: () => void, release!: () => void, acknowledge!: () => void;
+  const began = new Promise<void>(resolve => { entered = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const noticeAck = new Promise<void>(resolve => { acknowledge = resolve; });
+  const publish = f.channel.publish;
+  f.channel.publish = async update => {
+    const result = await publish(update);
+    if (update.kind === 'progress') await noticeAck;
+    return result;
+  };
+  f.behavior.result = async id => { entered(); await gate; return f.completed(id); };
+  const work = f.backend.delegate(f.request(), f.channel);
+  try {
+    await began;
+    assert.equal(f.saved()[0].status, 'dispatch_unknown');
+    assert.deepEqual(f.saved()[0].submitError, {
+      code: error.code, ...(error.status === undefined ? {} : { status: error.status }),
+      ...(error.remoteCode === undefined ? {} : { remoteCode: error.remoteCode }),
+      ...(error.retryable === undefined ? {} : { retryable: error.retryable }),
+      observedAt: f.saved()[0].submitError!.observedAt,
+    });
+    assert.ok(Number.isFinite(Date.parse(f.saved()[0].submitError!.observedAt)));
+    assert.equal(f.updates.length, 1);
+    assert.equal(f.updates[0].kind, 'progress'); assert.equal(f.updates[0].speak, true);
+    assert.equal(f.updates[0].expectedCallerRevision, f.saved()[0].frozenCallerRevision);
+    assert.match(f.updates[0].text, error.code === 'http_error' ? /returned an error/ : /not confirmed/);
+    assert.ok(!JSON.stringify({ saved: f.saved(), speech: f.updates }).includes('PRIVATE_'));
+  } finally { release(); acknowledge(); await work; }
+  assert.equal(f.posts.length, 1); assert.deepEqual(f.reads, [f.posts[0].requestId]);
+  assert.equal(f.saved()[0].status, 'completed');
+  assert.equal(f.updates.at(-1)!.text, 'Your balance is $10.25 USDC.');
+});
+
+test('first submit diagnostics survive successive read errors, closeout recovery and eventual completion', async t => {
+  const f = await fixture(t, { maxPollMs: 10 }); f.add('Read my balance.'); f.speech();
+  f.behavior.submit = async () => { throw new PrimaryApiError('http_error', 503, { code: 'primary_unavailable', retryable: true }); };
+  f.behavior.result = async () => { throw new PrimaryApiError('http_error', 404, { code: 'request_not_found', retryable: false }); };
+  await f.backend.delegate(f.request(), f.channel);
+  const original = structuredClone(f.saved()[0]);
+  assert.equal(original.status, 'dispatch_unknown');
+  assert.equal(original.lastResultReadError!.status, 404);
+  assert.equal(original.lastResultReadError!.remoteCode, 'request_not_found');
+  const restored = createPrimaryBackend(f.options);
+  f.behavior.result = async () => { throw new PrimaryApiError('http_error', 503, { code: 'primary_unavailable', retryable: true }); };
+  await restored.flushPendingCaptures();
+  assert.deepEqual(f.saved()[0].submitError, original.submitError);
+  assert.equal(f.saved()[0].lastResultReadError!.status, 503);
+  assert.equal(f.saved()[0].lastResultReadError!.retryable, true);
+  f.behavior.result = async id => f.completed(id);
+  await restored.delegate(f.request(), f.channel);
+  assert.equal(f.saved()[0].status, 'completed');
+  assert.equal(f.saved()[0].lastResultReadError!.status, 503); // Retained last failure, not the current outcome.
+  assert.deepEqual(f.saved()[0].submitError, original.submitError);
+  assert.deepEqual(f.saved()[0].submission, original.submission);
+  assert.equal(f.posts.length, 1); assert.ok(f.reads.every(id => id === f.posts[0].requestId));
+  assert.equal(f.updates.filter(update => update.id.endsWith('_submit_unknown')).length, 1);
+});
+
+test('untyped exceptions cannot put raw error details into the saved request or spoken notice', async t => {
+  const f = await fixture(t); f.add('Read my balance.'); f.speech();
+  f.behavior.submit = async () => { throw new Error('PRIVATE_SECRET_AND_REQUEST_BODY'); };
+  await f.backend.delegate(f.request(), f.channel);
+  assert.equal(f.saved()[0].submitError, undefined);
+  assert.ok(!JSON.stringify({ saved: f.saved(), speech: f.updates }).includes('PRIVATE_'));
+  assert.match(f.updates[0].text, /not confirmed/);
+  assert.equal(f.updates.at(-1)!.text, 'Your balance is $10.25 USDC.');
+});
+
+test('spoken progress continues during a blocked result read and is bounded across duplicate delegates', async t => {
+  const f = await fixture(t, { progressIntervalMs: 15, maxPollMs: 500 });
+  f.add('Read my balance.'); f.speech();
+  let entered!: () => void, release!: () => void;
+  const began = new Promise<void>(resolve => { entered = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  f.behavior.result = async id => { entered(); await gate; return f.completed(id); };
+  const work = Promise.all([f.backend.delegate(f.request(), f.channel), f.backend.delegate(f.request(), f.channel)]);
+  try {
+    await began;
+    await wait(110);
+    const progress = f.updates.filter(update => update.kind === 'progress');
+    assert.equal(progress.length, 4);
+    assert.equal(new Set(progress.map(update => update.id)).size, 4);
+    assert.ok(progress.every(update => update.speak === true && update.expectedCallerRevision === 1));
+    assert.equal(f.saved()[0].status, 'queued');
+  } finally { release(); await work; }
+  assert.equal(f.posts.length, 1); assert.ok(f.reads.every(id => id === f.posts[0].requestId));
+  assert.equal(f.saved()[0].status, 'completed');
+  assert.equal(f.updates.at(-1)!.text, 'Your balance is $10.25 USDC.');
+});
+
+test('pending status notices are periodic rather than emitted by every result poll', async t => {
+  const f = await fixture(t, { progressIntervalMs: 25, maxPollMs: 100, pollIntervalMs: 1 });
+  f.add('Read my balance.'); f.speech();
+  f.behavior.result = async id => ({ bindingId, requestId: id, state: 'running' });
+  await f.backend.delegate(f.request(), f.channel);
+  const progress = f.updates.filter(update => update.kind === 'progress');
+  assert.ok(progress.length >= 1 && progress.length <= 4);
+  assert.ok(f.reads.length > progress.length);
+  assert.ok(progress.every(update => update.speak === true));
+  assert.equal(f.posts.length, 1);
+});
+
+for (const change of ['abort', 'caller_revision', 'call_ended'] as const)
+  test(`blocked recovery suppresses attempted progress after ${change}`, async t => {
+    const f = await fixture(t, { progressIntervalMs: 10, maxPollMs: 200 });
+    f.add('Read my balance.'); f.speech();
+    let entered!: () => void, release!: () => void;
+    const began = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    f.behavior.result = async id => { entered(); await gate; return f.completed(id); };
+    const work = f.backend.delegate(f.request(), f.channel);
+    try {
+      await began;
+      if (change === 'abort') f.controller.abort();
+      else if (change === 'caller_revision') { f.add('Wait a moment.', 3000, 3200); f.speech(3000, 3200); }
+      else f.store.update(f.call.id, { endedAt: new Date().toISOString() });
+      await wait(35);
+      assert.deepEqual(f.updates, []);
+    } finally { release(); await work; }
+    assert.equal(f.posts.length, 1);
+  });
+
+test('fast completion and a pending Primary question receive no extra progress chatter', async t => {
+  for (const state of ['completed', 'waiting_for_reply'] as const) {
+    const f = await fixture(t, { progressIntervalMs: 10 }); f.add('Read my balance.'); f.speech();
+    if (state === 'waiting_for_reply') f.behavior.result = async id => waiting(id, question());
+    await f.backend.delegate(f.request(), f.channel);
+    assert.equal(f.updates.filter(update => update.kind === 'progress').length, 0);
+    assert.equal(f.saved()[0].status, state);
+  }
+});
+
 test('a restarted backend recovers a journalled unknown admission under the same request ID', async t => {
   const f = await fixture(t, { maxPollMs: 10 }); f.add('Read my balance.'); f.speech();
   f.behavior.submit = async () => { throw new Error('timeout'); };
