@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import type { BrokerPublicationJournal } from './publications.js';
 import { bindDurableFileParent, durablyReplaceJsonFile, type DurableParentBinding } from '../outbound/DurableFile.js';
 
 export type CallStatus = 'prepared' | 'dialing' | 'queued' | 'ringing' | 'in-progress' | 'completed' | 'busy' | 'no-answer' | 'canceled' | 'failed' | 'unknown';
@@ -15,6 +16,7 @@ export interface BrokerCall {
   voiceOpening?: { status: string; eventId?: string; reason?: string };
   finalized?: boolean; failure?: { code: string; message: string };
   canonicalTurns?: Record<string, unknown>;
+  publications?: BrokerPublicationJournal;
   acousticSpans?: unknown;
   primaryClosePending?: boolean;
   primaryClosed?: { bindingId: string; callSid: string; state: 'closed' };

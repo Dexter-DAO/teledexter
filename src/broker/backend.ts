@@ -4,6 +4,8 @@ import { LIVE_APPEND_MAX_BYTES } from '../live/session.js';
 import type { PrimaryApiClient, PrimaryApiErrorCode, PrimaryClosedCall, PrimaryQuestion, PrimaryQuestionResult, PrimaryReconciliation, PrimaryReplyInput, PrimaryResult, PrimarySubmission, PrimaryTurn } from './primaryApi.js';
 import { PrimaryApiError } from './primaryApi.js';
 import { terminalCallStatuses, type BrokerCall, type BrokerStore } from './store.js';
+import { beginBrokerPublication, settleBrokerPublication, selectBrokerPublicationReference } from './publications.js';
+import type { LiveBackendUpdate, LiveDelivery } from '../live/types.js';
 import { acknowledgedTurn, originalTurn, turnBodyDigest, validateNonAdmissionProof, type AcknowledgedTurnReceipt } from './reconciliation.js';
 
 export interface PrimaryBackendOptions {
@@ -551,7 +553,9 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
         callId: options.callId, callSid: options.callSid, bindingId: options.bindingId, sessionId: request.sessionId,
         delegationIds: [request.delegationId], status: 'prepared', updatedAt: new Date(now()).toISOString(),
         submission: { source: { callSid: options.callSid, itemId: `live-turn-${sourceEventId}`,
-          sourceEventId, revision: 1, receivedAt: new Date(mediaOrigin(request.sessionId) + first.startMs).toISOString(), role: 'user' }, text },
+          sourceEventId, revision: 1, receivedAt: new Date(mediaOrigin(request.sessionId) + first.startMs).toISOString(), role: 'user' }, text,
+          ...selectBrokerPublicationReference(boundCall(request.sessionId), { callId: options.callId, callSid: options.callSid,
+            bindingId: options.bindingId, sessionId: request.sessionId }, snapshot, first.sequence) },
         frozenCallerRevision: snapshot.callerRevision, firstSequence: first.sequence,
         lastSequence: Math.max(...fragments.map(fragment => fragment.sequence)),
         completionBasis: 'speech_and_transcript_stability',
@@ -614,6 +618,28 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       } catch { return save({ ...current, captureState: 'unknown' }); }
     });
   };
+  const publishRequest = (entry: BrokerDelegationRecord, channel: LiveBackendChannel, update: LiveBackendUpdate): Promise<LiveDelivery> => {
+    if (channel.signal.aborted) return Promise.resolve({ eventId: '', status: 'closed' });
+    const intent = beginBrokerPublication(options.store, { callId: options.callId, callSid: options.callSid,
+      bindingId: options.bindingId, sessionId: entry.sessionId }, entry.requestId, update, channel.getContext());
+    if (!intent) return channel.publish(update);
+    if (!intent.created) return Promise.resolve(intent.record.outcome
+      ? { eventId: intent.record.outcome.eventId, status: intent.record.outcome.status }
+      : { eventId: '', status: 'unconfirmed' });
+    // Attach a synchronous receipt write directly to the existing append promise.
+    // Live close settles pending append promises before the host closes the store.
+    let pending: Promise<LiveDelivery>;
+    try { pending = channel.publish(update); }
+    catch { pending = Promise.resolve({ eventId: '', status: 'unconfirmed' }); }
+    return pending.then(delivery => {
+      settleBrokerPublication(options.store, intent.record, delivery, channel.getContext(), channel.signal.aborted);
+      return delivery;
+    }, () => {
+      const delivery: LiveDelivery = { eventId: '', status: 'unconfirmed' };
+      settleBrokerPublication(options.store, intent.record, delivery, channel.getContext(), channel.signal.aborted);
+      return delivery;
+    });
+  };
   const deliverQuestion = async (entry: BrokerDelegationRecord, channel: LiveBackendChannel) => locked(async () => {
     let current = load(entry);
     const questionId = current.currentQuestionId;
@@ -622,7 +648,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     if (channel.signal.aborted) return;
     const prefix = `${entry.requestId}_${questionId ?? 'question'}_${snapshot.callerRevision}`;
     const tell = async (text: string, suffix: string) => {
-      const delivery = await channel.publish({ id: `${prefix}_${suffix}`, kind: 'result', text,
+      const delivery = await publishRequest(entry, channel, { id: `${prefix}_${suffix}`, kind: 'result', speak: true, text,
         expectedCallerRevision: snapshot.callerRevision });
       save({ ...load(entry), delivery: delivery.status });
     };
@@ -644,12 +670,12 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     try { chunks = liveResultChunks(text); }
     catch { await tell('I cannot read this question accurately over the phone. Please open it in Dexter.', 'format_unavailable'); return; }
     if (current.questionNotice === 'answer_too_long') {
-      const delivery = await channel.publish({ id: `${prefix}_shorter_answer`, kind: 'progress', speak: true,
+      const delivery = await publishRequest(entry, channel, { id: `${prefix}_shorter_answer`, kind: 'progress', speak: true,
         text: 'Please give me a shorter answer to this question.', expectedCallerRevision: snapshot.callerRevision });
       if (delivery.status !== 'accepted') return;
     }
     if (current.questionNotice === 'reply_refused') {
-      const delivery = await channel.publish({ id: `${prefix}_reply_refused`, kind: 'progress', speak: true,
+      const delivery = await publishRequest(entry, channel, { id: `${prefix}_reply_refused`, kind: 'progress', speak: true,
         text: record.reply?.refusal?.code === 'invalid_request'
           ? 'I could not accept that answer. Please say it again.'
           : 'That answer was not accepted. The request is still waiting for a reply.',
@@ -659,7 +685,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     // Commentary appends preserve the question and both meanings, including amounts.
     // Only completion of every append establishes the barrier for a later caller turn.
     for (const [index, chunk] of chunks.entries()) {
-      const delivery = await channel.publish({ id: `${prefix}_prompt_${index}`, kind: 'result', text: chunk,
+      const delivery = await publishRequest(entry, channel, { id: `${prefix}_prompt_${index}`, kind: 'result', text: chunk,
         speak: true, expectedCallerRevision: snapshot.callerRevision });
       if (delivery.status !== 'accepted') { save({ ...load(entry), delivery: delivery.status }); return; }
     }
@@ -703,7 +729,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     let chunks: string[];
     try { chunks = liveResultChunks(text); }
     catch {
-      const outcome = await channel.publish({ id: `${prefix}_format_unavailable`, kind: 'result',
+      const outcome = await publishRequest(entry, channel, { id: `${prefix}_format_unavailable`, kind: 'result', speak: true,
         text: 'I received the result, but cannot read that format accurately over this call. The full result has been saved.',
         expectedCallerRevision: current.callerRevision });
       save({ ...load(entry), delivery: `format_unsupported:${interrupted() ?? outcome.status}` });
@@ -715,7 +741,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     for (const [index, chunk] of chunks.entries()) {
       const stopped = interrupted();
       if (stopped) { save({ ...load(entry), delivery: stopped }); return; }
-      const outcome = await channel.publish({ id: `${prefix}_${entry.status}_result_${index}`, kind: 'result',
+      const outcome = await publishRequest(entry, channel, { id: `${prefix}_${entry.status}_result_${index}`, kind: 'result',
         speak: true, text: chunk, expectedCallerRevision: current.callerRevision });
       const status = interrupted() ?? outcome.status;
       if (status !== 'accepted') { save({ ...load(entry), delivery: status }); return; }
@@ -983,9 +1009,9 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
         notice!.lastAt = now();
         notice!.inFlight = true;
         // Audio acceptance must not delay the result GET. This continuation only
-        // releases an in-memory reservation; it never writes after store close.
+        // releases the notice reservation; its publication receipt settles before Live closes.
         try {
-          void channel.publish({ id: `${current.requestId}_${revision}_${announceSubmit ? 'submit_unknown' : `pending_${notice!.progressCount}`}`,
+          void publishRequest(current, channel, { id: `${current.requestId}_${revision}_${announceSubmit ? 'submit_unknown' : `pending_${notice!.progressCount}`}`,
             kind: 'progress', speak: true, text, expectedCallerRevision: revision })
             .catch(() => undefined).finally(() => { notice!.inFlight = false; });
         } catch { notice!.inFlight = false; }

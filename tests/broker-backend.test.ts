@@ -8,6 +8,7 @@ import { createPrimaryBackend, literalPhoneAnswer, type PrimaryBackendOptions, t
 import type { PrimaryQuestion, PrimaryQuestionResult, PrimaryReplyInput, PrimaryResult, PrimarySubmission, PrimaryTurn } from '../src/broker/primaryApi.js';
 import { PrimaryApiError } from '../src/broker/primaryApi.js';
 import { turnBodyDigest } from '../src/broker/reconciliation.js';
+import { rejectBrokerPublication } from '../src/broker/publications.js';
 import type { LiveBackendChannel, LiveBackendUpdate, LiveDelegationRequest, LiveTranscriptSnapshot } from '../src/live/session.js';
 
 const bindingId = '11111111-1111-5111-a111-111111111111';
@@ -34,7 +35,8 @@ function context() {
     subscribeContext: listener => { listeners.add(listener); return () => { listeners.delete(listener); }; },
     publish: async update => {
       updates.push(update);
-      return { eventId: update.id, status: controller.signal.aborted ? 'closed'
+      return { eventId: update.id, observedCallerRevision: snapshot.callerRevision, observedTranscriptSequence: snapshot.revision,
+        status: controller.signal.aborted ? 'closed'
         : update.expectedCallerRevision !== undefined && update.expectedCallerRevision !== snapshot.callerRevision ? 'stale' : 'accepted' };
     },
     signal: controller.signal,
@@ -110,6 +112,77 @@ async function fixture(t: TestContext, overrides: Partial<PrimaryBackendOptions>
   return { ...c, directory, store, call, api, options, backend, speech, request, posts, reads, captures, replies, questionReads, behavior, completed,
     saved, result: (text: string) => { resultText = text; } };
 }
+
+test('accepted publication binds the next unchanged caller request and exact retry retains its pair', async t => {
+  const f = await fixture(t);
+  f.add('Show my portfolio.'); f.speech();
+  const publish = f.channel.publish;
+  f.channel.publish = async update => {
+    const intent = f.store.get(f.call.id)!.publications?.records.find(record => record.updateId === update.id);
+    assert.ok(intent, 'intent must be durable before commentary dispatch');
+    assert.equal(intent.requestId, f.posts[0].requestId);
+    const result = await publish(update);
+    return { ...result, eventId: `broker_${f.updates.length}` };
+  };
+  await f.backend.delegate(f.request(), f.channel);
+  f.channel.publish = publish;
+  const original = f.posts[0].requestId;
+  f.add(' Then review it.\t', 4000, 4300); f.speech(4000, 4300);
+  await f.backend.delegate(f.request('followup'), f.channel);
+  assert.equal(f.posts.length, 2);
+  assert.equal(f.posts[1].input.text, ' Then review it.\t');
+  assert.equal(f.posts[1].input.relatedPrimaryRequestId, original);
+  assert.equal(f.posts[1].input.referenceOrigin, 'broker_status_publication');
+  const frozen = structuredClone(f.posts[1].input);
+  const firstPublication = f.store.get(f.call.id)!.publications!.records[0];
+  rejectBrokerPublication(f.store, firstPublication, firstPublication.outcome!.eventId, 'late_rejection');
+  await f.backend.delegate(f.request('followup'), f.channel);
+  assert.equal(f.posts.length, 2);
+  assert.deepEqual(f.saved()[1].submission, frozen, 'late evidence cannot rewrite an already submitted source');
+});
+
+test('late rejection before the next caller source excludes that publication reference', async t => {
+  const f = await fixture(t);
+  f.add('Show my portfolio.'); f.speech();
+  await f.backend.delegate(f.request(), f.channel);
+  const publication = f.store.get(f.call.id)!.publications!.records[0];
+  rejectBrokerPublication(f.store, publication, publication.outcome!.eventId, 'late_rejection');
+  f.add(' Then review it.', 4000, 4300); f.speech(4000, 4300);
+  await f.backend.delegate(f.request('followup'), f.channel);
+  assert.equal(f.posts.length, 2);
+  assert.equal(f.posts[1].input.relatedPrimaryRequestId, undefined);
+});
+
+test('missing provider frontier leaves accepted commentary ineligible for a caller reference', async t => {
+  const f = await fixture(t);
+  const publish = f.channel.publish;
+  f.channel.publish = async update => { const value = await publish(update); return { eventId: value.eventId, status: value.status }; };
+  f.add('Show my portfolio.'); f.speech();
+  await f.backend.delegate(f.request(), f.channel);
+  f.add(' Then review it.', 4000, 4300); f.speech(4000, 4300);
+  await f.backend.delegate(f.request('followup'), f.channel);
+  assert.equal(f.posts[1].input.relatedPrimaryRequestId, undefined);
+});
+
+test('unknown admission and restarted GET-only recovery retain the original referenced input', async t => {
+  const f = await fixture(t);
+  f.add('Show my portfolio.'); f.speech();
+  await f.backend.delegate(f.request(), f.channel);
+  f.behavior.submit = async () => { throw new PrimaryApiError('request_timeout'); };
+  f.behavior.result = async () => { throw new PrimaryApiError('http_error', 404, { code: 'request_not_found', retryable: false }); };
+  f.add(' Then review it.\t', 4000, 4300); f.speech(4000, 4300);
+  await f.backend.delegate(f.request('followup'), f.channel);
+  const submitted = structuredClone(f.posts[1]);
+  assert.equal(submitted.input.relatedPrimaryRequestId, f.posts[0].requestId);
+  assert.equal(f.saved()[1].status, 'dispatch_unknown');
+  const recovered = createPrimaryBackend(f.options);
+  f.behavior.result = async id => f.completed(id);
+  await recovered.delegate(f.request('followup'), f.channel);
+  assert.equal(f.posts.length, 2);
+  assert.deepEqual(f.saved()[1].submission, submitted.input);
+  assert.equal(f.saved()[1].status, 'completed');
+  assert.equal(f.reads.at(-1), submitted.requestId);
+});
 
 test('waits for stable acoustic caller text and journals one verbatim canonical source before POST', async t => {
   const f = await fixture(t);
