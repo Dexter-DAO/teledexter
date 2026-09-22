@@ -8,9 +8,11 @@ Later tasks use new Live delegations. Broker saves each completed caller turn an
 
 While media remains connected, the result observer continues beyond the initial polling window. It stops when media closes. Questions retain their original presentation and answer association while that observer runs.
 
-Caller text and the delegation position use Live's session timeline. Local audio activity establishes that audio arrived and became quiet; sound bursts do not identify transcript turns. Broker takes the whole stable phrase behind the delegation position. A phrase that crosses that position waits for a later delegation. Noise and pauses cannot permanently block later requests. Saved source identities and request contents survive late captions and restarts unchanged.
+Caller text and the delegation position use Live's session timeline. Local audio activity establishes that audio arrived and became quiet; sound bursts do not identify transcript turns. Broker selects the phrase whose first fragment was present at the handoff or began before its position. It preserves the whole stable phrase, including words that finish afterward. A distinct later phrase needs its own delegation. Saved source identities and request contents survive late captions and restarts unchanged.
 
-The journal records how much local audio had arrived when each delegation began. This observation is separate from the transcript-derived occurrence time; it does not claim exact acoustic onset. Queued requests retain that observation from their own delegation, even when another request takes time to finish.
+The journal records how much local audio had arrived when each delegation began. This observation is separate from the transcript-derived occurrence time; it does not claim exact acoustic onset or assign audio exclusively to one request. Queued requests retain that observation from their own delegation, even when another request takes time to finish.
+
+During a quiet interval, Broker records which caller text had stabilized. These local checkpoints let final transcript capture retain earlier completed speech if the call ends with a click or an unfinished new sentence. A checkpoint uploads no memory and applies only to its exact recorded text. Finalized late captions may still qualify against audio that was already quiet before disconnect. Waiting after hangup cannot finish an interrupted sentence.
 
 Two optional references accompany the unchanged caller text:
 

@@ -28,6 +28,8 @@ export interface PrimaryBackendOptions {
 }
 
 export interface PrimaryBackend extends BrokerLiveBackend {
+  /** Retain quiet-time completion evidence without uploading provisional speech. */
+  observeTranscript(snapshot: LiveTranscriptSnapshot): void;
   /** Host-observed acoustic speech time, in Date.now() milliseconds. */
   noteCallerSpeech(atMs?: number, audioOffsetMs?: number): void;
   /** Freeze the observed spans before the host reconstructs closeout after disconnect. */
@@ -451,7 +453,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     // only local activity/silence evidence: clicks and pauses prevent a reliable
     // one-to-one correspondence between captions and local sound bursts.
     const latestAudio = acousticSpans.at(-1);
-    if (!latestAudio || observedAt - latestAudio.lastSpeechAt < stabilityMs) return [];
+    if (!latestAudio) return [];
     const sessionId = currentSession();
     const grouped = callerGroups(snapshot).map(fragments => {
       fragments.sort((a, b) => a.sequence - b.sequence);
@@ -476,8 +478,52 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       const turn = value as CanonicalTurnRecord;
       if (turn.role === 'user' && !matchesAnchor(turn.sourceEventId)) return [];
     }
-    return grouped;
+    if (observedAt - latestAudio.lastSpeechAt >= stabilityMs) return grouped;
+    const checkpoints = boundCall(sessionId).callerCompletions;
+    return grouped.filter(group => {
+      const checkpoint = checkpoints?.[group.sourceEventId];
+      return checkpoint?.sessionId === sessionId && Date.parse(checkpoint.observedAt) <= observedAt
+        && checkpoint.firstSequence === group.fragments[0].sequence
+        && checkpoint.lastSequence === Math.max(...group.fragments.map(fragment => fragment.sequence))
+        && checkpoint.textDigest === digest(group.fragments.map(fragment => fragment.text).join(''));
+    });
   };
+  let observedTranscript: LiveTranscriptSnapshot | undefined;
+  let transcriptChangedAt = 0;
+  let completionTimer: ReturnType<typeof setTimeout> | undefined;
+  const scheduleCallerCompletion = () => {
+    clearTimeout(completionTimer);
+    if (!observedTranscript || options.store.get(options.callId)?.endedAt) return;
+    const quietSince = Math.max(transcriptChangedAt, speechTime() ?? 0);
+    completionTimer = setTimeout(() => {
+      try {
+        const snapshot = observedTranscript;
+        if (!snapshot || options.store.get(options.callId)?.endedAt) return;
+        if (now() - Math.max(transcriptChangedAt, speechTime() ?? 0) < stabilityMs) { scheduleCallerCompletion(); return; }
+        const sessionId = currentSession();
+        const call = boundCall(sessionId);
+        const checkpoints = { ...call.callerCompletions };
+        let changed = false;
+        for (const group of completedCallerGroups(snapshot)) {
+          const firstSequence = group.fragments[0].sequence;
+          const lastSequence = Math.max(...group.fragments.map(fragment => fragment.sequence));
+          const textDigest = digest(group.fragments.map(fragment => fragment.text).join(''));
+          const previous = checkpoints[group.sourceEventId];
+          if (previous?.sessionId === sessionId && previous.firstSequence === firstSequence
+              && previous.lastSequence === lastSequence && previous.textDigest === textDigest) continue;
+          checkpoints[group.sourceEventId] = { sessionId, firstSequence, lastSequence, textDigest, observedAt: new Date(now()).toISOString() };
+          changed = true;
+        }
+        if (changed) options.store.update(call.id, { callerCompletions: checkpoints });
+      } catch {
+        // The optional checkpoint must not crash an active call. Closeout will
+        // report unqualified text when no durable completion evidence exists.
+        console.error('broker_caller_completion_failed', { callId: options.callId });
+      }
+    }, Math.max(1, stabilityMs - (now() - quietSince)));
+    completionTimer.unref();
+  };
+  speechListeners.add(scheduleCallerCompletion);
   const stableContext = (channel: LiveBackendChannel): Promise<LiveTranscriptSnapshot | undefined> => {
     if (channel.signal.aborted) return Promise.resolve(undefined);
     return new Promise(resolve => {
@@ -549,14 +595,13 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
         ?? saved.find(entry => entry.delegationIds.includes(request.delegationId));
       if (duplicate) return duplicate;
       const latestSourceSequence = Math.max(0, ...saved.map(entry => entry.firstSequence));
-      const consumedAudio = Math.max(0, ...saved.flatMap(entry => [entry.audioThroughMs ?? 0,
-        ...entry.deferredTurns?.map(turn => turn.queuedRequest?.audioThroughMs ?? 0) ?? [],
-        ...Object.values(entry.questions ?? {}).flatMap(question => replyAttempts(question).map(reply => reply.audioThroughMs ?? 0))]));
       const candidate = completedCallerGroups(snapshot).filter(group => {
         const first = group.fragments.reduce((a, b) => a.sequence < b.sequence ? a : b);
         const source = brokerIdentity('source', options.callId, request.sessionId, first.eventId);
-        return audioThroughMs !== undefined && audioThroughMs > consumedAudio
-          && Math.max(...group.fragments.map(fragment => fragment.endMs)) <= request.offsetMs
+        const presentAtDelegation = request.transcript.fragments.some(fragment => fragment.role === 'user'
+          && fragment.eventId === first.eventId && fragment.sequence === first.sequence);
+        return audioThroughMs !== undefined
+          && (presentAtDelegation || first.startMs <= request.offsetMs)
           && first.sequence >= latestSourceSequence && !saved.some(entry => entry.submission.source.sourceEventId === source
           || entry.deferredTurns?.some(turn => turn.sourceEventId === source)
           || Object.values(entry.questions ?? {}).some(record => replyAttempts(record).some(reply => reply.input.source.sourceEventId === source)));
@@ -934,6 +979,13 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     return child;
   });
   return {
+    observeTranscript(snapshot) {
+      if (options.store.get(options.callId)?.endedAt) return;
+      if (observedTranscript?.callerRevision === snapshot.callerRevision) return;
+      observedTranscript = structuredClone(snapshot);
+      transcriptChangedAt = now();
+      scheduleCallerCompletion();
+    },
     async prepareCloseout() {
       const sessionId = currentSession();
       if (!eligibleForClosedRecovery(sessionId) || !options.api.reconcile) return;

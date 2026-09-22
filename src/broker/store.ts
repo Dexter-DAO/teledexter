@@ -20,6 +20,8 @@ export interface BrokerCall {
   canonicalTurns?: Record<string, unknown>;
   publications?: BrokerPublicationJournal;
   acousticSpans?: unknown;
+  callerCompletions?: Record<string, { sessionId: string; firstSequence: number; lastSequence: number;
+    textDigest: string; observedAt: string }>;
   primaryClosePending?: boolean;
   primaryClosed?: { bindingId: string; callSid: string; state: 'closed' };
   callback?: { requestId: string; consentedAt: string; state: 'requested' | 'started' | 'unavailable' };

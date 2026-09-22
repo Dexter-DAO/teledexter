@@ -367,7 +367,10 @@ export function createBrokerServer(options: BrokerServerOptions) {
               const name = receipts.sent(Buffer.from(payload, 'base64').length);
               ws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name } }));
             },
-            onTranscript(snapshot) { store.update(call.id, { transcript: snapshot, transcriptRevision: snapshot.revision }); },
+            onTranscript(snapshot) {
+              store.update(call.id, { transcript: snapshot, transcriptRevision: snapshot.revision });
+              backend?.observeTranscript(snapshot);
+            },
             onReady({ sessionId }) {
               connectedSessionId = sessionId;
               store.update(call.id, { liveSessionId: sessionId, voiceOpening: { status: 'pending' } });

@@ -358,15 +358,87 @@ test('a paused caller phrase stays whole across multiple local sound bursts', as
   assert.equal(f.captures.length, 0);
 });
 
-test('a phrase crossing the delegation frontier is withheld whole rather than truncated', async t => {
+test('the whole stable phrase survives a final caption ending after the delegation position', async t => {
   const f = await fixture(t);
-  f.add('Read my balance', 800, 1000); f.speech(800, 1000);
-  const delegated = f.request();
-  f.add(' and send it.', 1700, 1900); f.speech(1700, 1900);
+  f.add('And please read my most recent ', 17000, 19000); f.add('payment', 19400, 19600); f.speech(16480, 18840);
+  const delegated = { ...f.request(), offsetMs: 19400 };
   await f.backend.delegate(delegated, f.channel);
+  assert.equal(f.posts.length, 1); assert.equal(f.posts[0].input.text, 'And please read my most recent payment');
+});
+
+test('a later distinct phrase cannot borrow an earlier delegation', async t => {
+  const f = await fixture(t);
+  f.add('Read my balance.', 800, 1000); f.speech();
+  const delegated = f.request();
+  f.add('Read my payment.', 3000, 3200); f.speech(3000, 3200);
+  await f.backend.delegate(delegated, f.channel);
+  assert.deepEqual(f.posts.map(post => post.input.text), ['Read my balance.']);
+  await f.backend.delegate(f.request('payment'), f.channel);
+  assert.deepEqual(f.posts.map(post => post.input.text), ['Read my balance.', 'Read my payment.']);
+});
+
+test('two spoken turns before the first delayed delegation remain two requests', async t => {
+  const f = await fixture(t);
+  f.add('Read my balance.', 800, 1000); f.speech();
+  const firstDelegation = f.request();
+  f.add('Read my payment.', 3000, 3200); f.speech(3000, 3200);
+  await f.backend.delegate(firstDelegation, f.channel);
+  assert.equal(f.saved()[0].audioThroughMs, 3200);
+  await f.backend.delegate(f.request('payment'), f.channel);
+  assert.equal(f.saved()[1].audioThroughMs, 3200);
+  assert.deepEqual(f.posts.map(post => post.input.text), ['Read my balance.', 'Read my payment.']);
+});
+
+test('a quiet-time caller completion survives a later hangup click and process restart', async t => {
+  const f = await fixture(t);
+  f.add('Please remember our conversation.'); f.speech(); f.backend.observeTranscript(f.channel.getContext());
+  await wait(15);
+  assert.equal(Object.keys(f.store.get(f.call.id)!.callerCompletions ?? {}).length, 1);
+  assert.equal(f.captures.length, 0, 'checkpoint must not upload provisional memory');
+  f.speech(4000, 4020); f.backend.persistAcousticEvidence();
+  f.store.update(f.call.id, { endedAt: new Date().toISOString() });
+  const restored = createPrimaryBackend(f.options);
+  const result = await restored.captureCompletedTurns(f.channel.getContext(), { sessionFinalized: true, assistantPlaybackComplete: false });
+  assert.equal(result.captured, 1); assert.equal(f.captures[0].text, 'Please remember our conversation.');
   assert.equal(f.posts.length, 0);
-  await f.backend.delegate(f.request('complete_phrase'), f.channel);
-  assert.equal(f.posts.length, 1); assert.equal(f.posts[0].input.text, 'Read my balance and send it.');
+});
+
+test('earlier quiet speech is captured while unfinished final speech stays unqualified', async t => {
+  const f = await fixture(t);
+  f.add('Hello there.'); f.speech(); f.backend.observeTranscript(f.channel.getContext()); await wait(15);
+  f.add('Let me think', 4000, 4200); f.speech(4000, 4200); f.backend.observeTranscript(f.channel.getContext());
+  const endedAt = new Date().toISOString();
+  f.backend.persistAcousticEvidence(); f.store.update(f.call.id, { endedAt });
+  await wait(15);
+  const result = await createPrimaryBackend(f.options).captureCompletedTurns(f.channel.getContext(), { sessionFinalized: true, assistantPlaybackComplete: false });
+  assert.equal(result.captured, 1); assert.ok(result.unsupported.includes('unqualified_caller_turn'));
+  assert.deepEqual(f.captures.map(turn => turn.text), ['Hello there.']);
+  assert.equal(Object.keys(f.store.get(f.call.id)!.callerCompletions ?? {}).length, 1);
+});
+
+test('a changed late caption cannot reuse an earlier text completion checkpoint', async t => {
+  const f = await fixture(t);
+  f.add('Read my balance'); f.speech(); f.backend.observeTranscript(f.channel.getContext()); await wait(15);
+  f.add(' and send it.', 1000, 1200); f.speech(1000, 1200); f.backend.observeTranscript(f.channel.getContext());
+  const endedAt = new Date().toISOString();
+  f.backend.persistAcousticEvidence(); f.store.update(f.call.id, { endedAt });
+  await wait(15);
+  const result = await createPrimaryBackend(f.options).captureCompletedTurns(f.channel.getContext(), { sessionFinalized: true, assistantPlaybackComplete: false });
+  assert.equal(result.captured, 0); assert.ok(result.unsupported.includes('unqualified_caller_turn'));
+  assert.equal(f.captures.length, 0);
+});
+
+test('a failed optional completion write logs a safe cause without claiming a saved checkpoint', async t => {
+  const f = await fixture(t);
+  const errors: unknown[][] = []; const log = console.error;
+  console.error = (...args: unknown[]) => { errors.push(args); };
+  t.after(() => { console.error = log; });
+  const backend = createPrimaryBackend({ ...f.options, store: { get: id => f.store.get(id),
+    update: () => { throw new Error('private transcript and storage details'); } } });
+  f.add('A private caller remark.'); f.speech(800, 1000, backend); backend.observeTranscript(f.channel.getContext());
+  await wait(15);
+  assert.deepEqual(errors, [['broker_caller_completion_failed', { callId: f.call.id }]]);
+  assert.equal(f.store.get(f.call.id)!.callerCompletions, undefined); assert.equal(f.captures.length, 0);
 });
 
 test('late captions cannot merge two already accepted sources', async t => {
