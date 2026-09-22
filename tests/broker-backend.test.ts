@@ -710,26 +710,177 @@ test('caller source preserves delta delivery order even when approximate interva
   assert.equal(f.posts[0].input.text, 'Read my balance.');
 });
 
-test('delegation during active work records separate speech and delivers the original result without executing the followup', async t => {
+test('the interrupted caller request is submitted verbatim after the active result without caller repetition', async t => {
   const f = await fixture(t); f.add('Read my balance.'); f.speech();
   let entered!: () => void; const began = new Promise<void>(resolve => { entered = resolve; });
   let release!: () => void; const blocked = new Promise<void>(resolve => { release = resolve; });
   f.behavior.result = async id => { entered(); await blocked; return f.completed(id); };
   const first = f.backend.delegate(f.request(), f.channel); await began;
-  f.add('Read my last payment.', 3000, 3200); f.speech(3000, 3200);
+  const followup = ' No, answer my question first. Do you- you don\'t even have that included in the data that got returned, before you go pull anything? And you can pull it if you want, but I want both of those things';
+  f.add(followup, 3000, 3200); f.speech(3000, 3200);
   const second = f.backend.delegate(f.request('del_followup'), f.channel);
   await wait(12);
-  assert.equal(f.saved()[0].deferredTurns?.[0].text, 'Read my last payment.');
+  const queued = structuredClone(f.saved()[0].deferredTurns![0]);
+  assert.equal(queued.text, followup);
+  assert.equal(queued.status, 'queued');
+  assert.equal(f.posts.length, 1);
   release(); await Promise.all([first, second]);
-  assert.equal(f.posts.length, 1);
-  assert.equal(f.updates.at(-1)!.text, 'For your earlier request: Your balance is $10.25 USDC.');
+  assert.equal(f.posts.length, 2);
+  assert.deepEqual(f.posts[1].input, queued.queuedRequest!.submission);
+  assert.equal(f.posts[1].input.text, followup);
+  assert.equal(f.posts[1].requestId, queued.queuedRequest!.requestId);
+  assert.equal(f.posts[1].input.source.receivedAt, new Date(Date.parse(f.call.createdAt) + 3000).toISOString());
+  assert.equal(f.saved()[1].predecessorRequestId, f.posts[0].requestId);
+  assert.equal(f.posts[0].input.text, 'Read my balance.');
+  assert.equal(f.updates.at(-1)!.text, 'Your balance is $10.25 USDC.');
   assert.equal(f.updates.at(-1)!.speak, true);
-  assert.equal(f.saved()[0].deferredTurns?.[0].status, 'recorded_not_submitted');
+  assert.equal(f.saved()[0].deferredTurns?.[0].status, 'promoted');
   await f.backend.delegate(f.request('del_repeat_no_new_speech'), f.channel);
-  assert.equal(f.posts.length, 1);
+  assert.equal(f.posts.length, 2);
   f.add('Please read my last payment now.', 5000, 5200); f.speech(5000, 5200);
   await f.backend.delegate(f.request('del_fresh'), f.channel);
-  assert.equal(f.posts.length, 2); assert.equal(f.posts[1].input.text, 'Please read my last payment now.');
+  assert.equal(f.posts.length, 3); assert.equal(f.posts[2].input.text, 'Please read my last payment now.');
+});
+
+async function until(check: () => boolean) {
+  const deadline = Date.now() + 1000;
+  while (!check()) {
+    if (Date.now() >= deadline) throw new Error('fixture condition timed out');
+    await wait(2);
+  }
+}
+
+async function blockedQueueFixture(t: TestContext) {
+  const f = await fixture(t, { maxPollMs: 50 });
+  let release!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  let entered = false;
+  f.behavior.result = async id => {
+    if (id === f.posts[0].requestId) { entered = true; await blocked; }
+    return f.completed(id);
+  };
+  f.add(' Read my portfolio.'); f.speech();
+  const first = f.backend.delegate(f.request(), f.channel);
+  await until(() => entered);
+  f.add(' Read my last payment. ', 3000, 3200); f.speech(3000, 3200);
+  const second = f.backend.delegate(f.request('del_followup'), f.channel);
+  await until(() => f.saved()[0].deferredTurns?.length === 1);
+  return { ...f, first, second, release };
+}
+
+test('concurrent duplicate delegates drain one frozen child in the shared call worker', async t => {
+  const f = await blockedQueueFixture(t);
+  const duplicate = f.backend.delegate(f.request('del_followup'), f.channel);
+  const overlapping = createPrimaryBackend(f.options).delegate(f.request('del_overlap'), f.channel);
+  f.release(); await Promise.all([f.first, f.second, duplicate, overlapping]);
+  assert.equal(f.posts.length, 2);
+  assert.equal(f.saved()[0].deferredTurns!.length, 1);
+  assert.equal(f.saved()[1].predecessorRequestId, f.saved()[0].requestId);
+  assert.equal(f.updates.filter(update => update.kind === 'result').length, 2);
+});
+
+test('multiple completed deferred turns retain FIFO source order and predecessor identities', async t => {
+  const f = await blockedQueueFixture(t);
+  f.add(' Read the payment before that. ', 5000, 5200); f.speech(5000, 5200);
+  const third = f.backend.delegate(f.request('del_third'), f.channel);
+  await until(() => f.saved()[0].deferredTurns?.length === 2);
+  const queued = structuredClone(f.saved()[0].deferredTurns!);
+  f.release(); await Promise.all([f.first, f.second, third]);
+  assert.deepEqual(f.posts.map(post => post.input.text), [' Read my portfolio.', ' Read my last payment. ', ' Read the payment before that. ']);
+  assert.deepEqual(f.posts.slice(1).map(post => post.input), queued.map(turn => turn.queuedRequest!.submission));
+  assert.equal(f.saved()[1].predecessorRequestId, f.posts[0].requestId);
+  assert.equal(f.saved()[2].predecessorRequestId, f.posts[1].requestId);
+  assert.deepEqual(f.saved()[0].deferredTurns!.map(turn => turn.status), ['promoted', 'promoted']);
+});
+
+test('a disk-restored queue resumes the frozen request after predecessor recovery without new speech', async t => {
+  const f = await blockedQueueFixture(t);
+  const queued = structuredClone(f.saved()[0].deferredTurns![0]);
+  f.controller.abort(); f.release(); await Promise.all([f.first, f.second]);
+  assert.equal(f.posts.length, 1);
+  f.store.close();
+  const restored = new BrokerStore(f.directory); t.after(() => restored.close());
+  const channel: LiveBackendChannel = { ...f.channel, signal: new AbortController().signal,
+    publish: async update => ({ eventId: update.id, status: 'accepted' }) };
+  const backend = createPrimaryBackend({ ...f.options, store: restored });
+  await backend.delegate(f.request('del_followup'), channel);
+  assert.equal(f.posts.length, 2);
+  assert.deepEqual(f.posts[1], { bindingId, requestId: queued.queuedRequest!.requestId, input: queued.queuedRequest!.submission });
+  const saved = Object.values(restored.get(f.call.id)!.delegations) as BrokerDelegationRecord[];
+  assert.equal(saved[1].predecessorRequestId, saved[0].requestId);
+  await backend.delegate(f.request('del_followup'), channel);
+  assert.equal(f.posts.length, 2);
+});
+
+test('an uncertain deferred POST is recovered with the exact request ID and never submitted again', async t => {
+  const f = await blockedQueueFixture(t);
+  const originalResult = f.behavior.result;
+  f.behavior.submit = async id => { throw new Error(`synthetic unknown ${id}`); };
+  f.behavior.result = async id => {
+    if (id === f.posts[0].requestId) return originalResult(id);
+    throw new Error('synthetic result unavailable');
+  };
+  f.release(); await Promise.all([f.first, f.second]);
+  assert.equal(f.posts.length, 2);
+  assert.equal(f.saved()[1].status, 'dispatch_unknown');
+  const frozen = structuredClone(f.posts[1]);
+  f.store.close();
+  const restored = new BrokerStore(f.directory); t.after(() => restored.close());
+  f.behavior.result = async id => f.completed(id);
+  const backend = createPrimaryBackend({ ...f.options, store: restored });
+  await backend.delegate(f.request('del_followup'), f.channel);
+  assert.equal(f.posts.length, 2);
+  assert.equal(f.reads.at(-1), frozen.requestId);
+  assert.deepEqual((restored.get(f.call.id)!.delegations[frozen.requestId] as BrokerDelegationRecord).submission, frozen.input);
+});
+
+test('hangup preserves queued speech but closeout and restart cannot submit it', async t => {
+  const f = await blockedQueueFixture(t);
+  f.store.update(f.call.id, { status: 'completed', endedAt: new Date().toISOString() });
+  f.release(); await Promise.all([f.first, f.second]);
+  assert.equal(f.posts.length, 1);
+  assert.equal(f.saved()[0].deferredTurns![0].status, 'queued');
+  await createPrimaryBackend(f.options).flushPendingCaptures();
+  await createPrimaryBackend(f.options).delegate(f.request('del_followup'), f.channel);
+  assert.equal(f.posts.length, 1);
+});
+
+test('unknown predecessor admission blocks the queue until a GET confirms its terminal result', async t => {
+  const f = await fixture(t, { maxPollMs: 35 });
+  f.behavior.submit = async () => { throw new Error('synthetic submit timeout'); };
+  f.behavior.result = async () => { throw new Error('synthetic unknown admission'); };
+  f.add(' Read my portfolio.'); f.speech();
+  const first = f.backend.delegate(f.request(), f.channel);
+  await until(() => f.posts.length === 1);
+  f.add(' Read my last payment. ', 3000, 3200); f.speech(3000, 3200);
+  const second = f.backend.delegate(f.request('del_followup'), f.channel);
+  await Promise.all([first, second]);
+  assert.equal(f.posts.length, 1);
+  const queued = structuredClone(f.saved()[0].deferredTurns![0]);
+  assert.equal(queued.status, 'queued');
+  f.behavior.submit = async id => ({ ...f.completed(id), replayed: false });
+  f.behavior.result = async id => f.completed(id);
+  await createPrimaryBackend(f.options).delegate(f.request('del_followup'), f.channel);
+  assert.equal(f.posts.length, 2);
+  assert.deepEqual(f.posts[1].input, queued.queuedRequest!.submission);
+  assert.ok(f.reads.includes(f.posts[0].requestId));
+});
+
+test('interrupted result presentation preserves and processes the separately queued request once', async t => {
+  const f = await blockedQueueFixture(t);
+  const publish = f.channel.publish;
+  let interrupted = false;
+  f.channel.publish = async update => {
+    if (update.kind === 'result' && !interrupted) {
+      interrupted = true; f.add('Wait.', 5000, 5200); f.speech(5000, 5200);
+    }
+    return publish(update);
+  };
+  f.release(); await Promise.all([f.first, f.second]);
+  assert.equal(f.posts.length, 2);
+  assert.equal(f.saved()[0].delivery, 'stale');
+  assert.equal(f.posts[1].input.text, ' Read my last payment. ');
+  assert.equal(f.saved()[1].status, 'completed');
 });
 
 test('reconstructed closeout waits for an in-flight capture before deciding whether it needs replay', async t => {
@@ -819,6 +970,42 @@ test('a presented question takes a literal reply on the original run and capture
   assert.equal(f.captures.length, 0);
   await f.backend.delegate(f.request('duplicate_answer'), f.channel);
   assert.equal(f.posts.length, 1); assert.equal(f.replies.length, 1);
+});
+
+test('a queued second task waits for a same-run question answer and follows the original terminal result', async t => {
+  const f = await fixture(t);
+  let current = question();
+  let release!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  let entered = false;
+  f.behavior.result = async id => {
+    if (id !== f.posts[0].requestId) return f.completed(id);
+    entered = true; await blocked;
+    return current.state === 'pending' ? waiting(id, current) : f.completed(id);
+  };
+  f.behavior.question = async id => questionResult(id, current);
+  f.behavior.reply = async (id, _questionId, input) => {
+    current = answered(current, input);
+    return { ...questionResult(id, current), replayed: false };
+  };
+  f.add('Read my balance.'); f.speech();
+  const first = f.backend.delegate(f.request(), f.channel);
+  await until(() => entered);
+  f.add('Read my last payment.', 3000, 3200); f.speech(3000, 3200);
+  const second = f.backend.delegate(f.request('del_followup'), f.channel);
+  await until(() => f.saved()[0].deferredTurns?.length === 1);
+  release(); await Promise.all([first, second]);
+  assert.equal(f.posts.length, 1);
+  assert.equal(f.saved()[0].status, 'waiting_for_reply');
+  assert.equal(f.saved()[0].deferredTurns![0].status, 'queued');
+  f.add('Yes.', 5000, 5200); f.speech(5000, 5200);
+  await f.backend.delegate(f.request('answer'), f.channel);
+  assert.equal(f.replies.length, 1);
+  assert.equal(f.replies[0].requestId, f.posts[0].requestId);
+  assert.equal(f.posts.length, 2);
+  assert.equal(f.posts[1].input.text, 'Read my last payment.');
+  assert.equal(f.saved()[1].predecessorRequestId, f.posts[0].requestId);
+  assert.equal(f.saved()[0].deferredTurns!.length, 1);
 });
 
 test('literal reply mapping preserves canonical yes and no meanings and leaves qualified speech as other', () => {
@@ -945,6 +1132,12 @@ test('caller speech arriving before the complete question presentation cannot an
   assert.equal(f.posts.length, 1);
   assert.equal(f.saved()[0].questions![firstQuestionId].presentation!.callerRevision, 2);
   assert.equal(f.saved()[0].deferredTurns![0].text, 'Yes.');
+  assert.equal(f.saved()[0].deferredTurns![0].status, 'recorded_not_submitted');
+  assert.equal(f.saved()[0].deferredTurns![0].queuedRequest, undefined);
+  f.behavior.result = async id => f.completed(id);
+  await f.backend.delegate(f.request('original_finished'), f.channel);
+  assert.equal(f.posts.length, 1);
+  assert.equal(f.replies.length, 0);
 });
 
 test('an overlong answer asks for a shorter reply and stays on the waiting request', async t => {
@@ -954,6 +1147,7 @@ test('an overlong answer asks for a shorter reply and stays on the waiting reque
   assert.equal(f.posts.length, 1); assert.equal(f.replies.length, 0);
   assert.equal(f.saved()[0].status, 'waiting_for_reply');
   assert.ok(f.updates.some(update => /shorter answer/.test(update.text)));
+  assert.equal(f.saved()[0].deferredTurns![0].queuedRequest, undefined);
 });
 
 test('expired questions remain waiting without admitting a reply or a second run', async t => {
