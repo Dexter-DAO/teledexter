@@ -1,6 +1,7 @@
 import OpenAI from 'openai';
 import { LiveWS } from 'openai/resources/live/ws';
 import type { ClientEvent } from 'openai/resources/live/live';
+import { inputSpeechEnergy } from './phone.js';
 
 export interface LiveProbeConnection {
   onOpen(listener: () => void): void;
@@ -70,9 +71,9 @@ function connect(apiKey: string): LiveProbeConnection {
 }
 
 /**
- * Prove generated G.711 audio and finalized Live usage without dialing anyone.
+ * Prove non-silent G.711 output and finalized Live usage without dialing anyone.
  * No backend tools or Responses model are configured in this client delegation.
- * https://developers.openai.com/api/docs/guides/live-delegation#send-the-right-kind-of-update
+ * https://developers.openai.com/api/docs/guides/live-conversations#greet-before-the-caller-speaks
  * https://developers.openai.com/api/docs/guides/voice-websockets?api=live
  */
 export async function probeLive(options: LiveProbeOptions): Promise<LiveProbeResult> {
@@ -93,12 +94,20 @@ export async function probeLive(options: LiveProbeOptions): Promise<LiveProbeRes
     let started = false;
     let closeSent = false;
     let audioBytes = 0;
+    let audibleOutput = false;
     let sessionId = '';
+    let inputTimer: ReturnType<typeof setInterval> | undefined;
+
+    const stopInput = () => {
+      if (inputTimer !== undefined) clearInterval(inputTimer);
+      inputTimer = undefined;
+    };
 
     const finish = (code?: string) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      stopInput();
       // Stop even a socket still connecting; a close handshake must not outlive
       // the probe deadline. After session.closed, final usage is already known.
       try { connection?.close(); } catch { /* Cleanup still terminates below. */ }
@@ -133,13 +142,12 @@ export async function probeLive(options: LiveProbeOptions): Promise<LiveProbeRes
           }
           started = true;
           sessionId = session.id;
-          // Acknowledgment of this instruction is not audio proof. Wait for
-          // output_audio.delta, then keep receiving through session.closed.
-          send({
-            type: 'session.instructions.append', event_id: 'probe_speak',
-            delegation_id: null,
-            content: 'Say "Voice connection ready" once now. Do not delegate or ask a question.',
-          });
+          // Live advances on continuous input, including silence. Each frame is
+          // 20ms of 8kHz PCMU; sending it on a timer preserves the media clock.
+          const silence = Buffer.alloc(160, 0xff).toString('base64');
+          inputTimer = setInterval(() => {
+            if (!settled && !closeSent) send({ type: 'session.input_audio.append', audio: silence });
+          }, 20);
         } else if (event.type === 'session.output_audio.delta') {
           if (!started) { finish('live_audio_before_session'); return; }
           const delta = event.delta;
@@ -155,8 +163,10 @@ export async function probeLive(options: LiveProbeOptions): Promise<LiveProbeRes
             return;
           }
           audioBytes += bytes.length;
-          if (!closeSent) {
+          audibleOutput ||= inputSpeechEnergy(bytes) > 0.01;
+          if (audibleOutput && !closeSent) {
             closeSent = true;
+            stopInput();
             send({ type: 'session.close', event_id: 'probe_close' });
           }
         } else if (event.type === 'session.closed') {
@@ -165,7 +175,7 @@ export async function probeLive(options: LiveProbeOptions): Promise<LiveProbeRes
             finish('live_session_mismatch');
             return;
           }
-          finish(started && closeSent && audioBytes > 0
+          finish(started && closeSent && audibleOutput
             ? undefined : 'live_no_audio');
         }
       });
@@ -176,7 +186,7 @@ export async function probeLive(options: LiveProbeOptions): Promise<LiveProbeRes
           type: 'session.start', event_id: 'probe_start',
           session: {
             model,
-            instructions: 'This is a brief voice connection check. Follow the application instruction to speak once. No backend work is needed.',
+            instructions: 'This is a brief voice connection check. Say "Voice connection ready" once now. Do not delegate or ask a question.',
             audio: { format: { type: 'audio/pcmu', rate: 8000 }, output: { voice: options.voice } },
             delegation: { type: 'client' },
           },
