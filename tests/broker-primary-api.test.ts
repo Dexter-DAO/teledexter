@@ -29,6 +29,47 @@ const submission: PrimarySubmission = { source: {
   callSid, itemId: 'item_caller_1', sourceEventId, revision: 1, receivedAt: when, role: 'user',
 }, text: 'Tell me my current portfolio.' };
 
+test('publication reference is paired, preserved verbatim in submit and reconciliation, and digest-bound', async () => {
+  const input: PrimarySubmission = { ...submission, text: ' Then review it.\t',
+    relatedPrimaryRequestId: messageId, referenceOrigin: 'broker_status_publication' };
+  const turn = originalTurn(input);
+  const proof = { schemaVersion: 1, kind: 'phone_closed_call_non_admission', callSid,
+    source: { itemId: input.source.itemId, sourceEventId, revision: 1, receivedAt: when },
+    rawSubmissionDigest: rawSubmissionDigest(bindingId, input),
+    turn: { recordId: sourceEventId, revisionRecordId: eventId, bodyDigest: turnBodyDigest(turn) }, closedAt: when };
+  const { client, requests } = harness([json({ ...completed, replayed: false }, 202),
+    json({ outcome: 'not_admitted', bindingId, requestId, proof })]);
+  await client.submit(bindingId, requestId, input);
+  await client.reconcile(bindingId, requestId, input);
+  for (const request of requests) {
+    const body = JSON.parse(String(request.init.body));
+    assert.equal(body.relatedPrimaryRequestId, messageId);
+    assert.equal(body.referenceOrigin, 'broker_status_publication');
+    assert.equal(body.text, input.text);
+  }
+  assert.notEqual(rawSubmissionDigest(bindingId, input), rawSubmissionDigest(bindingId, { ...submission, text: input.text }));
+  assert.notEqual(rawSubmissionDigest(bindingId, input), rawSubmissionDigest(bindingId, { ...input, relatedPrimaryRequestId: eventId }));
+  assert.equal(turnBodyDigest(turn), turnBodyDigest(originalTurn({ ...submission, text: input.text })), 'reference is not transcript text');
+  const oldProof = { ...proof, rawSubmissionDigest: rawSubmissionDigest(bindingId, { ...submission, text: input.text }) };
+  await assert.rejects(harness([json({ outcome: 'not_admitted', bindingId, requestId, proof: oldProof })])
+    .client.reconcile(bindingId, requestId, input), code('identity_mismatch'));
+});
+
+test('invalid, incomplete, and self-referencing publication fields never reach HTTP', async () => {
+  for (const fields of [
+    { relatedPrimaryRequestId: messageId }, { referenceOrigin: 'broker_status_publication' },
+    { relatedPrimaryRequestId: messageId, referenceOrigin: 'caller_consent' },
+    { relatedPrimaryRequestId: 'not-a-uuid', referenceOrigin: 'broker_status_publication' },
+    { relatedPrimaryRequestId: requestId, referenceOrigin: 'broker_status_publication' },
+  ]) {
+    const { client, requests } = harness([]);
+    const input = { ...submission, ...fields } as PrimarySubmission;
+    await assert.rejects(client.submit(bindingId, requestId, input), code('invalid_request'));
+    await assert.rejects(client.reconcile(bindingId, requestId, input), code('invalid_request'));
+    assert.equal(requests.length, 0);
+  }
+});
+
 test('reconciliation sends exact original body without Idempotency-Key and validates stable capture/proof digests', async () => {
   const raw = { ...submission, text: ' Original speech\t' };
   const turn = originalTurn(raw);

@@ -9,6 +9,7 @@ import { WebSocket } from 'ws';
 import { createBrokerServer } from '../src/broker/server.js';
 import { streamToken } from '../src/broker/phone.js';
 import { brokerOpening } from '../src/broker/instructions.js';
+import { beginBrokerPublication, settleBrokerPublication } from '../src/broker/publications.js';
 import type { BrokerConfig } from '../src/broker/config.js';
 import type { PrimaryApiClient, PrimaryContextMessage } from '../src/broker/primaryApi.js';
 import type { BrokerLiveSessionOptions } from '../src/live/session.js';
@@ -183,6 +184,25 @@ test('signed outbound answer preserves the repair brief and speaks its role-awar
   assert.ok(prior.context.includes('$41.53'));
   assert.ok(!history[0].text.includes(factFreshnessScenarios.currentPortfolio.backendText));
   assert.match(f.voiceOptions()!.instructions, /Obtain a result for that request during this call/);
+  const requestId = randomUUID();
+  const current = f.broker.store.get(call.id)!;
+  const identity = { callId: call.id, callSid: f.sid, bindingId: f.bindingId, sessionId: 'fixture-live' };
+  f.broker.store.update(call.id, { delegations: { ...current.delegations, [requestId]: {
+    ...identity, requestId, status: 'completed', updatedAt: current.updatedAt,
+    primaryResult: { requestId, bindingId: f.bindingId, state: 'completed' },
+  } as typeof current.delegations[string] } });
+  const snapshot = { revision: 0, callerRevision: 0, fragments: [] };
+  const publication = beginBrokerPublication(f.broker.store, identity, requestId,
+    { id: 'synthetic_result', kind: 'result', speak: true, text: 'Saved result', expectedCallerRevision: 0 }, snapshot)!;
+  settleBrokerPublication(f.broker.store, publication.record, { eventId: 'broker_17', status: 'accepted',
+    observedCallerRevision: 0, observedTranscriptSequence: 0 }, snapshot, false);
+  f.voiceOptions()!.onEvent!({ type: 'live.append.late_rejection', eventId: 'foreign_command', code: 'bad' });
+  assert.deepEqual(f.broker.store.get(call.id)!.publications!.rejections, []);
+  f.voiceOptions()!.onEvent!({ type: 'live.append.late_rejection', eventId: 'broker_17', code: 'late_rejection' });
+  assert.deepEqual(f.broker.store.get(call.id)!.publications!.rejections,
+    [{ sessionId: 'fixture-live', eventId: 'broker_17', code: 'late_rejection' }]);
+  // Remove the synthetic incomplete delegation fixture before ordinary closeout.
+  f.broker.store.update(call.id, { delegations: current.delegations });
   ws.close();
   await new Promise<void>(resolve => ws.once('close', () => resolve()));
 });

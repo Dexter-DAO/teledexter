@@ -6,6 +6,7 @@ import { createBrokerLiveSession, type BrokerLiveSession, type BrokerLiveSession
 import type { LiveTranscriptSnapshot } from '../live/session.js';
 import { createPrimaryApiClient, type PrimaryApiClient } from './primaryApi.js';
 import { createPrimaryBackend } from './backend.js';
+import { rejectBrokerPublication } from './publications.js';
 import { createCallbackFlow } from './callback.js';
 import { type BrokerConfig, isPhoneNumber } from './config.js';
 import { BrokerStore, type BrokerCall, type CallStatus, terminalCallStatuses } from './store.js';
@@ -292,6 +293,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
   function connectMedia(ws: WebSocket, call: BrokerCall) {
     let streamSid: string | undefined;
     let live: BrokerLiveSession | undefined;
+    let connectedSessionId: string | undefined;
     let backend: ReturnType<typeof createPrimaryBackend> | undefined;
     let stopping = false;
     let stopPromise: Promise<void> | undefined;
@@ -366,6 +368,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
             },
             onTranscript(snapshot) { store.update(call.id, { transcript: snapshot, transcriptRevision: snapshot.revision }); },
             onReady({ sessionId }) {
+              connectedSessionId = sessionId;
               store.update(call.id, { liveSessionId: sessionId, voiceOpening: { status: 'pending' } });
               // Live's documented speak-first command runs while phone audio
               // continues. Its receipt confirms context injection, not playback.
@@ -382,6 +385,9 @@ export function createBrokerServer(options: BrokerServerOptions) {
               if (ws.readyState === WebSocket.OPEN && streamSid) ws.send(JSON.stringify({ event: 'clear', streamSid }));
             },
             onEvent(event) {
+              if (event.type === 'live.append.late_rejection' && connectedSessionId && typeof event.eventId === 'string')
+                rejectBrokerPublication(store, { callId: call.id, callSid: call.callSid!, bindingId: call.primary!.bindingId,
+                  sessionId: connectedSessionId }, event.eventId, typeof event.code === 'string' ? event.code : 'provider_error');
               if (event.type === 'live.error') store.update(call.id, { failure: { code: String(event.code || 'live_error'), message: 'The voice connection could not continue' } });
             },
           });

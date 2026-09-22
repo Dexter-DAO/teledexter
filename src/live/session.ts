@@ -112,7 +112,8 @@ export function createBrokerLiveSession(options: BrokerLiveSessionOptions): Brok
     if (!pending) return;
     clearTimer(pending.timer);
     appends.delete(eventId);
-    pending.resolve({ eventId, status, ...(reason ? { reason } : {}) });
+    pending.resolve({ eventId, status, ...(reason ? { reason } : {}),
+      observedCallerRevision: transcript.callerRevision, observedTranscriptSequence: transcript.revision });
     emit({ type: 'live.append.outcome', eventId, status, ...(reason ? { reason } : {}) });
   };
   const clearPlayback = (reason: 'application_interrupt' | 'session_closed' | 'session_failed') => {
