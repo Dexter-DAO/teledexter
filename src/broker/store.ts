@@ -1,12 +1,26 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { z } from 'zod';
 import { brokerCallAssignmentSchema, phoneCallAssignmentSchema, retainedPhoneCallAssignmentRefSchema, sameCallAssignmentRef, type BrokerCallAssignment, type PhoneCallAssignmentRef } from './assignment.js';
 import type { BrokerPublicationJournal } from './publications.js';
+import { resolvedHarkAssignmentSchema } from './harkAssignment.js';
+import { canonicalJson } from '../outbound/canonical.js';
+import { observeHark, pendingHarkEvents, settleHarkJournalEvent, validateHarkJournal,
+  type HarkDeliveryOutcome, type HarkEndedTiming, type HarkJournal, type HarkJournalEvent, type HarkProviderStatus } from './harkJournal.js';
 import { bindDurableFileParent, durablyReplaceJsonFile, type DurableParentBinding } from '../outbound/DurableFile.js';
 
 export type CallStatus = 'prepared' | 'dialing' | 'queued' | 'ringing' | 'in-progress' | 'completed' | 'busy' | 'no-answer' | 'canceled' | 'failed' | 'unknown';
 export const terminalCallStatuses = new Set<CallStatus>(['completed', 'busy', 'no-answer', 'canceled', 'failed']);
+export interface HarkDispatch {
+  version: 1;
+  notificationDigest: string;
+  state: 'not_dispatched' | 'dispatch_started' | 'provider_accepted';
+  reservedAt: string;
+  dispatchStartedAt?: string;
+  providerAcceptedAt?: string;
+  preDispatchFailure?: { observedAt: string; code: string; message: string };
+}
 export interface BrokerCall {
   id: string; requestId: string; direction: 'inbound' | 'outbound'; purpose: string;
   number: string; callSid?: string; streamSid?: string; status: CallStatus;
@@ -15,6 +29,8 @@ export interface BrokerCall {
   primary?: { bindingId: string; name: string | null; context: string; callAssignmentRef?: PhoneCallAssignmentRef };
   liveSessionId?: string; transcript?: unknown; transcriptRevision?: number;
   mediaStartedAt?: string;
+  harkJournal?: HarkJournal;
+  harkDispatch?: HarkDispatch;
   voiceOpening?: { status: string; eventId?: string; reason?: string };
   finalized?: boolean; failure?: { code: string; message: string };
   canonicalTurns?: Record<string, unknown>;
@@ -34,6 +50,33 @@ export interface BrokerCall {
   };
   metrics?: { receivedAudioBytes: number; sentAudioBytes: number; playedAudioBytes: number; clearedAudioBytes: number };
   delegations: Record<string, { requestId: string; status: string; updatedAt: string; result?: string }>;
+}
+
+const dispatchDigest = z.string().regex(/^[0-9a-f]{64}$/);
+const dispatchTime = z.string().datetime({ offset: true });
+const dispatchBase = { version: z.literal(1), notificationDigest: dispatchDigest, reservedAt: dispatchTime };
+const preDispatchFailure = z.object({ observedAt: dispatchTime,
+  code: z.string().min(1).max(80), message: z.string().min(1).max(400) }).strict().optional();
+const harkDispatchSchema = z.discriminatedUnion('state', [
+  z.object({ ...dispatchBase, state: z.literal('not_dispatched') }).strict(),
+  z.object({ ...dispatchBase, state: z.literal('dispatch_started'), dispatchStartedAt: dispatchTime, preDispatchFailure }).strict(),
+  z.object({ ...dispatchBase, state: z.literal('provider_accepted'), dispatchStartedAt: dispatchTime, providerAcceptedAt: dispatchTime, preDispatchFailure }).strict(),
+]);
+function validateHarkDispatch(call: BrokerCall): void {
+  if (call.harkDispatch === undefined) return;
+  const dispatch = harkDispatchSchema.parse(call.harkDispatch);
+  if (call.callAssignment?.origin !== 'authenticated_hark_delivery') throw new Error('Hark dispatch requires its original assignment');
+  if (dispatch.reservedAt !== call.createdAt) throw new Error('Hark dispatch reservation time changed');
+  if (dispatch.state === 'provider_accepted') {
+    if (!call.callSid || !/^CA[0-9a-fA-F]{32}$/.test(call.callSid)) throw new Error('Accepted Hark dispatch requires its provider SID');
+  } else {
+    if (call.callSid !== undefined || call.harkJournal !== undefined || call.primary !== undefined || call.streamSid !== undefined)
+      throw new Error('Unaccepted Hark dispatch has provider evidence');
+    if (dispatch.state === 'not_dispatched' && !['prepared', 'failed', 'canceled'].includes(call.status))
+      throw new Error('Undispatched Hark call has dispatched status');
+    if (dispatch.state === 'dispatch_started' && !['dialing', 'failed', 'unknown', 'canceled'].includes(call.status))
+      throw new Error('Unaccepted Hark dispatch has provider status');
+  }
 }
 
 function validateAssignment(call: BrokerCall): void {
@@ -80,6 +123,8 @@ export class BrokerStore {
       for (const [id, call] of Object.entries(this.state.calls)) {
         if (call.id !== id || !call.requestId || !call.number || !call.createdAt || !call.delegations) throw new Error('Invalid broker call record');
         validateAssignment(call);
+        validateHarkJournal(call);
+        validateHarkDispatch(call);
       }
     } catch (error) { this.close(); throw error; }
   }
@@ -104,6 +149,7 @@ export class BrokerStore {
     if (Object.prototype.hasOwnProperty.call(input, 'callAssignment')) throw new Error('Assignment must originate from control reservation');
     const existing = this.list().find(call => call.requestId === input.requestId || (input.callSid && call.callSid === input.callSid));
     if (existing) {
+      if (existing.callAssignment?.origin === 'authenticated_hark_delivery') throw new Error('Call origin conflicts with its saved record');
       if (existing.number !== input.number || existing.direction !== input.direction || existing.purpose !== input.purpose || (input.callSid && existing.callSid !== input.callSid)) throw new Error('Call request identity conflicts with its saved record');
       return { call: existing, existing: true };
     }
@@ -119,7 +165,79 @@ export class BrokerStore {
     return { call: structuredClone(call), existing: false };
   }
 
-  update(id: string, patch: Partial<Omit<BrokerCall, 'id' | 'requestId' | 'number' | 'direction' | 'purpose' | 'createdAt' | 'callAssignment'>>): BrokerCall {
+  /** Only the API's resolved Hark snapshot supplies this reservation. */
+  reserveHark(value: unknown, notificationDigest?: string): { call: BrokerCall; existing: boolean } {
+    if (notificationDigest !== undefined) dispatchDigest.parse(notificationDigest);
+    const resolved = resolvedHarkAssignmentSchema.parse(value);
+    const assignment = resolved.callAssignment;
+    const id = assignment.brokerCallId;
+    const existing = this.list().find(call => call.id === id || call.requestId === id);
+    if (existing) {
+      if (existing.id !== id || existing.requestId !== id || existing.direction !== 'outbound'
+          || existing.number !== resolved.to || existing.purpose !== assignment.purpose
+          || existing.callAssignment?.origin !== 'authenticated_hark_delivery'
+          || canonicalJson(existing.callAssignment.value) !== canonicalJson(assignment))
+        throw new Error('Hark delivery conflicts with its saved record');
+      if (existing.harkDispatch?.notificationDigest !== notificationDigest)
+        throw new Error('Hark notification conflicts with its saved record');
+      return { call: existing, existing: true };
+    }
+    const now = new Date().toISOString();
+    const call: BrokerCall = { id, requestId: id, direction: 'outbound', purpose: assignment.purpose,
+      number: resolved.to, status: 'prepared', createdAt: now, updatedAt: now, delegations: {},
+      callAssignment: { origin: 'authenticated_hark_delivery', value: assignment } };
+    if (notificationDigest !== undefined) call.harkDispatch = { version: 1, notificationDigest,
+      state: 'not_dispatched', reservedAt: now };
+    validateAssignment(call);
+    validateHarkDispatch(call);
+    this.persist({ version: 1, calls: { ...this.state.calls, [id]: call } });
+    return { call: structuredClone(call), existing: false };
+  }
+
+  /** Caller authentication is separate; this only checks the saved notification identity. */
+  byHarkNotification(deliveryId: string, notificationDigest: string): BrokerCall | undefined {
+    dispatchDigest.parse(notificationDigest);
+    const call = this.list().find(item => item.id === deliveryId || item.requestId === deliveryId);
+    if (!call) return undefined;
+    if (call.id !== deliveryId || call.requestId !== deliveryId || call.callAssignment?.origin !== 'authenticated_hark_delivery')
+      throw new Error('Hark delivery conflicts with its saved record');
+    if (!call.harkDispatch) throw new Error('Hark notification identity unavailable');
+    if (call.harkDispatch.notificationDigest !== notificationDigest) throw new Error('Hark notification conflicts with its saved record');
+    validateHarkDispatch(call);
+    return call;
+  }
+
+  beginHarkDispatch(id: string, observedAt: string): BrokerCall {
+    dispatchTime.parse(observedAt);
+    const previous = this.state.calls[id];
+    if (!previous) throw new Error('Unknown broker call');
+    validateHarkDispatch(previous);
+    if (!previous.harkDispatch) throw new Error('Hark dispatch history unavailable');
+    if (previous.harkDispatch.state !== 'not_dispatched') throw new Error('Hark dispatch already started');
+    const { failure, ...current } = previous;
+    return this.saveHarkCall({ ...current, status: 'dialing', updatedAt: observedAt,
+      harkDispatch: { ...previous.harkDispatch, state: 'dispatch_started', dispatchStartedAt: observedAt,
+        ...(failure ? { preDispatchFailure: { observedAt: previous.updatedAt, code: failure.code, message: failure.message } } : {}) } });
+  }
+
+  acceptHarkDispatch(id: string, sid: string, observedAt: string): BrokerCall {
+    dispatchTime.parse(observedAt);
+    if (!/^CA[0-9a-fA-F]{32}$/.test(sid)) throw new Error('Invalid call SID');
+    const previous = this.state.calls[id];
+    if (!previous) throw new Error('Unknown broker call');
+    validateHarkDispatch(previous);
+    if (!previous.harkDispatch) throw new Error('Hark dispatch history unavailable');
+    if (previous.harkDispatch.state === 'not_dispatched') throw new Error('Hark dispatch was not started');
+    if (previous.harkDispatch.state === 'provider_accepted') {
+      if (previous.callSid !== sid) throw new Error('Call SID cannot change');
+      return structuredClone(previous);
+    }
+    if (Object.values(this.state.calls).some(call => call.id !== id && call.callSid === sid)) throw new Error('Call SID is already bound');
+    return this.saveHarkCall({ ...previous, callSid: sid, updatedAt: observedAt,
+      harkDispatch: { ...previous.harkDispatch, state: 'provider_accepted', providerAcceptedAt: observedAt } });
+  }
+
+  update(id: string, patch: Partial<Omit<BrokerCall, 'id' | 'requestId' | 'number' | 'direction' | 'purpose' | 'createdAt' | 'callAssignment' | 'harkJournal' | 'harkDispatch'>>): BrokerCall {
     const previous = this.state.calls[id];
     if (!previous) throw new Error('Unknown broker call');
     // Runtime callers can bypass Omit. Check the same property snapshot that
@@ -132,8 +250,18 @@ export class BrokerStore {
     if (Object.prototype.hasOwnProperty.call(nextPatch, 'callAssignment')) {
       const assignment = (nextPatch as Partial<BrokerCall>).callAssignment;
       const normalized = assignment === undefined ? undefined : brokerCallAssignmentSchema.parse(assignment);
-      if (JSON.stringify(normalized) !== JSON.stringify(previous.callAssignment)) throw new Error('Call assignment cannot change');
-      (nextPatch as Partial<BrokerCall>).callAssignment = normalized;
+      if (canonicalJson(normalized) !== canonicalJson(previous.callAssignment)) throw new Error('Call assignment cannot change');
+      (nextPatch as Partial<BrokerCall>).callAssignment = previous.callAssignment;
+    }
+    if (Object.prototype.hasOwnProperty.call(nextPatch, 'harkJournal')) {
+      if (canonicalJson((nextPatch as Partial<BrokerCall>).harkJournal) !== canonicalJson(previous.harkJournal))
+        throw new Error('Hark journal requires an observed lifecycle transition');
+      delete (nextPatch as Partial<BrokerCall>).harkJournal;
+    }
+    if (Object.prototype.hasOwnProperty.call(nextPatch, 'harkDispatch')) {
+      if (canonicalJson((nextPatch as Partial<BrokerCall>).harkDispatch) !== canonicalJson(previous.harkDispatch))
+        throw new Error('Hark dispatch requires an explicit transition');
+      delete (nextPatch as Partial<BrokerCall>).harkDispatch;
     }
     if (Object.prototype.hasOwnProperty.call(nextPatch, 'primary')) {
       if (previous.callAssignment && previous.primary && nextPatch.primary?.bindingId !== previous.primary.bindingId)
@@ -159,8 +287,66 @@ export class BrokerStore {
     if (nextPatch.transcriptRevision !== undefined && nextPatch.transcriptRevision < (previous.transcriptRevision ?? 0)) { delete nextPatch.transcript; delete nextPatch.transcriptRevision; }
     const call: BrokerCall = { ...previous, ...nextPatch, updatedAt: new Date().toISOString() };
     validateAssignment(call);
+    validateHarkJournal(call);
+    validateHarkDispatch(call);
     this.persist({ version: 1, calls: { ...this.state.calls, [id]: call } });
     return structuredClone(call);
+  }
+
+  private saveHarkCall(call: BrokerCall): BrokerCall {
+    validateAssignment(call);
+    validateHarkJournal(call);
+    validateHarkDispatch(call);
+    this.persist({ version: 1, calls: { ...this.state.calls, [call.id]: call } });
+    return structuredClone(call);
+  }
+
+  observeHarkProvider(id: string, status: HarkProviderStatus, observedAt: string, endedTiming?: HarkEndedTiming): BrokerCall {
+    const previous = this.state.calls[id];
+    if (!previous) throw new Error('Unknown broker call');
+    const mapped = status === 'in-progress' ? 'answered' : status;
+    const harkJournal = observeHark(previous, mapped, observedAt, endedTiming);
+    const providerStatus = harkJournal.providerStatus;
+    const nextStatus = providerStatus === 'answered' || providerStatus === 'streaming' ? 'in-progress' : providerStatus;
+    return this.saveHarkCall({ ...previous, harkJournal, status: nextStatus,
+      ...(harkJournal.ended ? { endedAt: harkJournal.ended.observedAt } : {}), updatedAt: new Date().toISOString() });
+  }
+
+  observeHarkMediaStarted(id: string, observedAt: string): BrokerCall {
+    const previous = this.state.calls[id];
+    if (!previous) throw new Error('Unknown broker call');
+    const harkJournal = observeHark(previous, 'streaming', observedAt);
+    // A late/replayed media callback cannot reopen a terminal provider call.
+    const closed = Boolean(harkJournal.ended);
+    return this.saveHarkCall({ ...previous, harkJournal,
+      ...(closed ? {} : { status: 'in-progress' as const, mediaStartedAt: previous.mediaStartedAt ?? observedAt }),
+      updatedAt: new Date().toISOString() });
+  }
+
+  pendingHarkEvents(id?: string): Array<{ callId: string; event: HarkJournalEvent }> {
+    const calls = id === undefined ? Object.values(this.state.calls) : [this.state.calls[id]].filter(call => call !== undefined);
+    return calls.flatMap(call => pendingHarkEvents(call).map(event => ({ callId: call.id, event })));
+  }
+
+  recordHarkAttempt(id: string, eventId: string, bodyDigest: string, attemptedAt: string): HarkJournalEvent {
+    const call = this.get(id);
+    const item = call?.harkJournal?.events[eventId];
+    if (!call || !item || item.bodyDigest !== bodyDigest) throw new Error('Unknown Hark event identity');
+    if (!Number.isFinite(Date.parse(attemptedAt)) || !/^\d{4}-\d{2}-\d{2}T/.test(attemptedAt)) throw new Error('Invalid attempt time');
+    if (!pendingHarkEvents(call).some(event => event.id === eventId)) throw new Error('Hark event is not ready for delivery');
+    item.attempts += 1;
+    item.lastAttemptAt = attemptedAt;
+    this.saveHarkCall(call);
+    return structuredClone(item);
+  }
+
+  settleHarkEvent(id: string, eventId: string, bodyDigest: string, outcome: HarkDeliveryOutcome): HarkJournalEvent {
+    const call = this.get(id);
+    const item = call?.harkJournal?.events[eventId];
+    if (!call?.harkJournal || !item || item.bodyDigest !== bodyDigest) throw new Error('Unknown Hark event identity');
+    call.harkJournal.events[eventId] = settleHarkJournalEvent(item, outcome);
+    this.saveHarkCall(call);
+    return structuredClone(call.harkJournal.events[eventId]!);
   }
 
   close() {
