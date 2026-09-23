@@ -7,6 +7,9 @@ import type { LiveTranscriptSnapshot } from '../live/session.js';
 import { createPrimaryApiClient, type PrimaryApiClient } from './primaryApi.js';
 import { createPrimaryBackend } from './backend.js';
 import { newPhoneCallControlSchema } from './assignment.js';
+import { authorizedHarkIngress } from './harkAuth.js';
+import { OutboundAlertRequestSchema } from '../outbound/contract.js';
+import { canonicalJson, sha256Hex } from '../outbound/canonical.js';
 import { createHarkAssignmentResolver, HarkAssignmentError, type HarkAssignmentResolver } from './harkResolver.js';
 import { createHarkLifecycleDelivery } from './harkLifecycle.js';
 import { type HarkEndedTiming, type HarkProviderStatus } from './harkJournal.js';
@@ -81,6 +84,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
       statusSender: options.harkStatusSender, billingSender: options.harkBillingSender }) : undefined;
   const active = new Map<string, { stop(reason: string): Promise<void> }>();
   const dialing = new Set<string>();
+  const harkDispatching = new Set<string>();
   const claimed = new Set<string>();
   const pendingRequests = new Set<Promise<void>>();
   const sessionCalls = new Set<string>();
@@ -173,8 +177,16 @@ export function createBrokerServer(options: BrokerServerOptions) {
   }
 
   async function dialReserved(reservation: { call: BrokerCall; existing: boolean }): Promise<{ replayed: boolean; call: BrokerCall }> {
-    if (reservation.existing) return { replayed: true, call: reservation.call };
-    const call = reservation.call;
+    const call = store.get(reservation.call.id)!;
+    const hark = call.callAssignment?.origin === 'authenticated_hark_delivery';
+    if (hark) {
+      if (call.harkDispatch?.state === 'provider_accepted' && call.callSid)
+        return { replayed: true, call };
+      if (!call.harkDispatch || call.harkDispatch.state !== 'not_dispatched')
+        throw new HarkAssignmentError(409, 'hark_dispatch_uncertain');
+      if (harkDispatching.has(call.id)) throw new HarkAssignmentError(409, 'hark_dispatch_pending');
+    } else if (reservation.existing) return { replayed: true, call };
+
     const to = call.number;
     sessionCalls.add(call.id);
     if (dialing.has(to) || store.list().some(other => other.id !== call.id && other.number === to && !providerFinished(other))) {
@@ -182,6 +194,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
       throw Object.assign(new Error('Another call is already open'), { code: 'call_already_open' });
     }
     dialing.add(to);
+    if (hark) harkDispatching.add(call.id);
     try {
       try {
         if (call.callAssignment?.origin === 'authenticated_hark_delivery'
@@ -198,7 +211,9 @@ export function createBrokerServer(options: BrokerServerOptions) {
         store.update(call.id, { status: 'canceled', failure: { code: 'hark_event_expired', message: 'The saved watch event has expired' } });
         throw new HarkAssignmentError(403, 'hark_event_expired');
       }
-      store.update(call.id, { status: 'dialing' });
+      if (hark) store.beginHarkDispatch(call.id, new Date().toISOString());
+      else store.update(call.id, { status: 'dialing' });
+      let providerResponded = false;
       try {
         const created = await provider.calls.create({ from: config.from, to,
           url: `${config.publicOrigin}/broker/answer/${call.id}`, method: 'POST',
@@ -206,16 +221,26 @@ export function createBrokerServer(options: BrokerServerOptions) {
           statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
           timeout: 30, timeLimit: config.maxCallSeconds, record: false,
         });
+        providerResponded = true;
         if (!CALL_SID.test(created.sid)) throw new Error('invalid_provider_call_id');
-        store.update(call.id, { callSid: created.sid });
+        if (hark) store.acceptHarkDispatch(call.id, created.sid, new Date().toISOString());
+        else store.update(call.id, { callSid: created.sid });
         const saved = observeProviderState(call.id, 'queued');
         return { replayed: false, call: saved };
       } catch (error) {
+        // A signed callback can durably establish acceptance before create returns.
+        // A transport error must not erase that receipt or regress terminal state.
+        const saved = store.get(call.id)!;
+        if (hark && saved.harkDispatch?.state === 'provider_accepted' && saved.callSid) {
+          if (!providerResponded) return { replayed: true, call: saved };
+          store.update(call.id, { failure: safeFailure(error) });
+          throw error;
+        }
         const status = (error as { status?: number }).status;
-        store.update(call.id, { status: status && status >= 400 && status < 500 ? 'failed' : 'unknown', failure: safeFailure(error) });
+        store.update(call.id, { status: !hark && status && status >= 400 && status < 500 ? 'failed' : 'unknown', failure: safeFailure(error) });
         throw error;
       }
-    } finally { dialing.delete(to); }
+    } finally { dialing.delete(to); harkDispatching.delete(call.id); }
   }
 
   async function bind(call: BrokerCall, proof: ProviderCallProof): Promise<BrokerCall> {
@@ -231,25 +256,38 @@ export function createBrokerServer(options: BrokerServerOptions) {
     const route = request.url || '/';
     if (request.method === 'GET' && route === '/broker/health') return json(response, 200, { ok: accepting, service: 'dexter-broker', model: config.model, revision: process.env.BROKER_REVISION || 'development', activeCalls: active.size });
     if (route === '/internal/outbound-alerts' && request.method === 'POST') {
-      if (!accepting || !resolveHarkAssignment) return json(response, 503, { ok: false, error: 'hark_broker_not_configured' });
+      if (!accepting || !resolveHarkAssignment || !config.harkInternalToken) return json(response, 503, { ok: false, error: 'hark_broker_not_configured' });
       if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(request.socket.remoteAddress ?? ''))
         return json(response, 403, { ok: false, error: 'forbidden' });
       const token = request.headers['x-dexter-internal-auth'];
-      if (typeof token !== 'string' || !token || token.length > 4096)
+      if (!authorizedHarkIngress(request, config.harkInternalToken) || typeof token !== 'string')
         return json(response, 401, { ok: false, error: 'hark_authorization_required' });
       let notification: unknown;
       try { notification = JSON.parse(await body(request, 65_536)); }
       catch { return json(response, 400, { ok: false, error: 'invalid_hark_notification' }); }
       try {
-        const resolved = await resolveHarkAssignment(notification, token);
+        const parsed = OutboundAlertRequestSchema.safeParse(notification);
+        if (!parsed.success || !parsed.data.hark) throw new HarkAssignmentError(400, 'invalid_hark_notification');
+        const normalized = parsed.data;
+        const notificationDigest = sha256Hex(canonicalJson({ namespace: 'dexter-broker-hark-notification/v1', notification: normalized }));
+        const saved = store.byHarkNotification(normalized.hark!.deliveryId, notificationDigest);
+        if (saved?.harkDispatch?.state === 'provider_accepted' && saved.callSid) {
+          // Read-only recovery of the original receipt, not renewed dial authority.
+          return json(response, 200, { ok: true, replay: true, intentId: saved.id, callSid: saved.callSid, state: saved.status });
+        }
+        if (saved && saved.harkDispatch?.state !== 'not_dispatched') throw new HarkAssignmentError(409, 'hark_dispatch_uncertain');
+        if (saved && harkDispatching.has(saved.id)) throw new HarkAssignmentError(409, 'hark_dispatch_pending');
+        const resolved = await resolveHarkAssignment(normalized, token);
         if (!config.allowedTo.includes(resolved.to)) return json(response, 403, { ok: false, error: 'recipient_not_authorized' });
-        const result = await dialReserved(store.reserveHark(resolved));
+        const result = await dialReserved(store.reserveHark(resolved, notificationDigest));
         return json(response, result.replayed ? 200 : 202, { ok: true, replay: result.replayed,
           intentId: result.call.id, callSid: result.call.callSid ?? null, state: result.call.status });
       } catch (error) {
         if (error instanceof HarkAssignmentError) return json(response, error.status, { ok: false, error: error.code });
-        if (error instanceof Error && error.message === 'Hark delivery conflicts with its saved record')
+        if (error instanceof Error && ['Hark delivery conflicts with its saved record', 'Hark notification conflicts with its saved record'].includes(error.message))
           return json(response, 409, { ok: false, error: 'hark_delivery_conflict' });
+        if (error instanceof Error && error.message === 'Hark notification identity unavailable')
+          return json(response, 409, { ok: false, error: 'hark_dispatch_history_unavailable' });
         if ((error as { code?: string }).code === 'call_already_open') return json(response, 409, { ok: false, error: 'call_already_open' });
         throw error;
       }
@@ -330,7 +368,10 @@ export function createBrokerServer(options: BrokerServerOptions) {
           || (saved.direction === 'inbound' && (params.To !== config.from || params.From !== saved.number))
           || (saved.direction === 'inbound' && match?.[1] === 'answer')
           || (saved.callSid && saved.callSid !== params.CallSid)) return json(response, 403, { error: 'call_identity_mismatch' });
-      call = saved.callSid ? saved : store.update(saved.id, { callSid: params.CallSid });
+      if (!saved.callSid && saved.harkDispatch) {
+        if (saved.harkDispatch.state !== 'dispatch_started') return json(response, 403, { error: 'call_not_dispatched' });
+        call = store.acceptHarkDispatch(saved.id, params.CallSid, new Date().toISOString());
+      } else call = saved.callSid ? saved : store.update(saved.id, { callSid: params.CallSid });
       if (match?.[1] === 'callback') return xml(response, await callbacks.consent(call, proof));
       if (genericStatus || match![1] === 'status') {
         if (providerStates.has(params.CallStatus as CallStatus)) {

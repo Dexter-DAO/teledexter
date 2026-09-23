@@ -5,6 +5,7 @@ import { brokerConfig } from '../src/broker/config.js';
 
 const callbackSecret = 'hark-callback-secret-for-offline-tests';
 const ingressSecret = 'independent-ingress-secret-for-offline-tests';
+const internalToken = 'existing-internal-token-for-offline-tests';
 const baseEnv = (): NodeJS.ProcessEnv => ({
   BROKER_CONTROL_TOKEN: 'broker-control-secret-for-offline-tests',
   PHONE_SERVICE_SECRET: 'phone-service-secret-for-offline-tests',
@@ -22,6 +23,7 @@ const harkEnv = (): NodeJS.ProcessEnv => ({
   BROKER_HARK_API_URL: 'http://127.0.0.1:3030',
   HARK_PHONE_CALLBACK_SIGNING_SECRET: callbackSecret,
   OUTBOUND_ALERT_SIGNING_SECRET: ingressSecret,
+  DEXTER_INTERNAL_TOKEN: internalToken,
 });
 
 test('unset optional Hark wiring preserves the existing broker configuration', () => {
@@ -31,6 +33,7 @@ test('unset optional Hark wiring preserves the existing broker configuration', (
   assert.equal(config.phoneServiceSecret, baseEnv().PHONE_SERVICE_SECRET);
   assert.equal(Object.hasOwn(config, 'harkApiBaseUrl'), false);
   assert.equal(Object.hasOwn(config, 'harkCallbackSigningSecret'), false);
+  assert.equal(Object.hasOwn(config, 'harkInternalToken'), false);
 });
 
 test('unused or blank Hark origin does not require or export a callback key', () => {
@@ -40,6 +43,7 @@ test('unused or blank Hark origin does not require or export a callback key', ()
         HARK_PHONE_CALLBACK_SIGNING_SECRET: secret, OUTBOUND_ALERT_SIGNING_SECRET: ingressSecret });
       assert.equal(Object.hasOwn(config, 'harkApiBaseUrl'), false);
       assert.equal(Object.hasOwn(config, 'harkCallbackSigningSecret'), false);
+      assert.equal(Object.hasOwn(config, 'harkInternalToken'), false);
     }
   }
 });
@@ -51,6 +55,7 @@ for (const origin of ['http://127.0.0.1', 'http://127.0.0.1:3030/',
       HARK_PHONE_CALLBACK_SIGNING_SECRET: ` ${callbackSecret}\n` });
     assert.equal(config.harkApiBaseUrl, origin);
     assert.equal(config.harkCallbackSigningSecret, callbackSecret);
+    assert.equal(config.harkInternalToken, internalToken);
   });
 }
 
@@ -80,18 +85,32 @@ test('callback key must differ from the trimmed inbound alert key', () => {
   assert.equal(brokerConfig({ ...harkEnv(), OUTBOUND_ALERT_SIGNING_SECRET: undefined }).harkCallbackSigningSecret, callbackSecret);
 });
 
+test('Hark requires the existing internal token only when enabled and preserves its exact bytes', () => {
+  for (const token of [undefined, '', 'x'.repeat(4097), 'é'.repeat(2049)]) {
+    assert.throws(() => brokerConfig({ ...harkEnv(), DEXTER_INTERNAL_TOKEN: token }),
+      { message: 'Hark requires the existing bounded internal token' });
+    const disabled = brokerConfig({ ...baseEnv(), DEXTER_INTERNAL_TOKEN: token });
+    assert.equal(Object.hasOwn(disabled, 'harkInternalToken'), false);
+  }
+  for (const token of ['x'.repeat(4096), 'é'.repeat(2048), ` \t${internalToken} `]) {
+    assert.equal(brokerConfig({ ...harkEnv(), DEXTER_INTERNAL_TOKEN: token }).harkInternalToken, token);
+  }
+});
+
 test('configuration errors do not contain callback or ingress secrets', () => {
   for (const overrides of [
     { HARK_PHONE_CALLBACK_SIGNING_SECRET: callbackSecret, OUTBOUND_ALERT_SIGNING_SECRET: callbackSecret },
     { BROKER_HARK_API_URL: `http://user:${callbackSecret}@localhost:3030` },
     { BROKER_HARK_API_URL: `http://localhost:3030/?key=${callbackSecret}` },
     { BROKER_HARK_API_URL: `invalid-url-with-${callbackSecret}` },
+    { DEXTER_INTERNAL_TOKEN: internalToken.repeat(200) },
   ]) {
     assert.throws(() => brokerConfig({ ...harkEnv(), ...overrides }), (error: unknown) => {
       assert.ok(error instanceof Error);
       const diagnostic = inspect(error, { depth: 4 });
       assert.equal(diagnostic.includes(callbackSecret), false, 'error object exposes the callback key');
       assert.equal(diagnostic.includes(ingressSecret), false, 'error object exposes the ingress key');
+      assert.equal(diagnostic.includes(internalToken), false, 'error object exposes the internal token');
       return true;
     });
   }

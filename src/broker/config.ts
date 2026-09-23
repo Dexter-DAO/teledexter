@@ -7,6 +7,7 @@ export interface BrokerConfig {
   allowedTo: string[]; apiBaseUrl: string; phoneServiceSecret: string;
   harkApiBaseUrl?: string;
   harkCallbackSigningSecret?: string;
+  harkInternalToken?: string;
   maxCallSeconds: number;
 }
 
@@ -32,6 +33,7 @@ export function brokerConfig(env: NodeJS.ProcessEnv): BrokerConfig {
   const from = required('TWILIO_PHONE_NUMBER');
   const harkApiBaseUrl = env.BROKER_HARK_API_URL?.trim() || undefined;
   const harkCallbackSigningSecret = env.HARK_PHONE_CALLBACK_SIGNING_SECRET?.trim();
+  const harkInternalToken = env.DEXTER_INTERNAL_TOKEN;
   if (harkApiBaseUrl) {
     let hark: URL;
     try { hark = new URL(harkApiBaseUrl); }
@@ -42,6 +44,8 @@ export function brokerConfig(env: NodeJS.ProcessEnv): BrokerConfig {
     if (!harkCallbackSigningSecret || harkCallbackSigningSecret.length < 32
         || harkCallbackSigningSecret === env.OUTBOUND_ALERT_SIGNING_SECRET?.trim())
       throw new Error('Hark requires its existing independent callback signing secret');
+    if (!harkInternalToken || Buffer.byteLength(harkInternalToken, 'utf8') > 4096)
+      throw new Error('Hark requires the existing bounded internal token');
   }
   const allowedTo = (env.BROKER_ALLOWED_TO || '').split(',').map(v => v.trim()).filter(Boolean);
   if (!isPhoneNumber(from) || !allowedTo.every(isPhoneNumber) || allowedTo.includes(from)) throw new Error('Invalid broker phone configuration');
@@ -58,6 +62,6 @@ export function brokerConfig(env: NodeJS.ProcessEnv): BrokerConfig {
     apiKey: required('OPENAI_API_KEY'), model: env.BROKER_LIVE_MODEL || 'gpt-live-1',
     voice: env.BROKER_LIVE_VOICE || 'marin', twilioAccountSid: required('TWILIO_ACCOUNT_SID'),
     twilioAuthToken: required('TWILIO_AUTH_TOKEN'), from, allowedTo, apiBaseUrl,
-    phoneServiceSecret, maxCallSeconds, ...(harkApiBaseUrl ? { harkApiBaseUrl, harkCallbackSigningSecret } : {}),
+    phoneServiceSecret, maxCallSeconds, ...(harkApiBaseUrl ? { harkApiBaseUrl, harkCallbackSigningSecret, harkInternalToken } : {}),
   };
 }

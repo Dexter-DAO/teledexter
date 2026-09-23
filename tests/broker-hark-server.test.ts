@@ -52,10 +52,14 @@ function notificationFor(resolved: ResolvedHarkAssignment) {
       deliveryId: saved.deliveryId, originTaskId: saved.originTaskId } };
 }
 
-async function fixture(t: test.TestContext, overrides: { ambiguousDial?: boolean; failedRegistration?: boolean } = {}) {
+async function fixture(t: test.TestContext, overrides: { ambiguousDial?: boolean; failedRegistration?: boolean; returnedSid?: string } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-hark-server-'));
   let resolved = futureAssignment();
   let apiStatus = 200;
+  let readinessEligible = true;
+  let preflightFailure = false;
+  let beforePreflight: (() => Promise<void>) | undefined;
+  let beforeProviderReturn: (() => Promise<void>) | undefined;
   let apiBody: unknown;
   const apiRequests: { path: string | undefined; body: unknown; token: string | string[] | undefined }[] = [];
   const api = createServer(async (request, response) => {
@@ -72,7 +76,7 @@ async function fixture(t: test.TestContext, overrides: { ambiguousDial?: boolean
   const config: BrokerConfig = { host: '127.0.0.1', port: 3213, publicOrigin: 'https://phone.example.test',
     stateDir: directory, controlToken: 'control-fixture-'.repeat(4), apiKey: 'fixture-key', model: 'gpt-live-1', voice: 'marin',
     twilioAccountSid: 'AC' + '1'.repeat(32), twilioAuthToken: 'fixture-twilio-secret', from: '+12025550100',
-    allowedTo: ['+12025550123'], apiBaseUrl: 'https://api.example.test', phoneServiceSecret: 's'.repeat(40), maxCallSeconds: 60 };
+    allowedTo: ['+12025550123'], apiBaseUrl: 'https://api.example.test', phoneServiceSecret: 's'.repeat(40), maxCallSeconds: 60, harkInternalToken: 'private-hark-token' };
   const sid = 'CA' + '2'.repeat(32);
   const bindingId = randomUUID();
   const counters = { create: 0, readiness: 0, preflight: 0, bind: 0, voice: 0, opening: 0, updates: 0, fetch: 0 };
@@ -84,7 +88,7 @@ async function fixture(t: test.TestContext, overrides: { ambiguousDial?: boolean
   const opening = new Promise<void>(resolve => { openingResolve = resolve; });
   let broker: ReturnType<typeof createBrokerServer>;
   const primary = {
-    async readiness() { counters.readiness++; return { eligible: true, reason: 'ready' }; },
+    async readiness() { counters.readiness++; return { eligible: readinessEligible, reason: readinessEligible ? 'ready' : 'runtime_unavailable' }; },
     async openCall(proof: { params: Record<string, string> }, assignment?: PhoneCallAssignment) {
       counters.bind++;
       assert.equal(counters.voice, 0, 'voice session cannot start before registration');
@@ -118,13 +122,14 @@ async function fixture(t: test.TestContext, overrides: { ambiguousDial?: boolean
       assert.deepEqual(saved.callAssignment.value, resolved.callAssignment);
     }
     savedBeforeDial.push(saved);
+    await beforeProviderReturn?.();
     if (overrides.ambiguousDial) throw new Error('Provider response timed out');
-    return { sid, status: 'queued' };
+    return { sid: overrides.returnedSid ?? sid, status: 'queued' };
   } });
   function start() {
     broker = createBrokerServer({ config, primary, provider: { calls: provider } as unknown as ReturnType<typeof Twilio>,
       resolveHarkAssignment: resolver,
-      probe: async () => { counters.preflight++; return { model: 'gpt-live-1', audioBytes: 800, sessionId: 'fixture', finalized: true }; },
+      probe: async () => { counters.preflight++; await beforePreflight?.(); if (preflightFailure) throw new Error('Live unavailable'); return { model: 'gpt-live-1', audioBytes: 800, sessionId: 'fixture', finalized: true }; },
       voiceFactory: options => {
         counters.voice++;
         assert.ok(broker.store.get(options.callId)?.primary);
@@ -154,6 +159,10 @@ async function fixture(t: test.TestContext, overrides: { ambiguousDial?: boolean
   return {
     config, sid, bindingId, directory, counters, apiRequests, savedBeforeDial, registered, openings, opening,
     get broker() { return broker; }, get base() { return base; }, get resolved() { return resolved; },
+    setReadiness(value: boolean) { readinessEligible = value; },
+    setPreflightFailure(value: boolean) { preflightFailure = value; },
+    setBeforePreflight(value?: () => Promise<void>) { beforePreflight = value; },
+    setBeforeProviderReturn(value?: () => Promise<void>) { beforeProviderReturn = value; },
     setResolved(value: ResolvedHarkAssignment) { resolved = value; },
     setProviderRecord(value: Record<string, unknown>) { providerRecord = value; },
     setApi(status: number, value?: unknown) { apiStatus = status; apiBody = value; },
@@ -259,9 +268,9 @@ test('ambiguous provider dispatch stays unknown across retry and restart without
   const original = f.broker.store.list()[0];
   assert.equal(original.status, 'unknown');
   assert.equal(original.callSid, undefined);
-  assert.equal((await f.post(notification)).status, 200);
+  assert.equal((await f.post(notification)).status, 409);
   await f.restart();
-  assert.equal((await f.post(notification)).status, 200);
+  assert.equal((await f.post(notification)).status, 409);
   assert.equal(f.counters.create, 1);
   assert.equal(f.counters.readiness, 1);
   assert.deepEqual(f.broker.store.list()[0], original);
@@ -301,7 +310,8 @@ test('valid assignment to an unallowed destination is refused before reservation
 
 test('changed saved event snapshot cannot replace an existing assignment or redial', async t => {
   const f = await fixture(t);
-  assert.equal((await f.post(f.notification())).status, 202);
+  f.setReadiness(false);
+  assert.equal((await f.post(f.notification())).status, 503);
   const original = f.broker.store.list()[0];
   const changed = structuredClone(f.resolved);
   changed.callAssignment.hark.event.summary = 'Different saved event contents';
@@ -311,7 +321,7 @@ test('changed saved event snapshot cannot replace an existing assignment or redi
   const refusal = await f.post(f.notification());
   assert.equal(refusal.status, 409);
   assert.deepEqual(f.broker.store.list()[0], original);
-  assert.equal(f.counters.create, 1);
+  assert.equal(f.counters.create, 0);
 });
 
 test('Hark delivery identity cannot claim an existing operator or unassigned request', async t => {
@@ -336,7 +346,7 @@ test('expired saved event cannot dial and its refusal survives exact retry', asy
   assert.notEqual((await f.post(f.notification())).status, 202);
   const call = f.broker.store.list()[0];
   assert.equal(call.status, 'failed');
-  assert.equal((await f.post(f.notification())).status, 200);
+  assert.equal((await f.post(f.notification())).status, 403);
   assert.equal(f.counters.create, 0);
   assert.equal(f.counters.readiness, 0);
 });
@@ -431,16 +441,8 @@ test('actual retained API notificationVoice producer crosses Broker admission an
   const f = await fixture(t);
   const producer = retainedNotificationProducer();
   const snapshot = f.resolved.callAssignment.hark;
-  const input = { to: f.resolved.to, recipientName: 'Branch', title: 'Watched market movement',
-    message: 'Incoming source explanation, not an owner command.', priority: 'high', tags: ['stock'],
-    observedAt: snapshot.event.observedAt,
-    metadata: { eventId: `hark:${snapshot.deliveryId}`, destinationId: snapshot.destinationId,
-      subscriberUserId: snapshot.ownerSupabaseUserId, billingMandateId: snapshot.billing.mandateId,
-      billingUnitPriceMicro: snapshot.billing.unitPriceMicro, billingFreeSeconds: snapshot.billing.freeSeconds,
-      publisherContext: { facts: snapshot.event.facts, evidence: snapshot.event.evidence },
-      hark: { schemaVersion: 1, caseId: snapshot.caseId, watchId: snapshot.watch.id, eventId: snapshot.event.id,
-        deliveryId: snapshot.deliveryId, originTaskId: snapshot.originTaskId } } };
-  const dependencies = { url: f.base + '/internal/outbound-alerts', internalToken: 'actual-producer-token' };
+  const input = producerInput(f);
+  const dependencies = { url: f.base + '/internal/outbound-alerts', internalToken: 'private-hark-token' };
   const first = await producer.dispatchNotificationVoice(input, dependencies);
   t.diagnostic(JSON.stringify({ phase: 'first_delivery', result: first, dialCount: f.counters.create,
     resolverRequests: f.apiRequests.length }));
@@ -458,5 +460,201 @@ test('actual retained API notificationVoice producer crosses Broker admission an
   assert.equal(replay.replay, true);
   assert.equal(replay.intentId, first.intentId);
   assert.equal(replay.callSid, first.callSid);
+  assert.equal(f.counters.create, 1);
+});
+
+function producerInput(f: Awaited<ReturnType<typeof fixture>>) {
+  const snapshot = f.resolved.callAssignment.hark;
+  return { to: f.resolved.to, recipientName: 'Branch', title: 'Watched market movement',
+    message: 'Incoming source explanation, not an owner command.', priority: 'high', tags: ['stock'],
+    observedAt: snapshot.event.observedAt,
+    metadata: { eventId: `hark:${snapshot.deliveryId}`, destinationId: snapshot.destinationId,
+      subscriberUserId: snapshot.ownerSupabaseUserId, billingMandateId: snapshot.billing.mandateId,
+      billingUnitPriceMicro: snapshot.billing.unitPriceMicro, billingFreeSeconds: snapshot.billing.freeSeconds,
+      publisherContext: { facts: snapshot.event.facts, evidence: snapshot.event.evidence },
+      hark: { schemaVersion: 1, caseId: snapshot.caseId, watchId: snapshot.watch.id, eventId: snapshot.event.id,
+        deliveryId: snapshot.deliveryId, originTaskId: snapshot.originTaskId } } };
+}
+
+for (const stage of ['readiness', 'probe'] as const) test(`actual producer refuses repeated undialed ${stage} failure`, {
+  skip: !process.env.BROKER_API_NOTIFICATION_VOICE_SOURCE,
+}, async t => {
+  const f = await fixture(t);
+  const producer = retainedNotificationProducer();
+  const input = producerInput(f);
+  const send = () => producer.dispatchNotificationVoice(input, { url: f.base + '/internal/outbound-alerts', internalToken: 'private-hark-token' });
+  if (stage === 'readiness') f.setReadiness(false); else f.setPreflightFailure(true);
+  assert.equal((await send()).ok, false);
+  assert.equal(f.counters.create, 0);
+  const retry = await send();
+  t.diagnostic(JSON.stringify({ stage, retry, dialCount: f.counters.create }));
+  assert.equal(retry.ok, false, 'an undialed failed record must not be accepted by the API sender');
+  assert.equal(f.counters.create, 0);
+  await f.restart();
+  assert.equal((await send()).ok, false);
+  f.setReadiness(true); f.setPreflightFailure(false);
+  const recovered = await send();
+  assert.equal(recovered.ok, true);
+  assert.equal(recovered.callSid, f.sid);
+  const accepted = f.broker.store.list()[0];
+  assert.equal(accepted.failure, undefined);
+  assert.ok(accepted.harkDispatch?.preDispatchFailure);
+  assert.equal(f.counters.create, 1);
+  assert.equal((await send()).ok, true);
+  assert.equal(f.counters.create, 1);
+});
+
+test('actual producer recovers terminal receipt after resolver stops admitting delivery', {
+  skip: !process.env.BROKER_API_NOTIFICATION_VOICE_SOURCE,
+}, async t => {
+  const f = await fixture(t);
+  const producer = retainedNotificationProducer();
+  const input = producerInput(f);
+  const send = () => producer.dispatchNotificationVoice(input, { url: f.base + '/internal/outbound-alerts', internalToken: 'private-hark-token' });
+  const first = await send();
+  assert.equal(first.ok, true);
+  await f.status(f.resolved.callAssignment.assignmentId, 'completed');
+  f.setApi(403, { error: 'delivery_not_dispatchable' });
+  const before = f.apiRequests.length;
+  await f.restart();
+  const retry = await send();
+  t.diagnostic(JSON.stringify({ retry, dialCount: f.counters.create, resolverRequests: f.apiRequests.length }));
+  assert.equal(retry.ok, true, 'a saved terminal receipt needs current authentication, not renewed dial admission');
+  assert.equal(retry.callSid, first.callSid);
+  assert.equal(f.apiRequests.length, before);
+  assert.equal(f.counters.create, 1);
+  assert.equal(f.counters.readiness, 1);
+  assert.equal(f.counters.preflight, 1);
+});
+
+
+test('never-dispatched retry must pass current resolver admission before another preflight', async t => {
+  const f = await fixture(t);
+  f.setReadiness(false);
+  const notification = f.notification();
+  assert.equal((await f.post(notification)).status, 503);
+  const saved = f.broker.store.list()[0];
+  f.setReadiness(true);
+  f.setApi(403, { error: 'watch_revoked' });
+  assert.equal((await f.post(notification)).status, 403);
+  assert.equal(f.counters.readiness, 1);
+  assert.equal(f.counters.create, 0);
+  assert.deepEqual(f.broker.store.list()[0], saved);
+});
+
+test('receipt recovery binds full normalized body and requires the current producer token', async t => {
+  const f = await fixture(t);
+  const notification = f.notification();
+  assert.equal((await f.post(notification)).status, 202);
+  const saved = f.broker.store.list()[0];
+  const bytes = fs.readFileSync(path.join(f.directory, 'calls.json'), 'utf8');
+  f.setApi(403, { error: 'watch_revoked' });
+  f.config.harkInternalToken = 'rotated-current-service-token';
+  assert.equal((await f.post(notification)).status, 401);
+  assert.equal((await f.post(notification, f.config.controlToken)).status, 401);
+  for (const changed of [{ ...notification, briefing: 'Changed briefing' },
+    { ...notification, observedAt: '2026-09-23T19:31:00.000Z' },
+    { ...notification, to: '+12025550124' },
+    { ...notification, hark: { ...notification.hark, originTaskId: 'another-task' } }]) {
+    assert.equal((await f.post(changed, f.config.harkInternalToken)).status, 409);
+  }
+  const reordered = Object.fromEntries(Object.entries(notification).reverse());
+  delete reordered.ttlSeconds; // explicit default and omitted default are the same normalized request
+  assert.equal((await f.post(reordered, f.config.harkInternalToken)).status, 200);
+  assert.equal(f.apiRequests.length, 1);
+  assert.equal(f.counters.create, 1);
+  assert.deepEqual(f.broker.store.list()[0], saved);
+  assert.equal(fs.readFileSync(path.join(f.directory, 'calls.json'), 'utf8'), bytes);
+  assert.equal(bytes.includes('private-hark-token'), false);
+  assert.equal(bytes.includes('rotated-current-service-token'), false);
+});
+
+test('simultaneous exact retry during preflight cannot cancel or redial the first attempt', async t => {
+  const f = await fixture(t);
+  let reached!: () => void; let release!: () => void;
+  const entered = new Promise<void>(resolve => { reached = resolve; });
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  f.setBeforePreflight(async () => { reached(); await blocked; });
+  const notification = f.notification();
+  const first = f.post(notification);
+  await entered;
+  const pending = await f.post(notification);
+  assert.equal(pending.status, 409);
+  assert.equal((await pending.json() as { error: string }).error, 'hark_dispatch_pending');
+  assert.equal(f.broker.store.list()[0].status, 'prepared');
+  release();
+  assert.equal((await first).status, 202);
+  assert.equal(f.counters.create, 1);
+  assert.equal(f.counters.preflight, 1);
+  assert.equal(f.broker.store.list()[0].status, 'queued');
+});
+
+test('signed early callback supplies a receipt even when provider create subsequently times out', async t => {
+  const f = await fixture(t, { ambiguousDial: true });
+  const notification = f.notification();
+  f.setBeforeProviderReturn(async () => {
+    const saved = f.broker.store.list()[0];
+    assert.equal(saved.harkDispatch?.state, 'dispatch_started');
+    assert.equal((await f.status(saved.id, 'completed')).status, 200);
+  });
+  const response = await f.post(notification);
+  assert.equal(response.status, 200);
+  assert.equal((await response.json() as { callSid: string }).callSid, f.sid);
+  assert.equal(f.broker.store.list()[0].status, 'completed');
+  assert.equal(f.broker.store.list()[0].harkDispatch?.state, 'provider_accepted');
+  f.setApi(403);
+  assert.equal((await f.post(notification)).status, 200);
+  assert.equal(f.counters.create, 1);
+});
+
+test('signed callback cannot invent dispatch before the saved provider boundary', async t => {
+  const f = await fixture(t);
+  f.setReadiness(false);
+  assert.equal((await f.post(f.notification())).status, 503);
+  const saved = f.broker.store.list()[0];
+  assert.equal((await f.status(saved.id, 'ringing')).status, 403);
+  assert.deepEqual(f.broker.store.list()[0], saved);
+});
+
+test('legacy no-marker Hark record cannot be reinterpreted as proven undialed', async t => {
+  const f = await fixture(t);
+  const saved = f.broker.store.reserveHark(f.resolved).call;
+  f.broker.store.update(saved.id, { status: 'failed' });
+  const before = f.broker.store.list()[0];
+  assert.equal((await f.post(f.notification())).status, 409);
+  assert.equal(f.counters.create, 0);
+  assert.equal(f.apiRequests.length, 0);
+  assert.deepEqual(f.broker.store.list()[0], before);
+});
+
+test('actual API sender never accepts a possible dispatch without its SID', {
+  skip: !process.env.BROKER_API_NOTIFICATION_VOICE_SOURCE,
+}, async t => {
+  const f = await fixture(t, { ambiguousDial: true });
+  const producer = retainedNotificationProducer();
+  const input = producerInput(f);
+  const send = () => producer.dispatchNotificationVoice(input, { url: f.base + '/internal/outbound-alerts', internalToken: 'private-hark-token' });
+  assert.equal((await send()).ok, false);
+  const saved = f.broker.store.list()[0];
+  assert.equal(saved.harkDispatch?.state, 'dispatch_started');
+  await f.restart();
+  assert.equal((await send()).ok, false);
+  assert.equal(f.counters.create, 1);
+  assert.equal(f.apiRequests.length, 1);
+  assert.deepEqual(f.broker.store.list()[0], saved);
+});
+
+
+test('contradictory provider create identity cannot turn a saved callback into success', async t => {
+  const f = await fixture(t, { returnedSid: 'CA' + '3'.repeat(32) });
+  f.setBeforeProviderReturn(async () => {
+    assert.equal((await f.status(f.broker.store.list()[0].id, 'ringing')).status, 200);
+  });
+  assert.equal((await f.post(f.notification())).status, 503);
+  const saved = f.broker.store.list()[0];
+  assert.equal(saved.callSid, f.sid);
+  assert.equal(saved.harkDispatch?.state, 'provider_accepted');
+  assert.equal(saved.status, 'ringing');
+  assert.ok(saved.failure);
   assert.equal(f.counters.create, 1);
 });

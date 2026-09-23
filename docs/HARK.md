@@ -6,13 +6,17 @@ This adapter is source preparation. Activation requires the matching API release
 
 ## Assignment and delivery
 
-The existing notification producer sends its Hark-v1 body to Broker's local `POST /internal/outbound-alerts`, using `x-dexter-internal-auth`. Broker forwards that credential to the local API resolver as `x-internal-auth` with `{notification}`. The resolver route is `POST /internal/phone/resolve-hark-assignment`. The existing authorization route is `/internal/phone/authorize-outbound`.
+The existing notification producer sends its Hark-v1 body to Broker's local `POST /internal/outbound-alerts`, using `x-dexter-internal-auth`. Broker verifies the current configured `DEXTER_INTERNAL_TOKEN` locally with exact, constant-time comparison. The header must occur once and contain at most 4096 UTF-8 bytes; its value is never trimmed, logged or saved in the call journal. Dial admission forwards that credential to the local API resolver as `x-internal-auth` with `{notification}`. The resolver route is `POST /internal/phone/resolve-hark-assignment`. The existing authorization route is `/internal/phone/authorize-outbound`.
 
 The resolver checks the saved watch, event, delivery, owner, destination and billing agreement. It reserves the API's delivery intent and voice lifecycle before returning the assignment. That reservation carries no charge.
 
-Broker saves the returned assignment before dialing. For a new Hark delivery, the delivery UUID also identifies the Broker call, request and assignment. Exact retries recover this record. A changed assignment or a collision with an operator call is refused. An uncertain provider response stays uncertain until its original call can be recovered; retrying the notification does not dial again.
+Broker saves the returned assignment and a digest of the complete normalized notification before dialing. For a new Hark delivery, the delivery UUID also identifies the Broker call, request and assignment. A changed notification, changed assignment on a new attempt, or collision with an operator call is refused. The journal records whether dispatch has started and whether a provider call ID has been received.
 
-New acceptance returns HTTP202 with `ok`, `intentId`, `callSid`, `state` and `replay:false`. Exact replay returns HTTP200 with `replay:true`. These fields match the existing notification producer. Acceptance records dispatch state; the separate provider observations establish what happened afterward.
+A failure before dispatch can retry after fresh API admission and account readiness checks. Beginning that dispatch preserves the previous failure in history and clears the current error. Once dispatch starts, an attempt without a saved provider call ID returns a non-success response and remains uncertain. It cannot redial. Older records without dispatch evidence keep that uncertainty. Concurrent retries also cannot cancel the original attempt or start another call.
+
+New provider acceptance returns HTTP202 with `ok`, `intentId`, `callSid`, `state` and `replay:false`. Exact saved receipt recovery returns HTTP200 with `replay:true`. Both require a saved provider call ID. A signed callback can establish that receipt before the provider's create response arrives.
+
+Receipt recovery verifies the current service credential and original notification digest, then returns the saved call without calling the resolver or provider again. This also works after the event expires or delivery becomes terminal. Current admission still governs any new dispatch and account access when the call is answered. Uncertain dispatch or missing historical identity returns HTTP409; failure before dispatch remains a non-success response. The API sender cannot mark an undialed failure as accepted.
 
 At the signed answer callback, Broker gives Primary the same saved assignment. The API rechecks current admission and compares the saved source. Changes cause refusal rather than replacing the assignment during the call. The watch's originating task identifies its source; Primary continues to use its current owner-approved authority.
 
@@ -40,6 +44,6 @@ Local account or voice failures remain separate from provider termination. A cal
 
 ## Configuration and checks
 
-Set `BROKER_HARK_API_URL` to the selected local API HTTP origin and reuse `HARK_PHONE_CALLBACK_SIGNING_SECRET`. The callback key must differ from the alert ingress signing key. The resolver uses the existing producer credential; Broker does not create or store another credential. The API release owner selects these values and coordinates the notification route.
+Set `BROKER_HARK_API_URL` to the selected local API HTTP origin and reuse `HARK_PHONE_CALLBACK_SIGNING_SECRET`. The callback key must differ from the alert ingress signing key. Hark also requires the existing API/producer `DEXTER_INTERNAL_TOKEN` in Broker's private environment. The release owner must coordinate its rotation across the producer, API and Broker. Ordinary Broker control continues to use its separate Bearer credential. The API release owner selects these values and coordinates the notification route.
 
 Focused tests cover the actual retained notification producer over local HTTP, saved assignment registration after a signed answer, duplicate and uncertain dispatch, journal recovery, signed delivery receipts, billing order, delayed timing recovery and legacy operator behavior. Shared API tests qualify database admission separately. Full source checks and a useful customer conversation remain release requirements.
