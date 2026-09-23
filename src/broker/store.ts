@@ -3,6 +3,10 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { brokerCallAssignmentSchema, phoneCallAssignmentSchema, retainedPhoneCallAssignmentRefSchema, sameCallAssignmentRef, type BrokerCallAssignment, type PhoneCallAssignmentRef } from './assignment.js';
 import type { BrokerPublicationJournal } from './publications.js';
+import { resolvedHarkAssignmentSchema } from './harkAssignment.js';
+import { canonicalJson } from '../outbound/canonical.js';
+import { observeHark, pendingHarkEvents, settleHarkJournalEvent, validateHarkJournal,
+  type HarkDeliveryOutcome, type HarkEndedTiming, type HarkJournal, type HarkJournalEvent, type HarkProviderStatus } from './harkJournal.js';
 import { bindDurableFileParent, durablyReplaceJsonFile, type DurableParentBinding } from '../outbound/DurableFile.js';
 
 export type CallStatus = 'prepared' | 'dialing' | 'queued' | 'ringing' | 'in-progress' | 'completed' | 'busy' | 'no-answer' | 'canceled' | 'failed' | 'unknown';
@@ -15,6 +19,7 @@ export interface BrokerCall {
   primary?: { bindingId: string; name: string | null; context: string; callAssignmentRef?: PhoneCallAssignmentRef };
   liveSessionId?: string; transcript?: unknown; transcriptRevision?: number;
   mediaStartedAt?: string;
+  harkJournal?: HarkJournal;
   voiceOpening?: { status: string; eventId?: string; reason?: string };
   finalized?: boolean; failure?: { code: string; message: string };
   canonicalTurns?: Record<string, unknown>;
@@ -80,6 +85,7 @@ export class BrokerStore {
       for (const [id, call] of Object.entries(this.state.calls)) {
         if (call.id !== id || !call.requestId || !call.number || !call.createdAt || !call.delegations) throw new Error('Invalid broker call record');
         validateAssignment(call);
+        validateHarkJournal(call);
       }
     } catch (error) { this.close(); throw error; }
   }
@@ -104,6 +110,7 @@ export class BrokerStore {
     if (Object.prototype.hasOwnProperty.call(input, 'callAssignment')) throw new Error('Assignment must originate from control reservation');
     const existing = this.list().find(call => call.requestId === input.requestId || (input.callSid && call.callSid === input.callSid));
     if (existing) {
+      if (existing.callAssignment?.origin === 'authenticated_hark_delivery') throw new Error('Call origin conflicts with its saved record');
       if (existing.number !== input.number || existing.direction !== input.direction || existing.purpose !== input.purpose || (input.callSid && existing.callSid !== input.callSid)) throw new Error('Call request identity conflicts with its saved record');
       return { call: existing, existing: true };
     }
@@ -119,7 +126,30 @@ export class BrokerStore {
     return { call: structuredClone(call), existing: false };
   }
 
-  update(id: string, patch: Partial<Omit<BrokerCall, 'id' | 'requestId' | 'number' | 'direction' | 'purpose' | 'createdAt' | 'callAssignment'>>): BrokerCall {
+  /** Only the API's resolved Hark snapshot supplies this reservation. */
+  reserveHark(value: unknown): { call: BrokerCall; existing: boolean } {
+    const resolved = resolvedHarkAssignmentSchema.parse(value);
+    const assignment = resolved.callAssignment;
+    const id = assignment.brokerCallId;
+    const existing = this.list().find(call => call.id === id || call.requestId === id);
+    if (existing) {
+      if (existing.id !== id || existing.requestId !== id || existing.direction !== 'outbound'
+          || existing.number !== resolved.to || existing.purpose !== assignment.purpose
+          || existing.callAssignment?.origin !== 'authenticated_hark_delivery'
+          || canonicalJson(existing.callAssignment.value) !== canonicalJson(assignment))
+        throw new Error('Hark delivery conflicts with its saved record');
+      return { call: existing, existing: true };
+    }
+    const now = new Date().toISOString();
+    const call: BrokerCall = { id, requestId: id, direction: 'outbound', purpose: assignment.purpose,
+      number: resolved.to, status: 'prepared', createdAt: now, updatedAt: now, delegations: {},
+      callAssignment: { origin: 'authenticated_hark_delivery', value: assignment } };
+    validateAssignment(call);
+    this.persist({ version: 1, calls: { ...this.state.calls, [id]: call } });
+    return { call: structuredClone(call), existing: false };
+  }
+
+  update(id: string, patch: Partial<Omit<BrokerCall, 'id' | 'requestId' | 'number' | 'direction' | 'purpose' | 'createdAt' | 'callAssignment' | 'harkJournal'>>): BrokerCall {
     const previous = this.state.calls[id];
     if (!previous) throw new Error('Unknown broker call');
     // Runtime callers can bypass Omit. Check the same property snapshot that
@@ -132,8 +162,13 @@ export class BrokerStore {
     if (Object.prototype.hasOwnProperty.call(nextPatch, 'callAssignment')) {
       const assignment = (nextPatch as Partial<BrokerCall>).callAssignment;
       const normalized = assignment === undefined ? undefined : brokerCallAssignmentSchema.parse(assignment);
-      if (JSON.stringify(normalized) !== JSON.stringify(previous.callAssignment)) throw new Error('Call assignment cannot change');
-      (nextPatch as Partial<BrokerCall>).callAssignment = normalized;
+      if (canonicalJson(normalized) !== canonicalJson(previous.callAssignment)) throw new Error('Call assignment cannot change');
+      (nextPatch as Partial<BrokerCall>).callAssignment = previous.callAssignment;
+    }
+    if (Object.prototype.hasOwnProperty.call(nextPatch, 'harkJournal')) {
+      if (canonicalJson((nextPatch as Partial<BrokerCall>).harkJournal) !== canonicalJson(previous.harkJournal))
+        throw new Error('Hark journal requires an observed lifecycle transition');
+      delete (nextPatch as Partial<BrokerCall>).harkJournal;
     }
     if (Object.prototype.hasOwnProperty.call(nextPatch, 'primary')) {
       if (previous.callAssignment && previous.primary && nextPatch.primary?.bindingId !== previous.primary.bindingId)
@@ -159,8 +194,64 @@ export class BrokerStore {
     if (nextPatch.transcriptRevision !== undefined && nextPatch.transcriptRevision < (previous.transcriptRevision ?? 0)) { delete nextPatch.transcript; delete nextPatch.transcriptRevision; }
     const call: BrokerCall = { ...previous, ...nextPatch, updatedAt: new Date().toISOString() };
     validateAssignment(call);
+    validateHarkJournal(call);
     this.persist({ version: 1, calls: { ...this.state.calls, [id]: call } });
     return structuredClone(call);
+  }
+
+  private saveHarkCall(call: BrokerCall): BrokerCall {
+    validateAssignment(call);
+    validateHarkJournal(call);
+    this.persist({ version: 1, calls: { ...this.state.calls, [call.id]: call } });
+    return structuredClone(call);
+  }
+
+  observeHarkProvider(id: string, status: HarkProviderStatus, observedAt: string, endedTiming?: HarkEndedTiming): BrokerCall {
+    const previous = this.state.calls[id];
+    if (!previous) throw new Error('Unknown broker call');
+    const mapped = status === 'in-progress' ? 'answered' : status;
+    const harkJournal = observeHark(previous, mapped, observedAt, endedTiming);
+    const providerStatus = harkJournal.providerStatus;
+    const nextStatus = providerStatus === 'answered' || providerStatus === 'streaming' ? 'in-progress' : providerStatus;
+    return this.saveHarkCall({ ...previous, harkJournal, status: nextStatus,
+      ...(harkJournal.ended ? { endedAt: harkJournal.ended.observedAt } : {}), updatedAt: new Date().toISOString() });
+  }
+
+  observeHarkMediaStarted(id: string, observedAt: string): BrokerCall {
+    const previous = this.state.calls[id];
+    if (!previous) throw new Error('Unknown broker call');
+    const harkJournal = observeHark(previous, 'streaming', observedAt);
+    // A late/replayed media callback cannot reopen a terminal provider call.
+    const closed = Boolean(harkJournal.ended);
+    return this.saveHarkCall({ ...previous, harkJournal,
+      ...(closed ? {} : { status: 'in-progress' as const, mediaStartedAt: previous.mediaStartedAt ?? observedAt }),
+      updatedAt: new Date().toISOString() });
+  }
+
+  pendingHarkEvents(id?: string): Array<{ callId: string; event: HarkJournalEvent }> {
+    const calls = id === undefined ? Object.values(this.state.calls) : [this.state.calls[id]].filter(call => call !== undefined);
+    return calls.flatMap(call => pendingHarkEvents(call).map(event => ({ callId: call.id, event })));
+  }
+
+  recordHarkAttempt(id: string, eventId: string, bodyDigest: string, attemptedAt: string): HarkJournalEvent {
+    const call = this.get(id);
+    const item = call?.harkJournal?.events[eventId];
+    if (!call || !item || item.bodyDigest !== bodyDigest) throw new Error('Unknown Hark event identity');
+    if (!Number.isFinite(Date.parse(attemptedAt)) || !/^\d{4}-\d{2}-\d{2}T/.test(attemptedAt)) throw new Error('Invalid attempt time');
+    if (!pendingHarkEvents(call).some(event => event.id === eventId)) throw new Error('Hark event is not ready for delivery');
+    item.attempts += 1;
+    item.lastAttemptAt = attemptedAt;
+    this.saveHarkCall(call);
+    return structuredClone(item);
+  }
+
+  settleHarkEvent(id: string, eventId: string, bodyDigest: string, outcome: HarkDeliveryOutcome): HarkJournalEvent {
+    const call = this.get(id);
+    const item = call?.harkJournal?.events[eventId];
+    if (!call?.harkJournal || !item || item.bodyDigest !== bodyDigest) throw new Error('Unknown Hark event identity');
+    call.harkJournal.events[eventId] = settleHarkJournalEvent(item, outcome);
+    this.saveHarkCall(call);
+    return structuredClone(call.harkJournal.events[eventId]!);
   }
 
   close() {

@@ -6,6 +6,8 @@ import {
   type PrimaryApiOptions, type PrimaryProviderProof, type PrimarySubmission,
 } from '../src/broker/primaryApi.js';
 import { originalTurn, rawSubmissionDigest, turnBodyDigest } from '../src/broker/reconciliation.js';
+import { HARK_PHONE_SNAPSHOT_MAX_BYTES, harkSourceDigest } from '../src/broker/harkAssignment.js';
+import { makeResolvedHarkAssignment } from './fixtures/broker-hark.js';
 
 const bindingId = '11111111-1111-4111-8111-111111111111';
 const requestId = '22222222-2222-4222-8222-222222222222';
@@ -361,6 +363,56 @@ test('reply validation refuses oversized, contradictory and caller-supplied extr
 const assignment = { assignmentId: requestId, brokerCallId: sourceEventId, revision: 1 as const, purpose: 'Read the current portfolio.' };
 const assignmentRef = { assignmentId: requestId, revision: 1 as const, digest: 'a'.repeat(64) };
 const assignedCall = { ...call, callAssignmentRef: assignmentRef };
+
+test('full Hark snapshot crosses actual openCall serialization without changing values or source digest', async () => {
+  const harkAssignment = makeResolvedHarkAssignment().callAssignment;
+  harkAssignment.hark.event.facts.padding = '';
+  harkAssignment.hark.event.facts.padding = 'x'.repeat(HARK_PHONE_SNAPSHOT_MAX_BYTES
+    - Buffer.byteLength(JSON.stringify(harkAssignment.hark)));
+  const { sourceDigest: _oldDigest, ...source } = harkAssignment.hark;
+  harkAssignment.hark.sourceDigest = harkSourceDigest(source);
+  assert.equal(Buffer.byteLength(JSON.stringify(harkAssignment.hark)), 32_768);
+  const response = { ...call, callAssignmentRef: { ...assignmentRef, assignmentId: harkAssignment.assignmentId } };
+  const { client, requests } = harness([json(response)]);
+  assert.deepEqual(await client.openCall(proof, harkAssignment), response);
+  assert.equal(requests.length, 1);
+  const serialized = String(requests[0].init.body);
+  assert.ok(Buffer.byteLength(serialized) > 24 * 1024);
+  assert.ok(Buffer.byteLength(serialized) < 48 * 1024);
+  assert.deepEqual(JSON.parse(serialized), { providerProof: proof, callAssignment: harkAssignment });
+});
+
+function proofWithSerializedSize(bytes: number, callAssignment?: Parameters<ReturnType<typeof createPrimaryApiClient>['openCall']>[1]) {
+  const candidate = structuredClone(proof);
+  const body = { providerProof: candidate, ...(callAssignment === undefined ? {} : { callAssignment }) };
+  for (let index = 0; Buffer.byteLength(JSON.stringify(body)) < bytes; index++) {
+    assert.ok(index < 70, 'Proof remains inside its field-count limit');
+    const key = `Padding${index}`;
+    candidate.params[key] = '';
+    const remaining = bytes - Buffer.byteLength(JSON.stringify(body));
+    assert.ok(remaining >= 0);
+    candidate.params[key] = 'x'.repeat(Math.min(2048, remaining));
+  }
+  assert.equal(Buffer.byteLength(JSON.stringify(body)), bytes);
+  return candidate;
+}
+
+test('only validated Hark registration receives the 48 KiB request limit', async () => {
+  const harkAssignment = makeResolvedHarkAssignment().callAssignment;
+  const response = { ...call, callAssignmentRef: { ...assignmentRef, assignmentId: harkAssignment.assignmentId } };
+  const exact = harness([json(response)]);
+  await exact.client.openCall(proofWithSerializedSize(48 * 1024, harkAssignment), harkAssignment);
+  assert.equal(Buffer.byteLength(String(exact.requests[0].init.body)), 48 * 1024);
+  const refused = harness([]);
+  await assert.rejects(refused.client.openCall(proofWithSerializedSize(48 * 1024 + 1, harkAssignment), harkAssignment), code('invalid_request'));
+  for (const ordinary of [undefined, assignment]) {
+    const accepted = harness([json(ordinary === undefined ? call : assignedCall)]);
+    await accepted.client.openCall(proofWithSerializedSize(24 * 1024, ordinary), ordinary);
+    assert.equal(Buffer.byteLength(String(accepted.requests[0].init.body)), 24 * 1024);
+    await assert.rejects(refused.client.openCall(proofWithSerializedSize(24 * 1024 + 1, ordinary), ordinary), code('invalid_request'));
+  }
+  assert.equal(refused.requests.length, 0);
+});
 
 test('call assignment registers separately and exact reference accompanies raw submission and reconciliation', async () => {
   const input = { ...submission, text: ' Hello. ', callAssignmentRef: assignmentRef,

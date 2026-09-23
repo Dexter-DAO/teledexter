@@ -5,6 +5,8 @@ export interface BrokerConfig {
   controlToken: string; apiKey: string; model: string; voice: string;
   twilioAccountSid: string; twilioAuthToken: string; from: string;
   allowedTo: string[]; apiBaseUrl: string; phoneServiceSecret: string;
+  harkApiBaseUrl?: string;
+  harkCallbackSigningSecret?: string;
   maxCallSeconds: number;
 }
 
@@ -28,6 +30,19 @@ export function brokerConfig(env: NodeJS.ProcessEnv): BrokerConfig {
   if (api.username || api.password || api.search || api.hash || !['https:', 'http:'].includes(api.protocol)) throw new Error('Invalid DEXTER_API_URL');
   if (api.protocol === 'http:' && !['127.0.0.1', 'localhost', '[::1]'].includes(api.hostname)) throw new Error('Remote Dexter API requires HTTPS');
   const from = required('TWILIO_PHONE_NUMBER');
+  const harkApiBaseUrl = env.BROKER_HARK_API_URL?.trim() || undefined;
+  const harkCallbackSigningSecret = env.HARK_PHONE_CALLBACK_SIGNING_SECRET?.trim();
+  if (harkApiBaseUrl) {
+    let hark: URL;
+    try { hark = new URL(harkApiBaseUrl); }
+    catch { throw new Error('BROKER_HARK_API_URL must be a local HTTP origin'); }
+    if (hark.protocol !== 'http:' || !['127.0.0.1', '[::1]', 'localhost'].includes(hark.hostname)
+        || hark.username || hark.password || hark.search || hark.hash || hark.pathname !== '/')
+      throw new Error('BROKER_HARK_API_URL must be a local HTTP origin');
+    if (!harkCallbackSigningSecret || harkCallbackSigningSecret.length < 32
+        || harkCallbackSigningSecret === env.OUTBOUND_ALERT_SIGNING_SECRET?.trim())
+      throw new Error('Hark requires its existing independent callback signing secret');
+  }
   const allowedTo = (env.BROKER_ALLOWED_TO || '').split(',').map(v => v.trim()).filter(Boolean);
   if (!isPhoneNumber(from) || !allowedTo.every(isPhoneNumber) || allowedTo.includes(from)) throw new Error('Invalid broker phone configuration');
   const port = Number(env.BROKER_PORT || 3213);
@@ -43,6 +58,6 @@ export function brokerConfig(env: NodeJS.ProcessEnv): BrokerConfig {
     apiKey: required('OPENAI_API_KEY'), model: env.BROKER_LIVE_MODEL || 'gpt-live-1',
     voice: env.BROKER_LIVE_VOICE || 'marin', twilioAccountSid: required('TWILIO_ACCOUNT_SID'),
     twilioAuthToken: required('TWILIO_AUTH_TOKEN'), from, allowedTo, apiBaseUrl,
-    phoneServiceSecret, maxCallSeconds,
+    phoneServiceSecret, maxCallSeconds, ...(harkApiBaseUrl ? { harkApiBaseUrl, harkCallbackSigningSecret } : {}),
   };
 }

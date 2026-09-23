@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { brokerInstructions, brokerHistory, brokerOpening } from '../src/broker/instructions.js';
+import { brokerInstructions, brokerHistory, brokerOpening, brokerWatchBrief } from '../src/broker/instructions.js';
+import { makeHarkSnapshot } from './fixtures/broker-hark.js';
 import { factFreshnessScenarios, historicalAccountMessages } from './fixtures/broker-fact-freshness.js';
 
 test('call direction and purpose guide the opening while account text stays in history', () => {
@@ -105,4 +106,25 @@ test('registered call opening starts its assigned work from the real first respo
   assert.match(instructions, /Ordinary acknowledgments such as thank-you stay conversational/);
   assert.doesNotMatch(brokerInstructions({ ...call, registeredAssignment: false }), /task is registered with Primary/);
   assert.equal(brokerOpening('inbound', true), brokerOpening('inbound'));
+});
+
+test('watch briefing exposes its exact reported event and time without copying the evidence snapshot', () => {
+  const watch = makeHarkSnapshot();
+  const brief = JSON.parse(brokerWatchBrief(watch));
+  assert.deepEqual(brief, { source: 'saved_watch_event', watchName: watch.watch.name,
+    observedAt: watch.event.observedAt, summary: watch.event.summary });
+  const instructions = brokerInstructions({ direction: 'outbound', purpose: 'Internal watch assignment', registeredAssignment: true, watch });
+  assert.ok(instructions.includes(brokerWatchBrief(watch)));
+  for (const privateField of [watch.ownerSupabaseUserId, watch.billing.mandateId, watch.originTaskId, watch.sourceDigest])
+    assert.ok(!instructions.includes(privateField));
+  assert.ok(!brokerInstructions({ direction: 'inbound', purpose: '', watch }).includes(watch.event.summary));
+});
+
+test('an oversized escaped watch summary is omitted whole while its name and observation remain', () => {
+  const watch = makeHarkSnapshot();
+  watch.event.summary = '\u0001'.repeat(2000);
+  const encoded = brokerWatchBrief(watch);
+  assert.ok(Buffer.byteLength(encoded) <= 8192);
+  assert.deepEqual(JSON.parse(encoded), { source: 'saved_watch_event', watchName: watch.watch.name,
+    observedAt: watch.event.observedAt, summaryOmitted: true, explanationFromPrimaryRequired: true });
 });

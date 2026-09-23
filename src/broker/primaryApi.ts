@@ -167,6 +167,7 @@ const PREFIX = '/internal/primary-dexter/channels/phone';
 const MAX_TIMEOUT_MS = 30_000;
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_REQUEST_BYTES = 24 * 1024;
+const MAX_HARK_CALL_REQUEST_BYTES = 48 * 1024;
 
 function createTransport(options: PrimaryApiOptions) {
   let base: URL;
@@ -188,12 +189,14 @@ function createTransport(options: PrimaryApiOptions) {
   const fetcher = options.fetch ?? globalThis.fetch;
 
   return async (method: 'GET' | 'POST', path: string,
-    body?: unknown, headers?: Record<string, string>, expectedStatus = 200): Promise<unknown> => {
+    body?: unknown, headers?: Record<string, string>, expectedStatus = 200, harkCallAssignment = false): Promise<unknown> => {
     let serialized: string | undefined;
     if (body !== undefined) {
       try { serialized = JSON.stringify(body); }
       catch { throw new PrimaryApiError('invalid_request'); }
-      if (serialized === undefined || Buffer.byteLength(serialized) > MAX_REQUEST_BYTES) {
+      const maxRequestBytes = method === 'POST' && path === '/calls' && harkCallAssignment
+        ? MAX_HARK_CALL_REQUEST_BYTES : MAX_REQUEST_BYTES;
+      if (serialized === undefined || Buffer.byteLength(serialized) > maxRequestBytes) {
         throw new PrimaryApiError('invalid_request');
       }
     }
@@ -444,7 +447,8 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
         if (!proof.params[key]) throw new PrimaryApiError('invalid_request');
       }
       const call = parse(callSchema, await request('POST', '/calls', { providerProof: proof,
-        ...(assignment === undefined ? {} : { callAssignment: assignment }) }), 'invalid_response');
+        ...(assignment === undefined ? {} : { callAssignment: assignment }) }, undefined, 200,
+      assignment !== undefined && 'hark' in assignment), 'invalid_response');
       if ((assignment === undefined) !== (call.callAssignmentRef === undefined)) throw new PrimaryApiError('identity_mismatch');
       if (assignment && call.callAssignmentRef) {
         same(call.callAssignmentRef.assignmentId, assignment.assignmentId); same(call.callAssignmentRef.revision, assignment.revision);
