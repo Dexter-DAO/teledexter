@@ -3,6 +3,16 @@ import { z } from 'zod';
 import { phoneCallAssignmentSchema, phoneCallAssignmentRefSchema, sameCallAssignmentRef, type PhoneCallAssignment, type PhoneCallAssignmentRef } from './assignment.js';
 export type { PhoneCallAssignment, PhoneCallAssignmentRef } from './assignment.js';
 import { rawSubmissionDigest, turnBodyDigest, type PhoneNonAdmissionProof } from './reconciliation.js';
+import { canonicalJson } from '../outbound/canonical.js';
+import {
+  inboundBeginIdentitySchema, inboundOutcomeSchema, recoverInboundResultSchema,
+  consumeInboundApprovalSchema, closeConsumedInboundAttachmentSchema,
+  consumedInboundClosureReceiptSchema, sameInboundBeginRef, sameInboundApprovalRef, inboundBeginRef,
+  type InboundBeginIdentity, type InboundBeginRef, type InboundApprovalRef, type InboundOutcome,
+  type RecoverInboundResult, type CloseConsumedInboundAttachment, type ConsumedInboundClosureReceipt,
+} from './inboundContract.js';
+export type { InboundBeginIdentity, InboundBeginRef, InboundApprovalRef, InboundOutcome,
+  RecoverInboundResult, CloseConsumedInboundAttachment, ConsumedInboundClosureReceipt } from './inboundContract.js';
 
 export interface PrimaryProviderProof {
   url: string;
@@ -143,6 +153,12 @@ export interface PrimaryApiClient {
   reply(bindingId: string, requestId: string, questionId: string, input: PrimaryReplyInput): Promise<PrimaryQuestionResult>;
   captureTurn(bindingId: string, input: PrimaryTurn): Promise<PrimaryTurnReceipt>;
   close(bindingId: string): Promise<PrimaryClosedCall>;
+  beginInbound?(begin: InboundBeginIdentity): Promise<InboundOutcome>;
+  recoverInbound?(begin: InboundBeginIdentity): Promise<RecoverInboundResult>;
+  cancelInbound?(begin: InboundBeginIdentity): Promise<InboundOutcome>;
+  inboundStatus?(attachmentId: string): Promise<InboundOutcome>;
+  closeInbound?(attachmentId: string, input: CloseConsumedInboundAttachment): Promise<ConsumedInboundClosureReceipt>;
+  openInboundCall?(providerProof: PrimaryProviderProof, approvalRef: InboundApprovalRef): Promise<PrimaryCall>;
 }
 
 export type PrimaryApiErrorCode =
@@ -301,6 +317,13 @@ const contextSchema = z.object({
 const callSchema = z.object({
   bindingId: uuid, callSid, state: z.enum(['open', 'closed']), context: contextSchema, callAssignmentRef: phoneCallAssignmentRefSchema.optional(),
 });
+const inboundCallSchema = z.object({
+  bindingId: uuid, callSid, state: z.enum(['open', 'closed']),
+  context: z.object({
+    primaryDexterId: uuid, threadId: uuid, displayName: z.string().min(1).max(200),
+    messages: z.array(z.object({ id: uuid, role: z.enum(['user', 'assistant']), text: textValue }).strict()).max(20),
+  }).strict().refine(value => value.messages.reduce((size, message) => size + Buffer.byteLength(message.text), 0) <= MAX_REQUEST_BYTES),
+}).strict();
 const questionText = (limit: number) => z.string().min(1).refine(value => value.trim() === value
   && Buffer.byteLength(value) <= limit && !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value)
   && Array.from(value).every(c => c.codePointAt(0)! < 0xd800 || c.codePointAt(0)! > 0xdfff));
@@ -381,6 +404,14 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
   const calls = new Map<string, {
     callSid: string; primaryDexterId: string; threadId: string; state: 'open' | 'closed'; callAssignmentRef?: PhoneCallAssignmentRef;
   }>();
+  type InboundMemory = {
+    beginRef?: InboundBeginRef; approvalRef?: InboundApprovalRef; callSid: string;
+    bindingId?: string; state?: InboundOutcome['state']; expiresAt?: string | null;
+    consumedAt?: string; cancelledAt?: string; callState?: 'open' | 'closed'; closedAt?: string;
+  };
+  const inboundCalls = new Map<string, InboundMemory>();
+  const inboundBegins = new Map<string, { body: string; callSid: string; beginRef?: InboundBeginRef; attachmentId?: string }>();
+  const inboundBySid = new Map<string, string>();
   const bindingHeaders = (bindingId: string) => {
     parse(uuid, bindingId, 'invalid_request');
     return { 'X-Dexter-Binding-Id': bindingId };
@@ -405,6 +436,77 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
     });
     return reference === undefined ? call : { ...call, callAssignmentRef: { ...reference } };
   };
+  const requireSameApproval = (left: InboundApprovalRef, right: InboundApprovalRef) => {
+    if (!sameInboundApprovalRef(left, right)) throw new PrimaryApiError('identity_mismatch');
+  };
+  const checkInboundTransport = (proof: PrimaryProviderProof) => {
+    const url = new URL(proof.url);
+    if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || !proof.signature)
+      throw new PrimaryApiError('invalid_request');
+  };
+  const checkedBegin = (input: InboundBeginIdentity) => {
+    const begin = parse(inboundBeginIdentitySchema, input, 'invalid_request');
+    checkInboundTransport(begin.providerProof);
+    const body = canonicalJson(begin);
+    const known = inboundBegins.get(begin.brokerCallId);
+    if (known && known.body !== body) throw new PrimaryApiError('identity_mismatch');
+    if (!known) inboundBegins.set(begin.brokerCallId, { body, callSid: begin.providerProof.params.CallSid!, beginRef: inboundBeginRef(begin) });
+    return begin;
+  };
+  const checkBeginRef = (ref: InboundBeginRef, begin?: InboundBeginIdentity) => {
+    if (begin) {
+      same(ref.brokerCallId, begin.brokerCallId);
+      same(ref.callSid, begin.providerProof.params.CallSid!);
+      same(ref.digest, inboundBeginRef(begin).digest);
+    }
+    const known = inboundBegins.get(ref.brokerCallId);
+    if (known) {
+      same(ref.callSid, known.callSid);
+      if (known.beginRef && !sameInboundBeginRef(ref, known.beginRef)) throw new PrimaryApiError('identity_mismatch');
+    }
+  };
+  const rememberInbound = (outcome: InboundOutcome, begin?: InboundBeginIdentity) => {
+    checkBeginRef(outcome.beginRef, begin);
+    const previous = inboundCalls.get(outcome.attachmentId);
+    if (previous) {
+      same(outcome.beginRef.callSid, previous.callSid);
+      if (previous.beginRef && !sameInboundBeginRef(outcome.beginRef, previous.beginRef)) throw new PrimaryApiError('identity_mismatch');
+      if (previous.approvalRef && 'approvalRef' in outcome) requireSameApproval(outcome.approvalRef, previous.approvalRef);
+      if (previous.bindingId && (outcome.state !== 'bound' || outcome.bindingId !== previous.bindingId))
+        throw new PrimaryApiError('identity_mismatch');
+      if (previous.state === 'approved' && outcome.state === 'pending') throw new PrimaryApiError('identity_mismatch');
+      if ((previous.state === 'expired' || previous.state === 'cancelled') && previous.state !== outcome.state)
+        throw new PrimaryApiError('identity_mismatch');
+      if ('expiresAt' in outcome && previous.expiresAt !== undefined && outcome.expiresAt !== previous.expiresAt)
+        throw new PrimaryApiError('identity_mismatch');
+      if (outcome.state === 'bound') {
+        if (previous.consumedAt !== undefined) same(outcome.consumedAt, previous.consumedAt);
+        if (previous.callState === 'closed' && outcome.callState !== 'closed') throw new PrimaryApiError('identity_mismatch');
+      }
+      if (outcome.state === 'cancelled' && previous.cancelledAt !== undefined) same(outcome.cancelledAt, previous.cancelledAt);
+    }
+    const previousId = inboundBySid.get(outcome.beginRef.callSid);
+    if (previousId !== undefined) same(outcome.attachmentId, previousId);
+    const beginMemory = inboundBegins.get(outcome.beginRef.brokerCallId);
+    if (beginMemory?.attachmentId !== undefined) same(outcome.attachmentId, beginMemory.attachmentId);
+    if (outcome.state === 'bound') {
+      const contextual = calls.get(outcome.bindingId);
+      if (contextual) {
+        same(outcome.beginRef.callSid, contextual.callSid);
+        if (contextual.callAssignmentRef || (contextual.state === 'closed' && outcome.callState !== 'closed'))
+          throw new PrimaryApiError('identity_mismatch');
+      }
+    }
+    const next: InboundMemory = { ...previous, callSid: outcome.beginRef.callSid, beginRef: outcome.beginRef, state: outcome.state };
+    if ('approvalRef' in outcome) next.approvalRef = outcome.approvalRef;
+    if ('expiresAt' in outcome) next.expiresAt = outcome.expiresAt;
+    if (outcome.state === 'bound') Object.assign(next, { bindingId: outcome.bindingId, consumedAt: outcome.consumedAt, callState: outcome.callState });
+    if (outcome.state === 'cancelled') next.cancelledAt = outcome.cancelledAt;
+    inboundCalls.set(outcome.attachmentId, structuredClone(next));
+    inboundBySid.set(outcome.beginRef.callSid, outcome.attachmentId);
+    if (beginMemory) inboundBegins.set(outcome.beginRef.brokerCallId, { ...beginMemory, beginRef: structuredClone(outcome.beginRef), attachmentId: outcome.attachmentId });
+    return outcome;
+  };
   const decodeResult = (value: unknown, bindingId: string, requestId: string, submit: boolean) => {
     const result = parse(requestSchema, value, 'invalid_response');
     same(result.bindingId, bindingId); same(result.requestId, requestId);
@@ -427,6 +529,123 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
     return result;
   };
   return {
+    async beginInbound(input) {
+      const begin = checkedBegin(input);
+      return rememberInbound(parse(inboundOutcomeSchema,
+        await request('POST', '/inbound-attachments', begin), 'invalid_response'), begin);
+    },
+    async recoverInbound(input) {
+      const begin = checkedBegin(input);
+      const outcome = parse(recoverInboundResultSchema,
+        await request('POST', '/inbound-attachments/recover', { begin }), 'invalid_response');
+      if (outcome.state !== 'absent') return rememberInbound(outcome, begin);
+      checkBeginRef(outcome.beginRef, begin);
+      if (inboundBegins.get(begin.brokerCallId)?.attachmentId !== undefined
+        || inboundBySid.has(outcome.beginRef.callSid)) throw new PrimaryApiError('identity_mismatch');
+      return outcome;
+    },
+    async cancelInbound(input) {
+      const begin = checkedBegin(input);
+      const outcome = parse(inboundOutcomeSchema,
+        await request('POST', '/inbound-attachments/cancel', { begin }), 'invalid_response');
+      if (outcome.state === 'pending' || outcome.state === 'approved') throw new PrimaryApiError('invalid_response');
+      return rememberInbound(outcome, begin);
+    },
+    async inboundStatus(attachmentId) {
+      parse(uuid, attachmentId, 'invalid_request');
+      const outcome = parse(inboundOutcomeSchema,
+        await request('GET', `/inbound-attachments/${attachmentId}`), 'invalid_response');
+      same(outcome.attachmentId, attachmentId);
+      return rememberInbound(outcome);
+    },
+    async openInboundCall(providerProof, approvalRef) {
+      const input = parse(consumeInboundApprovalSchema, { providerProof, inboundApprovalRef: approvalRef }, 'invalid_request');
+      checkInboundTransport(input.providerProof);
+      const sid = input.providerProof.params.CallSid!;
+      const validateKnown = () => {
+        const known = inboundCalls.get(input.inboundApprovalRef.attachmentId);
+        if (known) {
+          same(known.callSid, sid);
+          if (known.approvalRef) requireSameApproval(input.inboundApprovalRef, known.approvalRef);
+          if (known.state === 'expired' || known.state === 'cancelled') throw new PrimaryApiError('identity_mismatch');
+          if (known.beginRef) {
+            const begin = checkedBegin({ brokerCallId: known.beginRef.brokerCallId, providerProof: input.providerProof });
+            checkBeginRef(known.beginRef, begin);
+          }
+        }
+        const previousId = inboundBySid.get(sid);
+        if (previousId !== undefined) same(previousId, input.inboundApprovalRef.attachmentId);
+        return known;
+      };
+      validateKnown();
+      const call = parse(inboundCallSchema, await request('POST', '/calls', input), 'invalid_response');
+      const known = validateKnown();
+      same(call.callSid, sid);
+      if (known?.bindingId !== undefined) same(call.bindingId, known.bindingId);
+      if (known?.callState === 'closed' && call.state !== 'closed') throw new PrimaryApiError('identity_mismatch');
+      if (calls.get(call.bindingId)?.callAssignmentRef) throw new PrimaryApiError('identity_mismatch');
+      const result = remember(call);
+      inboundCalls.set(input.inboundApprovalRef.attachmentId, structuredClone({ ...known,
+        callSid: sid, approvalRef: input.inboundApprovalRef, bindingId: call.bindingId, callState: call.state }));
+      inboundBySid.set(sid, input.inboundApprovalRef.attachmentId);
+      // The private context response has no consumedAt. Recover its separate
+      // receipt before deriving any media-start deadline.
+      return result;
+    },
+    async closeInbound(attachmentId, value) {
+      parse(uuid, attachmentId, 'invalid_request');
+      const input = parse(closeConsumedInboundAttachmentSchema, value, 'invalid_request');
+      same(attachmentId, input.approvalRef.attachmentId);
+      const begin = checkedBegin(input.begin);
+      const known = inboundCalls.get(attachmentId);
+      const sid = begin.providerProof.params.CallSid!;
+      if (known) {
+        same(known.callSid, sid);
+        if (known.beginRef) checkBeginRef(known.beginRef, begin);
+        if (known.approvalRef) requireSameApproval(input.approvalRef, known.approvalRef);
+        if (known.bindingId !== undefined) same(input.bindingId, known.bindingId);
+        if (known.state === 'expired' || known.state === 'cancelled') throw new PrimaryApiError('identity_mismatch');
+      }
+      const previousId = inboundBySid.get(sid);
+      if (previousId !== undefined) same(attachmentId, previousId);
+      const beginMemory = inboundBegins.get(begin.brokerCallId)!;
+      if (beginMemory.attachmentId !== undefined) same(attachmentId, beginMemory.attachmentId);
+      const contextual = calls.get(input.bindingId);
+      if (contextual) {
+        same(contextual.callSid, sid);
+        if (contextual.callAssignmentRef) throw new PrimaryApiError('identity_mismatch');
+      }
+      const receipt = parse(consumedInboundClosureReceiptSchema,
+        await request('POST', `/inbound-attachments/${attachmentId}/close`, { ...input, begin }), 'invalid_response');
+      same(receipt.attachmentId, attachmentId); same(receipt.bindingId, input.bindingId); same(receipt.callSid, sid);
+      checkBeginRef(receipt.beginRef, begin); requireSameApproval(receipt.approvalRef, input.approvalRef);
+      // Another exact operation may have completed while HTTP was pending.
+      const latest = inboundCalls.get(attachmentId);
+      if (latest) {
+        same(latest.callSid, sid);
+        if (latest.beginRef && !sameInboundBeginRef(latest.beginRef, receipt.beginRef)) throw new PrimaryApiError('identity_mismatch');
+        if (latest.approvalRef) requireSameApproval(latest.approvalRef, receipt.approvalRef);
+        if (latest.bindingId !== undefined) same(latest.bindingId, receipt.bindingId);
+        if (latest.closedAt !== undefined) same(receipt.closedAt, latest.closedAt);
+        if (latest.state === 'expired' || latest.state === 'cancelled') throw new PrimaryApiError('identity_mismatch');
+      }
+      const latestContext = calls.get(input.bindingId);
+      if (latestContext) {
+        same(latestContext.callSid, sid);
+        if (latestContext.callAssignmentRef) throw new PrimaryApiError('identity_mismatch');
+      }
+      const latestId = inboundBySid.get(sid);
+      if (latestId !== undefined) same(attachmentId, latestId);
+      const latestBegin = inboundBegins.get(begin.brokerCallId)!;
+      if (latestBegin.attachmentId !== undefined) same(attachmentId, latestBegin.attachmentId);
+      if (latestContext) calls.set(input.bindingId, { ...latestContext, state: 'closed' });
+      inboundCalls.set(attachmentId, structuredClone({ ...latest, beginRef: receipt.beginRef,
+        approvalRef: receipt.approvalRef, callSid: sid, bindingId: receipt.bindingId,
+        state: 'bound', callState: 'closed', closedAt: receipt.closedAt }));
+      inboundBySid.set(sid, attachmentId);
+      inboundBegins.set(begin.brokerCallId, { ...latestBegin, attachmentId });
+      return receipt;
+    },
     async readiness(callerNumber) {
       parse(z.string().regex(/^\+[1-9]\d{7,14}$/), callerNumber, 'invalid_request');
       return parse(readinessSchema, await request('POST', '/readiness', { callerNumber }), 'invalid_response');

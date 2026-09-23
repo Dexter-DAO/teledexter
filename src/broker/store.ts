@@ -9,6 +9,9 @@ import { canonicalJson } from '../outbound/canonical.js';
 import { observeHark, pendingHarkEvents, settleHarkJournalEvent, validateHarkJournal,
   type HarkDeliveryOutcome, type HarkEndedTiming, type HarkJournal, type HarkJournalEvent, type HarkProviderStatus } from './harkJournal.js';
 import { bindDurableFileParent, durablyReplaceJsonFile, type DurableParentBinding } from '../outbound/DurableFile.js';
+import { assertInboundMediaStart, createInboundJournal, inboundRequestId, reduceInboundJournal, validateInboundJournal,
+  type InboundJournal, type InboundJournalEvent, type InboundWaitPolicy } from './inboundJournal.js';
+import type { InboundBeginIdentity } from './inboundContract.js';
 
 export type CallStatus = 'prepared' | 'dialing' | 'queued' | 'ringing' | 'in-progress' | 'completed' | 'busy' | 'no-answer' | 'canceled' | 'failed' | 'unknown';
 export const terminalCallStatuses = new Set<CallStatus>(['completed', 'busy', 'no-answer', 'canceled', 'failed']);
@@ -31,6 +34,7 @@ export interface BrokerCall {
   mediaStartedAt?: string;
   harkJournal?: HarkJournal;
   harkDispatch?: HarkDispatch;
+  inbound?: InboundJournal;
   voiceOpening?: { status: string; eventId?: string; reason?: string };
   finalized?: boolean; failure?: { code: string; message: string };
   canonicalTurns?: Record<string, unknown>;
@@ -125,6 +129,7 @@ export class BrokerStore {
         validateAssignment(call);
         validateHarkJournal(call);
         validateHarkDispatch(call);
+        validateInboundJournal(call);
       }
     } catch (error) { this.close(); throw error; }
   }
@@ -144,6 +149,38 @@ export class BrokerStore {
   get(id: string): BrokerCall | undefined { const call = this.state.calls[id]; return call && structuredClone(call); }
   bySid(sid: string): BrokerCall | undefined { return this.list().find(call => call.callSid === sid); }
   list(): BrokerCall[] { return structuredClone(Object.values(this.state.calls)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
+
+  reserveInbound(input: { requestId: string; purpose: string; providerProof: InboundBeginIdentity['providerProof'] },
+    policy: InboundWaitPolicy, now = new Date().toISOString()): { call: BrokerCall; existing: boolean } {
+    const proof = structuredClone(input.providerProof);
+    const callSid = proof.params.CallSid;
+    if (input.requestId !== inboundRequestId(callSid) || typeof input.purpose !== 'string'
+        || !input.purpose || input.purpose.length > 1500) throw new Error('Invalid inbound reservation');
+    const existing = this.list().find(call => call.requestId === input.requestId || call.callSid === callSid);
+    if (existing) {
+      if (!existing.inbound || existing.requestId !== input.requestId || existing.callSid !== callSid
+          || existing.purpose !== input.purpose || canonicalJson(existing.inbound.begin.providerProof) !== canonicalJson(proof))
+        throw new Error('Inbound reservation conflicts with its saved record');
+      validateInboundJournal(existing);
+      // New runtime policy cannot renew a saved attempt's wait or media budget.
+      return { call: existing, existing: true };
+    }
+    const id = randomUUID();
+    const call: BrokerCall = { id, requestId: input.requestId, direction: 'inbound', purpose: input.purpose,
+      number: proof.params.From, callSid, status: 'prepared', createdAt: now, updatedAt: now, delegations: {},
+      inbound: createInboundJournal({ brokerCallId: id, providerProof: proof }, policy, now) };
+    validateInboundJournal(call);
+    this.persist({ version: 1, calls: { ...this.state.calls, [id]: call } });
+    return { call: structuredClone(call), existing: false };
+  }
+
+  transitionInbound(id: string, event: InboundJournalEvent): BrokerCall {
+    const previous = this.state.calls[id];
+    if (!previous) throw new Error('Unknown broker call');
+    const next = reduceInboundJournal(previous, event, new Date().toISOString());
+    if (next === previous) return structuredClone(previous);
+    return this.saveHarkCall(next);
+  }
 
   reserve(input: Pick<BrokerCall, 'requestId' | 'direction' | 'purpose' | 'number'> & { callSid?: string }, origin?: 'authenticated_broker_control'): { call: BrokerCall; existing: boolean } {
     if (Object.prototype.hasOwnProperty.call(input, 'callAssignment')) throw new Error('Assignment must originate from control reservation');
@@ -237,12 +274,14 @@ export class BrokerStore {
       harkDispatch: { ...previous.harkDispatch, state: 'provider_accepted', providerAcceptedAt: observedAt } });
   }
 
-  update(id: string, patch: Partial<Omit<BrokerCall, 'id' | 'requestId' | 'number' | 'direction' | 'purpose' | 'createdAt' | 'callAssignment' | 'harkJournal' | 'harkDispatch'>>): BrokerCall {
+  update(id: string, patch: Partial<Omit<BrokerCall, 'id' | 'requestId' | 'number' | 'direction' | 'purpose' | 'createdAt' | 'callAssignment' | 'harkJournal' | 'harkDispatch' | 'inbound'>>): BrokerCall {
     const previous = this.state.calls[id];
     if (!previous) throw new Error('Unknown broker call');
     // Runtime callers can bypass Omit. Check the same property snapshot that
     // will be persisted, so accessors cannot change a value after validation.
     const nextPatch = { ...patch };
+    if (Object.prototype.hasOwnProperty.call(nextPatch, 'mediaStartedAt'))
+      assertInboundMediaStart(previous, nextPatch.mediaStartedAt, new Date().toISOString());
     for (const key of ['id', 'requestId', 'number', 'direction', 'purpose', 'createdAt'] as const) {
       if (Object.prototype.hasOwnProperty.call(nextPatch, key)
           && (nextPatch as Partial<BrokerCall>)[key] !== previous[key]) throw new Error('Call identity cannot change');
@@ -263,7 +302,14 @@ export class BrokerStore {
         throw new Error('Hark dispatch requires an explicit transition');
       delete (nextPatch as Partial<BrokerCall>).harkDispatch;
     }
+    if (Object.prototype.hasOwnProperty.call(nextPatch, 'inbound')) {
+      if (canonicalJson((nextPatch as Partial<BrokerCall>).inbound) !== canonicalJson(previous.inbound))
+        throw new Error('Inbound journal requires an explicit transition');
+      delete (nextPatch as Partial<BrokerCall>).inbound;
+    }
     if (Object.prototype.hasOwnProperty.call(nextPatch, 'primary')) {
+      if (previous.inbound && canonicalJson(nextPatch.primary) !== canonicalJson(previous.primary))
+        throw new Error('Inbound context requires an explicit transition');
       if (previous.callAssignment && previous.primary && nextPatch.primary?.bindingId !== previous.primary.bindingId)
         throw new Error('Assigned Primary binding cannot change');
       if (previous.primary?.callAssignmentRef && !sameCallAssignmentRef(previous.primary.callAssignmentRef, nextPatch.primary?.callAssignmentRef))
@@ -272,7 +318,11 @@ export class BrokerStore {
     }
     if (Object.prototype.hasOwnProperty.call(nextPatch, 'primaryClosed')) {
       const closed = nextPatch.primaryClosed;
-      if (!closed || closed.state !== 'closed' || closed.bindingId !== previous.primary?.bindingId || closed.callSid !== previous.callSid
+      if (previous.inbound) {
+        if (canonicalJson(closed) !== canonicalJson(previous.primaryClosed))
+          throw new Error('Inbound closure requires an explicit receipt transition');
+        delete nextPatch.primaryClosed;
+      } else if (!closed || closed.state !== 'closed' || closed.bindingId !== previous.primary?.bindingId || closed.callSid !== previous.callSid
           || (previous.primaryClosed && (closed.bindingId !== previous.primaryClosed.bindingId || closed.callSid !== previous.primaryClosed.callSid)))
         throw new Error('Closed Primary binding cannot change');
     }
@@ -289,6 +339,7 @@ export class BrokerStore {
     validateAssignment(call);
     validateHarkJournal(call);
     validateHarkDispatch(call);
+    validateInboundJournal(call);
     this.persist({ version: 1, calls: { ...this.state.calls, [id]: call } });
     return structuredClone(call);
   }
@@ -297,6 +348,7 @@ export class BrokerStore {
     validateAssignment(call);
     validateHarkJournal(call);
     validateHarkDispatch(call);
+    validateInboundJournal(call);
     this.persist({ version: 1, calls: { ...this.state.calls, [call.id]: call } });
     return structuredClone(call);
   }
