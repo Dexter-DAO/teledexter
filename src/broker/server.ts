@@ -6,6 +6,8 @@ import { createBrokerLiveSession, type BrokerLiveSession, type BrokerLiveSession
 import type { LiveTranscriptSnapshot } from '../live/session.js';
 import { createPrimaryApiClient, type PrimaryApiClient } from './primaryApi.js';
 import { createPrimaryBackend } from './backend.js';
+import { newPhoneCallControlSchema } from './assignment.js';
+import { rejectBrokerPublication } from './publications.js';
 import { createCallbackFlow } from './callback.js';
 import { type BrokerConfig, isPhoneNumber } from './config.js';
 import { BrokerStore, type BrokerCall, type CallStatus, terminalCallStatuses } from './store.js';
@@ -113,7 +115,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
     return pending;
   }
 
-  async function requestOutbound(input: { requestId: string; purpose: string; to: string; callbackFor?: string }): Promise<{ replayed: boolean; call: BrokerCall }> {
+  async function requestOutbound(input: { requestId: string; purpose: string; to: string; callbackFor?: string; origin?: 'authenticated_broker_control' }): Promise<{ replayed: boolean; call: BrokerCall }> {
     const to = input.to;
     if (!accepting || !UUID.test(input.requestId) || !config.allowedTo.includes(to)) throw new Error('call_not_available');
     if (input.callbackFor) {
@@ -121,7 +123,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
       if (!inbound || inbound.direction !== 'inbound' || inbound.number !== to || !terminalCallStatuses.has(inbound.status)
         || inbound.callback?.requestId !== input.requestId || inbound.callback.state !== 'requested') throw new Error('callback_identity_mismatch');
     }
-    const reservation = store.reserve({ requestId: input.requestId, direction: 'outbound', purpose: input.purpose.trim(), number: to });
+    const reservation = store.reserve({ requestId: input.requestId, direction: 'outbound', purpose: input.purpose.trim(), number: to }, input.origin);
     if (reservation.existing) return { replayed: true, call: reservation.call };
     const call = reservation.call;
     sessionCalls.add(call.id);
@@ -158,11 +160,12 @@ export function createBrokerServer(options: BrokerServerOptions) {
   }
 
   async function bind(call: BrokerCall, proof: ProviderCallProof): Promise<BrokerCall> {
-    const binding = await primary.openCall(proof);
+    const binding = await primary.openCall(proof, call.callAssignment?.value);
     if (binding.callSid !== call.callSid || binding.state !== 'open') throw new Error('primary_call_identity_mismatch');
     const context = binding.context;
     const text = context.messages.map(message => `${message.role}: ${message.text}`).join('\n');
-    return store.update(call.id, { primary: { bindingId: binding.bindingId, name: context.displayName, context: text.slice(-8_000) } });
+    return store.update(call.id, { primary: { bindingId: binding.bindingId, name: context.displayName, context: text.slice(-8_000),
+      ...(binding.callAssignmentRef === undefined ? {} : { callAssignmentRef: binding.callAssignmentRef }) } });
   }
 
   async function handle(request: IncomingMessage, response: ServerResponse) {
@@ -181,8 +184,13 @@ export function createBrokerServer(options: BrokerServerOptions) {
           || Object.keys(input).some(key => !['requestId', 'purpose', 'to'].includes(key))) return json(response, 400, { error: 'invalid_call_request' });
         const to = input.to as string | undefined ?? (config.allowedTo.length === 1 ? config.allowedTo[0] : undefined);
         if (!to || !config.allowedTo.includes(to)) return json(response, 403, { error: 'recipient_not_authorized' });
+        const saved = store.list().find(call => call.requestId === input.requestId);
+        // Historical exact retries recover their original record. New calls
+        // must satisfy the shared API contract before reservation or dialing.
+        if (!saved && !newPhoneCallControlSchema.safeParse({ assignmentId: input.requestId,
+          purpose: input.purpose.trim() }).success) return json(response, 400, { error: 'invalid_call_request' });
         try {
-          const result = await requestOutbound({ requestId: input.requestId, purpose: input.purpose.trim(), to });
+          const result = await requestOutbound({ requestId: input.requestId, purpose: input.purpose.trim(), to, origin: 'authenticated_broker_control' });
           return json(response, result.replayed ? 200 : 201, { replayed: result.replayed, call: publicCall(result.call) });
         } catch (error) {
           if ((error as { code?: string }).code === 'call_already_open') return json(response, 409, { error: 'call_already_open' });
@@ -292,6 +300,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
   function connectMedia(ws: WebSocket, call: BrokerCall) {
     let streamSid: string | undefined;
     let live: BrokerLiveSession | undefined;
+    let connectedSessionId: string | undefined;
     let backend: ReturnType<typeof createPrimaryBackend> | undefined;
     let stopping = false;
     let stopPromise: Promise<void> | undefined;
@@ -352,9 +361,9 @@ export function createBrokerServer(options: BrokerServerOptions) {
           streamSid = mediaStart(frame.start, { accountSid: config.twilioAccountSid, callSid: call.callSid!, token: streamToken(config.controlToken, call.id, call.callSid!) });
           clearTimeout(startTimer);
           store.update(call.id, { streamSid, status: 'in-progress', mediaStartedAt: new Date().toISOString() });
-          backend = createPrimaryBackend({ callId: call.id, callSid: call.callSid!, bindingId: call.primary!.bindingId, api: primary, store, lastCallerSpeechAt: () => lastSpeechAt });
+          backend = createPrimaryBackend({ callId: call.id, callSid: call.callSid!, bindingId: call.primary!.bindingId, api: primary, store, watchUntilCallEnds: true, lastCallerSpeechAt: () => lastSpeechAt });
           live = voiceFactory({ apiKey: config.apiKey, callId: call.id, voice: config.voice,
-            instructions: brokerInstructions({ direction: call.direction, purpose: call.purpose, name: call.primary!.name, context: call.primary!.context }),
+            instructions: brokerInstructions({ direction: call.direction, purpose: call.purpose, registeredAssignment: !!call.callAssignment, name: call.primary!.name, context: call.primary!.context }),
             history: brokerHistory({ name: call.primary!.name, context: call.primary!.context }),
             backend,
             onAudio(payload) {
@@ -364,14 +373,18 @@ export function createBrokerServer(options: BrokerServerOptions) {
               const name = receipts.sent(Buffer.from(payload, 'base64').length);
               ws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name } }));
             },
-            onTranscript(snapshot) { store.update(call.id, { transcript: snapshot, transcriptRevision: snapshot.revision }); },
+            onTranscript(snapshot) {
+              store.update(call.id, { transcript: snapshot, transcriptRevision: snapshot.revision });
+              backend?.observeTranscript(snapshot);
+            },
             onReady({ sessionId }) {
+              connectedSessionId = sessionId;
               store.update(call.id, { liveSessionId: sessionId, voiceOpening: { status: 'pending' } });
               // Live's documented speak-first command runs while phone audio
               // continues. Its receipt confirms context injection, not playback.
               queueMicrotask(() => {
                 if (stopping || !live) return;
-                void live.appendInstructions(brokerOpening(call.direction))
+                void live.appendInstructions(brokerOpening(call.direction, !!call.callAssignment))
                   .then(result => { store.update(call.id, { voiceOpening: result }); })
                   .catch(() => { if (!stopping) store.update(call.id, { voiceOpening: { status: 'unconfirmed', reason: 'opening_delivery_failed' } }); });
               });
@@ -382,6 +395,9 @@ export function createBrokerServer(options: BrokerServerOptions) {
               if (ws.readyState === WebSocket.OPEN && streamSid) ws.send(JSON.stringify({ event: 'clear', streamSid }));
             },
             onEvent(event) {
+              if (event.type === 'live.append.late_rejection' && connectedSessionId && typeof event.eventId === 'string')
+                rejectBrokerPublication(store, { callId: call.id, callSid: call.callSid!, bindingId: call.primary!.bindingId,
+                  sessionId: connectedSessionId }, event.eventId, typeof event.code === 'string' ? event.code : 'provider_error');
               if (event.type === 'live.error') store.update(call.id, { failure: { code: String(event.code || 'live_error'), message: 'The voice connection could not continue' } });
             },
           });

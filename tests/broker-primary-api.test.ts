@@ -29,6 +29,47 @@ const submission: PrimarySubmission = { source: {
   callSid, itemId: 'item_caller_1', sourceEventId, revision: 1, receivedAt: when, role: 'user',
 }, text: 'Tell me my current portfolio.' };
 
+test('publication reference is paired, preserved verbatim in submit and reconciliation, and digest-bound', async () => {
+  const input: PrimarySubmission = { ...submission, text: ' Then review it.\t',
+    relatedPrimaryRequestId: messageId, referenceOrigin: 'broker_status_publication' };
+  const turn = originalTurn(input);
+  const proof = { schemaVersion: 1, kind: 'phone_closed_call_non_admission', callSid,
+    source: { itemId: input.source.itemId, sourceEventId, revision: 1, receivedAt: when },
+    rawSubmissionDigest: rawSubmissionDigest(bindingId, input),
+    turn: { recordId: sourceEventId, revisionRecordId: eventId, bodyDigest: turnBodyDigest(turn) }, closedAt: when };
+  const { client, requests } = harness([json({ ...completed, replayed: false }, 202),
+    json({ outcome: 'not_admitted', bindingId, requestId, proof })]);
+  await client.submit(bindingId, requestId, input);
+  await client.reconcile(bindingId, requestId, input);
+  for (const request of requests) {
+    const body = JSON.parse(String(request.init.body));
+    assert.equal(body.relatedPrimaryRequestId, messageId);
+    assert.equal(body.referenceOrigin, 'broker_status_publication');
+    assert.equal(body.text, input.text);
+  }
+  assert.notEqual(rawSubmissionDigest(bindingId, input), rawSubmissionDigest(bindingId, { ...submission, text: input.text }));
+  assert.notEqual(rawSubmissionDigest(bindingId, input), rawSubmissionDigest(bindingId, { ...input, relatedPrimaryRequestId: eventId }));
+  assert.equal(turnBodyDigest(turn), turnBodyDigest(originalTurn({ ...submission, text: input.text })), 'reference is not transcript text');
+  const oldProof = { ...proof, rawSubmissionDigest: rawSubmissionDigest(bindingId, { ...submission, text: input.text }) };
+  await assert.rejects(harness([json({ outcome: 'not_admitted', bindingId, requestId, proof: oldProof })])
+    .client.reconcile(bindingId, requestId, input), code('identity_mismatch'));
+});
+
+test('invalid, incomplete, and self-referencing publication fields never reach HTTP', async () => {
+  for (const fields of [
+    { relatedPrimaryRequestId: messageId }, { referenceOrigin: 'broker_status_publication' },
+    { relatedPrimaryRequestId: messageId, referenceOrigin: 'caller_consent' },
+    { relatedPrimaryRequestId: 'not-a-uuid', referenceOrigin: 'broker_status_publication' },
+    { relatedPrimaryRequestId: requestId, referenceOrigin: 'broker_status_publication' },
+  ]) {
+    const { client, requests } = harness([]);
+    const input = { ...submission, ...fields } as PrimarySubmission;
+    await assert.rejects(client.submit(bindingId, requestId, input), code('invalid_request'));
+    await assert.rejects(client.reconcile(bindingId, requestId, input), code('invalid_request'));
+    assert.equal(requests.length, 0);
+  }
+});
+
 test('reconciliation sends exact original body without Idempotency-Key and validates stable capture/proof digests', async () => {
   const raw = { ...submission, text: ' Original speech\t' };
   const turn = originalTurn(raw);
@@ -315,4 +356,99 @@ test('reply validation refuses oversized, contradictory and caller-supplied extr
   await assert.rejects(client.reply(bindingId, requestId, questionId, { ...replyInput, reply: { ...replyInput.reply, answer: 'other', text: '🙂'.repeat(501) } }), code('invalid_request'));
   await assert.rejects(client.reply(bindingId, requestId, questionId, { ...replyInput, owner: 'another-owner' } as typeof replyInput), code('invalid_request'));
   assert.equal(requests.length, 0);
+});
+
+const assignment = { assignmentId: requestId, brokerCallId: sourceEventId, revision: 1 as const, purpose: 'Read the current portfolio.' };
+const assignmentRef = { assignmentId: requestId, revision: 1 as const, digest: 'a'.repeat(64) };
+const assignedCall = { ...call, callAssignmentRef: assignmentRef };
+
+test('call assignment registers separately and exact reference accompanies raw submission and reconciliation', async () => {
+  const input = { ...submission, text: ' Hello. ', callAssignmentRef: assignmentRef,
+    relatedPrimaryRequestId: messageId, referenceOrigin: 'broker_status_publication' as const };
+  const turn = originalTurn(input);
+  const nonAdmission = { schemaVersion: 1, kind: 'phone_closed_call_non_admission', callSid,
+    source: { itemId: input.source.itemId, sourceEventId, revision: 1, receivedAt: when },
+    rawSubmissionDigest: rawSubmissionDigest(bindingId, input),
+    turn: { recordId: sourceEventId, revisionRecordId: eventId, bodyDigest: turnBodyDigest(turn) }, closedAt: when };
+  const { client, requests } = harness([json(assignedCall), json({ ...completed, replayed: false }, 202),
+    json({ outcome: 'not_admitted', bindingId, requestId, proof: nonAdmission })]);
+  const opened = await client.openCall(proof, assignment);
+  // The caller cannot mutate the client's remembered immutable receipt.
+  opened.callAssignmentRef!.digest = 'b'.repeat(64);
+  await client.submit(bindingId, requestId, input);
+  await client.reconcile(bindingId, requestId, input);
+  assert.deepEqual(JSON.parse(String(requests[0].init.body)), { providerProof: proof, callAssignment: assignment });
+  for (const request of requests.slice(1)) {
+    const body = JSON.parse(String(request.init.body));
+    assert.deepEqual(body.callAssignmentRef, assignmentRef);
+    assert.equal(body.text, ' Hello. ');
+    assert.equal(body.relatedPrimaryRequestId, messageId);
+    assert.equal(body.purpose, undefined);
+    assert.equal(body.callAssignment, undefined);
+  }
+  assert.equal(turn.text, ' Hello. ');
+  assert.equal(turnBodyDigest(turn), turnBodyDigest(originalTurn({ ...submission, text: input.text })));
+});
+
+test('registration and remembered context cannot lose or change an assignment reference', async () => {
+  for (const response of [call, { ...assignedCall, callAssignmentRef: { ...assignmentRef, assignmentId: messageId } },
+    { ...assignedCall, callAssignmentRef: { ...assignmentRef, revision: 2 } }]) {
+    await assert.rejects(harness([json(response)]).client.openCall(proof, assignment), error => error instanceof PrimaryApiError);
+  }
+  await assert.rejects(harness([json(assignedCall)]).client.openCall(proof), code('identity_mismatch'));
+  const contextRefresh = harness([json(assignedCall), json(call)]);
+  await contextRefresh.client.openCall(proof, assignment);
+  assert.deepEqual((await contextRefresh.client.getContext(bindingId)).callAssignmentRef, assignmentRef, 'GET context omission preserves existing registration receipt');
+  for (const response of [{ ...assignedCall, callAssignmentRef: { ...assignmentRef, digest: 'b'.repeat(64) } }]) {
+    const { client } = harness([json(assignedCall), json(response)]);
+    await client.openCall(proof, assignment);
+    await assert.rejects(client.getContext(bindingId), code('identity_mismatch'));
+  }
+  const { client, requests } = harness([json(assignedCall)]);
+  await client.openCall(proof, assignment);
+  for (const input of [submission, { ...submission, callAssignmentRef: { ...assignmentRef, digest: 'b'.repeat(64) } }]) {
+    await assert.rejects(client.submit(bindingId, requestId, input), code('identity_mismatch'));
+    await assert.rejects(client.reconcile(bindingId, requestId, input), code('identity_mismatch'));
+  }
+  assert.equal(requests.length, 1);
+});
+
+test('assignment validation uses exact trimmed purpose and the existing UTF-16 1500 limit', async () => {
+  const good = { ...assignment, purpose: '😀'.repeat(750) };
+  assert.equal(good.purpose.length, 1500);
+  const h = harness([json(assignedCall)]);
+  await h.client.openCall(proof, good);
+  assert.equal(JSON.parse(String(h.requests[0].init.body)).callAssignment.purpose, good.purpose);
+  for (const value of [{ ...good, purpose: good.purpose + 'a' }, { ...assignment, purpose: ' padded ' },
+    { ...assignment, purpose: '' }, { ...assignment, purpose: 'Read\u0000portfolio' },
+    { ...assignment, purpose: 'Read\uD800portfolio' }, { ...assignment, purpose: 'Read\uDC00portfolio' },
+    { ...assignment, assignmentId: 'ABCDEFAB-CDEF-4ABC-8ABC-ABCDEFABCDEF' },
+    { ...assignment, brokerCallId: 'ABCDEFAB-CDEF-4ABC-8ABC-ABCDEFABCDEF' },
+    { ...assignment, revision: 2 }, { ...assignment, issuer: 'owner' }]) {
+    const { client, requests } = harness([]);
+    await assert.rejects(client.openCall(proof, value as typeof assignment), code('invalid_request'));
+    assert.equal(requests.length, 0);
+  }
+});
+
+test('question replies reject assignment refs instead of silently treating them as new missions', async () => {
+  const { client, requests } = harness([]);
+  const { role, ...source } = submission.source;
+  await assert.rejects(client.reply(bindingId, requestId, messageId, { source, role, text: 'Yes',
+    reply: { questionRevision: 1, clientReplyId: eventId, answer: 'yes', text: null },
+    callAssignmentRef: assignmentRef } as never), code('invalid_request'));
+  assert.equal(requests.length, 0);
+});
+
+
+test('registration replays echo the same original control UUID and immutable returned receipt', async () => {
+  const originalId = 'abcdefab-cdef-4abc-8abc-abcdefabcdef';
+  const original = { ...assignment, assignmentId: originalId };
+  const reference = { ...assignmentRef, assignmentId: originalId };
+  const response = { ...call, callAssignmentRef: reference };
+  const { client, requests } = harness([json(response), json(response)]);
+  assert.deepEqual(await client.openCall(proof, original), response);
+  assert.deepEqual(await client.openCall(proof, original), response);
+  assert.equal(requests[0].init.body, requests[1].init.body);
+  assert.equal(JSON.parse(String(requests[0].init.body)).callAssignment.assignmentId, originalId);
 });

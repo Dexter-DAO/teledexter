@@ -4,6 +4,9 @@ import { LIVE_APPEND_MAX_BYTES } from '../live/session.js';
 import type { PrimaryApiClient, PrimaryApiErrorCode, PrimaryClosedCall, PrimaryQuestion, PrimaryQuestionResult, PrimaryReconciliation, PrimaryReplyInput, PrimaryResult, PrimarySubmission, PrimaryTurn } from './primaryApi.js';
 import { PrimaryApiError } from './primaryApi.js';
 import { terminalCallStatuses, type BrokerCall, type BrokerStore } from './store.js';
+import { beginBrokerPublication, settleBrokerPublication, selectBrokerPublicationReference } from './publications.js';
+import { phoneCallAssignmentRefSchema } from './assignment.js';
+import type { LiveBackendUpdate, LiveDelivery } from '../live/types.js';
 import { acknowledgedTurn, originalTurn, turnBodyDigest, validateNonAdmissionProof, type AcknowledgedTurnReceipt } from './reconciliation.js';
 
 export interface PrimaryBackendOptions {
@@ -16,6 +19,8 @@ export interface PrimaryBackendOptions {
   maxWaitMs?: number;
   pollIntervalMs?: number;
   maxPollMs?: number;
+  /** Live media owns cancellation; keep observing accepted work until the call ends. */
+  watchUntilCallEnds?: boolean;
   progressIntervalMs?: number;
   now?: () => number;
   lastCallerSpeechAt?: () => number | undefined;
@@ -23,6 +28,8 @@ export interface PrimaryBackendOptions {
 }
 
 export interface PrimaryBackend extends BrokerLiveBackend {
+  /** Retain quiet-time completion evidence without uploading provisional speech. */
+  observeTranscript(snapshot: LiveTranscriptSnapshot): void;
   /** Host-observed acoustic speech time, in Date.now() milliseconds. */
   noteCallerSpeech(atMs?: number, audioOffsetMs?: number): void;
   /** Freeze the observed spans before the host reconstructs closeout after disconnect. */
@@ -53,6 +60,8 @@ export interface BrokerDelegationRecord {
   frozenCallerRevision: number;
   firstSequence: number;
   lastSequence: number;
+  /** Local received-audio clock; independent of Live transcript timestamps. */
+  audioThroughMs?: number;
   completionBasis: 'transcript_stability' | 'speech_and_transcript_stability';
   sourceRevision: number;
   capturedText: string;
@@ -71,8 +80,28 @@ export interface BrokerDelegationRecord {
   questions?: Record<string, BrokerQuestionRecord>;
   currentQuestionId?: string;
   questionNotice?: 'answer_too_long' | 'reply_unknown' | 'reply_refused' | 'question_unavailable' | 'answered_elsewhere';
-  deferredTurns?: Array<{ delegationId: string; sourceEventId: string; text: string; firstSequence: number;
-    callerRevision: number; status: 'recorded_not_submitted' }>;
+  /** Local ordering evidence; never added to the caller's raw submission text. */
+  predecessorRequestId?: string;
+  deferredTurns?: BrokerDeferredTurn[];
+}
+
+export interface BrokerDeferredTurn {
+  delegationId: string;
+  sourceEventId: string;
+  text: string;
+  firstSequence: number;
+  callerRevision: number;
+  status: 'recorded_not_submitted' | 'queued' | 'promoted';
+  /** Absent on legacy records and speech that cannot be admitted as another request. */
+  queuedRequest?: {
+    requestId: string;
+    predecessorRequestId: string;
+    submission: PrimarySubmission;
+    bodyDigest: string;
+    lastSequence: number;
+    completionBasis: 'speech_and_transcript_stability';
+    audioThroughMs?: number;
+  };
 }
 
 export interface PrimaryApiDiagnostic {
@@ -99,6 +128,7 @@ export interface BrokerQuestionReplyRecord {
   callerRevision: number;
   firstSequence: number;
   lastSequence: number;
+  audioThroughMs?: number;
   refusal?: { origin: 'local_validation' | 'api_non_admission'; code: string; status?: number };
 }
 
@@ -151,6 +181,9 @@ interface CanonicalTurnRecord extends PrimaryTurn {
 // A closeout backend can coexist briefly with the detached voice backend. Both
 // must serialize the same call journal and capture submissions.
 const storeAdmissions = new WeakMap<object, Map<string, Promise<void>>>();
+// One live worker delivers results and drains a call's queue. Admission remains
+// independently locked so caller turns can be saved while a result GET waits.
+const storeWorkers = new WeakMap<object, Map<string, Promise<void>>>();
 // Concurrent Live delegations can observe the same saved request. Share notice
 // reservations without changing its admission or transcript journal.
 const storeNotices = new WeakMap<object, Map<string, {
@@ -228,6 +261,8 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
   if (!admissions) { admissions = new Map(); storeAdmissions.set(options.store, admissions); }
   let notices = storeNotices.get(options.store);
   if (!notices) { notices = new Map(); storeNotices.set(options.store, notices); }
+  let workers = storeWorkers.get(options.store);
+  if (!workers) { workers = new Map(); storeWorkers.set(options.store, workers); }
   const locked = async <T>(fn: () => Promise<T>): Promise<T> => {
     const previous = admissions!.get(options.callId) ?? Promise.resolve();
     let release!: () => void;
@@ -283,6 +318,27 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
           validateNonAdmissionProof(options.bindingId, entry.submission, entry.originalCapture.receipt, closed, reconciliation.proof);
         }
       } else if (entry.status === 'not_admitted') throw new Error('missing_non_admission_proof');
+      for (const turn of entry.deferredTurns ?? []) {
+        const queued = turn.queuedRequest;
+        if (turn.status === 'recorded_not_submitted' && !queued) continue;
+        if (!queued || !['queued', 'promoted'].includes(turn.status)
+            || !uuidPattern.test(queued.requestId) || !uuidPattern.test(queued.predecessorRequestId)
+            || queued.requestId !== brokerIdentity('request', options.callId, entry.sessionId, turn.delegationId)
+            || queued.bodyDigest !== digest(queued.submission) || queued.submission.text !== turn.text
+            || queued.submission.source.sourceEventId !== turn.sourceEventId
+            || queued.submission.source.callSid !== options.callSid || queued.submission.source.revision !== 1
+            || queued.submission.source.role !== 'user' || queued.submission.source.itemId !== `live-turn-${turn.sourceEventId}`
+            || !Number.isFinite(Date.parse(queued.submission.source.receivedAt))
+            || !Number.isSafeInteger(turn.firstSequence) || turn.firstSequence < 1
+            || !Number.isSafeInteger(queued.lastSequence) || queued.lastSequence < turn.firstSequence
+            || queued.completionBasis !== 'speech_and_transcript_stability' || !validTurnText(turn.text))
+          throw new Error('invalid_saved_deferred_turn');
+        if (turn.status === 'promoted') {
+          const child = boundCall(sessionId).delegations[queued.requestId] as BrokerDelegationRecord | undefined;
+          if (!child || child.predecessorRequestId !== queued.predecessorRequestId
+              || digest(child.submission) !== queued.bodyDigest) throw new Error('invalid_promoted_deferred_turn');
+        }
+      }
       return entry;
     }).filter(entry => entry.sessionId === sessionId);
   };
@@ -376,9 +432,10 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     } else if (unresolvedReply(reply)) current = { ...current, questionNotice: 'reply_unknown' };
     return save(current);
   };
-  const recoverReplies = async (entry: BrokerDelegationRecord) => {
+  const recoverReplies = async (entry: BrokerDelegationRecord, stopped?: () => boolean) => {
     let current = load(entry);
     for (const [questionId, record] of Object.entries(current.questions ?? {})) {
+      if (stopped?.()) break;
       if (!unresolvedReply(record.reply)) continue;
       try { current = applyReplyObservation(current, questionId, await options.api.question(options.bindingId, current.requestId, questionId)); }
       catch { current = save({ ...load(current), questionNotice: 'reply_unknown' }); }
@@ -391,26 +448,82 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     return Date.parse(origin);
   };
   const speechTime = () => options.lastCallerSpeechAt?.() ?? lastSpeechAt;
-  const acousticGroups = (snapshot: LiveTranscriptSnapshot, observedAt = now()) => {
-    const grouped = acousticSpans.map(span => ({ span, fragments: [] as LiveTranscriptSnapshot['fragments'], ambiguous: false }));
-    for (const fragments of callerGroups(snapshot)) {
-      // Transcript times are approximate, so associate the complete contiguous
-      // phrase with acoustic evidence. Filtering each word against the acoustic
-      // boundary can truncate a phrase whose last caption is timestamped later.
-      const startMs = Math.min(...fragments.map(fragment => fragment.startMs));
-      const endMs = Math.max(...fragments.map(fragment => fragment.endMs));
-      const matches = grouped.filter(({ span }) => endMs >= span.startMs - 300 && startMs <= span.endMs + 300);
-      if (matches.length === 1) matches[0].fragments.push(...fragments);
-      // Preserve uncertain text in the transcript without combining distinct
-      // acoustic turns or admitting only a convenient subset of the phrase.
-      else for (const match of matches) match.ambiguous = true;
+  const completedCallerGroups = (snapshot: LiveTranscriptSnapshot, observedAt = now()) => {
+    // Captions and delegations share Live's session clock. Input amplitude is
+    // only local activity/silence evidence: clicks and pauses prevent a reliable
+    // one-to-one correspondence between captions and local sound bursts.
+    const latestAudio = acousticSpans.at(-1);
+    if (!latestAudio) return [];
+    const sessionId = currentSession();
+    const grouped = callerGroups(snapshot).map(fragments => {
+      fragments.sort((a, b) => a.sequence - b.sequence);
+      return { fragments, sourceEventId: brokerIdentity('source', options.callId, sessionId, fragments[0].eventId) };
+    });
+    if (grouped.some((group, index) => index > 0 && group.fragments[0].sequence <= grouped[index - 1].fragments[0].sequence)) return [];
+    const matchesAnchor = (sourceEventId: string, firstSequence?: number, lastSequence?: number) => {
+      const group = grouped.find(value => value.sourceEventId === sourceEventId);
+      return !!group && (firstSequence === undefined || group.fragments[0].sequence === firstSequence)
+        && (lastSequence === undefined || group.fragments.some(fragment => fragment.sequence === lastSequence));
+    };
+    // A late caption may extend its source, but cannot split, merge or replace
+    // an already accepted source. Saved requests/replies remain byte-exact.
+    for (const entry of entries(sessionId)) {
+      if (!matchesAnchor(entry.submission.source.sourceEventId, entry.firstSequence, entry.lastSequence)) return [];
+      for (const turn of entry.deferredTurns ?? [])
+        if (!matchesAnchor(turn.sourceEventId, turn.firstSequence, turn.queuedRequest?.lastSequence)) return [];
+      for (const question of Object.values(entry.questions ?? {})) for (const reply of replyAttempts(question))
+        if (!matchesAnchor(reply.input.source.sourceEventId, reply.firstSequence, reply.lastSequence)) return [];
     }
-    return grouped.filter(({ span, fragments, ambiguous }, index) => fragments.length && !ambiguous
-      && (index < acousticSpans.length - 1 || observedAt - span.lastSpeechAt >= stabilityMs))
-      // Timing chooses the source span; delta text itself is appended exactly in
-      // provider delivery order, as required by the Live transcript contract.
-      .map(group => ({ ...group, fragments: group.fragments.sort((a, b) => a.sequence - b.sequence) }));
+    for (const value of Object.values(boundCall(sessionId).canonicalTurns ?? {})) {
+      const turn = value as CanonicalTurnRecord;
+      if (turn.role === 'user' && !matchesAnchor(turn.sourceEventId)) return [];
+    }
+    if (observedAt - latestAudio.lastSpeechAt >= stabilityMs) return grouped;
+    const checkpoints = boundCall(sessionId).callerCompletions;
+    return grouped.filter(group => {
+      const checkpoint = checkpoints?.[group.sourceEventId];
+      return checkpoint?.sessionId === sessionId && Date.parse(checkpoint.observedAt) <= observedAt
+        && checkpoint.firstSequence === group.fragments[0].sequence
+        && checkpoint.lastSequence === Math.max(...group.fragments.map(fragment => fragment.sequence))
+        && checkpoint.textDigest === digest(group.fragments.map(fragment => fragment.text).join(''));
+    });
   };
+  let observedTranscript: LiveTranscriptSnapshot | undefined;
+  let transcriptChangedAt = 0;
+  let completionTimer: ReturnType<typeof setTimeout> | undefined;
+  const scheduleCallerCompletion = () => {
+    clearTimeout(completionTimer);
+    if (!observedTranscript || options.store.get(options.callId)?.endedAt) return;
+    const quietSince = Math.max(transcriptChangedAt, speechTime() ?? 0);
+    completionTimer = setTimeout(() => {
+      try {
+        const snapshot = observedTranscript;
+        if (!snapshot || options.store.get(options.callId)?.endedAt) return;
+        if (now() - Math.max(transcriptChangedAt, speechTime() ?? 0) < stabilityMs) { scheduleCallerCompletion(); return; }
+        const sessionId = currentSession();
+        const call = boundCall(sessionId);
+        const checkpoints = { ...call.callerCompletions };
+        let changed = false;
+        for (const group of completedCallerGroups(snapshot)) {
+          const firstSequence = group.fragments[0].sequence;
+          const lastSequence = Math.max(...group.fragments.map(fragment => fragment.sequence));
+          const textDigest = digest(group.fragments.map(fragment => fragment.text).join(''));
+          const previous = checkpoints[group.sourceEventId];
+          if (previous?.sessionId === sessionId && previous.firstSequence === firstSequence
+              && previous.lastSequence === lastSequence && previous.textDigest === textDigest) continue;
+          checkpoints[group.sourceEventId] = { sessionId, firstSequence, lastSequence, textDigest, observedAt: new Date(now()).toISOString() };
+          changed = true;
+        }
+        if (changed) options.store.update(call.id, { callerCompletions: checkpoints });
+      } catch {
+        // The optional checkpoint must not crash an active call. Closeout will
+        // report unqualified text when no durable completion evidence exists.
+        console.error('broker_caller_completion_failed', { callId: options.callId });
+      }
+    }, Math.max(1, stabilityMs - (now() - quietSince)));
+    completionTimer.unref();
+  };
+  speechListeners.add(scheduleCallerCompletion);
   const stableContext = (channel: LiveBackendChannel): Promise<LiveTranscriptSnapshot | undefined> => {
     if (channel.signal.aborted) return Promise.resolve(undefined);
     return new Promise(resolve => {
@@ -442,10 +555,35 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       schedule();
     });
   };
+  // Both immediate and deferred requests freeze their submission at the caller
+  // frontier. Any conversation reference belongs here, never at later promotion.
+  const submissionForTurn = (sessionId: string, snapshot: LiveTranscriptSnapshot,
+    fragments: LiveTranscriptSnapshot['fragments']): PrimarySubmission => {
+    const first = fragments.reduce((a, b) => a.sequence < b.sequence ? a : b);
+    const sourceEventId = brokerIdentity('source', options.callId, sessionId, first.eventId);
+    const call = boundCall(sessionId);
+    const assignment = call.callAssignment;
+    const assignmentRef = call.primary?.callAssignmentRef;
+    if ((assignment === undefined) !== (assignmentRef === undefined)
+        || (assignment && (assignment.origin !== 'authenticated_broker_control'
+          || assignment.value.assignmentId !== call.requestId || assignment.value.brokerCallId !== call.id
+          || assignment.value.purpose !== call.purpose || assignment.value.revision !== 1
+          || assignmentRef!.assignmentId !== assignment.value.assignmentId || assignmentRef!.revision !== 1)))
+      throw new Error('call_assignment_binding_mismatch');
+    const frozenAssignmentRef = assignmentRef === undefined ? undefined : phoneCallAssignmentRefSchema.parse(assignmentRef);
+    return { source: { callSid: options.callSid, itemId: `live-turn-${sourceEventId}`, sourceEventId,
+      revision: 1, receivedAt: new Date(mediaOrigin(sessionId) + first.startMs).toISOString(), role: 'user' },
+    text: fragments.map(fragment => fragment.text).join(''),
+    ...selectBrokerPublicationReference(call, { callId: options.callId, callSid: options.callSid,
+      bindingId: options.bindingId, sessionId }, snapshot, first.sequence),
+    ...(frozenAssignmentRef === undefined ? {} : { callAssignmentRef: frozenAssignmentRef }) };
+  };
   const accept = async (request: LiveDelegationRequest, channel: LiveBackendChannel): Promise<BrokerDelegationRecord | undefined> => {
     if (request.callId !== options.callId) throw new Error('broker_call_identity_mismatch');
+    const audioThroughMs = acousticSpans.at(-1)?.endMs;
     const before = entries(request.sessionId);
-    const replay = before.find(entry => entry.delegationIds.includes(request.delegationId));
+    const replay = before.find(entry => entry.predecessorRequestId && entry.delegationIds.includes(request.delegationId))
+      ?? before.find(entry => entry.delegationIds.includes(request.delegationId));
     if (replay) return replay;
     const snapshot = await stableContext(channel);
     if (!snapshot || channel.signal.aborted) return undefined;
@@ -453,19 +591,28 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       if (channel.signal.aborted) return undefined;
       if (boundCall(request.sessionId).endedAt) throw new Error('broker_call_ended');
       const saved = entries(request.sessionId);
-      const duplicate = saved.find(entry => entry.delegationIds.includes(request.delegationId));
+      const duplicate = saved.find(entry => entry.predecessorRequestId && entry.delegationIds.includes(request.delegationId))
+        ?? saved.find(entry => entry.delegationIds.includes(request.delegationId));
       if (duplicate) return duplicate;
-      const callStartedAt = mediaOrigin(request.sessionId);
-      const latestSourceStart = Math.max(0, ...saved.map(entry => Date.parse(entry.submission.source.receivedAt) - callStartedAt));
-      const candidate = acousticGroups(snapshot).filter(group => {
+      const latestSourceSequence = Math.max(0, ...saved.map(entry => entry.firstSequence));
+      const candidate = completedCallerGroups(snapshot).filter(group => {
         const first = group.fragments.reduce((a, b) => a.sequence < b.sequence ? a : b);
         const source = brokerIdentity('source', options.callId, request.sessionId, first.eventId);
-        return first.startMs >= latestSourceStart && !saved.some(entry => entry.submission.source.sourceEventId === source
+        const presentAtDelegation = request.transcript.fragments.some(fragment => fragment.role === 'user'
+          && fragment.eventId === first.eventId && fragment.sequence === first.sequence);
+        return audioThroughMs !== undefined
+          && (presentAtDelegation || first.startMs <= request.offsetMs)
+          && first.sequence >= latestSourceSequence && !saved.some(entry => entry.submission.source.sourceEventId === source
           || entry.deferredTurns?.some(turn => turn.sourceEventId === source)
           || Object.values(entry.questions ?? {}).some(record => replyAttempts(record).some(reply => reply.input.source.sourceEventId === source)));
       }).at(-1);
       const fragments = candidate?.fragments;
-      const active = saved.find(entry => !terminal(entry.status));
+      const queuedTurns = saved.flatMap(entry => entry.deferredTurns ?? []).filter(turn => turn.status === 'queued')
+        .sort((a, b) => a.firstSequence - b.firstSequence);
+      // A newly delegated turn cannot jump ahead of saved work during the small
+      // interval between a terminal result and queue promotion.
+      const active = saved.find(entry => !terminal(entry.status))
+        ?? saved.find(entry => entry.deferredTurns?.some(turn => turn.status === 'queued'));
       if (active) {
         let current = save({ ...active, delegationIds: [...active.delegationIds, request.delegationId] });
         if (Object.values(current.questions ?? {}).some(record => unresolvedReply(record.reply))) {
@@ -508,6 +655,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
           options.store.update(options.callId, { acousticSpans: structuredClone(acousticSpans) });
           const reply: NonNullable<BrokerQuestionRecord['reply']> = { input, inputDigest: digest(input), status: 'prepared',
             callerRevision: snapshot.callerRevision, firstSequence: first.sequence,
+            audioThroughMs,
             lastSequence: Math.max(...fragments!.map(fragment => fragment.sequence)) };
           if (refreshed.reply && refreshed.reply.status !== 'refused') return current;
           current = save({ ...current, questionNotice: undefined, questions: { ...current.questions,
@@ -523,16 +671,29 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
                 status: refusal ? 'refused' : 'unknown', ...(refusal ? { refusal } : {}) } } } });
           }
         }
-        const deferredTurns = [...active.deferredTurns ?? []];
+        const deferredTurns = [...current.deferredTurns ?? []];
         if (fragments?.length) {
           const first = fragments.reduce((a, b) => a.sequence < b.sequence ? a : b);
           const text = fragments.map(fragment => fragment.text).join('');
-          if (validTurnText(text)) deferredTurns.push({ delegationId: request.delegationId,
-            sourceEventId: brokerIdentity('source', options.callId, request.sessionId, first.eventId), text,
-            firstSequence: first.sequence, callerRevision: snapshot.callerRevision, status: 'recorded_not_submitted' });
+          if (validTurnText(text)) {
+            const sourceEventId = brokerIdentity('source', options.callId, request.sessionId, first.eventId);
+            const turn: BrokerDeferredTurn = { delegationId: request.delegationId, sourceEventId, text,
+              firstSequence: first.sequence, callerRevision: snapshot.callerRevision, status: 'recorded_not_submitted' };
+            // Early, expired and overlong question answers must never turn into
+            // independent requests when the original run eventually finishes.
+            if (current.status !== 'waiting_for_reply') {
+              const submission = submissionForTurn(request.sessionId, snapshot, fragments);
+              turn.status = 'queued';
+              turn.queuedRequest = { requestId: brokerIdentity('request', options.callId, request.sessionId, request.delegationId),
+                predecessorRequestId: queuedTurns.at(-1)?.queuedRequest!.requestId ?? current.requestId,
+                submission, bodyDigest: digest(submission), lastSequence: Math.max(...fragments.map(fragment => fragment.sequence)),
+                audioThroughMs,
+                completionBasis: 'speech_and_transcript_stability' };
+              options.store.update(options.callId, { acousticSpans: structuredClone(acousticSpans) });
+            }
+            deferredTurns.push(turn);
+          }
         }
-        // Preserve a separate caller request without guessing whether it corrects the
-        // admitted action. It requires another caller utterance, never an automatic run.
         return save({ ...current, deferredTurns });
       }
       if (!fragments?.length) {
@@ -550,9 +711,9 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
         version: 1, requestId: brokerIdentity('request', options.callId, request.sessionId, request.delegationId),
         callId: options.callId, callSid: options.callSid, bindingId: options.bindingId, sessionId: request.sessionId,
         delegationIds: [request.delegationId], status: 'prepared', updatedAt: new Date(now()).toISOString(),
-        submission: { source: { callSid: options.callSid, itemId: `live-turn-${sourceEventId}`,
-          sourceEventId, revision: 1, receivedAt: new Date(mediaOrigin(request.sessionId) + first.startMs).toISOString(), role: 'user' }, text },
+        submission: submissionForTurn(request.sessionId, snapshot, fragments),
         frozenCallerRevision: snapshot.callerRevision, firstSequence: first.sequence,
+        audioThroughMs,
         lastSequence: Math.max(...fragments.map(fragment => fragment.sequence)),
         completionBasis: 'speech_and_transcript_stability',
         sourceRevision: 1, capturedText: text,
@@ -596,7 +757,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       let current = load(entry);
       if (channel.signal.aborted || boundCall(entry.sessionId).endedAt) return current;
       if (current.captureState === 'unknown' || current.captureState === 'dispatching') return current;
-      const fragments = acousticGroups(stable).find(group => group.fragments.some(fragment => fragment.sequence === current.firstSequence))?.fragments;
+      const fragments = completedCallerGroups(stable).find(group => group.fragments.some(fragment => fragment.sequence === current.firstSequence))?.fragments;
       if (!fragments) return current;
       const text = fragments.map(fragment => fragment.text).join('');
       if (text === current.capturedText) return current;
@@ -614,6 +775,28 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       } catch { return save({ ...current, captureState: 'unknown' }); }
     });
   };
+  const publishRequest = (entry: BrokerDelegationRecord, channel: LiveBackendChannel, update: LiveBackendUpdate): Promise<LiveDelivery> => {
+    if (channel.signal.aborted) return Promise.resolve({ eventId: '', status: 'closed' });
+    const intent = beginBrokerPublication(options.store, { callId: options.callId, callSid: options.callSid,
+      bindingId: options.bindingId, sessionId: entry.sessionId }, entry.requestId, update, channel.getContext());
+    if (!intent) return channel.publish(update);
+    if (!intent.created) return Promise.resolve(intent.record.outcome
+      ? { eventId: intent.record.outcome.eventId, status: intent.record.outcome.status }
+      : { eventId: '', status: 'unconfirmed' });
+    // Attach a synchronous receipt write directly to the existing append promise.
+    // Live close settles pending append promises before the host closes the store.
+    let pending: Promise<LiveDelivery>;
+    try { pending = channel.publish(update); }
+    catch { pending = Promise.resolve({ eventId: '', status: 'unconfirmed' }); }
+    return pending.then(delivery => {
+      settleBrokerPublication(options.store, intent.record, delivery, channel.getContext(), channel.signal.aborted);
+      return delivery;
+    }, () => {
+      const delivery: LiveDelivery = { eventId: '', status: 'unconfirmed' };
+      settleBrokerPublication(options.store, intent.record, delivery, channel.getContext(), channel.signal.aborted);
+      return delivery;
+    });
+  };
   const deliverQuestion = async (entry: BrokerDelegationRecord, channel: LiveBackendChannel) => locked(async () => {
     let current = load(entry);
     const questionId = current.currentQuestionId;
@@ -622,7 +805,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     if (channel.signal.aborted) return;
     const prefix = `${entry.requestId}_${questionId ?? 'question'}_${snapshot.callerRevision}`;
     const tell = async (text: string, suffix: string) => {
-      const delivery = await channel.publish({ id: `${prefix}_${suffix}`, kind: 'result', text,
+      const delivery = await publishRequest(entry, channel, { id: `${prefix}_${suffix}`, kind: 'result', speak: true, text,
         expectedCallerRevision: snapshot.callerRevision });
       save({ ...load(entry), delivery: delivery.status });
     };
@@ -644,12 +827,12 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     try { chunks = liveResultChunks(text); }
     catch { await tell('I cannot read this question accurately over the phone. Please open it in Dexter.', 'format_unavailable'); return; }
     if (current.questionNotice === 'answer_too_long') {
-      const delivery = await channel.publish({ id: `${prefix}_shorter_answer`, kind: 'progress', speak: true,
+      const delivery = await publishRequest(entry, channel, { id: `${prefix}_shorter_answer`, kind: 'progress', speak: true,
         text: 'Please give me a shorter answer to this question.', expectedCallerRevision: snapshot.callerRevision });
       if (delivery.status !== 'accepted') return;
     }
     if (current.questionNotice === 'reply_refused') {
-      const delivery = await channel.publish({ id: `${prefix}_reply_refused`, kind: 'progress', speak: true,
+      const delivery = await publishRequest(entry, channel, { id: `${prefix}_reply_refused`, kind: 'progress', speak: true,
         text: record.reply?.refusal?.code === 'invalid_request'
           ? 'I could not accept that answer. Please say it again.'
           : 'That answer was not accepted. The request is still waiting for a reply.',
@@ -659,7 +842,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     // Commentary appends preserve the question and both meanings, including amounts.
     // Only completion of every append establishes the barrier for a later caller turn.
     for (const [index, chunk] of chunks.entries()) {
-      const delivery = await channel.publish({ id: `${prefix}_prompt_${index}`, kind: 'result', text: chunk,
+      const delivery = await publishRequest(entry, channel, { id: `${prefix}_prompt_${index}`, kind: 'result', text: chunk,
         speak: true, expectedCallerRevision: snapshot.callerRevision });
       if (delivery.status !== 'accepted') { save({ ...load(entry), delivery: delivery.status }); return; }
     }
@@ -703,7 +886,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     let chunks: string[];
     try { chunks = liveResultChunks(text); }
     catch {
-      const outcome = await channel.publish({ id: `${prefix}_format_unavailable`, kind: 'result',
+      const outcome = await publishRequest(entry, channel, { id: `${prefix}_format_unavailable`, kind: 'result', speak: true,
         text: 'I received the result, but cannot read that format accurately over this call. The full result has been saved.',
         expectedCallerRevision: current.callerRevision });
       save({ ...load(entry), delivery: `format_unsupported:${interrupted() ?? outcome.status}` });
@@ -715,7 +898,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     for (const [index, chunk] of chunks.entries()) {
       const stopped = interrupted();
       if (stopped) { save({ ...load(entry), delivery: stopped }); return; }
-      const outcome = await channel.publish({ id: `${prefix}_${entry.status}_result_${index}`, kind: 'result',
+      const outcome = await publishRequest(entry, channel, { id: `${prefix}_${entry.status}_result_${index}`, kind: 'result',
         speak: true, text: chunk, expectedCallerRevision: current.callerRevision });
       const status = interrupted() ?? outcome.status;
       if (status !== 'accepted') { save({ ...load(entry), delivery: status }); return; }
@@ -759,7 +942,50 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     boundCall(sessionId);
     return sessionId;
   };
+  const promoteDeferred = (sessionId: string, channel: LiveBackendChannel) => locked(async (): Promise<BrokerDelegationRecord | undefined> => {
+    const call = boundCall(sessionId);
+    if (channel.signal.aborted || call.endedAt || call.primaryClosed || call.primaryClosePending
+        || terminalCallStatuses.has(call.status)) return undefined;
+    const saved = entries(sessionId);
+    const active = saved.find(entry => !terminal(entry.status));
+    if (active) return active;
+    const pending = saved.flatMap(owner => (owner.deferredTurns ?? []).filter(turn => turn.status === 'queued')
+      .map(turn => ({ owner, turn }))).sort((a, b) => a.turn.firstSequence - b.turn.firstSequence);
+    const next = pending[0];
+    if (!next) return undefined;
+    const frozen = next.turn.queuedRequest!;
+    const predecessor = saved.find(entry => entry.requestId === frozen.predecessorRequestId);
+    if (!predecessor || !terminal(predecessor.status)) return undefined;
+    if (saved.some(entry => entry.requestId === frozen.requestId
+        || entry.submission.source.sourceEventId === next.turn.sourceEventId)) throw new Error('deferred_source_already_admitted');
+    const timestamp = new Date(now()).toISOString();
+    let child: BrokerDelegationRecord = {
+      version: 1, requestId: frozen.requestId, predecessorRequestId: frozen.predecessorRequestId,
+      callId: options.callId, callSid: options.callSid, bindingId: options.bindingId, sessionId,
+      delegationIds: [next.turn.delegationId], status: 'prepared', updatedAt: timestamp,
+      submission: structuredClone(frozen.submission), frozenCallerRevision: next.turn.callerRevision,
+      firstSequence: next.turn.firstSequence, lastSequence: frozen.lastSequence,
+      ...(frozen.audioThroughMs === undefined ? {} : { audioThroughMs: frozen.audioThroughMs }),
+      completionBasis: frozen.completionBasis, sourceRevision: 1, capturedText: next.turn.text,
+    };
+    // Publish parent disposition and the exact child journal in one durable write.
+    // A crash after this point recovers the child by GET, never a fresh POST.
+    const owner = { ...next.owner, updatedAt: timestamp, deferredTurns: next.owner.deferredTurns!.map(turn =>
+      turn.sourceEventId === next.turn.sourceEventId ? { ...turn, status: 'promoted' as const } : turn) };
+    options.store.update(call.id, { delegations: { ...call.delegations, [owner.requestId]: owner, [child.requestId]: child } });
+    child = save({ ...child, status: 'dispatching' });
+    try { child = applyResult(child, await options.api.submit(options.bindingId, child.requestId, structuredClone(child.submission))); }
+    catch (error) { child = save({ ...load(child), status: 'dispatch_unknown' }, { submitError: diagnostic(error) }); }
+    return child;
+  });
   return {
+    observeTranscript(snapshot) {
+      if (options.store.get(options.callId)?.endedAt) return;
+      if (observedTranscript?.callerRevision === snapshot.callerRevision) return;
+      observedTranscript = structuredClone(snapshot);
+      transcriptChangedAt = now();
+      scheduleCallerCompletion();
+    },
     async prepareCloseout() {
       const sessionId = currentSession();
       if (!eligibleForClosedRecovery(sessionId) || !options.api.reconcile) return;
@@ -882,8 +1108,8 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       // had finished. Freeze the observation clock at the host's disconnect time.
       const observedAt = call.endedAt ? Math.min(now(), Date.parse(call.endedAt)) : now();
       options.store.update(call.id, { acousticSpans: structuredClone(acousticSpans) });
-      const groups: Array<{ role: 'user' | 'assistant'; fragments: LiveTranscriptSnapshot['fragments']; span?: AcousticSpan }> =
-        acousticGroups(snapshot, observedAt).map(group => ({ role: 'user', fragments: group.fragments, span: group.span }));
+      const groups: Array<{ role: 'user' | 'assistant'; fragments: LiveTranscriptSnapshot['fragments'] }> =
+        completedCallerGroups(snapshot, observedAt).map(group => ({ role: 'user', fragments: group.fragments }));
       const included = new Set(groups.flatMap(group => group.fragments.map(f => f.eventId)));
       if (snapshot.fragments.some(f => f.role === 'user' && !included.has(f.eventId))) unsupported.push('unqualified_caller_turn');
       const assistant = snapshot.fragments.filter(f => f.role === 'assistant');
@@ -916,7 +1142,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
             itemId: delegated?.submission.source.itemId ?? `live-turn-${sourceEventId}`,
             role: group.role, text, occurredAt: previous?.occurredAt ?? delegated?.submission.source.receivedAt
               ?? new Date(mediaOrigin(sessionId) + first.startMs).toISOString(),
-            state: 'dispatching', ...(group.span ? { acousticSpan: { ...group.span } } : {}),
+            state: 'dispatching', ...(previous?.acousticSpan ? { acousticSpan: { ...previous.acousticSpan } } : {}),
           };
           const persist = (value: CanonicalTurnRecord) => persistCanonical(sessionId, value);
           persist(turn);
@@ -947,80 +1173,115 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
           expectedCallerRevision: channel.getContext().callerRevision });
         return;
       }
-      const deadline = now() + maxPollMs;
-      const noticeKey = `${options.callId}:${entry.requestId}`;
-      let notice = notices!.get(noticeKey);
-      if (!notice) {
-        notice = { submitAnnounced: false, progressCount: 0, lastAt: now(), inFlight: false };
-        notices!.set(noticeKey, notice);
+      const workerKey = `${options.callId}:${request.sessionId}`;
+      while (workers!.has(workerKey)) {
+        await workers!.get(workerKey);
+        if (channel.signal.aborted || boundCall(request.sessionId).endedAt) return;
+        const saved = entries(request.sessionId);
+        entry = saved.find(value => !terminal(value.status)) ?? load(entry);
+        if (terminal(entry.status)
+            && !saved.some(value => value.deferredTurns?.some(turn => turn.status === 'queued'))) return;
       }
-      const publishStatus = (immediate: boolean) => {
-        if (channel.signal.aborted || options.store.get(options.callId)?.endedAt || notice!.inFlight) return;
-        const current = load(entry!);
-        if (terminal(current.status) || current.status === 'waiting_for_reply'
-            || Object.values(current.questions ?? {}).some(record => unresolvedReply(record.reply))) return;
-        const reviewedRevision = Math.max(current.frozenCallerRevision, ...Object.values(current.questions ?? {})
-          .filter(record => record.reply?.status === 'accepted').map(record => record.reply!.callerRevision));
-        const revision = channel.getContext().callerRevision;
-        const lastSpeech = speechTime();
-        if (lastSpeech !== undefined && now() - lastSpeech < stabilityMs) return;
-        const announceSubmit = immediate && current.status === 'dispatch_unknown' && !notice!.submitAnnounced;
-        if (!announceSubmit && (immediate || notice!.progressCount >= 4 || now() - notice!.lastAt < progressIntervalMs
-            || now() >= deadline)) return;
-        const text = announceSubmit
-          ? current.submitError?.code === 'http_error'
-            ? 'My connection to your account tools returned an error. I am checking whether your request was saved.'
-            : 'I have not confirmed whether your request was saved. I am checking the original request.'
-          : ['prepared', 'dispatching', 'dispatch_unknown'].includes(current.status)
-            ? revision !== reviewedRevision
-              ? 'I am still checking whether your earlier request was saved.'
-              : 'I am still checking whether your request was saved.'
-            : revision !== reviewedRevision
-              ? 'I am still waiting for the result of your earlier request.'
-              : 'Your request is still being handled. I am waiting for its result.';
-        if (announceSubmit) notice!.submitAnnounced = true;
-        else notice!.progressCount++;
-        notice!.lastAt = now();
-        notice!.inFlight = true;
-        // Audio acceptance must not delay the result GET. This continuation only
-        // releases an in-memory reservation; it never writes after store close.
-        try {
-          void channel.publish({ id: `${current.requestId}_${revision}_${announceSubmit ? 'submit_unknown' : `pending_${notice!.progressCount}`}`,
-            kind: 'progress', speak: true, text, expectedCallerRevision: revision })
-            .catch(() => undefined).finally(() => { notice!.inFlight = false; });
-        } catch { notice!.inFlight = false; }
-      };
-      publishStatus(true);
-      const progressTimer = setInterval(() => publishStatus(false), progressIntervalMs);
-      progressTimer.unref();
-      // Preserve caller changes in the local journal immediately. Only stable snapshots
-      // go to the source-revision API; revisions never create another run here.
-      const unsubscribe = channel.subscribeContext(snapshot => {
-        if (snapshot.callerRevision > entry!.frozenCallerRevision) {
-          const saved = load(entry!);
-          const original = acousticGroups(snapshot).find(group => group.fragments.some(fragment => fragment.sequence === saved.firstSequence));
-          if (original && original.fragments.map(fragment => fragment.text).join('') !== saved.capturedText) {
-            save({ ...saved, laterCallerRevision: snapshot.callerRevision, correctionState: 'recorded_not_applied',
-              lastSequence: Math.max(saved.lastSequence, ...original.fragments.map(f => f.sequence)) });
-          }
-        }
-      });
-      try {
+      const run = async () => {
         while (!channel.signal.aborted) {
-          entry = load(entry);
-          if (Object.values(entry.questions ?? {}).some(record => unresolvedReply(record.reply)))
-            entry = await locked(() => recoverReplies(entry!));
-          if (!terminal(entry.status)) {
-            try { entry = applyResult(entry, await options.api.result(options.bindingId, resultRequestId(entry))); }
-            catch (error) { entry = recordReadError(entry, error); /* GET errors never authorize another POST. */ }
+          entry = load(entry!);
+          const alreadyDelivered = terminal(entry.status) && entry.delivery === 'accepted'
+            && entries(entry.sessionId).some(value => value.deferredTurns?.some(turn => turn.status === 'queued'));
+          if (!alreadyDelivered) {
+            const deadline = now() + maxPollMs;
+            const noticeKey = `${options.callId}:${entry.requestId}`;
+            let notice = notices!.get(noticeKey);
+            if (!notice) {
+              notice = { submitAnnounced: false, progressCount: 0, lastAt: now(), inFlight: false };
+              notices!.set(noticeKey, notice);
+            }
+            const publishStatus = (immediate: boolean) => {
+              if (channel.signal.aborted || options.store.get(options.callId)?.endedAt || notice!.inFlight) return;
+              const current = load(entry!);
+              if (terminal(current.status) || current.status === 'waiting_for_reply'
+                  || Object.values(current.questions ?? {}).some(record => unresolvedReply(record.reply))) return;
+              const reviewedRevision = Math.max(current.frozenCallerRevision, ...Object.values(current.questions ?? {})
+                .filter(record => record.reply?.status === 'accepted').map(record => record.reply!.callerRevision));
+              const revision = channel.getContext().callerRevision;
+              const lastSpeech = speechTime();
+              if (lastSpeech !== undefined && now() - lastSpeech < stabilityMs) return;
+              const announceSubmit = immediate && current.status === 'dispatch_unknown' && !notice!.submitAnnounced;
+              if (!announceSubmit && (immediate || notice!.progressCount >= 4 || now() - notice!.lastAt < progressIntervalMs
+                  || now() >= deadline)) return;
+              const text = announceSubmit
+                ? current.submitError?.code === 'http_error'
+                  ? 'My connection to your account tools returned an error. I am checking whether your request was saved.'
+                  : 'I have not confirmed whether your request was saved. I am checking the original request.'
+                : ['prepared', 'dispatching', 'dispatch_unknown'].includes(current.status)
+                  ? revision !== reviewedRevision
+                    ? 'I am still checking whether your earlier request was saved.'
+                    : 'I am still checking whether your request was saved.'
+                  : revision !== reviewedRevision
+                    ? 'I am still waiting for the result of your earlier request.'
+                    : 'Your request is still being handled. I am waiting for its result.';
+              if (announceSubmit) notice!.submitAnnounced = true;
+              else notice!.progressCount++;
+              notice!.lastAt = now();
+              notice!.inFlight = true;
+              // Audio acceptance must not delay the result GET. This continuation only
+              // releases the notice reservation; its publication receipt settles before Live closes.
+              try {
+                void publishRequest(current, channel, { id: `${current.requestId}_${revision}_${announceSubmit ? 'submit_unknown' : `pending_${notice!.progressCount}`}`,
+                  kind: 'progress', speak: true, text, expectedCallerRevision: revision })
+                  .catch(() => undefined).finally(() => { notice!.inFlight = false; });
+              } catch { notice!.inFlight = false; }
+            };
+            publishStatus(true);
+            const progressTimer = setInterval(() => publishStatus(false), progressIntervalMs);
+            progressTimer.unref();
+            // Preserve caller changes in the local journal immediately. Only stable snapshots
+            // go to the source-revision API; revisions never create another run here.
+            const unsubscribe = channel.subscribeContext(snapshot => {
+              if (snapshot.callerRevision > entry!.frozenCallerRevision) {
+                const saved = load(entry!);
+                const original = completedCallerGroups(snapshot).find(group => group.fragments.some(fragment => fragment.sequence === saved.firstSequence));
+                if (original && original.fragments.map(fragment => fragment.text).join('') !== saved.capturedText) {
+                  save({ ...saved, laterCallerRevision: snapshot.callerRevision, correctionState: 'recorded_not_applied',
+                    lastSequence: Math.max(saved.lastSequence, ...original.fragments.map(f => f.sequence)) });
+                }
+              }
+            });
+            try {
+              while (!channel.signal.aborted) {
+                entry = load(entry);
+                if (Object.values(entry.questions ?? {}).some(record => unresolvedReply(record.reply)))
+                  entry = await locked(() => recoverReplies(entry!,
+                    () => channel.signal.aborted || Boolean(boundCall(entry!.sessionId).endedAt)));
+                if (channel.signal.aborted || boundCall(entry.sessionId).endedAt) return;
+                if (!terminal(entry.status)) {
+                  try { entry = applyResult(entry, await options.api.result(options.bindingId, resultRequestId(entry))); }
+                  catch (error) { entry = recordReadError(entry, error); /* GET errors never authorize another POST. */ }
+                }
+                entry = await captureRevision(entry, channel);
+                if (channel.signal.aborted) return;
+                if (terminal(entry.status)) break;
+                if (entry.status === 'waiting_for_reply') {
+                  if (!options.watchUntilCallEnds) break;
+                  const questionRecord = entry.currentQuestionId ? entry.questions?.[entry.currentQuestionId] : undefined;
+                  if (!questionRecord?.presentation || entry.questionNotice
+                      || Object.values(entry.questions ?? {}).some(record => unresolvedReply(record.reply)))
+                    await deliver(load(entry), channel);
+                }
+                if (now() >= deadline && !options.watchUntilCallEnds) break;
+                if (!(await delay(pollIntervalMs, channel.signal))) return;
+              }
+              await deliver(load(entry), channel);
+            } finally { clearInterval(progressTimer); unsubscribe(); }
           }
-          entry = await captureRevision(entry, channel);
-          if (channel.signal.aborted) return;
-          if (terminal(entry.status) || entry.status === 'waiting_for_reply' || now() >= deadline) break;
-          if (!(await delay(pollIntervalMs, channel.signal))) return;
+          const next = await promoteDeferred(entry.sessionId, channel);
+          if (!next || next.requestId === entry.requestId) return;
+          entry = next;
         }
-        await deliver(load(entry), channel);
-      } finally { clearInterval(progressTimer); unsubscribe(); }
+      };
+      const work = run();
+      workers!.set(workerKey, work);
+      try { await work; }
+      finally { if (workers!.get(workerKey) === work) workers!.delete(workerKey); }
     },
   };
 }

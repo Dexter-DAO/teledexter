@@ -106,6 +106,30 @@ function fixture(overrides: Partial<BrokerLiveSessionOptions> = {}) {
   return { session, transport, requests, transcripts, outputs, events, clears, closed, ready, transcript, delegate, finish };
 }
 
+test('append receipt observes raw caller frontier before asynchronous transcript persistence', async () => {
+  let release!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  let block = false;
+  const f = fixture({ onTranscript: () => block ? pending : undefined });
+  f.transport.start();
+  f.transcript('first', 'Show my portfolio.', 100);
+  await flush(); f.delegate(); await flush();
+  const channel = f.requests[0].channel;
+  const publication = channel.publish({ id: 'result_1', kind: 'result', speak: true, text: 'Here is your portfolio.', expectedCallerRevision: 1 });
+  const command = f.transport.sent.at(-1)!;
+  block = true;
+  f.transcript('second', 'Then review it.', 4000);
+  assert.equal(channel.getContext().callerRevision, 1, 'durable transcript is still pending');
+  f.transport.receive(appendAck('commentary', command.event_id));
+  const receipt = await publication;
+  assert.equal(receipt.status, 'accepted');
+  assert.equal(receipt.observedCallerRevision, 2);
+  assert.equal(receipt.observedTranscriptSequence, 2);
+  release(); await flush();
+  assert.equal(channel.getContext().callerRevision, 2);
+  await f.finish();
+});
+
 test('starts a client-delegation PCMU session once and preserves startup audio order', async () => {
   const f = fixture({ history: [{ role: 'user', text: 'My last question.' }, { role: 'assistant', text: 'A prior answer.' }] });
   f.session.appendAudio(audio);

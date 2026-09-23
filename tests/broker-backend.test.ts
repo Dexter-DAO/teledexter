@@ -8,6 +8,7 @@ import { createPrimaryBackend, literalPhoneAnswer, type PrimaryBackendOptions, t
 import type { PrimaryQuestion, PrimaryQuestionResult, PrimaryReplyInput, PrimaryResult, PrimarySubmission, PrimaryTurn } from '../src/broker/primaryApi.js';
 import { PrimaryApiError } from '../src/broker/primaryApi.js';
 import { turnBodyDigest } from '../src/broker/reconciliation.js';
+import { rejectBrokerPublication } from '../src/broker/publications.js';
 import type { LiveBackendChannel, LiveBackendUpdate, LiveDelegationRequest, LiveTranscriptSnapshot } from '../src/live/session.js';
 
 const bindingId = '11111111-1111-5111-a111-111111111111';
@@ -34,7 +35,8 @@ function context() {
     subscribeContext: listener => { listeners.add(listener); return () => { listeners.delete(listener); }; },
     publish: async update => {
       updates.push(update);
-      return { eventId: update.id, status: controller.signal.aborted ? 'closed'
+      return { eventId: update.id, observedCallerRevision: snapshot.callerRevision, observedTranscriptSequence: snapshot.revision,
+        status: controller.signal.aborted ? 'closed'
         : update.expectedCallerRevision !== undefined && update.expectedCallerRevision !== snapshot.callerRevision ? 'stale' : 'accepted' };
     },
     signal: controller.signal,
@@ -48,12 +50,16 @@ function context() {
   return { channel, add, updates, controller };
 }
 
-async function fixture(t: TestContext, overrides: Partial<PrimaryBackendOptions> = {}) {
+async function fixture(t: TestContext, overrides: Partial<PrimaryBackendOptions> = {}, assigned = false) {
   const directory = await mkdtemp(path.join(tmpdir(), 'broker-backend-'));
   const store = new BrokerStore(directory);
   t.after(async () => { store.close(); await rm(directory, { recursive: true, force: true }); });
-  const call = store.reserve({ requestId: 'test-call', number: '+15550000001', direction: 'inbound', purpose: 'test', callSid: 'CA_test' }).call;
-  store.update(call.id, { primary: { bindingId, name: null, context: '' }, liveSessionId: 'sess_test', mediaStartedAt: call.createdAt });
+  const call = store.reserve({ requestId: assigned ? 'abababab-abab-5bab-abab-abababababab' : 'test-call',
+    number: '+15550000001', direction: assigned ? 'outbound' : 'inbound', purpose: 'test', callSid: 'CA_test' },
+  assigned ? 'authenticated_broker_control' : undefined).call;
+  store.update(call.id, { primary: { bindingId, name: null, context: '', ...(assigned ? { callAssignmentRef: {
+    assignmentId: call.requestId, revision: 1 as const, digest: 'a'.repeat(64),
+  } } : {}) }, liveSessionId: 'sess_test', mediaStartedAt: call.createdAt });
   const c = context();
   const posts: Array<{ bindingId: string; requestId: string; input: PrimarySubmission }> = [];
   const reads: string[] = [];
@@ -105,11 +111,82 @@ async function fixture(t: TestContext, overrides: Partial<PrimaryBackendOptions>
     for (let offset = startMs; offset <= endMs; offset += 5) instance.noteCallerSpeech(Date.now(), offset);
   };
   const request = (delegationId = 'del_1'): LiveDelegationRequest => ({ callId: call.id, sessionId: 'sess_test', delegationId,
-    requestId: `live_${delegationId}`, offsetMs: 1200, transcript: c.channel.getContext() });
+    requestId: `live_${delegationId}`, offsetMs: Math.max(0, ...c.channel.getContext().fragments.map(fragment => fragment.endMs)) + 200, transcript: c.channel.getContext() });
   const saved = () => Object.values(store.get(call.id)!.delegations) as BrokerDelegationRecord[];
   return { ...c, directory, store, call, api, options, backend, speech, request, posts, reads, captures, replies, questionReads, behavior, completed,
     saved, result: (text: string) => { resultText = text; } };
 }
+
+test('accepted publication binds the next unchanged caller request and exact retry retains its pair', async t => {
+  const f = await fixture(t);
+  f.add('Show my portfolio.'); f.speech();
+  const publish = f.channel.publish;
+  f.channel.publish = async update => {
+    const intent = f.store.get(f.call.id)!.publications?.records.find(record => record.updateId === update.id);
+    assert.ok(intent, 'intent must be durable before commentary dispatch');
+    assert.equal(intent.requestId, f.posts[0].requestId);
+    const result = await publish(update);
+    return { ...result, eventId: `broker_${f.updates.length}` };
+  };
+  await f.backend.delegate(f.request(), f.channel);
+  f.channel.publish = publish;
+  const original = f.posts[0].requestId;
+  f.add(' Then review it.\t', 4000, 4300); f.speech(4000, 4300);
+  await f.backend.delegate(f.request('followup'), f.channel);
+  assert.equal(f.posts.length, 2);
+  assert.equal(f.posts[1].input.text, ' Then review it.\t');
+  assert.equal(f.posts[1].input.relatedPrimaryRequestId, original);
+  assert.equal(f.posts[1].input.referenceOrigin, 'broker_status_publication');
+  const frozen = structuredClone(f.posts[1].input);
+  const firstPublication = f.store.get(f.call.id)!.publications!.records[0];
+  rejectBrokerPublication(f.store, firstPublication, firstPublication.outcome!.eventId, 'late_rejection');
+  await f.backend.delegate(f.request('followup'), f.channel);
+  assert.equal(f.posts.length, 2);
+  assert.deepEqual(f.saved()[1].submission, frozen, 'late evidence cannot rewrite an already submitted source');
+});
+
+test('late rejection before the next caller source excludes that publication reference', async t => {
+  const f = await fixture(t);
+  f.add('Show my portfolio.'); f.speech();
+  await f.backend.delegate(f.request(), f.channel);
+  const publication = f.store.get(f.call.id)!.publications!.records[0];
+  rejectBrokerPublication(f.store, publication, publication.outcome!.eventId, 'late_rejection');
+  f.add(' Then review it.', 4000, 4300); f.speech(4000, 4300);
+  await f.backend.delegate(f.request('followup'), f.channel);
+  assert.equal(f.posts.length, 2);
+  assert.equal(f.posts[1].input.relatedPrimaryRequestId, undefined);
+});
+
+test('missing provider frontier leaves accepted commentary ineligible for a caller reference', async t => {
+  const f = await fixture(t);
+  const publish = f.channel.publish;
+  f.channel.publish = async update => { const value = await publish(update); return { eventId: value.eventId, status: value.status }; };
+  f.add('Show my portfolio.'); f.speech();
+  await f.backend.delegate(f.request(), f.channel);
+  f.add(' Then review it.', 4000, 4300); f.speech(4000, 4300);
+  await f.backend.delegate(f.request('followup'), f.channel);
+  assert.equal(f.posts[1].input.relatedPrimaryRequestId, undefined);
+});
+
+test('unknown admission and restarted GET-only recovery retain the original referenced input', async t => {
+  const f = await fixture(t);
+  f.add('Show my portfolio.'); f.speech();
+  await f.backend.delegate(f.request(), f.channel);
+  f.behavior.submit = async () => { throw new PrimaryApiError('request_timeout'); };
+  f.behavior.result = async () => { throw new PrimaryApiError('http_error', 404, { code: 'request_not_found', retryable: false }); };
+  f.add(' Then review it.\t', 4000, 4300); f.speech(4000, 4300);
+  await f.backend.delegate(f.request('followup'), f.channel);
+  const submitted = structuredClone(f.posts[1]);
+  assert.equal(submitted.input.relatedPrimaryRequestId, f.posts[0].requestId);
+  assert.equal(f.saved()[1].status, 'dispatch_unknown');
+  const recovered = createPrimaryBackend(f.options);
+  f.behavior.result = async id => f.completed(id);
+  await recovered.delegate(f.request('followup'), f.channel);
+  assert.equal(f.posts.length, 2);
+  assert.deepEqual(f.saved()[1].submission, submitted.input);
+  assert.equal(f.saved()[1].status, 'completed');
+  assert.equal(f.reads.at(-1), submitted.requestId);
+});
 
 test('waits for stable acoustic caller text and journals one verbatim canonical source before POST', async t => {
   const f = await fixture(t);
@@ -134,6 +211,80 @@ test('waits for stable acoustic caller text and journals one verbatim canonical 
   assert.match(f.posts[0].input.source.itemId, /^[A-Za-z0-9_-]{1,128}$/);
   assert.equal(f.saved()[0].completionBasis, 'speech_and_transcript_stability');
   assert.equal(f.saved()[0].status, 'completed');
+});
+
+test('recorded Hello delegates the assigned mission across distinct Live and phone audio clocks', async t => {
+  const f = await fixture(t, {}, true);
+  // Retained 14:51 rehearsal: Live caption 10600..10800, local audio 9620..10120.
+  f.add(' Hello', 10600, 10800, 'user', 'recorded_hello'); f.speech(9640, 10120);
+  await f.backend.delegate(f.request('item_EQw7mnC2ABitLPfHNrYAX'), f.channel);
+  assert.equal(f.posts.length, 1);
+  assert.equal(f.posts[0].input.text, ' Hello');
+  assert.deepEqual(f.posts[0].input.callAssignmentRef, f.store.get(f.call.id)!.primary!.callAssignmentRef);
+  assert.equal(f.saved()[0].audioThroughMs, 10120);
+  assert.equal(f.posts[0].input.source.receivedAt, new Date(Date.parse(f.call.createdAt) + 10600).toISOString());
+  const original = structuredClone(f.posts[0]);
+  await f.backend.delegate(f.request('item_EQw7mnC2ABitLPfHNrYAX'), f.channel);
+  assert.equal(f.posts.length, 1); assert.deepEqual(f.posts[0], original);
+});
+
+test('ordered caller turns retain their sources when clock distance changes without a fixed offset', async t => {
+  const f = await fixture(t);
+  f.add('Read my portfolio.', 50, 100); f.speech(8000, 8500);
+  await f.backend.delegate(f.request(), f.channel);
+  f.add('Read my last payment.', 3000, 3400); f.speech(20000, 20500);
+  await f.backend.delegate(f.request('second'), f.channel);
+  assert.deepEqual(f.posts.map(post => post.input.text), ['Read my portfolio.', 'Read my last payment.']);
+  assert.equal(f.saved()[1].audioThroughMs, 20500);
+  assert.equal(f.posts[1].input.source.receivedAt, new Date(Date.parse(f.call.createdAt) + 3000).toISOString());
+  f.store.update(f.call.id, { endedAt: new Date().toISOString() });
+  const restored = createPrimaryBackend(f.options);
+  assert.deepEqual(await restored.captureCompletedTurns(f.channel.getContext(), { sessionFinalized: true, assistantPlaybackComplete: true }),
+    { captured: 0, pending: 0, unsupported: [] });
+});
+
+test('noise without a caption neither submits a task nor prevents later caller speech after restart', async t => {
+  const f = await fixture(t);
+  f.speech(200, 400); // A sound burst without recognized words.
+  f.add('Read my balance.', 10600, 10800); f.speech(9640, 10120);
+  await f.backend.delegate(f.request(), f.channel);
+  assert.equal(f.posts.length, 1);
+  const original = structuredClone(f.saved()[0].submission);
+  f.speech(15000, 15400); f.backend.persistAcousticEvidence();
+  const restored = createPrimaryBackend(f.options);
+  await restored.delegate(f.request(), f.channel);
+  assert.equal(f.posts.length, 1); assert.deepEqual(f.saved()[0].submission, original);
+  f.add('Read my last payment.', 16000, 16300); f.speech(20000, 20400, restored);
+  await restored.delegate(f.request('payment'), f.channel);
+  assert.deepEqual(f.posts.map(post => post.input.text), ['Read my balance.', 'Read my last payment.']);
+  assert.deepEqual(f.saved()[0].submission, original);
+});
+
+test('legacy accepted sources retain original timestamps and exact request bytes when a late caption is captured', async t => {
+  const f = await fixture(t);
+  f.add('Read my balance.'); f.speech(); await f.backend.delegate(f.request(), f.channel);
+  const original = structuredClone(f.saved()[0]); delete original.audioThroughMs;
+  f.store.update(f.call.id, { delegations: { [original.requestId]: original } });
+  f.add(' please.', 1000, 1200);
+  const restored = createPrimaryBackend(f.options);
+  assert.equal((await restored.captureCompletedTurns(f.channel.getContext(), { sessionFinalized: true, assistantPlaybackComplete: true })).captured, 1);
+  assert.equal(f.captures[0].sourceEventId, original.submission.source.sourceEventId);
+  assert.equal(f.captures[0].occurredAt, original.submission.source.receivedAt);
+  assert.equal(f.captures[0].revision, 2);
+  assert.deepEqual(f.saved()[0].submission, original.submission);
+  assert.equal(f.saved()[0].audioThroughMs, undefined);
+  await restored.delegate(f.request(), f.channel); assert.equal(f.posts.length, 1);
+});
+
+test('late captions cannot reorder an accepted source even when caption and acoustic counts match', async t => {
+  const f = await fixture(t);
+  f.add('Read my balance.', 3000, 3200); f.speech(800, 1000);
+  await f.backend.delegate(f.request(), f.channel);
+  const original = structuredClone(f.saved()[0]);
+  f.add('An earlier caption.', 100, 200); f.speech(4000, 4200);
+  const result = await f.backend.captureCompletedTurns(f.channel.getContext(), { sessionFinalized: true, assistantPlaybackComplete: true });
+  assert.equal(result.captured, 0); assert.ok(result.unsupported.includes('unqualified_caller_turn'));
+  assert.deepEqual(f.saved()[0], original);
 });
 
 test('recorded Live phrase includes all six available fragments despite the late caption boundary', async t => {
@@ -195,17 +346,128 @@ test('closeout recovers a late phrase caption on the saved source after the requ
   assert.equal(f.posts.length, 1);
 });
 
-test('a contiguous transcript overlapping two acoustic spans stays whole and unsubmitted', async t => {
+test('a paused caller phrase stays whole across multiple local sound bursts', async t => {
   const f = await fixture(t);
   f.add('Read my balance', 800, 1000); f.speech(800, 1000);
   f.add(' and send it.', 1700, 1900); f.speech(1700, 1900);
   await f.backend.delegate(f.request(), f.channel);
-  assert.equal(f.posts.length, 0);
-  assert.equal(f.channel.getContext().fragments.map(fragment => fragment.text).join(''), 'Read my balance and send it.');
+  assert.equal(f.posts.length, 1);
+  assert.equal(f.posts[0].input.text, 'Read my balance and send it.');
   const result = await f.backend.captureCompletedTurns(f.channel.getContext(), { assistantPlaybackComplete: true, sessionFinalized: true });
-  assert.equal(result.captured, 0);
-  assert.ok(result.unsupported.includes('unqualified_caller_turn'));
+  assert.deepEqual(result, { captured: 0, pending: 0, unsupported: [] });
   assert.equal(f.captures.length, 0);
+});
+
+test('the whole stable phrase survives a final caption ending after the delegation position', async t => {
+  const f = await fixture(t);
+  f.add('And please read my most recent ', 17000, 19000); f.add('payment', 19400, 19600); f.speech(16480, 18840);
+  const delegated = { ...f.request(), offsetMs: 19400 };
+  await f.backend.delegate(delegated, f.channel);
+  assert.equal(f.posts.length, 1); assert.equal(f.posts[0].input.text, 'And please read my most recent payment');
+});
+
+test('a later distinct phrase cannot borrow an earlier delegation', async t => {
+  const f = await fixture(t);
+  f.add('Read my balance.', 800, 1000); f.speech();
+  const delegated = f.request();
+  f.add('Read my payment.', 3000, 3200); f.speech(3000, 3200);
+  await f.backend.delegate(delegated, f.channel);
+  assert.deepEqual(f.posts.map(post => post.input.text), ['Read my balance.']);
+  await f.backend.delegate(f.request('payment'), f.channel);
+  assert.deepEqual(f.posts.map(post => post.input.text), ['Read my balance.', 'Read my payment.']);
+});
+
+test('two spoken turns before the first delayed delegation remain two requests', async t => {
+  const f = await fixture(t);
+  f.add('Read my balance.', 800, 1000); f.speech();
+  const firstDelegation = f.request();
+  f.add('Read my payment.', 3000, 3200); f.speech(3000, 3200);
+  await f.backend.delegate(firstDelegation, f.channel);
+  assert.equal(f.saved()[0].audioThroughMs, 3200);
+  await f.backend.delegate(f.request('payment'), f.channel);
+  assert.equal(f.saved()[1].audioThroughMs, 3200);
+  assert.deepEqual(f.posts.map(post => post.input.text), ['Read my balance.', 'Read my payment.']);
+});
+
+test('a quiet-time caller completion survives a later hangup click and process restart', async t => {
+  const f = await fixture(t);
+  f.add('Please remember our conversation.'); f.speech(); f.backend.observeTranscript(f.channel.getContext());
+  await wait(15);
+  assert.equal(Object.keys(f.store.get(f.call.id)!.callerCompletions ?? {}).length, 1);
+  assert.equal(f.captures.length, 0, 'checkpoint must not upload provisional memory');
+  f.speech(4000, 4020); f.backend.persistAcousticEvidence();
+  f.store.update(f.call.id, { endedAt: new Date().toISOString() });
+  const restored = createPrimaryBackend(f.options);
+  const result = await restored.captureCompletedTurns(f.channel.getContext(), { sessionFinalized: true, assistantPlaybackComplete: false });
+  assert.equal(result.captured, 1); assert.equal(f.captures[0].text, 'Please remember our conversation.');
+  assert.equal(f.posts.length, 0);
+});
+
+test('earlier quiet speech is captured while unfinished final speech stays unqualified', async t => {
+  const f = await fixture(t);
+  f.add('Hello there.'); f.speech(); f.backend.observeTranscript(f.channel.getContext()); await wait(15);
+  f.add('Let me think', 4000, 4200); f.speech(4000, 4200); f.backend.observeTranscript(f.channel.getContext());
+  const endedAt = new Date().toISOString();
+  f.backend.persistAcousticEvidence(); f.store.update(f.call.id, { endedAt });
+  await wait(15);
+  const result = await createPrimaryBackend(f.options).captureCompletedTurns(f.channel.getContext(), { sessionFinalized: true, assistantPlaybackComplete: false });
+  assert.equal(result.captured, 1); assert.ok(result.unsupported.includes('unqualified_caller_turn'));
+  assert.deepEqual(f.captures.map(turn => turn.text), ['Hello there.']);
+  assert.equal(Object.keys(f.store.get(f.call.id)!.callerCompletions ?? {}).length, 1);
+});
+
+test('a changed late caption cannot reuse an earlier text completion checkpoint', async t => {
+  const f = await fixture(t);
+  f.add('Read my balance'); f.speech(); f.backend.observeTranscript(f.channel.getContext()); await wait(15);
+  f.add(' and send it.', 1000, 1200); f.speech(1000, 1200); f.backend.observeTranscript(f.channel.getContext());
+  const endedAt = new Date().toISOString();
+  f.backend.persistAcousticEvidence(); f.store.update(f.call.id, { endedAt });
+  await wait(15);
+  const result = await createPrimaryBackend(f.options).captureCompletedTurns(f.channel.getContext(), { sessionFinalized: true, assistantPlaybackComplete: false });
+  assert.equal(result.captured, 0); assert.ok(result.unsupported.includes('unqualified_caller_turn'));
+  assert.equal(f.captures.length, 0);
+});
+
+test('a failed optional completion write logs a safe cause without claiming a saved checkpoint', async t => {
+  const f = await fixture(t);
+  const errors: unknown[][] = []; const log = console.error;
+  console.error = (...args: unknown[]) => { errors.push(args); };
+  t.after(() => { console.error = log; });
+  const backend = createPrimaryBackend({ ...f.options, store: { get: id => f.store.get(id),
+    update: () => { throw new Error('private transcript and storage details'); } } });
+  f.add('A private caller remark.'); f.speech(800, 1000, backend); backend.observeTranscript(f.channel.getContext());
+  await wait(15);
+  assert.deepEqual(errors, [['broker_caller_completion_failed', { callId: f.call.id }]]);
+  assert.equal(f.store.get(f.call.id)!.callerCompletions, undefined); assert.equal(f.captures.length, 0);
+});
+
+test('late captions cannot merge two already accepted sources', async t => {
+  const f = await fixture(t);
+  f.add('Read my balance.', 800, 1000); f.speech(); await f.backend.delegate(f.request(), f.channel);
+  f.add('Read my payment.', 3000, 3200); f.speech(3000, 3200); await f.backend.delegate(f.request('second'), f.channel);
+  const originals = f.saved().map(entry => structuredClone(entry.submission));
+  f.add(' bridging caption ', 1500, 2400);
+  const captured = await f.backend.captureCompletedTurns(f.channel.getContext(), { assistantPlaybackComplete: true, sessionFinalized: true });
+  assert.equal(captured.captured, 0); assert.ok(captured.unsupported.includes('unqualified_caller_turn'));
+  assert.deepEqual(f.saved().map(entry => entry.submission), originals);
+  assert.equal(f.posts.length, 2);
+});
+
+test('second speech arriving before first admission keeps its own delegated task', async t => {
+  const f = await fixture(t);
+  f.add('Read my balance.', 800, 1000); f.speech();
+  let entered!: () => void; const began = new Promise<void>(resolve => { entered = resolve; });
+  let release!: () => void; const blocked = new Promise<void>(resolve => { release = resolve; });
+  f.behavior.result = async id => { entered(); await blocked; return f.completed(id); };
+  const first = f.backend.delegate(f.request(), f.channel);
+  f.add('Read my last payment.', 3000, 3200); f.speech(3000, 3200);
+  const second = f.backend.delegate(f.request('second'), f.channel);
+  await began; await wait(12);
+  const queued = f.saved()[0].deferredTurns?.[0];
+  assert.equal(queued?.status, 'queued'); assert.equal(queued?.text, 'Read my last payment.');
+  assert.equal(f.saved()[0].audioThroughMs, 1000); assert.equal(queued?.queuedRequest?.audioThroughMs, 3200);
+  release(); await Promise.all([first, second]);
+  assert.deepEqual(f.posts.map(post => post.input.text), ['Read my balance.', 'Read my last payment.']);
 });
 
 test('duplicate and overlapping delegation delivery cannot produce a second submission', async t => {
@@ -710,26 +972,303 @@ test('caller source preserves delta delivery order even when approximate interva
   assert.equal(f.posts[0].input.text, 'Read my balance.');
 });
 
-test('delegation during active work records separate speech and delivers the original result without executing the followup', async t => {
+test('the interrupted caller request is submitted verbatim after the active result without caller repetition', async t => {
   const f = await fixture(t); f.add('Read my balance.'); f.speech();
   let entered!: () => void; const began = new Promise<void>(resolve => { entered = resolve; });
   let release!: () => void; const blocked = new Promise<void>(resolve => { release = resolve; });
   f.behavior.result = async id => { entered(); await blocked; return f.completed(id); };
   const first = f.backend.delegate(f.request(), f.channel); await began;
-  f.add('Read my last payment.', 3000, 3200); f.speech(3000, 3200);
+  const followup = ' No, answer my question first. Do you- you don\'t even have that included in the data that got returned, before you go pull anything? And you can pull it if you want, but I want both of those things';
+  f.add(followup, 3000, 3200); f.speech(3000, 3200);
   const second = f.backend.delegate(f.request('del_followup'), f.channel);
   await wait(12);
-  assert.equal(f.saved()[0].deferredTurns?.[0].text, 'Read my last payment.');
+  const queued = structuredClone(f.saved()[0].deferredTurns![0]);
+  assert.equal(queued.text, followup);
+  assert.equal(queued.status, 'queued');
+  assert.equal(queued.queuedRequest!.audioThroughMs, 3200);
+  assert.equal(f.posts.length, 1);
   release(); await Promise.all([first, second]);
-  assert.equal(f.posts.length, 1);
-  assert.equal(f.updates.at(-1)!.text, 'For your earlier request: Your balance is $10.25 USDC.');
+  assert.equal(f.posts.length, 2);
+  assert.deepEqual(f.posts[1].input, queued.queuedRequest!.submission);
+  assert.equal(f.posts[1].input.text, followup);
+  assert.equal(f.posts[1].requestId, queued.queuedRequest!.requestId);
+  assert.equal(f.posts[1].input.source.receivedAt, new Date(Date.parse(f.call.createdAt) + 3000).toISOString());
+  assert.equal(f.saved()[1].predecessorRequestId, f.posts[0].requestId);
+  assert.equal(f.saved()[1].audioThroughMs, queued.queuedRequest!.audioThroughMs);
+  assert.equal(f.posts[0].input.text, 'Read my balance.');
+  assert.equal(f.updates.at(-1)!.text, 'Your balance is $10.25 USDC.');
   assert.equal(f.updates.at(-1)!.speak, true);
-  assert.equal(f.saved()[0].deferredTurns?.[0].status, 'recorded_not_submitted');
+  assert.equal(f.saved()[0].deferredTurns?.[0].status, 'promoted');
   await f.backend.delegate(f.request('del_repeat_no_new_speech'), f.channel);
-  assert.equal(f.posts.length, 1);
+  assert.equal(f.posts.length, 2);
   f.add('Please read my last payment now.', 5000, 5200); f.speech(5000, 5200);
   await f.backend.delegate(f.request('del_fresh'), f.channel);
-  assert.equal(f.posts.length, 2); assert.equal(f.posts[1].input.text, 'Please read my last payment now.');
+  assert.equal(f.posts.length, 3); assert.equal(f.posts[2].input.text, 'Please read my last payment now.');
+});
+
+async function until(check: () => boolean) {
+  const deadline = Date.now() + 1000;
+  while (!check()) {
+    if (Date.now() >= deadline) throw new Error('fixture condition timed out');
+    await wait(2);
+  }
+}
+
+async function blockedQueueFixture(t: TestContext) {
+  const f = await fixture(t, { maxPollMs: 50 });
+  let release!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  let entered = false;
+  f.behavior.result = async id => {
+    if (id === f.posts[0].requestId) { entered = true; await blocked; }
+    return f.completed(id);
+  };
+  f.add(' Read my portfolio.'); f.speech();
+  const first = f.backend.delegate(f.request(), f.channel);
+  await until(() => entered);
+  f.add(' Read my last payment. ', 3000, 3200); f.speech(3000, 3200);
+  const second = f.backend.delegate(f.request('del_followup'), f.channel);
+  await until(() => f.saved()[0].deferredTurns?.length === 1);
+  return { ...f, first, second, release };
+}
+
+test('concurrent duplicate delegates drain one frozen child in the shared call worker', async t => {
+  const f = await blockedQueueFixture(t);
+  const duplicate = f.backend.delegate(f.request('del_followup'), f.channel);
+  const overlapping = createPrimaryBackend(f.options).delegate(f.request('del_overlap'), f.channel);
+  f.release(); await Promise.all([f.first, f.second, duplicate, overlapping]);
+  assert.equal(f.posts.length, 2);
+  assert.equal(f.saved()[0].deferredTurns!.length, 1);
+  assert.equal(f.saved()[1].predecessorRequestId, f.saved()[0].requestId);
+  assert.equal(f.updates.filter(update => update.kind === 'result').length, 2);
+});
+
+test('queued follow-up freezes its accepted publication before promotion and unknown recovery', async t => {
+  const f = await fixture(t, { maxPollMs: 40, progressIntervalMs: 5 });
+  let release!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  f.behavior.result = async id => {
+    if (id === f.posts[0].requestId) { await blocked; return f.completed(id); }
+    throw new PrimaryApiError('request_timeout');
+  };
+  f.add(' Read my portfolio.'); f.speech();
+  const first = f.backend.delegate(f.request(), f.channel);
+  await until(() => Boolean(f.store.get(f.call.id)!.publications?.records.some(record => record.outcome?.status === 'accepted')));
+  const originalRequestId = f.posts[0].requestId;
+  f.add(' Then review it.\t', 3000, 3200); f.speech(3000, 3200);
+  const second = f.backend.delegate(f.request('queued_review'), f.channel);
+  await until(() => f.saved()[0].deferredTurns?.length === 1);
+  const queued = structuredClone(f.saved()[0].deferredTurns![0].queuedRequest!);
+  assert.equal(queued.submission.relatedPrimaryRequestId, originalRequestId);
+  assert.equal(queued.submission.referenceOrigin, 'broker_status_publication');
+  assert.equal(queued.submission.text, ' Then review it.\t');
+  assert.equal(f.posts.length, 1);
+  const publication = f.store.get(f.call.id)!.publications!.records.find(record => record.outcome?.status === 'accepted')!;
+  rejectBrokerPublication(f.store, publication, publication.outcome!.eventId, 'late_rejection');
+  f.behavior.submit = async () => { throw new PrimaryApiError('request_timeout'); };
+  release(); await Promise.all([first, second]);
+  assert.equal(f.posts.length, 2);
+  assert.deepEqual(f.posts[1].input, queued.submission, 'promotion must use the original caller frontier');
+  assert.equal(f.posts[1].requestId, queued.requestId);
+  assert.equal(f.saved()[1].status, 'dispatch_unknown');
+  f.store.close();
+  const restored = new BrokerStore(f.directory); t.after(() => restored.close());
+  f.behavior.result = async id => f.completed(id);
+  await createPrimaryBackend({ ...f.options, store: restored }).delegate(f.request('queued_review'), f.channel);
+  assert.equal(f.posts.length, 2, 'recovery must not resubmit the queued source');
+  const recovered = restored.get(f.call.id)!.delegations[queued.requestId] as BrokerDelegationRecord;
+  assert.deepEqual(recovered.submission, queued.submission);
+  assert.equal(recovered.status, 'completed');
+});
+
+test('live call observes a slow predecessor beyond the initial window and drains its queued task', async t => {
+  const f = await fixture(t, { maxPollMs: 15, watchUntilCallEnds: true });
+  let ready = false;
+  f.behavior.result = async id => ready || id !== f.posts[0].requestId
+    ? f.completed(id) : { bindingId, requestId: id, state: 'running' };
+  f.add('Read my portfolio.'); f.speech();
+  const first = f.backend.delegate(f.request(), f.channel);
+  await until(() => f.posts.length === 1);
+  f.add('Then read my last payment.', 3000, 3200); f.speech(3000, 3200);
+  const second = f.backend.delegate(f.request('slow_followup'), f.channel);
+  await until(() => f.saved()[0].deferredTurns?.length === 1);
+  await wait(45);
+  const previousReads = f.reads.length;
+  await wait(20);
+  assert.ok(f.reads.length > previousReads, 'GET observation must continue while the call remains open');
+  assert.equal(f.posts.length, 1);
+  ready = true;
+  await Promise.all([first, second]);
+  assert.equal(f.posts.length, 2);
+  assert.equal(f.posts[1].input.text, 'Then read my last payment.');
+  assert.deepEqual(f.saved().map(entry => entry.status), ['completed', 'completed']);
+});
+
+test('live call observer stops on media abort and never dispatches the remaining queue', async t => {
+  const f = await fixture(t, { maxPollMs: 10, watchUntilCallEnds: true });
+  f.behavior.result = async id => ({ bindingId, requestId: id, state: 'running' });
+  f.add('Read my portfolio.'); f.speech();
+  const first = f.backend.delegate(f.request(), f.channel);
+  await until(() => f.posts.length === 1);
+  f.add('Read my last payment.', 3000, 3200); f.speech(3000, 3200);
+  const second = f.backend.delegate(f.request('abort_followup'), f.channel);
+  await until(() => f.saved()[0].deferredTurns?.length === 1);
+  await wait(30);
+  f.controller.abort();
+  await Promise.all([first, second]);
+  const reads = f.reads.length;
+  await wait(20);
+  assert.equal(f.reads.length, reads);
+  assert.equal(f.posts.length, 1);
+  assert.equal(f.saved()[0].deferredTurns![0].status, 'queued');
+});
+
+test('assigned call freezes its reference alongside the queued publication and preserves raw speech', async t => {
+  const f = await fixture(t, { maxPollMs: 40, progressIntervalMs: 5 }, true);
+  let release!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  f.behavior.result = async id => {
+    if (id === f.posts[0].requestId) await blocked;
+    return f.completed(id);
+  };
+  f.add(' Hello.\t'); f.speech();
+  const first = f.backend.delegate(f.request(), f.channel);
+  await until(() => Boolean(f.store.get(f.call.id)!.publications?.records.some(record => record.outcome?.status === 'accepted')));
+  const assignmentRef = f.store.get(f.call.id)!.primary!.callAssignmentRef;
+  assert.deepEqual(f.posts[0].input.callAssignmentRef, assignmentRef);
+  assert.equal(f.posts[0].input.text, ' Hello.\t');
+  f.add(' Then review it.', 3000, 3200); f.speech(3000, 3200);
+  const second = f.backend.delegate(f.request('assigned_followup'), f.channel);
+  await until(() => f.saved()[0].deferredTurns?.length === 1);
+  const queued = structuredClone(f.saved()[0].deferredTurns![0].queuedRequest!.submission);
+  assert.deepEqual(queued.callAssignmentRef, assignmentRef);
+  assert.equal(queued.relatedPrimaryRequestId, f.posts[0].requestId);
+  assert.equal(queued.referenceOrigin, 'broker_status_publication');
+  assert.equal(queued.text, ' Then review it.');
+  release(); await Promise.all([first, second]);
+  assert.equal(f.posts.length, 2);
+  assert.deepEqual(f.posts[1].input, queued);
+  assert.equal('purpose' in f.posts[0].input, false);
+});
+
+test('a known assignment without its bound registration reference refuses before caller submission', async t => {
+  const f = await fixture(t, {}, true);
+  const backend = createPrimaryBackend({ ...f.options, store: {
+    get: id => {
+      const call = f.store.get(id)!;
+      delete call.primary!.callAssignmentRef;
+      return call;
+    },
+    update: f.store.update.bind(f.store),
+  } });
+  f.add('Hello.'); f.speech(800, 1000, backend);
+  await assert.rejects(backend.delegate(f.request(), f.channel), /call_assignment_binding_mismatch/);
+  assert.equal(f.posts.length, 0);
+  assert.equal(f.saved().length, 0);
+});
+
+test('multiple completed deferred turns retain FIFO source order and predecessor identities', async t => {
+  const f = await blockedQueueFixture(t);
+  f.add(' Read the payment before that. ', 5000, 5200); f.speech(5000, 5200);
+  const third = f.backend.delegate(f.request('del_third'), f.channel);
+  await until(() => f.saved()[0].deferredTurns?.length === 2);
+  const queued = structuredClone(f.saved()[0].deferredTurns!);
+  f.release(); await Promise.all([f.first, f.second, third]);
+  assert.deepEqual(f.posts.map(post => post.input.text), [' Read my portfolio.', ' Read my last payment. ', ' Read the payment before that. ']);
+  assert.deepEqual(f.posts.slice(1).map(post => post.input), queued.map(turn => turn.queuedRequest!.submission));
+  assert.equal(f.saved()[1].predecessorRequestId, f.posts[0].requestId);
+  assert.equal(f.saved()[2].predecessorRequestId, f.posts[1].requestId);
+  assert.deepEqual(f.saved()[0].deferredTurns!.map(turn => turn.status), ['promoted', 'promoted']);
+});
+
+test('a disk-restored queue resumes the frozen request after predecessor recovery without new speech', async t => {
+  const f = await blockedQueueFixture(t);
+  const queued = structuredClone(f.saved()[0].deferredTurns![0]);
+  f.controller.abort(); f.release(); await Promise.all([f.first, f.second]);
+  assert.equal(f.posts.length, 1);
+  f.store.close();
+  const restored = new BrokerStore(f.directory); t.after(() => restored.close());
+  const channel: LiveBackendChannel = { ...f.channel, signal: new AbortController().signal,
+    publish: async update => ({ eventId: update.id, status: 'accepted' }) };
+  const backend = createPrimaryBackend({ ...f.options, store: restored });
+  await backend.delegate(f.request('del_followup'), channel);
+  assert.equal(f.posts.length, 2);
+  assert.deepEqual(f.posts[1], { bindingId, requestId: queued.queuedRequest!.requestId, input: queued.queuedRequest!.submission });
+  const saved = Object.values(restored.get(f.call.id)!.delegations) as BrokerDelegationRecord[];
+  assert.equal(saved[1].predecessorRequestId, saved[0].requestId);
+  await backend.delegate(f.request('del_followup'), channel);
+  assert.equal(f.posts.length, 2);
+});
+
+test('an uncertain deferred POST is recovered with the exact request ID and never submitted again', async t => {
+  const f = await blockedQueueFixture(t);
+  const originalResult = f.behavior.result;
+  f.behavior.submit = async id => { throw new Error(`synthetic unknown ${id}`); };
+  f.behavior.result = async id => {
+    if (id === f.posts[0].requestId) return originalResult(id);
+    throw new Error('synthetic result unavailable');
+  };
+  f.release(); await Promise.all([f.first, f.second]);
+  assert.equal(f.posts.length, 2);
+  assert.equal(f.saved()[1].status, 'dispatch_unknown');
+  const frozen = structuredClone(f.posts[1]);
+  f.store.close();
+  const restored = new BrokerStore(f.directory); t.after(() => restored.close());
+  f.behavior.result = async id => f.completed(id);
+  const backend = createPrimaryBackend({ ...f.options, store: restored });
+  await backend.delegate(f.request('del_followup'), f.channel);
+  assert.equal(f.posts.length, 2);
+  assert.equal(f.reads.at(-1), frozen.requestId);
+  assert.deepEqual((restored.get(f.call.id)!.delegations[frozen.requestId] as BrokerDelegationRecord).submission, frozen.input);
+});
+
+test('hangup preserves queued speech but closeout and restart cannot submit it', async t => {
+  const f = await blockedQueueFixture(t);
+  f.store.update(f.call.id, { status: 'completed', endedAt: new Date().toISOString() });
+  f.release(); await Promise.all([f.first, f.second]);
+  assert.equal(f.posts.length, 1);
+  assert.equal(f.saved()[0].deferredTurns![0].status, 'queued');
+  await createPrimaryBackend(f.options).flushPendingCaptures();
+  await createPrimaryBackend(f.options).delegate(f.request('del_followup'), f.channel);
+  assert.equal(f.posts.length, 1);
+});
+
+test('unknown predecessor admission blocks the queue until a GET confirms its terminal result', async t => {
+  const f = await fixture(t, { maxPollMs: 35 });
+  f.behavior.submit = async () => { throw new Error('synthetic submit timeout'); };
+  f.behavior.result = async () => { throw new Error('synthetic unknown admission'); };
+  f.add(' Read my portfolio.'); f.speech();
+  const first = f.backend.delegate(f.request(), f.channel);
+  await until(() => f.posts.length === 1);
+  f.add(' Read my last payment. ', 3000, 3200); f.speech(3000, 3200);
+  const second = f.backend.delegate(f.request('del_followup'), f.channel);
+  await Promise.all([first, second]);
+  assert.equal(f.posts.length, 1);
+  const queued = structuredClone(f.saved()[0].deferredTurns![0]);
+  assert.equal(queued.status, 'queued');
+  f.behavior.submit = async id => ({ ...f.completed(id), replayed: false });
+  f.behavior.result = async id => f.completed(id);
+  await createPrimaryBackend(f.options).delegate(f.request('del_followup'), f.channel);
+  assert.equal(f.posts.length, 2);
+  assert.deepEqual(f.posts[1].input, queued.queuedRequest!.submission);
+  assert.ok(f.reads.includes(f.posts[0].requestId));
+});
+
+test('interrupted result presentation preserves and processes the separately queued request once', async t => {
+  const f = await blockedQueueFixture(t);
+  const publish = f.channel.publish;
+  let interrupted = false;
+  f.channel.publish = async update => {
+    if (update.kind === 'result' && !interrupted) {
+      interrupted = true; f.add('Wait.', 5000, 5200); f.speech(5000, 5200);
+    }
+    return publish(update);
+  };
+  f.release(); await Promise.all([f.first, f.second]);
+  assert.equal(f.posts.length, 2);
+  assert.equal(f.saved()[0].delivery, 'stale');
+  assert.equal(f.posts[1].input.text, ' Read my last payment. ');
+  assert.equal(f.saved()[1].status, 'completed');
 });
 
 test('reconstructed closeout waits for an in-flight capture before deciding whether it needs replay', async t => {
@@ -821,6 +1360,69 @@ test('a presented question takes a literal reply on the original run and capture
   assert.equal(f.posts.length, 1); assert.equal(f.replies.length, 1);
 });
 
+test('live observer keeps the original question presentation while caller speech is awaiting admission', async t => {
+  const f = await fixture(t, { maxPollMs: 10, watchUntilCallEnds: true });
+  let current = question();
+  f.behavior.result = async id => current.state === 'pending' ? waiting(id, current) : f.completed(id);
+  f.behavior.question = async id => questionResult(id, current);
+  f.behavior.reply = async (id, _questionId, input) => {
+    current = answered(current, input);
+    return { ...questionResult(id, current), replayed: false };
+  };
+  f.add('Please buy $10.25 of this stock.'); f.speech();
+  const first = f.backend.delegate(f.request(), f.channel);
+  await until(() => Boolean(f.saved()[0]?.questions?.[firstQuestionId].presentation));
+  const presentation = structuredClone(f.saved()[0].questions![firstQuestionId].presentation!);
+  const prompts = f.updates.length;
+  f.add('Yes.', 3000, 3200); f.speech(3000, 3200);
+  await wait(30);
+  assert.deepEqual(f.saved()[0].questions![firstQuestionId].presentation, presentation);
+  assert.equal(f.updates.length, prompts, 'polling must not re-present the question against the answer frontier');
+  const reply = f.backend.delegate(f.request('live_answer'), f.channel);
+  await Promise.all([first, reply]);
+  assert.equal(f.posts.length, 1);
+  assert.equal(f.replies.length, 1);
+  assert.equal(f.replies[0].requestId, f.posts[0].requestId);
+  assert.equal(f.replies[0].input.reply.answer, 'yes');
+  assert.equal(f.saved()[0].status, 'completed');
+});
+
+test('a queued second task waits for a same-run question answer and follows the original terminal result', async t => {
+  const f = await fixture(t);
+  let current = question();
+  let release!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  let entered = false;
+  f.behavior.result = async id => {
+    if (id !== f.posts[0].requestId) return f.completed(id);
+    entered = true; await blocked;
+    return current.state === 'pending' ? waiting(id, current) : f.completed(id);
+  };
+  f.behavior.question = async id => questionResult(id, current);
+  f.behavior.reply = async (id, _questionId, input) => {
+    current = answered(current, input);
+    return { ...questionResult(id, current), replayed: false };
+  };
+  f.add('Read my balance.'); f.speech();
+  const first = f.backend.delegate(f.request(), f.channel);
+  await until(() => entered);
+  f.add('Read my last payment.', 3000, 3200); f.speech(3000, 3200);
+  const second = f.backend.delegate(f.request('del_followup'), f.channel);
+  await until(() => f.saved()[0].deferredTurns?.length === 1);
+  release(); await Promise.all([first, second]);
+  assert.equal(f.posts.length, 1);
+  assert.equal(f.saved()[0].status, 'waiting_for_reply');
+  assert.equal(f.saved()[0].deferredTurns![0].status, 'queued');
+  f.add('Yes.', 5000, 5200); f.speech(5000, 5200);
+  await f.backend.delegate(f.request('answer'), f.channel);
+  assert.equal(f.replies.length, 1);
+  assert.equal(f.replies[0].requestId, f.posts[0].requestId);
+  assert.equal(f.posts.length, 2);
+  assert.equal(f.posts[1].input.text, 'Read my last payment.');
+  assert.equal(f.saved()[1].predecessorRequestId, f.posts[0].requestId);
+  assert.equal(f.saved()[0].deferredTurns!.length, 1);
+});
+
 test('literal reply mapping preserves canonical yes and no meanings and leaves qualified speech as other', () => {
   for (const text of ['yes', ' Yes. ', 'YES!']) assert.deepEqual(literalPhoneAnswer(text), { answer: 'yes', text: null });
   for (const text of ['no', ' No. ', 'NO!']) assert.deepEqual(literalPhoneAnswer(text), { answer: 'no', text: null });
@@ -873,6 +1475,28 @@ test('a lost reply response is recovered through the exact old question after a 
   assert.equal(f.replies.length, 1); assert.equal(f.posts.length, 1);
   assert.ok(f.questionReads.every(read => read.questionId === firstQuestionId));
   assert.ok(f.questionReads.every(read => read.requestId === f.posts[0].requestId));
+});
+
+test('media abort during question recovery prevents a new result GET after that recovery settles', async t => {
+  const f = await waitingFixture(t);
+  f.behavior.reply = async () => { throw new PrimaryApiError('request_timeout'); };
+  f.behavior.question = async id => questionResult(id, f.currentQuestion());
+  f.add('Yes.', 3000, 3200); f.speech(3000, 3200);
+  await f.backend.delegate(f.request('unconfirmed_answer'), f.channel);
+  assert.equal(f.saved()[0].questions![firstQuestionId].reply!.status, 'unknown');
+  let entered = false;
+  let release!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  f.behavior.question = async id => { entered = true; await blocked; return questionResult(id, f.currentQuestion()); };
+  const resumed = createPrimaryBackend({ ...f.options, watchUntilCallEnds: true })
+    .delegate(f.request('unconfirmed_answer'), f.channel);
+  await until(() => entered);
+  const reads = f.reads.length;
+  f.controller.abort(); release();
+  await resumed;
+  assert.equal(f.reads.length, reads);
+  assert.equal(f.posts.length, 1);
+  assert.equal(f.replies.length, 1);
 });
 
 test('two sequential questions use separate reply identities and one original Primary run', async t => {
@@ -945,6 +1569,12 @@ test('caller speech arriving before the complete question presentation cannot an
   assert.equal(f.posts.length, 1);
   assert.equal(f.saved()[0].questions![firstQuestionId].presentation!.callerRevision, 2);
   assert.equal(f.saved()[0].deferredTurns![0].text, 'Yes.');
+  assert.equal(f.saved()[0].deferredTurns![0].status, 'recorded_not_submitted');
+  assert.equal(f.saved()[0].deferredTurns![0].queuedRequest, undefined);
+  f.behavior.result = async id => f.completed(id);
+  await f.backend.delegate(f.request('original_finished'), f.channel);
+  assert.equal(f.posts.length, 1);
+  assert.equal(f.replies.length, 0);
 });
 
 test('an overlong answer asks for a shorter reply and stays on the waiting request', async t => {
@@ -954,6 +1584,7 @@ test('an overlong answer asks for a shorter reply and stays on the waiting reque
   assert.equal(f.posts.length, 1); assert.equal(f.replies.length, 0);
   assert.equal(f.saved()[0].status, 'waiting_for_reply');
   assert.ok(f.updates.some(update => /shorter answer/.test(update.text)));
+  assert.equal(f.saved()[0].deferredTurns![0].queuedRequest, undefined);
 });
 
 test('expired questions remain waiting without admitting a reply or a second run', async t => {

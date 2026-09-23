@@ -1,5 +1,7 @@
 import { createHmac } from 'node:crypto';
 import { z } from 'zod';
+import { phoneCallAssignmentSchema, phoneCallAssignmentRefSchema, sameCallAssignmentRef, type PhoneCallAssignment, type PhoneCallAssignmentRef } from './assignment.js';
+export type { PhoneCallAssignment, PhoneCallAssignmentRef } from './assignment.js';
 import { rawSubmissionDigest, turnBodyDigest, type PhoneNonAdmissionProof } from './reconciliation.js';
 
 export interface PrimaryProviderProof {
@@ -26,6 +28,7 @@ export interface PrimaryCall {
   callSid: string;
   state: 'open' | 'closed';
   context: PrimaryContext;
+  callAssignmentRef?: PhoneCallAssignmentRef;
 }
 
 export interface PrimarySubmission {
@@ -38,6 +41,9 @@ export interface PrimarySubmission {
     role: 'user';
   };
   text: string;
+  relatedPrimaryRequestId?: string;
+  referenceOrigin?: 'broker_status_publication';
+  callAssignmentRef?: PhoneCallAssignmentRef;
 }
 
 export interface PrimaryTurn {
@@ -128,7 +134,7 @@ export interface PrimaryClosedCall {
 
 export interface PrimaryApiClient {
   readiness(callerNumber: string): Promise<PrimaryReadiness>;
-  openCall(providerProof: PrimaryProviderProof): Promise<PrimaryCall>;
+  openCall(providerProof: PrimaryProviderProof, callAssignment?: PhoneCallAssignment): Promise<PrimaryCall>;
   getContext(bindingId: string): Promise<PrimaryCall>;
   submit(bindingId: string, requestId: string, input: PrimarySubmission): Promise<PrimaryRequestResult>;
   result(bindingId: string, requestId: string): Promise<PrimaryRequestResult>;
@@ -290,7 +296,7 @@ const contextSchema = z.object({
   messages: z.array(z.object({ id: uuid, role: z.enum(['user', 'assistant']), text: textValue })).max(20),
 }).refine((value) => value.messages.reduce((size, message) => size + Buffer.byteLength(message.text), 0) <= MAX_REQUEST_BYTES);
 const callSchema = z.object({
-  bindingId: uuid, callSid, state: z.enum(['open', 'closed']), context: contextSchema,
+  bindingId: uuid, callSid, state: z.enum(['open', 'closed']), context: contextSchema, callAssignmentRef: phoneCallAssignmentRefSchema.optional(),
 });
 const questionText = (limit: number) => z.string().min(1).refine(value => value.trim() === value
   && Buffer.byteLength(value) <= limit && !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value)
@@ -330,7 +336,9 @@ const replyInputSchema = z.object({
 const submissionSchema = z.object({
   source: z.object({ callSid, itemId, sourceEventId: uuid, revision: z.literal(1), receivedAt: timestamp, role: z.literal('user') }).strict(),
   text: sourceText,
-}).strict();
+  relatedPrimaryRequestId: uuid.optional(), referenceOrigin: z.literal('broker_status_publication').optional(),
+  callAssignmentRef: phoneCallAssignmentRefSchema.optional(),
+}).strict().refine(value => (value.relatedPrimaryRequestId === undefined) === (value.referenceOrigin === undefined));
 const turnSchema = z.object({
   sourceEventId: uuid, revision, itemId, role: z.enum(['user', 'assistant']), text: sourceText, occurredAt: timestamp,
 }).strict();
@@ -368,7 +376,7 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
   // Known bindings add a second consistency check across open/context/submit/
   // close. Recovery in a fresh process still validates exact wire identities.
   const calls = new Map<string, {
-    callSid: string; primaryDexterId: string; threadId: string; state: 'open' | 'closed';
+    callSid: string; primaryDexterId: string; threadId: string; state: 'open' | 'closed'; callAssignmentRef?: PhoneCallAssignmentRef;
   }>();
   const bindingHeaders = (bindingId: string) => {
     parse(uuid, bindingId, 'invalid_request');
@@ -380,13 +388,19 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
       same(call.callSid, existing.callSid);
       same(call.context.primaryDexterId, existing.primaryDexterId);
       same(call.context.threadId, existing.threadId);
+      if (call.callAssignmentRef !== undefined && !sameCallAssignmentRef(call.callAssignmentRef, existing.callAssignmentRef))
+        throw new PrimaryApiError('identity_mismatch');
       if (existing.state === 'closed' && call.state !== 'closed') throw new PrimaryApiError('identity_mismatch');
     }
+    // Context does not need to repeat the registration receipt. Omission may
+    // not erase the validated local receipt for this exact binding.
+    const reference = call.callAssignmentRef ?? existing?.callAssignmentRef;
     calls.set(call.bindingId, {
       callSid: call.callSid, primaryDexterId: call.context.primaryDexterId,
       threadId: call.context.threadId, state: call.state,
+      ...(reference === undefined ? {} : { callAssignmentRef: { ...reference } }),
     });
-    return call;
+    return reference === undefined ? call : { ...call, callAssignmentRef: { ...reference } };
   };
   const decodeResult = (value: unknown, bindingId: string, requestId: string, submit: boolean) => {
     const result = parse(requestSchema, value, 'invalid_response');
@@ -414,7 +428,8 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
       parse(z.string().regex(/^\+[1-9]\d{7,14}$/), callerNumber, 'invalid_request');
       return parse(readinessSchema, await request('POST', '/readiness', { callerNumber }), 'invalid_response');
     },
-    async openCall(providerProof) {
+    async openCall(providerProof, callAssignment) {
+      const assignment = callAssignment === undefined ? undefined : parse(phoneCallAssignmentSchema, callAssignment, 'invalid_request');
       const proof = parse(z.object({
         url: z.string().url().max(2048), signature: z.string().min(1).max(512),
         params: z.record(z.string().min(1).max(128), z.string().max(2048))
@@ -428,7 +443,12 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
       for (const key of ['AccountSid', 'Direction', 'From', 'To']) {
         if (!proof.params[key]) throw new PrimaryApiError('invalid_request');
       }
-      const call = parse(callSchema, await request('POST', '/calls', { providerProof: proof }), 'invalid_response');
+      const call = parse(callSchema, await request('POST', '/calls', { providerProof: proof,
+        ...(assignment === undefined ? {} : { callAssignment: assignment }) }), 'invalid_response');
+      if ((assignment === undefined) !== (call.callAssignmentRef === undefined)) throw new PrimaryApiError('identity_mismatch');
+      if (assignment && call.callAssignmentRef) {
+        same(call.callAssignmentRef.assignmentId, assignment.assignmentId); same(call.callAssignmentRef.revision, assignment.revision);
+      }
       same(call.callSid, expectedCallSid);
       return remember(call);
     },
@@ -441,10 +461,17 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
       const headers = bindingHeaders(bindingId);
       parse(uuid, requestId, 'invalid_request');
       const parsed = parse(submissionSchema, input, 'invalid_request');
+      if (parsed.relatedPrimaryRequestId === requestId) throw new PrimaryApiError('invalid_request');
+      const reference = parsed.relatedPrimaryRequestId === undefined ? {} : {
+        relatedPrimaryRequestId: parsed.relatedPrimaryRequestId, referenceOrigin: parsed.referenceOrigin };
       const existing = calls.get(bindingId);
-      if (existing) same(parsed.source.callSid, existing.callSid);
+      if (existing) {
+        same(parsed.source.callSid, existing.callSid);
+        if (!sameCallAssignmentRef(parsed.callAssignmentRef, existing.callAssignmentRef)) throw new PrimaryApiError('identity_mismatch');
+      }
       const { role, ...source } = parsed.source;
-      return decodeResult(await request('POST', '/requests', { bindingId, source, role, text: parsed.text },
+      return decodeResult(await request('POST', '/requests', { bindingId, source, role, text: parsed.text, ...reference,
+        ...(parsed.callAssignmentRef === undefined ? {} : { callAssignmentRef: parsed.callAssignmentRef }) },
         { ...headers, 'Idempotency-Key': requestId }, 202), bindingId, requestId, true);
     },
     async result(bindingId, requestId) {
@@ -456,11 +483,18 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
       const headers = bindingHeaders(bindingId);
       parse(uuid, requestId, 'invalid_request');
       const parsed = parse(submissionSchema, input, 'invalid_request');
+      if (parsed.relatedPrimaryRequestId === requestId) throw new PrimaryApiError('invalid_request');
+      const reference = parsed.relatedPrimaryRequestId === undefined ? {} : {
+        relatedPrimaryRequestId: parsed.relatedPrimaryRequestId, referenceOrigin: parsed.referenceOrigin };
       const known = calls.get(bindingId);
-      if (known) same(parsed.source.callSid, known.callSid);
+      if (known) {
+        same(parsed.source.callSid, known.callSid);
+        if (!sameCallAssignmentRef(parsed.callAssignmentRef, known.callAssignmentRef)) throw new PrimaryApiError('identity_mismatch');
+      }
       const { role, ...source } = parsed.source;
       const result = parse(reconciliationSchema, await request('POST', `/requests/${requestId}/reconcile`,
-        { bindingId, role, text: parsed.text, source }, headers), 'invalid_response');
+        { bindingId, role, text: parsed.text, source, ...reference,
+          ...(parsed.callAssignmentRef === undefined ? {} : { callAssignmentRef: parsed.callAssignmentRef }) }, headers), 'invalid_response');
       same(result.bindingId, bindingId); same(result.requestId, requestId);
       if (result.outcome === 'admitted') {
         return { ...result, result: decodeResult(result.result, bindingId, result.canonicalRequestId, false) };

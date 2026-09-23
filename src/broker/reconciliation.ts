@@ -25,7 +25,11 @@ export function turnBodyDigest(turn: PrimaryTurn): string {
 export function rawSubmissionDigest(bindingId: string, input: PrimarySubmission): string {
   return sha({ bindingId, callSid: input.source.callSid, itemId: input.source.itemId,
     sourceEventId: input.source.sourceEventId, revision: input.source.revision,
-    receivedAt: input.source.receivedAt, role: input.source.role, text: input.text });
+    receivedAt: input.source.receivedAt, role: input.source.role, text: input.text,
+    ...(input.relatedPrimaryRequestId === undefined ? {} : { relatedPrimaryRequestId: input.relatedPrimaryRequestId,
+      referenceOrigin: input.referenceOrigin }),
+    ...(input.callAssignmentRef === undefined ? {} : { callAssignmentRef: {
+      assignmentId: input.callAssignmentRef.assignmentId, revision: input.callAssignmentRef.revision, digest: input.callAssignmentRef.digest } }) });
 }
 export function acknowledgedTurn(bindingId: string, turn: PrimaryTurn, receipt: PrimaryTurnReceipt): AcknowledgedTurnReceipt {
   if (receipt.bindingId !== bindingId || receipt.sourceEventId !== turn.sourceEventId

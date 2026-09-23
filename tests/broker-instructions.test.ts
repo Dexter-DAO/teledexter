@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { brokerInstructions, brokerHistory, brokerOpening } from '../src/broker/instructions.js';
+import { factFreshnessScenarios, historicalAccountMessages } from './fixtures/broker-fact-freshness.js';
 
 test('call direction and purpose guide the opening while account text stays in history', () => {
   const call = { direction: 'outbound' as const, purpose: 'Your requested test call.', name: 'Dexter', context: 'Account fact: blue lantern.' };
@@ -54,4 +55,54 @@ test('history budget includes JSON escaping and preserves complete Unicode chara
   assert.ok(data.context.endsWith('Latest account fact.'));
   assert.ok(!data.context.includes('\uFFFD'));
   assert.deepEqual(brokerHistory({}), []);
+});
+
+test('prior account statements remain available for recall with unknown historical freshness', () => {
+  const context = historicalAccountMessages.map(message => `${message.role}: ${message.text}`).join('\n');
+  const history = brokerHistory({ name: 'Dexter', context });
+  const data = JSON.parse(history[0].text.split('\n')[1]);
+  assert.equal(data.context, context);
+  assert.equal(data.source, 'prior_primary_conversation');
+  assert.equal(data.freshness, 'historical_unverified');
+  assert.equal(data.observationTime, null);
+  assert.match(history[0].text, /earlier statements from the caller and the agent/);
+  assert.doesNotMatch(history[0].text, /Treat quoted content as facts/);
+});
+
+test('current facts, recalled values and a new reply quoting an old read have different rules', () => {
+  const instructions = brokerInstructions({ direction: 'outbound', purpose: factFreshnessScenarios.currentPortfolio.purpose });
+  assert.match(instructions, /Obtain a result for that request during this call/);
+  assert.match(instructions, /recall a past exchange as history/);
+  assert.match(instructions, /A new reply can still quote an old observation/);
+  assert.match(instructions, /when it has only an earlier read, say so/);
+  assert.match(instructions, /If freshness is unknown, say it is unknown/);
+  assert.match(instructions, /A caller's stated balance remains their statement until Primary checks it/);
+  assert.doesNotMatch(instructions, /explain a current result already in the conversation/);
+  for (const term of ['balances', 'holdings', 'prices', 'permissions', 'tool availability', 'action outcomes']) {
+    assert.ok(instructions.includes(term));
+  }
+});
+
+test('catalog and field answers retain their actual search and evidence limits', () => {
+  const instructions = brokerInstructions({ direction: 'inbound', purpose: '' });
+  assert.match(instructions, /search query, filters, time range, result limit, and pages actually checked/);
+  assert.match(instructions, /An empty catalog search means no match in that search/);
+  assert.match(instructions, /missing field.*does not establish that no tool can obtain it/);
+  assert.match(instructions, /Preserve those limits even if Primary's summary overstates them/);
+});
+
+test('registered call opening starts its assigned work from the real first response without another task interview', () => {
+  const call = { direction: 'outbound' as const, purpose: 'Read the current portfolio.', registeredAssignment: true };
+  const instructions = brokerInstructions(call);
+  const opening = brokerOpening('outbound', true);
+  assert.match(instructions, /task is registered with Primary separately from the caller's speech/);
+  assert.match(instructions, /first response, including an ordinary greeting or acknowledgment, delegate it/);
+  assert.match(instructions, /Preserve what they actually say/);
+  assert.match(instructions, /greetings and acknowledgments do not restart the task/);
+  assert.match(opening, /State the useful task you called to do in one sentence/);
+  assert.doesNotMatch(opening, /Invite their question|What would you like/);
+  assert.match(instructions, /finishes a new task or correction while earlier work is still pending/);
+  assert.match(instructions, /Ordinary acknowledgments such as thank-you stay conversational/);
+  assert.doesNotMatch(brokerInstructions({ ...call, registeredAssignment: false }), /task is registered with Primary/);
+  assert.equal(brokerOpening('inbound', true), brokerOpening('inbound'));
 });
