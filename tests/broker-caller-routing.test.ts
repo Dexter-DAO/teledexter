@@ -3,15 +3,16 @@ import test, { type TestContext } from 'node:test';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { ZodError } from 'zod';
 import { BrokerStore, type BrokerCall } from '../src/broker/store.js';
 import { brokerIdentity, type BrokerDelegationRecord, type BrokerQuestionRecord } from '../src/broker/backend.js';
 import { beginBrokerPublication, settleBrokerPublication, rejectBrokerPublication, callerIntentResultPublicationCandidates, callerIntentResultPublicationInventory,
   type OrdinaryPublicationEvidence } from '../src/broker/publications.js';
 import { callerRouteRef, findCallerRoute, requireCallerRoute, callerRouteUsedSourceIds, callerRoutingSourceAnchors,
-  callerRoutePendingCaptures, callerQuestionPresentationDigest, type CallerRoutePreparation,
+  callerRoutePendingCaptures, callerQuestionPresentationDigest, validateCallerRouting, type CallerRoutePreparation,
   callerIntentQuestionForTarget, requireCallerRouteDispatch, CallerRouteExpiredError,
   type CallerQuestionTarget, type CallerRouteDecision, type CallerRouteRecord } from '../src/broker/callerRouting.js';
-import { callerIntentInputDigest, type CallerIntentInput, type CallerIntentResponse, type CallerIntentDecision } from '../src/broker/callerIntentContract.js';
+import { callerIntentInputDigest, callerIntentResponseSchema, type CallerIntentInput, type CallerIntentResponse, type CallerIntentDecision } from '../src/broker/callerIntentContract.js';
 import { turnBodyDigest } from '../src/broker/reconciliation.js';
 import { createMixedWorkRouter, recoverCallerRouteCaptures } from '../src/broker/mixedWork.js';
 import type { PrimaryTurnReceipt, PrimaryQuestion } from '../src/broker/primaryApi.js';
@@ -20,6 +21,14 @@ import type { LiveBackendChannel, LiveDelegationRequest } from '../src/live/type
 const uuid = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
 const sid = `CA${'e'.repeat(32)}`, bindingId = uuid(2), owner = uuid(3), primary = uuid(4), thread = uuid(5);
 const session = 'route_session_1', generationId = uuid(6);
+function assertCallerIntentIssue(action: () => unknown, issuePath: Array<string | number>, message: string) {
+  assert.throws(action, error => {
+    assert.ok(error instanceof ZodError);
+    assert.deepEqual(error.issues.map(({ code, path, message }) => ({ code, path, message })),
+      [{ code: 'custom', path: issuePath, message }]);
+    return true;
+  });
+}
 function fixture(t: TestContext) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-caller-routing-'));
   const instances: BrokerStore[] = [];
@@ -152,7 +161,12 @@ test('never-dispatched saved v1 task cannot make its first downstream dispatch o
   assert.throws(() => requireCallerRoute(f.read(), f.request, callerRouteRef(record), 'task'), /legacy_dispatch_refused/);
   const upcast = structuredClone(f.read().callerRouting!);
   upcast.records[0]!.resolutionInput.resultCoverage = { state: 'complete', count: 0 };
-  assert.throws(() => f.store().update(f.call.id, { callerRouting: upcast }), /identity_changed|history_changed/);
+  assert.throws(() => f.store().update(f.call.id,
+    { callerRouting: upcast } as unknown as Parameters<BrokerStore['update']>[1]),
+    { message: 'Caller routing requires an explicit transition' });
+  assert.equal(f.bytes(), saved);
+  assert.throws(() => validateCallerRouting({ ...f.read(), callerRouting: upcast }, f.read()),
+    { message: 'caller_route_identity_changed' });
   assert.deepEqual(f.read().delegations, {}); assert.equal(f.bytes(), saved);
 });
 
@@ -230,7 +244,13 @@ test('a local inventory refusal cannot claim complete-zero coverage, carry refer
   input.resolutionInput.references = []; const record = f.prepare(input), saved = f.bytes();
   const changed = structuredClone(f.read().callerRouting!);
   changed.records[0]!.resolutionInput.classificationRefusal = 'caller_result_inventory_unverifiable';
-  assert.throws(() => f.store().update(f.call.id, { callerRouting: changed }), /identity_changed/);
+  assert.throws(() => f.store().update(f.call.id,
+    { callerRouting: changed } as unknown as Parameters<BrokerStore['update']>[1]),
+    { message: 'Caller routing requires an explicit transition' });
+  assert.equal(f.bytes(), saved);
+  assert.throws(() => validateCallerRouting({ ...f.read(), callerRouting: changed }, f.read()),
+    { message: 'caller_route_identity_changed' });
+  assert.equal(f.bytes(), saved);
   assert.throws(() => f.store().decideCallerRoute(f.call.id, callerRouteRef(record),
     { inputDigest: record.inputDigest, decision: { kind: 'task' } }), /inventory_refused/);
   assert.equal(f.bytes(), saved); assert.equal(callerRoutePendingCaptures(f.read()), 1);
@@ -280,10 +300,28 @@ test('duplicate request identity cannot switch delegation or call', t => {
 
 test('wrong resolution digest, offered target or reference cannot establish a decision', t => {
   const f = fixture(t), record = f.prepare(), ref = callerRouteRef(record);
-  assert.throws(() => f.store().decideCallerRoute(f.call.id, ref, { inputDigest: 'd'.repeat(64), decision: { kind: 'task' } }), /identity_changed/);
-  assert.throws(() => f.decide({ kind: 'task', contextReference: { id: 'unknown', digest: 'a'.repeat(64) } }), /reference_not_offered/);
-  assert.throws(() => f.decide({ kind: 'answer', target: { kind: 'selected', bindingId: uuid(80), requestId: uuid(81),
-    runId: uuid(82), questionId: uuid(83), questionRevision: 1, presentationDigest: 'a'.repeat(64), associationId: uuid(84) } }), /target_not_offered/);
+  const initial = f.bytes();
+  assert.throws(() => f.store().decideCallerRoute(f.call.id, ref, { inputDigest: 'd'.repeat(64), decision: { kind: 'task' } }),
+    { message: 'caller_route_identity_changed' });
+  assert.equal(f.bytes(), initial); assert.equal(f.read().callerRouting!.records[0]!.decision, undefined);
+  f.prepareIntent(); const prepared = f.bytes();
+  const task: CallerRouteDecision = { kind: 'task', contextReference: { id: 'unknown', digest: 'a'.repeat(64) } };
+  const answer: CallerRouteDecision = { kind: 'answer', target: { kind: 'selected', bindingId: uuid(80), requestId: uuid(81),
+    runId: uuid(82), questionId: uuid(83), questionRevision: 1, presentationDigest: 'a'.repeat(64), associationId: uuid(84) } };
+  assertCallerIntentIssue(() => f.decide(task), ['decision', 'reference'], 'Task reference was not supplied');
+  assert.equal(f.bytes(), prepared); assert.equal(f.read().callerRouting!.records[0]!.intent?.response, undefined);
+  assert.equal(f.read().callerRouting!.records[0]!.decision, undefined);
+  assertCallerIntentIssue(() => f.decide(answer), ['decision', 'target'], 'Answer target was not supplied');
+  assert.equal(f.bytes(), prepared); assert.equal(f.read().callerRouting!.records[0]!.intent?.response, undefined);
+  assert.equal(f.read().callerRouting!.records[0]!.decision, undefined);
+  f.recordResponse(f.intentResponse(f.read().callerRouting!.records[0]!, { kind: 'task' }));
+  const resolved = f.bytes();
+  assert.throws(() => f.store().decideCallerRoute(f.call.id, ref, { inputDigest: record.inputDigest, decision: task }),
+    { message: 'caller_route_reference_not_offered' });
+  assert.equal(f.bytes(), resolved); assert.equal(f.read().callerRouting!.records[0]!.decision, undefined);
+  assert.throws(() => f.store().decideCallerRoute(f.call.id, ref, { inputDigest: record.inputDigest, decision: answer }),
+    { message: 'caller_route_target_not_offered' });
+  assert.equal(f.bytes(), resolved);
   assert.equal(f.read().callerRouting!.records[0]!.decision, undefined);
 });
 
@@ -318,10 +356,16 @@ test('capture must acknowledge the original body and exact binding', t => {
 
 test('new caller revision makes an unresolved classification stale without changing the saved source', t => {
   const f = fixture(t); f.prepare(); const journal = structuredClone(f.read().liveGenerations!);
-  journal.segments[0]!.transcript.callerRevision++;
+  const transcript = journal.segments[0]!.transcript;
+  transcript.fragments.push({ eventId: 'caller_2', sequence: 2, role: 'user', text: 'Also compare Microsoft.', startMs: 2100, endMs: 2200 });
+  transcript.revision++; transcript.callerRevision++;
+  assert.deepEqual(transcript.fragments[0], f.request.transcript.fragments[0]);
   f.store().update(f.call.id, { liveGenerations: journal });
-  assert.throws(() => f.decide({ kind: 'task' }), /stale_context/);
-  assert.equal(f.read().callerRouting!.records[0]!.frozen.turn.text, f.frozen.turn.text);
+  const saved = f.bytes();
+  assert.throws(() => f.decide({ kind: 'task' }), { message: 'caller_route_stale_context' });
+  assert.equal(f.bytes(), saved);
+  assert.deepEqual(f.read().callerRouting!.records[0]!.frozen, f.frozen);
+  assert.equal(f.read().callerRouting!.records[0]!.decision, undefined);
 });
 
 test('generic update and reservation cannot bypass routing transitions', t => {
@@ -533,15 +577,24 @@ test('operation ID, full input and first response timing survive exact retries',
 
 test('all response echoes and the API input digest remain bound to one operation', t => {
   const f = fixture(t); f.prepare(); f.prepareIntent(); const response = f.intentResponse();
+  const saved = f.bytes();
+  assertCallerIntentIssue(() => f.recordResponse({ ...response,
+    validUntil: new Date(Date.parse(response.validUntil) + 1).toISOString() }),
+    ['validUntil'], 'Decision deadline differs from original budget');
+  assert.equal(f.bytes(), saved); assert.equal(f.read().callerRouting!.records[0]!.intent?.response, undefined);
   const mutations = [
     { operationId: uuid(88) }, { bindingId: uuid(89) }, { inputDigest: 'f'.repeat(64) },
     { brokerInputDigest: 'e'.repeat(64) }, { presentationDigest: 'd'.repeat(64) },
     { sourceSessionId: 'other_session' }, { generationId: uuid(90) },
     { callDeadlineAt: new Date(Date.parse(response.callDeadlineAt) + 1).toISOString() },
-    { validUntil: new Date(Date.parse(response.validUntil) + 1).toISOString() },
     { version: { ...response.version, contextEpoch: '99' } },
   ];
-  for (const mutation of mutations) assert.throws(() => f.recordResponse({ ...response, ...mutation }), /identity_changed/);
+  for (const mutation of mutations) {
+    const changed = { ...response, ...mutation };
+    assert.doesNotThrow(() => callerIntentResponseSchema.parse(changed));
+    assert.throws(() => f.recordResponse(changed), { message: 'caller_intent_response_identity_changed' });
+    assert.equal(f.bytes(), saved); assert.equal(f.read().callerRouting!.records[0]!.intent?.response, undefined);
+  }
   assert.equal(f.read().callerRouting!.records[0]!.intent?.response, undefined);
 });
 
@@ -561,11 +614,23 @@ test('local abort clarification retains pending API receipt without converting i
 test('queued first dispatch keeps exact receipt without requiring its old caption or publication frontier', t => {
   const f = fixture(t), pending = pendingQuestion(f); f.prepare(); f.decide({ kind: 'task' });
   const route = f.read().callerRouting!.records[0]!, receipt = route.intent!.response!;
-  const generation = structuredClone(f.read().liveGenerations!); generation.segments[0]!.transcript.callerRevision++;
+  const generation = structuredClone(f.read().liveGenerations!), transcript = generation.segments[0]!.transcript;
+  transcript.fragments.push({ eventId: 'caller_2', sequence: 2, role: 'user', text: 'Also compare Microsoft.', startMs: 2100, endMs: 2200 });
+  transcript.revision++; transcript.callerRevision++;
+  assert.deepEqual(transcript.fragments[0], f.request.transcript.fragments[0]);
   f.store().update(f.call.id, { liveGenerations: generation });
-  beginBrokerPublication(f.store(), pending.identity, pending.requestId,
-    { id: 'later_output', kind: 'progress', text: 'The comparison is pending.', speak: true, expectedCallerRevision: 1 }, f.request.transcript);
-  assert.throws(() => requireCallerRoute(f.read(), f.request, callerRouteRef(route), 'task'), /stale_context/);
+  const publication = beginBrokerPublication(f.store(), pending.identity, pending.requestId,
+    { id: 'later_output', kind: 'progress', text: 'The comparison is pending.', speak: true, expectedCallerRevision: transcript.callerRevision }, transcript);
+  assert.ok(publication, 'current later output must create a publication');
+  assert.equal(publication.record.publicationSequence, route.resolutionInput.publicationSequence + 1);
+  assert.equal(f.read().publications!.records.at(-1)!.publicationSequence, publication.record.publicationSequence);
+  assert.equal(publication.record.callerRevision, 2); assert.equal(publication.record.transcriptSequence, 2);
+  assert.deepEqual(f.read().callerRouting!.records[0]!.frozen, route.frozen);
+  assert.deepEqual(f.read().callerRouting!.records[0]!.intent!.response, receipt);
+  const saved = f.bytes();
+  assert.throws(() => requireCallerRoute(f.read(), f.request, callerRouteRef(route), 'task'),
+    { message: 'caller_route_stale_context' });
+  assert.equal(f.bytes(), saved);
   assert.doesNotThrow(() => requireCallerRouteDispatch(f.read(), route.frozen.turn.sourceEventId, Date.parse(receipt.validUntil) - 1));
   assert.throws(() => requireCallerRouteDispatch(f.read(), route.frozen.turn.sourceEventId, Date.parse(receipt.validUntil)), error => {
     assert.ok(error instanceof CallerRouteExpiredError);
