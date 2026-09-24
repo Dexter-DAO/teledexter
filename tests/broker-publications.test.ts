@@ -3,9 +3,11 @@ import test, { type TestContext } from 'node:test';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
-import { BrokerStore } from '../src/broker/store.js';
+import { createHash } from 'node:crypto';
+import { BrokerStore, type BrokerCall } from '../src/broker/store.js';
 import { beginBrokerPublication, settleBrokerPublication, selectBrokerPublicationReference, rejectBrokerPublication } from '../src/broker/publications.js';
 import type { LiveDelivery, LiveTranscriptSnapshot } from '../src/live/types.js';
+import type { LiveGenerationJournal } from '../src/broker/liveGeneration.js';
 
 const bindingId = '11111111-1111-4111-8111-111111111111';
 const requestA = '22222222-2222-4222-8222-222222222222';
@@ -18,12 +20,12 @@ const after: LiveTranscriptSnapshot = { revision: 2, callerRevision: 2, fragment
 ] };
 const accepted = (eventId: string): LiveDelivery => ({ eventId, status: 'accepted', observedCallerRevision: 1, observedTranscriptSequence: 1 });
 
-async function fixture(t: TestContext) {
+async function fixture(t: TestContext, callSid = 'CA_test') {
   const directory = await mkdtemp(path.join(tmpdir(), 'broker-publications-'));
   const store = new BrokerStore(directory);
   t.after(async () => { store.close(); await rm(directory, { recursive: true, force: true }); });
-  const call = store.reserve({ requestId: 'synthetic-call', number: '+15550000001', direction: 'outbound', purpose: 'test', callSid: 'CA_test' }).call;
-  const identity = { callId: call.id, callSid: 'CA_test', bindingId, sessionId: 'sess_1' };
+  const call = store.reserve({ requestId: 'synthetic-call', number: '+15550000001', direction: 'outbound', purpose: 'test', callSid }).call;
+  const identity = { callId: call.id, callSid, bindingId, sessionId: 'sess_1' };
   store.update(call.id, { status: 'in-progress', liveSessionId: identity.sessionId, primary: { bindingId, name: null, context: '' },
     delegations: Object.fromEntries([requestA, requestB].map(requestId => [requestId, {
       ...identity, requestId, status: 'completed', updatedAt: '2026-09-22T00:00:00.000Z',
@@ -147,4 +149,137 @@ test('quiet thinking, missing request, unknown admission and changed update bodi
   const call = f.store.get(f.call.id)!;
   f.store.update(f.call.id, { delegations: { ...call.delegations, [requestA]: { ...call.delegations[requestA], status: 'dispatch_unknown' } } });
   assert.equal(f.begin(requestA, 'unknown'), undefined);
+});
+
+async function generationFixture(t: TestContext) {
+  const f = await fixture(t, `CA${'1'.repeat(32)}`);
+  const ownerPrincipalId = '44444444-4444-4444-8444-444444444444';
+  const primaryDexterId = '55555555-5555-4555-8555-555555555555';
+  const threadId = '66666666-6666-4666-8666-666666666666';
+  const oldGenerationId = '77777777-7777-4777-8777-777777777777';
+  const currentGenerationId = '88888888-8888-4888-8888-888888888888';
+  const when = '2026-09-24T12:00:00.000Z';
+  const version = { ownerPrincipalId, primaryDexterId, threadId, contextEpoch: '1',
+    threadEventSequence: '10', digest: '1'.repeat(64) };
+  const liveGenerations: LiveGenerationJournal = {
+    version: 1, callId: f.call.id,
+    binding: { bindingId, callSid: f.identity.callSid, ownerPrincipalId, primaryDexterId, threadId },
+    clocks: { callDeadlineAt: '2026-09-24T12:05:00.000Z' }, phase: 'active', inputNextSample: 0,
+    deliveryAttachment: { generationId: currentGenerationId, sessionId: 'sess_2' },
+    segments: [
+      { generationId: oldGenerationId, ordinal: 1, createdAt: when, state: 'closed', sessionId: 'sess_1',
+        closedAt: when, providerFinalized: true, version, pageDigest: 'a'.repeat(64), transcript: before, outputDiscarded: true },
+      { generationId: currentGenerationId, ordinal: 2, createdAt: when, state: 'active', sessionId: 'sess_2',
+        readyAt: when, version: { ...version, contextEpoch: '2', digest: '2'.repeat(64) },
+        pageDigest: 'b'.repeat(64), transcript: before, outputDiscarded: false },
+    ],
+  };
+  const current = f.store.get(f.call.id)!;
+  f.store.update(f.call.id, { primary: { ...current.primary!, primaryDexterId, threadId },
+    liveSessionId: 'sess_2', liveGenerations });
+  const deliveryIdentity = { ...f.identity, sessionId: 'sess_2' };
+  const publicationIdentity = { ...deliveryIdentity, sourceSessionId: 'sess_1' };
+  const update = { id: 'generation_result', kind: 'result' as const, speak: true,
+    text: 'The saved comparison is ready.', expectedCallerRevision: 1 };
+  const begin = () => beginBrokerPublication(f.store, publicationIdentity, requestA, update, before)!;
+  const select = () => selectBrokerPublicationReference(f.store.get(f.call.id)!, deliveryIdentity, after, 2);
+  return { ...f, deliveryIdentity, publicationIdentity, update, begin, select };
+}
+
+test('accepted current-generation publication retains old request source and supports the next explicit caller reference', async t => {
+  const f = await generationFixture(t);
+  const original = structuredClone(f.store.get(f.call.id)!.delegations[requestA]);
+  const intent = f.begin();
+  assert.equal(intent.record.sessionId, 'sess_2');
+  assert.equal(intent.record.sourceSessionId, 'sess_1');
+  assert.equal(f.select(), undefined);
+  settleBrokerPublication(f.store, intent.record, accepted('new_generation_command'), before, false);
+  assert.deepEqual(f.select(), { relatedPrimaryRequestId: requestA, referenceOrigin: 'broker_status_publication' });
+  assert.equal('sourceSessionId' in f.deliveryIdentity, false, 'new caller does not claim the earlier source session');
+  assert.deepEqual(f.store.get(f.call.id)!.delegations[requestA], original);
+  const bytes = await readFile(path.join(f.directory, 'calls.json'), 'utf8');
+  f.store.close();
+  const restarted = new BrokerStore(f.directory); t.after(() => restarted.close());
+  assert.equal(await readFile(path.join(f.directory, 'calls.json'), 'utf8'), bytes);
+  assert.deepEqual(selectBrokerPublicationReference(restarted.get(f.call.id)!, f.deliveryIdentity, after, 2),
+    { relatedPrimaryRequestId: requestA, referenceOrigin: 'broker_status_publication' });
+});
+
+test('cross-generation publication needs explicit original source and both registered sessions', async t => {
+  const f = await generationFixture(t);
+  assert.equal(beginBrokerPublication(f.store, f.deliveryIdentity, requestA, f.update, before), undefined);
+  assert.equal(beginBrokerPublication(f.store, { ...f.publicationIdentity, sourceSessionId: 'sess_2' }, requestA, f.update, before), undefined);
+  assert.equal(beginBrokerPublication(f.store, { ...f.publicationIdentity, sourceSessionId: 'other' }, requestA, f.update, before), undefined);
+  for (const missing of ['all', 'sess_1', 'sess_2']) {
+    const call = structuredClone(f.store.get(f.call.id)!);
+    if (missing === 'all') delete call.liveGenerations;
+    else call.liveGenerations!.segments = call.liveGenerations!.segments.filter(segment => segment.sessionId !== missing);
+    const readOnly = { get: () => call, update: () => { throw new Error('unexpected publication write'); } };
+    assert.equal(beginBrokerPublication(readOnly, f.publicationIdentity, requestA, f.update, before), undefined);
+  }
+  assert.equal(f.store.get(f.call.id)!.publications, undefined);
+});
+
+test('saved cross-generation selection rejects changed source identity and missing generation evidence', async t => {
+  const f = await generationFixture(t);
+  const intent = f.begin();
+  settleBrokerPublication(f.store, intent.record, accepted('new_generation_command'), before, false);
+  for (const mutate of [
+    (call: ReturnType<typeof f.store.get>) => { call!.publications!.records[0].sourceSessionId = 'sess_2'; },
+    (call: ReturnType<typeof f.store.get>) => { delete call!.publications!.records[0].sourceSessionId; },
+    (call: ReturnType<typeof f.store.get>) => { delete call!.liveGenerations; },
+    (call: ReturnType<typeof f.store.get>) => { call!.liveGenerations!.segments = call!.liveGenerations!.segments.slice(1); },
+    (call: ReturnType<typeof f.store.get>) => { call!.liveGenerations!.segments = call!.liveGenerations!.segments.slice(0, 1); },
+    (call: ReturnType<typeof f.store.get>) => {
+      (call!.delegations[requestA] as BrokerCall['delegations'][string] & { sessionId: string }).sessionId = 'foreign';
+    },
+    (call: ReturnType<typeof f.store.get>) => { call!.publications!.records[0].sessionId = 'sess_1'; },
+  ]) {
+    const call = structuredClone(f.store.get(f.call.id)!); mutate(call);
+    assert.equal(selectBrokerPublicationReference(call, f.deliveryIdentity, after, 2), undefined);
+  }
+  assert.ok(f.select(), 'retained original remains eligible');
+});
+
+test('new generation does not infer a request from recency or acceptance in the retired session', async t => {
+  const f = await generationFixture(t);
+  const call = f.store.get(f.call.id)!;
+  assert.equal(f.select(), undefined, 'completed request alone is not an accepted publication');
+  assert.equal(selectBrokerPublicationReference(call, f.identity, after, 2), undefined);
+  const a = f.begin();
+  const b = beginBrokerPublication(f.store, f.publicationIdentity, requestB,
+    { ...f.update, id: 'generation_result_b' }, before)!;
+  settleBrokerPublication(f.store, a.record, accepted('generation_command_a'), before, false);
+  assert.equal(f.select(), undefined, 'second publication remains uncertain');
+  settleBrokerPublication(f.store, b.record, accepted('generation_command_b'), before, false);
+  assert.equal(f.select(), undefined, 'two accepted requests do not select the newest');
+});
+
+test('cross-generation publication exact replay preserves its source and command while changed content is refused', async t => {
+  const f = await generationFixture(t);
+  const first = f.begin();
+  settleBrokerPublication(f.store, first.record, accepted('generation_command'), before, false);
+  const record = structuredClone(f.store.get(f.call.id)!.publications!.records[0]);
+  assert.equal(f.begin().created, false);
+  assert.deepEqual(f.begin().record, record);
+  assert.throws(() => beginBrokerPublication(f.store, f.publicationIdentity, requestA,
+    { ...f.update, text: 'Altered answer.' }, before), /publication_identity_changed/);
+  assert.equal(beginBrokerPublication(f.store, { ...f.publicationIdentity, sourceSessionId: 'other' },
+    requestA, f.update, before), undefined);
+  assert.deepEqual(f.store.get(f.call.id)!.publications!.records[0], record);
+});
+
+test('legacy publication JSON order and text digest stay unchanged with absent source session and generation journal', async t => {
+  const f = await fixture(t);
+  const intent = f.begin();
+  const expected = { ...f.identity, updateId: 'update_a', requestId: requestA, requestState: 'completed',
+    kind: 'result', speak: true, textDigest: createHash('sha256').update('Portfolio result', 'utf8').digest('hex'),
+    callerRevision: 1, transcriptSequence: 1, publicationSequence: 1 };
+  assert.equal(JSON.stringify(intent.record), JSON.stringify(expected));
+  assert.equal('sourceSessionId' in intent.record, false);
+  assert.equal(f.store.get(f.call.id)!.liveGenerations, undefined);
+  settleBrokerPublication(f.store, intent.record, accepted('legacy_command'), before, false);
+  assert.equal(JSON.stringify(f.store.get(f.call.id)!.publications!.records[0]), JSON.stringify({ ...expected,
+    outcome: { eventId: 'legacy_command', status: 'accepted', callerRevision: 1, transcriptSequence: 1 } }));
+  assert.equal(f.select()?.relatedPrimaryRequestId, requestA);
 });

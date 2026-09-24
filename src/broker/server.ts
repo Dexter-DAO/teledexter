@@ -6,12 +6,19 @@ import { createBrokerLiveSession, type BrokerLiveSession, type BrokerLiveSession
 import type { LiveTranscriptSnapshot } from '../live/session.js';
 import { createPrimaryApiClient, type PrimaryApiClient } from './primaryApi.js';
 import { createPrimaryBackend } from './backend.js';
+import { eligiblePhoneCallSchema, type EligibleContextClient } from './eligibleContext.js';
+import { createGenerationVoice, type GenerationVoiceOptions, type GenerationVoiceSession } from './generationVoice.js';
+import { createSelectedQuestionRecovery, selectedQuestionSourceAnchors } from './selectedQuestionVoice.js';
 import { newPhoneCallControlSchema } from './assignment.js';
+import { assertCallContinuationReplay, callContinuationPatch, CallContinuationError, type CallContinuation } from './callContinuation.js';
+import { callRequestIdFromLookupPath, callRequestReceiptFailure, readCallRequestReceipt } from './callRequestReceipt.js';
 import { authorizedHarkIngress } from './harkAuth.js';
 import { OutboundAlertRequestSchema } from '../outbound/contract.js';
 import { canonicalJson, sha256Hex } from '../outbound/canonical.js';
 import { createHarkAssignmentResolver, HarkAssignmentError, type HarkAssignmentResolver } from './harkResolver.js';
 import { createHarkLifecycleDelivery } from './harkLifecycle.js';
+import { createPrimaryHarkReceiptDispatcher, createPrimaryHarkReceiptSender,
+  type PrimaryHarkReceiptSender } from './harkPrimaryReceiptDelivery.js';
 import { type HarkEndedTiming, type HarkProviderStatus } from './harkJournal.js';
 import { harkProviderTiming } from './harkTiming.js';
 import type { deliverHarkStatus } from './harkStatusDelivery.js';
@@ -49,6 +56,7 @@ const publicCall = (call: BrokerCall) => ({
   voiceOpening: call.voiceOpening,
   primaryClosePending: call.primaryClosePending ?? false, transcriptCapture: call.transcriptCapture,
   callback: call.callback,
+  ...callContinuationPatch(call.continuation),
   metrics: call.metrics, delegationCount: Object.keys(call.delegations).length,
   ...(call.callAssignment?.origin === 'authenticated_hark_delivery' ? { watchDelivery: {
     deliveryId: call.callAssignment.value.hark.deliveryId,
@@ -63,12 +71,17 @@ export interface BrokerServerOptions {
   config: BrokerConfig;
   store?: BrokerStore;
   primary?: PrimaryApiClient;
+  /** Coordinated successor composition. Omission retains the legacy transport contract. */
+  eligibleContext?: EligibleContextClient;
+  /** Explicit successor composition; ordinary and Hark calls omit this selection. */
+  selectedQuestion?: GenerationVoiceOptions['selectedQuestion'];
   provider?: ReturnType<typeof Twilio>;
   voiceFactory?: (options: BrokerLiveSessionOptions) => BrokerLiveSession;
   probe?: typeof probeLive;
   resolveHarkAssignment?: HarkAssignmentResolver;
   harkStatusSender?: typeof deliverHarkStatus;
   harkBillingSender?: typeof deliverHarkBilling;
+  harkPrimaryReceiptSender?: PrimaryHarkReceiptSender;
   /** Explicit composition point for the chosen owner approval surface. Omitted in current production startup. */
   inboundAttachment?: {
     waitingResponse(input: { callId: string; continuationUrl: string; attachmentId?: string; expiresAt?: string }): string;
@@ -78,7 +91,9 @@ export interface BrokerServerOptions {
 export function createBrokerServer(options: BrokerServerOptions) {
   const { config } = options;
   const store = options.store ?? new BrokerStore(config.stateDir);
-  const primary = options.primary ?? createPrimaryApiClient({ apiBaseUrl: config.apiBaseUrl, phoneServiceSecret: config.phoneServiceSecret });
+  const primary = options.primary ?? createPrimaryApiClient({ apiBaseUrl: config.apiBaseUrl, phoneServiceSecret: config.phoneServiceSecret,
+    ...(options.eligibleContext ? { contextProtocol: { version: 'memory-eligible-v1' as const,
+      parse: (value: unknown) => eligiblePhoneCallSchema.parse(value) } } : {}) });
   const provider = options.provider ?? Twilio(config.twilioAccountSid, config.twilioAuthToken, { autoRetry: false, timeout: 15_000 });
   const voiceFactory = options.voiceFactory ?? createBrokerLiveSession;
   const probe = options.probe ?? probeLive;
@@ -87,6 +102,9 @@ export function createBrokerServer(options: BrokerServerOptions) {
   const harkLifecycle = config.harkApiBaseUrl && config.harkCallbackSigningSecret
     ? createHarkLifecycleDelivery({ store, apiBaseUrl: config.harkApiBaseUrl, signingSecret: config.harkCallbackSigningSecret,
       statusSender: options.harkStatusSender, billingSender: options.harkBillingSender }) : undefined;
+  const harkReceipts = createPrimaryHarkReceiptDispatcher({ store,
+    send: options.harkPrimaryReceiptSender ?? createPrimaryHarkReceiptSender({
+      apiBaseUrl: config.apiBaseUrl, phoneServiceSecret: config.phoneServiceSecret }) });
   const active = new Map<string, { stop(reason: string): Promise<void> }>();
   const dialing = new Set<string>();
   const harkDispatching = new Set<string>();
@@ -94,6 +112,9 @@ export function createBrokerServer(options: BrokerServerOptions) {
   const pendingRequests = new Set<Promise<void>>();
   const sessionCalls = new Set<string>();
   const closingBindings = new Map<string, Promise<void>>();
+  // Keep a stopped host until its already-observed source preparation settles.
+  // A restart recovers only the durable captures and reply-read obligations.
+  const selectedHosts = new Map<string, GenerationVoiceSession>();
   let accepting = true;
   const providerFinished = (call: BrokerCall) => call.callSid && call.callAssignment?.origin === 'authenticated_hark_delivery'
     ? Boolean(call.harkJournal?.ended) : terminalCallStatuses.has(call.status);
@@ -101,6 +122,8 @@ export function createBrokerServer(options: BrokerServerOptions) {
   const flushHark = async () => {
     try { await harkLifecycle?.flush(); }
     catch (error) { console.error('[dexter-broker] Hark callback journal unavailable', { code: safeFailure(error).code }); }
+    try { await harkReceipts.flush(); }
+    catch (error) { console.error('[dexter-broker] Hark receipt journal unavailable', { code: safeFailure(error).code }); }
   };
   function observeProviderState(id: string, status: HarkProviderStatus, timing?: HarkEndedTiming): BrokerCall {
     const call = store.get(id)!;
@@ -144,23 +167,51 @@ export function createBrokerServer(options: BrokerServerOptions) {
       // Closing admission first would make an unacknowledged, never-accepted turn
       // impossible to recover. Reconcile the exact journal before closing it.
       const current = store.get(call.id)!;
-      let recovery: ReturnType<typeof createPrimaryBackend> | undefined;
-      if (current.callSid && current.liveSessionId) {
-        recovery = createPrimaryBackend({ callId: current.id, callSid: current.callSid,
-          bindingId, api: primary, store });
-        if (!current.primaryClosed) await recovery.prepareCloseout();
-        const flushed = await recovery.flushPendingCaptures();
-        let pendingCount = flushed.pending;
-        let unsupported = flushed.unsupported;
-        if (current.transcriptCapture?.state === 'pending' && current.transcript) {
-          const captured = await recovery.captureCompletedTurns(current.transcript as LiveTranscriptSnapshot, current.transcriptCapture);
-          pendingCount = captured.pending;
-          unsupported = [...new Set([...unsupported, ...captured.unsupported])];
+      const recoveries: ReturnType<typeof createPrimaryBackend>[] = [];
+      if (current.continuation) {
+        const host = selectedHosts.get(current.id);
+        if (host) {
+          if (!(await host.prepareSelectedCloseout()).ready) return;
+        } else if (current.selectedQuestion || current.selectedQuestionVoice) {
+          if (!options.selectedQuestion) throw new Error('selected_question_recovery_unavailable');
+          const recovery = createSelectedQuestionRecovery({ callId: current.id, store, primary,
+            requests: options.selectedQuestion.requests });
+          if (!(await recovery.prepareCloseout()).ready) return;
         }
-        if (current.transcriptCapture) store.update(call.id, { transcriptCapture: {
-          ...current.transcriptCapture, state: pendingCount ? 'pending' : 'complete', pending: pendingCount, unsupported,
+      }
+      if (current.callSid && current.liveSessionId) {
+        const segments = current.liveGenerations?.segments.filter(segment => segment.sessionId);
+        const sources = segments?.length ? segments.map(segment => ({ sessionId: segment.sessionId!,
+          transcript: segment.transcript, proof: { sessionFinalized: segment.providerFinalized === true && segment.transcriptPersisted === true,
+            // Rotation clears queued output. A socket close never proves a whole assistant turn was heard.
+            assistantPlaybackComplete: false } }))
+          : [{ sessionId: current.liveSessionId, transcript: current.transcript as LiveTranscriptSnapshot | undefined,
+            proof: current.transcriptCapture }];
+        let pendingCount = 0;
+        const unsupported: string[] = [];
+        for (const source of sources) {
+          const recovery = createPrimaryBackend({ callId: current.id, callSid: current.callSid,
+            bindingId, api: primary, store, ...(segments ? { sourceSessionId: source.sessionId } : {}),
+            ...(current.continuation ? { selectedQuestionSources: () => selectedQuestionSourceAnchors(store.get(current.id)!) } : {}) });
+          recoveries.push(recovery);
+          if (!current.primaryClosed) await recovery.prepareCloseout();
+          const flushed = await recovery.flushPendingCaptures();
+          let sourcePending = flushed.pending;
+          unsupported.push(...flushed.unsupported);
+          if (source.transcript && source.proof) {
+            const captured = await recovery.captureCompletedTurns(source.transcript, source.proof);
+            sourcePending = captured.pending;
+            unsupported.push(...captured.unsupported);
+          }
+          pendingCount += sourcePending;
+        }
+        if (current.transcriptCapture || segments) store.update(call.id, { transcriptCapture: {
+          state: pendingCount ? 'pending' : 'complete', pending: pendingCount, unsupported: [...new Set(unsupported)],
+          assistantPlaybackComplete: segments ? false : current.transcriptCapture?.assistantPlaybackComplete ?? false,
+          sessionFinalized: segments ? segments.every(segment => segment.providerFinalized === true)
+            : current.transcriptCapture?.sessionFinalized ?? false,
         } });
-        if (recovery.closeoutPending()) return;
+        if (recoveries.some(recovery => recovery.closeoutPending())) return;
       }
       let closed = store.get(call.id)!.primaryClosed;
       if (!closed) {
@@ -178,18 +229,20 @@ export function createBrokerServer(options: BrokerServerOptions) {
           store.update(call.id, { primaryClosed: closed });
         }
       }
-      if (recovery && (await recovery.reconcileClosedRequests(closed)).pending) return;
+      for (const recovery of recoveries) if ((await recovery.reconcileClosedRequests(closed)).pending) return;
       const captured = store.get(call.id)!.transcriptCapture;
       if (captured) store.update(call.id, { transcriptCapture: { ...captured, state: 'complete', pending: 0,
         unsupported: captured.unsupported.filter(reason => reason !== 'source_admission_unknown') } });
       store.update(call.id, { primaryClosePending: false });
+      selectedHosts.delete(call.id);
     })().catch(error => { store.update(call.id, { failure: safeFailure(error) }); })
       .finally(() => closingBindings.delete(call.id));
     closingBindings.set(call.id, pending);
     return pending;
   }
 
-  async function requestOutbound(input: { requestId: string; purpose: string; to: string; callbackFor?: string; origin?: 'authenticated_broker_control' }): Promise<{ replayed: boolean; call: BrokerCall }> {
+  async function requestOutbound(input: { requestId: string; purpose: string; to: string; callbackFor?: string;
+    origin?: 'authenticated_broker_control'; continuation?: CallContinuation }): Promise<{ replayed: boolean; call: BrokerCall }> {
     const to = input.to;
     if (!accepting || !UUID.test(input.requestId) || !config.allowedTo.includes(to)) throw new Error('call_not_available');
     if (input.callbackFor) {
@@ -197,7 +250,8 @@ export function createBrokerServer(options: BrokerServerOptions) {
       if (!inbound || inbound.direction !== 'inbound' || inbound.number !== to || !terminalCallStatuses.has(inbound.status)
         || inbound.callback?.requestId !== input.requestId || inbound.callback.state !== 'requested') throw new Error('callback_identity_mismatch');
     }
-    const reservation = store.reserve({ requestId: input.requestId, direction: 'outbound', purpose: input.purpose.trim(), number: to }, input.origin);
+    const reservation = store.reserve({ requestId: input.requestId, direction: 'outbound', purpose: input.purpose.trim(), number: to,
+      ...callContinuationPatch(input.continuation) }, input.origin);
     return dialReserved(reservation);
   }
 
@@ -354,6 +408,22 @@ export function createBrokerServer(options: BrokerServerOptions) {
       }
     }
     if (route.startsWith('/internal/broker/')) {
+      // Receipt recovery remains available while new-call admission is stopped.
+      if (request.method === 'GET' && route.startsWith('/internal/broker/call-requests')) {
+        const receiptJson = (status: number, value: unknown) => {
+          response.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'private, no-store' });
+          response.end(JSON.stringify(value));
+        };
+        if (!authorizedControl(request.headers.authorization, config.controlToken))
+          return receiptJson(401, { error: 'unauthorized' });
+        try {
+          const requestId = callRequestIdFromLookupPath(route);
+          return receiptJson(200, readCallRequestReceipt(store, requestId));
+        } catch (error) {
+          const failure = callRequestReceiptFailure(error);
+          return receiptJson(failure.status, failure.body);
+        }
+      }
       if (!authorizedControl(request.headers.authorization, config.controlToken)) return json(response, 401, { error: 'unauthorized' });
       if (request.method === 'GET' && route === '/internal/broker/calls') return json(response, 200, { calls: store.list().slice(0, 50).map(publicCall) });
       if (request.method !== 'POST' || !accepting) return json(response, 405, { error: 'unavailable' });
@@ -363,7 +433,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
         if (typeof input.requestId !== 'string' || !UUID.test(input.requestId)
           || typeof input.purpose !== 'string' || !input.purpose.trim() || input.purpose.length > 1500
           || (input.to !== undefined && !isPhoneNumber(input.to))
-          || Object.keys(input).some(key => !['requestId', 'purpose', 'to'].includes(key))) return json(response, 400, { error: 'invalid_call_request' });
+          || Object.keys(input).some(key => !['requestId', 'purpose', 'to', 'continuation'].includes(key))) return json(response, 400, { error: 'invalid_call_request' });
         const to = input.to as string | undefined ?? (config.allowedTo.length === 1 ? config.allowedTo[0] : undefined);
         if (!to || !config.allowedTo.includes(to)) return json(response, 403, { error: 'recipient_not_authorized' });
         const saved = store.list().find(call => call.requestId === input.requestId);
@@ -372,9 +442,18 @@ export function createBrokerServer(options: BrokerServerOptions) {
         if (!saved && !newPhoneCallControlSchema.safeParse({ assignmentId: input.requestId,
           purpose: input.purpose.trim() }).success) return json(response, 400, { error: 'invalid_call_request' });
         try {
-          const result = await requestOutbound({ requestId: input.requestId, purpose: input.purpose.trim(), to, origin: 'authenticated_broker_control' });
+          const selected = callContinuationPatch(input.continuation);
+          if (saved) assertCallContinuationReplay(saved.continuation, selected.continuation);
+          // Historical receipts require no new admission. New selected calls
+          // need the complete eligible-history and selected-answer composition.
+          if (selected.continuation && !saved && (!options.eligibleContext || !options.selectedQuestion))
+            return json(response, 503, { error: 'call_continuation_unavailable' });
+          const result = await requestOutbound({ requestId: input.requestId, purpose: input.purpose.trim(), to,
+            origin: 'authenticated_broker_control', ...selected });
           return json(response, result.replayed ? 200 : 201, { replayed: result.replayed, call: publicCall(result.call) });
         } catch (error) {
+          if (error instanceof CallContinuationError) return json(response,
+            error.code === 'invalid_call_continuation' ? 400 : 409, { error: error.code });
           if ((error as { code?: string }).code === 'call_already_open') return json(response, 409, { error: 'call_already_open' });
           throw error;
         }
@@ -536,12 +615,13 @@ export function createBrokerServer(options: BrokerServerOptions) {
     let backend: ReturnType<typeof createPrimaryBackend> | undefined;
     let stopping = false;
     let stopPromise: Promise<void> | undefined;
-    let inputBytes = 0;
+    let inputBytes = call.liveGenerations?.inputNextSample ?? 0;
     let lastSpeechAt = 0;
     const receipts = new PlaybackReceipts();
     const metrics = () => ({ receivedAudioBytes: inputBytes, sentAudioBytes: receipts.sentBytes, playedAudioBytes: receipts.playedBytes, clearedAudioBytes: receipts.clearedBytes });
     const startTimer = setTimeout(() => { void stop('media_start_timeout'); }, 8_000);
-    const durationTimer = setTimeout(() => { void stop('duration_limit'); }, config.maxCallSeconds * 1000);
+    const callDeadlineAt = call.liveGenerations?.clocks.callDeadlineAt ?? new Date(Date.now() + config.maxCallSeconds * 1000).toISOString();
+    const durationTimer = setTimeout(() => { void stop('duration_limit'); }, Math.max(0, Date.parse(callDeadlineAt) - Date.now()));
 
     function stop(reason: string): Promise<void> {
       if (stopPromise) return stopPromise;
@@ -599,14 +679,14 @@ export function createBrokerServer(options: BrokerServerOptions) {
           if (call.callAssignment?.origin === 'authenticated_hark_delivery') {
             store.update(call.id, { streamSid });
             store.observeHarkMediaStarted(call.id, new Date().toISOString());
-          } else store.update(call.id, { streamSid, status: 'in-progress', mediaStartedAt: new Date().toISOString() });
-          backend = createPrimaryBackend({ callId: call.id, callSid: call.callSid!, bindingId: call.primary!.bindingId, api: primary, store, watchUntilCallEnds: true, lastCallerSpeechAt: () => lastSpeechAt });
-          live = voiceFactory({ apiKey: config.apiKey, callId: call.id, voice: config.voice,
+          } else store.update(call.id, { streamSid, status: 'in-progress', mediaStartedAt: store.get(call.id)!.mediaStartedAt ?? new Date().toISOString() });
+          if (!options.eligibleContext) backend = createPrimaryBackend({ callId: call.id, callSid: call.callSid!, bindingId: call.primary!.bindingId, api: primary, store, watchUntilCallEnds: true, lastCallerSpeechAt: () => lastSpeechAt });
+          const voiceOptions: BrokerLiveSessionOptions = { apiKey: config.apiKey, callId: call.id, voice: config.voice,
             instructions: brokerInstructions({ direction: call.direction, purpose: call.purpose, registeredAssignment: !!call.callAssignment,
               ...(call.callAssignment?.origin === 'authenticated_hark_delivery' ? { watch: call.callAssignment.value.hark } : {}),
               name: call.primary!.name, context: call.primary!.context }),
             history: brokerHistory({ name: call.primary!.name, context: call.primary!.context }),
-            backend,
+            backend: backend ?? { async delegate() { throw new Error('generation_backend_required'); } },
             onAudio(payload) {
               if (stopping || ws.readyState !== WebSocket.OPEN || !streamSid) return;
               if (ws.bufferedAmount > 256_000 || receipts.pendingCount > 300 || receipts.backlogMs > 6_000) { void stop('audio_backpressure'); return; }
@@ -620,6 +700,10 @@ export function createBrokerServer(options: BrokerServerOptions) {
             },
             onReady({ sessionId }) {
               connectedSessionId = sessionId;
+              // The selected host publishes the exact eligible saved question.
+              // Its operator purpose must never become an automatic new task.
+              if (call.continuation) return;
+              if (options.eligibleContext && store.get(call.id)!.voiceOpening) return;
               store.update(call.id, { liveSessionId: sessionId, voiceOpening: { status: 'pending' } });
               // Live's documented speak-first command runs while phone audio
               // continues. Its receipt confirms context injection, not playback.
@@ -641,7 +725,19 @@ export function createBrokerServer(options: BrokerServerOptions) {
                   sessionId: connectedSessionId }, event.eventId, typeof event.code === 'string' ? event.code : 'provider_error');
               if (event.type === 'live.error') store.update(call.id, { failure: { code: String(event.code || 'live_error'), message: 'The voice connection could not continue' } });
             },
-          });
+          };
+          live = options.eligibleContext ? createGenerationVoice({ call: store.get(call.id)!, callDeadlineAt,
+            apiKey: config.apiKey, voice: config.voice, store, primary, context: options.eligibleContext, voiceFactory,
+            ...(options.selectedQuestion ? { selectedQuestion: options.selectedQuestion } : {}),
+            onAudio: payload => voiceOptions.onAudio(payload, { deliveryId: 'generation_host_audio' }),
+            onReady: voiceOptions.onReady, onClosed: voiceOptions.onClosed,
+            onPlaybackClear: () => voiceOptions.onPlaybackClear?.('application_interrupt'),
+            onProblem(code) { queueMicrotask(() => { if (stopping) return;
+              store.update(call.id, { failure: safeFailure(Object.assign(new Error(code), { code })) });
+              void stop('voice_unavailable');
+            }); },
+          }) : voiceFactory(voiceOptions);
+          if (call.continuation && options.eligibleContext) selectedHosts.set(call.id, live as GenerationVoiceSession);
         } else if (frame.event === 'media') {
           if (!streamSid || frame.streamSid !== streamSid || frame.media?.track !== 'inbound'
               || typeof frame.media.payload !== 'string' || frame.media.payload.length > 32768) throw new Error('invalid_input_audio');
@@ -650,7 +746,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
           if (inputBytes > (config.maxCallSeconds + 10) * 8000) throw new Error('input_duration_exceeded');
           // Twilio timestamps are media positions, not an authorization or a turn boundary.
           if (inputSpeechEnergy(bytes) > 0.012) { lastSpeechAt = Date.now(); backend?.noteCallerSpeech(lastSpeechAt, inputBytes / 8); }
-          live?.appendAudio(frame.media.payload);
+          if (live?.appendAudio(frame.media.payload) === false) void stop('input_audio_refused');
         } else if (frame.event === 'mark' && frame.streamSid === streamSid && typeof frame.mark?.name === 'string') {
           receipts.acknowledge(frame.mark.name);
         } else if (frame.event === 'stop') {
@@ -681,7 +777,11 @@ export function createBrokerServer(options: BrokerServerOptions) {
           }
           continue;
         }
-        if (call.primaryClosePending) await closePrimary(call);
+        // A terminal callback can be durable just before a process stops,
+        // without reaching the first closePrimary write. Recover that exact
+        // selected call after restart, while active media retains its own stop.
+        if (call.primaryClosePending || (call.continuation && call.primary && !call.primaryClosed
+          && providerFinished(call) && !active.has(call.id) && !claimed.has(call.id))) await closePrimary(call);
         if (!call.callSid || (providerFinished(call) && !needsHarkTiming(call)) || active.has(call.id) || claimed.has(call.id)
             || Date.now() - Date.parse(call.createdAt) < 60_000) continue;
         try {

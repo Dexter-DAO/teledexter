@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import OpenAI from 'openai';
 import { LiveWS } from 'openai/resources/live/ws';
 import type { ClientEvent, InitialItem } from 'openai/resources/live/live';
+import { validatePreparedEligibleHistory } from '../broker/eligibleHistory.js';
 import type {
   BrokerLiveConnection, BrokerLiveEvent, BrokerLiveSession, BrokerLiveSessionOptions,
   LiveBackendChannel, LiveBackendUpdate, LiveDelegationRequest, LiveDelivery,
@@ -67,10 +68,12 @@ export function createBrokerLiveSession(options: BrokerLiveSessionOptions): Brok
   if (!options.apiKey?.trim() || !id(options.callId) || !id(voice)
       || typeof options.instructions !== 'string' || !options.instructions.trim()
       || Buffer.byteLength(options.instructions) > 16_384) throw new Error('invalid_live_configuration');
-  const history = options.history ?? [];
+  if (options.eligibleHistory && options.history !== undefined) throw new Error('ambiguous_live_history');
+  const eligible = options.eligibleHistory === undefined ? undefined : validatePreparedEligibleHistory(options.eligibleHistory);
+  const history = eligible?.history ?? options.history ?? [];
   if (history.length > 128 || history.some(h => !['user', 'assistant', 'developer'].includes(h.role)
       || typeof h.text !== 'string')
-      || history.reduce((n, h) => n + Buffer.byteLength(h.text), 0) > 8_000) throw new Error('invalid_live_history');
+      || (!eligible && history.reduce((n, h) => n + Buffer.byteLength(h.text), 0) > 8_000)) throw new Error('invalid_live_history');
   const deadline = (value: number | undefined, fallback: number) => {
     if (value === undefined) return fallback;
     if (!Number.isInteger(value) || value < 1 || value > 120_000) throw new Error('invalid_live_timeout');
@@ -178,7 +181,7 @@ export function createBrokerLiveSession(options: BrokerLiveSessionOptions): Brok
   const start = () => {
     if (started || closing || closed || !transport.isOpen()) return;
     started = true;
-    const input: InitialItem[] = history.map(h => h.role === 'assistant'
+    const input: InitialItem[] = eligible?.initialItems ?? history.map(h => h.role === 'assistant'
       ? { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: h.text }] }
       : { type: 'message', role: h.role, content: [{ type: 'input_text', text: h.text }] });
     send({ type: 'session.start', event_id: commandId(), session: {
@@ -359,6 +362,7 @@ export function createBrokerLiveSession(options: BrokerLiveSessionOptions): Brok
     },
     appendContext: text => append('thinking', text, null),
     appendInstructions: text => append('instructions', text, null),
+    appendCommentary: text => append('commentary', text, null),
     interruptPlayback: instruction => { clearPlayback('application_interrupt'); return append('instructions', instruction, null); },
     resumePlayback: () => { if (!closing && !closed) playbackBlocked = false; },
     getTranscript: () => clone(transcript),

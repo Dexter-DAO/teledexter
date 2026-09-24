@@ -94,6 +94,8 @@ export interface BrokerLiveSessionOptions {
   instructions: string;
   voice?: string;
   history?: Array<{ role: 'user' | 'assistant' | 'developer'; text: string }>;
+  /** Complete, source-validated successor history. Provider startup accepts or refuses its token budget. */
+  eligibleHistory?: import('../broker/eligibleHistory.js').PreparedEligibleHistory;
   backend: BrokerLiveBackend;
   /** Ordered audio deliveries use connection-local IDs, never provider event IDs. */
   onAudio(base64: string, metadata: { deliveryId: string }): void;
@@ -113,6 +115,8 @@ export interface BrokerLiveSession {
   appendAudio(base64: string): boolean;
   appendContext(text: string): Promise<LiveDelivery>;
   appendInstructions(text: string): Promise<LiveDelivery>;
+  /** Unaddressed spoken result publication; never resumes an earlier delegation. */
+  appendCommentary?(text: string): Promise<LiveDelivery>;
   /** Drops queued/new output until the application explicitly resumes playback. */
   interruptPlayback(instruction: string): Promise<LiveDelivery>;
   resumePlayback(): void;

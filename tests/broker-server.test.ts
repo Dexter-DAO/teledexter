@@ -143,6 +143,42 @@ async function preCallAssignmentCases(t: test.TestContext, parser: { safeParse(v
   });
 }
 
+test('unmounted selected-question continuation refuses before reservation or any call operation', async t => {
+  const f = await fixture(t);
+  const response = await f.post('/internal/broker/calls', { requestId: randomUUID(), purpose: 'Continue my saved question.',
+    continuation: { originalRequestId: randomUUID(), questionId: randomUUID(), questionRevision: 1 } });
+  assert.equal(response.status, 503);
+  assert.deepEqual(await response.json(), { error: 'call_continuation_unavailable' });
+  assert.deepEqual(f.broker.store.list(), []);
+  assert.equal(f.calls.readiness, 0); assert.equal(f.calls.preflight, 0);
+  assert.equal(f.calls.create, 0); assert.equal(f.calls.bind, 0);
+});
+
+test('invalid selected-question identity refuses before reservation or dialing', async t => {
+  const f = await fixture(t);
+  for (const continuation of [null, {}, { originalRequestId: randomUUID(), questionId: randomUUID(), questionRevision: 2 },
+    { originalRequestId: randomUUID(), questionId: randomUUID(), questionRevision: 1, purpose: 'Extra authority' }]) {
+    const response = await f.post('/internal/broker/calls', { requestId: randomUUID(), purpose: 'Continue my saved question.', continuation });
+    assert.equal(response.status, 400); await response.text();
+  }
+  assert.deepEqual(f.broker.store.list(), []);
+  assert.equal(f.calls.readiness, 0); assert.equal(f.calls.preflight, 0); assert.equal(f.calls.create, 0);
+});
+
+test('ordinary call replay cannot acquire a saved-question selector', async t => {
+  const f = await fixture(t);
+  const request = { requestId: randomUUID(), purpose: 'Read my portfolio.' };
+  const first = await f.post('/internal/broker/calls', request);
+  assert.equal(first.status, 201); await first.text();
+  const before = f.broker.store.list();
+  const changed = await f.post('/internal/broker/calls', { ...request,
+    continuation: { originalRequestId: randomUUID(), questionId: randomUUID(), questionRevision: 1 } });
+  assert.equal(changed.status, 409);
+  assert.deepEqual(await changed.json(), { error: 'call_continuation_changed' });
+  assert.deepEqual(f.broker.store.list(), before);
+  assert.equal(f.calls.create, 1);
+});
+
 test('new call HTTP admission matches registration before reservation or dialing', async t => {
   await preCallAssignmentCases(t, phoneCallAssignmentSchema);
 });
