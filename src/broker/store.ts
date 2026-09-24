@@ -544,7 +544,7 @@ export class BrokerStore {
     call.outboundObservation = createOutboundObservation(call, providerIdentity);
     let calls = { ...this.state.calls, [id]: call };
     if (call.retryOf) {
-      const prepared = prepareOutboundRetry(this.state.calls, { ...call, retryOf: call.retryOf });
+      const prepared = prepareOutboundRetry<BrokerCall>(this.state.calls, { ...call, retryOf: call.retryOf });
       calls = { ...this.state.calls, [prepared.predecessor.id]: prepared.predecessor, [id]: prepared.child };
     }
     this.persist({ version: 1, calls });
