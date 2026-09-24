@@ -494,8 +494,14 @@ test('selected result retains its original execution and exact association when 
   const response: Parameters<typeof beginSelectedQuestionPublication>[2] = { bindingId, callSid: sid,
     requestId: selected.originalRequestId, version: f.version, deliveryAssociation: association,
     delivery: { state: 'ready', text: 'The earlier comparison is saved.', source: { kind: 'assistant',
-      messageId: uuid(206), eventSequence: '11', provenance: { messageCreatedAt: f.call.createdAt,
+      messageId: uuid(206), eventSequence: '1', provenance: { messageCreatedAt: f.call.createdAt,
         eventId: uuid(207), eventOccurredAt: f.call.createdAt, runId: association.execution.runId } } } };
+  const current = f.read().liveGenerations!;
+  assert.deepEqual(current.deliveryAttachment, { generationId, sessionId: session });
+  assert.deepEqual(response.version, current.segments[0]!.version);
+  assert.equal(response.version.threadEventSequence, '2');
+  assert.ok(response.delivery.state === 'ready');
+  assert.ok(BigInt(response.delivery.source.eventSequence) <= BigInt(response.version.threadEventSequence));
   const identity = { callId: f.call.id, bindingId, callSid: sid, sessionId: session };
   const publication = beginSelectedQuestionPublication(f.store(), identity, response, { id: 'selected_0', kind: 'result',
     speak: true, text: 'The earlier comparison is saved.', expectedCallerRevision: 1 }, f.request.transcript, 0)!;
@@ -506,6 +512,7 @@ test('selected result retains its original execution and exact association when 
   const input = f.input(); input.resolutionInput.references = [{ id: candidate.id, digest: candidate.digest }];
   const record = f.prepare(input), resolver = transport(f, async (_url, init) => {
     const value = JSON.parse(String(init!.body));
+    assert.deepEqual(value.version, response.version);
     assert.equal(value.results[0].deliveryAssociationId, association.id);
     assert.deepEqual(value.results[0].execution, association.execution);
     return Response.json(f.intentResponse(f.read().callerRouting!.records[0]!, { kind: 'task', reference: candidate.reference }));
