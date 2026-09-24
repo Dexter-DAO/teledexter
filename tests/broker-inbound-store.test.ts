@@ -45,6 +45,44 @@ function fixture(t: test.TestContext) {
       return this.send({ type: 'outcome', outcome: bound, observedAt: after(11_000) }); } };
 }
 
+test('inbound API context retains the exact result conversation across restart and rejects changed identities', t => {
+  const f = fixture(t); f.bind();
+  const saved = f.send({ type: 'context', context: f.context, observedAt: after(12_000) });
+  assert.equal(saved.primary?.primaryDexterId, f.context.context.primaryDexterId);
+  assert.equal(saved.primary?.threadId, f.context.context.threadId);
+  const bytes = fs.readFileSync(f.file, 'utf8');
+  assert.deepEqual(f.restart(), saved);
+  assert.equal(fs.readFileSync(f.file, 'utf8'), bytes);
+  for (const field of ['primaryDexterId', 'threadId'] as const) {
+    assert.throws(() => f.send({ type: 'context', observedAt: after(13_000), context: {
+      ...f.context, context: { ...f.context.context, [field]: '66666666-6666-4666-8666-666666666666' },
+    } }), /identity cannot change/);
+    assert.throws(() => f.send({ type: 'context', observedAt: after(13_000), context: {
+      ...f.context, context: { ...f.context.context, [field]: undefined },
+    } as unknown as PrimaryCall }), /Invalid inbound private context/);
+  }
+  assert.equal(fs.readFileSync(f.file, 'utf8'), bytes);
+  assert.throws(() => f.store.recordPrimaryBinding(f.call.id, f.context), /explicit transition/);
+  const repeated = f.send({ type: 'context', context: f.context, observedAt: after(13_000) });
+  assert.deepEqual(repeated.primary, saved.primary);
+});
+
+test('legacy inbound context gains result identifiers only from a verified context transition', t => {
+  const f = fixture(t); f.bind();
+  const saved = f.send({ type: 'context', context: f.context, observedAt: after(12_000) });
+  f.store.close(); delete saved.primary!.primaryDexterId; delete saved.primary!.threadId;
+  const bytes = JSON.stringify({ version: 1, calls: { [saved.id]: saved } }, null, 2) + '\n';
+  fs.writeFileSync(f.file, bytes);
+  assert.deepEqual(f.restart(), saved);
+  assert.equal(fs.readFileSync(f.file, 'utf8'), bytes);
+  assert.throws(() => f.store.update(f.call.id, { primary: { ...saved.primary!,
+    primaryDexterId: f.context.context.primaryDexterId, threadId: f.context.context.threadId } }), /explicit transition/);
+  assert.equal(fs.readFileSync(f.file, 'utf8'), bytes);
+  const enriched = f.send({ type: 'context', context: f.context, observedAt: after(13_000) });
+  assert.equal(enriched.primary?.primaryDexterId, f.context.context.primaryDexterId);
+  assert.equal(enriched.primary?.threadId, f.context.context.threadId);
+});
+
 test('reservation atomically preserves original proof, original request hash, caller and fixed budgets', t => {
   const f = fixture(t); const saved = f.call;
   assert.equal(saved.requestId, input.requestId); assert.equal(saved.number, proof.params.From);
@@ -202,7 +240,8 @@ for (const field of ['attachmentId', 'bindingId', 'callSid', 'beginRef', 'approv
 test('valid context attaches only the exact bound open call and preserves existing capture state on closure', t => {
   const f = fixture(t); f.bind();
   const bound = f.send({ type: 'context', context: f.context, observedAt: after(12_000) });
-  assert.deepEqual(bound.primary, { bindingId, name: 'Dexter', context: 'user: Previous conversation' });
+  assert.deepEqual(bound.primary, { bindingId, name: 'Dexter', context: 'user: Previous conversation',
+    primaryDexterId: f.context.context.primaryDexterId, threadId: f.context.context.threadId });
   f.store.update(f.call.id, { primaryClosePending: true, transcriptCapture: { state: 'pending', pending: 1,
     unsupported: ['capture_outcome_unknown'], sessionFinalized: false, assistantPlaybackComplete: false } });
   const closed = f.send({ type: 'closure', receipt: f.closure });

@@ -12,6 +12,7 @@ import { bindDurableFileParent, durablyReplaceJsonFile, type DurableParentBindin
 import { assertInboundMediaStart, createInboundJournal, inboundRequestId, reduceInboundJournal, validateInboundJournal,
   type InboundJournal, type InboundJournalEvent, type InboundWaitPolicy } from './inboundJournal.js';
 import type { InboundBeginIdentity } from './inboundContract.js';
+import type { PrimaryCall } from './primaryApi.js';
 
 export type CallStatus = 'prepared' | 'dialing' | 'queued' | 'ringing' | 'in-progress' | 'completed' | 'busy' | 'no-answer' | 'canceled' | 'failed' | 'unknown';
 export const terminalCallStatuses = new Set<CallStatus>(['completed', 'busy', 'no-answer', 'canceled', 'failed']);
@@ -29,7 +30,8 @@ export interface BrokerCall {
   number: string; callSid?: string; streamSid?: string; status: CallStatus;
   createdAt: string; updatedAt: string; endedAt?: string;
   callAssignment?: BrokerCallAssignment;
-  primary?: { bindingId: string; name: string | null; context: string; callAssignmentRef?: PhoneCallAssignmentRef };
+  primary?: { bindingId: string; name: string | null; context: string; callAssignmentRef?: PhoneCallAssignmentRef;
+    primaryDexterId?: string; threadId?: string };
   liveSessionId?: string; transcript?: unknown; transcriptRevision?: number;
   mediaStartedAt?: string;
   harkJournal?: HarkJournal;
@@ -96,6 +98,25 @@ function validateAssignment(call: BrokerCall): void {
   if (assignment && call.primary && !reference) throw new Error('Call assignment reference missing');
 }
 
+const primaryResultId = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+function validatePrimaryIdentity(call: BrokerCall): void {
+  const primary = call.primary;
+  // Old journals lack both IDs. Reading them must not manufacture or persist IDs.
+  if (primary?.primaryDexterId === undefined && primary?.threadId === undefined) return;
+  if (!primaryResultId.safeParse(primary?.primaryDexterId).success || !primaryResultId.safeParse(primary?.threadId).success)
+    throw new Error('Invalid Primary result identity');
+}
+
+function assertPrimaryIdentityUnchanged(previous: BrokerCall, next: BrokerCall): void {
+  if (!previous.primary) return;
+  if (next.primary?.bindingId !== previous.primary.bindingId)
+    throw new Error('Primary binding cannot change');
+  for (const field of ['primaryDexterId', 'threadId'] as const) {
+    if (previous.primary[field] !== undefined && next.primary?.[field] !== previous.primary[field])
+      throw new Error('Primary result identity cannot change');
+  }
+}
+
 interface State { version: 1; calls: Record<string, BrokerCall> }
 
 /** One process owns call admission. Provider dispatch always follows a durable state write. */
@@ -127,6 +148,7 @@ export class BrokerStore {
       for (const [id, call] of Object.entries(this.state.calls)) {
         if (call.id !== id || !call.requestId || !call.number || !call.createdAt || !call.delegations) throw new Error('Invalid broker call record');
         validateAssignment(call);
+        validatePrimaryIdentity(call);
         validateHarkJournal(call);
         validateHarkDispatch(call);
         validateInboundJournal(call);
@@ -274,6 +296,28 @@ export class BrokerStore {
       harkDispatch: { ...previous.harkDispatch, state: 'provider_accepted', providerAcceptedAt: observedAt } });
   }
 
+  /** The IDs come from the authenticated API binding response, never caller input. */
+  recordPrimaryBinding(id: string, response: PrimaryCall): BrokerCall {
+    const previous = this.state.calls[id];
+    if (!previous) throw new Error('Unknown broker call');
+    if (previous.inbound) throw new Error('Inbound context requires an explicit transition');
+    const binding = structuredClone(response);
+    if (!previous.callSid || binding.callSid !== previous.callSid || binding.state !== 'open' || previous.primaryClosed)
+      throw new Error('Primary call identity mismatch');
+    const context = binding.context;
+    if (!context || !primaryResultId.safeParse(context.primaryDexterId).success || !primaryResultId.safeParse(context.threadId).success
+        || typeof context.displayName !== 'string' || !Array.isArray(context.messages)
+        || context.messages.some(message => !['user', 'assistant'].includes(message.role) || typeof message.text !== 'string'))
+      throw new Error('Invalid Primary binding context');
+    if (previous.primary?.callAssignmentRef && !sameCallAssignmentRef(previous.primary.callAssignmentRef, binding.callAssignmentRef))
+      throw new Error('Call assignment reference cannot change');
+    return this.saveHarkCall({ ...previous, updatedAt: new Date().toISOString(), primary: {
+      bindingId: binding.bindingId, primaryDexterId: context.primaryDexterId, threadId: context.threadId,
+      name: context.displayName, context: context.messages.map(message => `${message.role}: ${message.text}`).join('\n').slice(-8_000),
+      ...(binding.callAssignmentRef === undefined ? {} : { callAssignmentRef: binding.callAssignmentRef }),
+    } });
+  }
+
   update(id: string, patch: Partial<Omit<BrokerCall, 'id' | 'requestId' | 'number' | 'direction' | 'purpose' | 'createdAt' | 'callAssignment' | 'harkJournal' | 'harkDispatch' | 'inbound'>>): BrokerCall {
     const previous = this.state.calls[id];
     if (!previous) throw new Error('Unknown broker call');
@@ -308,13 +352,17 @@ export class BrokerStore {
       delete (nextPatch as Partial<BrokerCall>).inbound;
     }
     if (Object.prototype.hasOwnProperty.call(nextPatch, 'primary')) {
+      nextPatch.primary = nextPatch.primary && structuredClone(nextPatch.primary);
       if (previous.inbound && canonicalJson(nextPatch.primary) !== canonicalJson(previous.primary))
         throw new Error('Inbound context requires an explicit transition');
       if (previous.callAssignment && previous.primary && nextPatch.primary?.bindingId !== previous.primary.bindingId)
         throw new Error('Assigned Primary binding cannot change');
       if (previous.primary?.callAssignmentRef && !sameCallAssignmentRef(previous.primary.callAssignmentRef, nextPatch.primary?.callAssignmentRef))
         throw new Error('Call assignment reference cannot change');
-      nextPatch.primary = nextPatch.primary && structuredClone(nextPatch.primary);
+      for (const field of ['primaryDexterId', 'threadId'] as const) {
+        if (nextPatch.primary?.[field] !== previous.primary?.[field])
+          throw new Error('Primary result identity requires an API binding response');
+      }
     }
     if (Object.prototype.hasOwnProperty.call(nextPatch, 'primaryClosed')) {
       const closed = nextPatch.primaryClosed;
@@ -336,6 +384,8 @@ export class BrokerStore {
     if (nextPatch.status && (terminalCallStatuses.has(previous.status) || (previous.status !== 'unknown' && ((rank[nextPatch.status] ?? 9) < (rank[previous.status] ?? -1))))) delete nextPatch.status;
     if (nextPatch.transcriptRevision !== undefined && nextPatch.transcriptRevision < (previous.transcriptRevision ?? 0)) { delete nextPatch.transcript; delete nextPatch.transcriptRevision; }
     const call: BrokerCall = { ...previous, ...nextPatch, updatedAt: new Date().toISOString() };
+    assertPrimaryIdentityUnchanged(previous, call);
+    validatePrimaryIdentity(call);
     validateAssignment(call);
     validateHarkJournal(call);
     validateHarkDispatch(call);
@@ -345,6 +395,9 @@ export class BrokerStore {
   }
 
   private saveHarkCall(call: BrokerCall): BrokerCall {
+    const previous = this.state.calls[call.id];
+    if (previous) assertPrimaryIdentityUnchanged(previous, call);
+    validatePrimaryIdentity(call);
     validateAssignment(call);
     validateHarkJournal(call);
     validateHarkDispatch(call);

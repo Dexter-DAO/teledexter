@@ -28,6 +28,8 @@ async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; 
   const callbackSid = 'CA' + '4'.repeat(32);
   let inboundStatus = 'in-progress';
   const bindingId = randomUUID();
+  const primaryDexterId = randomUUID();
+  const threadId = randomUUID();
   const calls = { create: 0, update: 0, preflight: 0, readiness: 0, bind: 0, close: 0, audio: 0, fetch: 0 };
   let voiceOptions: BrokerLiveSessionOptions | undefined;
   let readyVoice: (() => void) | undefined;
@@ -41,7 +43,7 @@ async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; 
       if (overrides.assignmentParser) assert.deepEqual(overrides.assignmentParser.parse(assignment), assignment);
       assert.equal(broker.store.bySid(sid)?.voiceOpening, undefined);
       return { bindingId, callSid: sid, state: 'open',
-        ...(assignment && overrides.assignmentResponse !== 'missing' ? { callAssignmentRef: { assignmentId: overrides.assignmentResponse === 'wrong' ? randomUUID() : assignment.assignmentId, revision: 1, digest: 'a'.repeat(64) } } : {}), context: { primaryDexterId: randomUUID(), threadId: randomUUID(), displayName: 'Branch', messages: overrides.history ?? [] } };
+        ...(assignment && overrides.assignmentResponse !== 'missing' ? { callAssignmentRef: { assignmentId: overrides.assignmentResponse === 'wrong' ? randomUUID() : assignment.assignmentId, revision: 1, digest: 'a'.repeat(64) } } : {}), context: { primaryDexterId, threadId, displayName: 'Branch', messages: overrides.history ?? [] } };
     },
     async close() { calls.close++; return { bindingId, callSid: sid, state: 'closed' }; },
   } as unknown as PrimaryApiClient;
@@ -89,7 +91,7 @@ async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; 
   const webhook = (route: string, params: Record<string, string>, valid = true) => fetch(base + route, {
     method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-twilio-signature': valid ? Twilio.getExpectedTwilioSignature(config.twilioAuthToken, config.publicOrigin + route, params) : 'bad' }, body: new URLSearchParams(params),
   });
-  return { broker, config, calls, sid, bindingId, base, post, webhook, voiceOptions: () => voiceOptions,
+  return { broker, config, calls, sid, bindingId, primaryDexterId, threadId, base, post, webhook, voiceOptions: () => voiceOptions,
     readyVoice: () => { assert.ok(readyVoice); readyVoice(); }, openingCommands,
     setInboundStatus: (status: string) => { inboundStatus = status; } };
 }
@@ -264,6 +266,8 @@ test('signed outbound answer preserves the repair brief and speaks its role-awar
   assert.deepEqual(call.callAssignment, { origin: 'authenticated_broker_control', value: { assignmentId: call.requestId, brokerCallId: call.id, revision: 1, purpose } });
   assert.equal(f.broker.store.get(call.id)!.primary!.callAssignmentRef!.assignmentId, call.requestId);
   assert.equal(f.broker.store.get(call.id)!.primary!.bindingId, f.bindingId);
+  assert.equal(f.broker.store.get(call.id)!.primary!.primaryDexterId, f.primaryDexterId);
+  assert.equal(f.broker.store.get(call.id)!.primary!.threadId, f.threadId);
   assert.equal(f.broker.store.get(call.id)!.voiceOpening!.status, 'accepted');
   // Exercise the actual openCall -> persisted context -> Live options path.
   // A voiceFactory fixture cannot establish how the model will speak these facts.

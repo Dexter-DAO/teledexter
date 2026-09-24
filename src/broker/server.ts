@@ -271,10 +271,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
   async function bind(call: BrokerCall, proof: ProviderCallProof): Promise<BrokerCall> {
     const binding = await primary.openCall(proof, call.callAssignment?.value);
     if (binding.callSid !== call.callSid || binding.state !== 'open') throw new Error('primary_call_identity_mismatch');
-    const context = binding.context;
-    const text = context.messages.map(message => `${message.role}: ${message.text}`).join('\n');
-    return store.update(call.id, { primary: { bindingId: binding.bindingId, name: context.displayName, context: text.slice(-8_000),
-      ...(binding.callAssignmentRef === undefined ? {} : { callAssignmentRef: binding.callAssignmentRef }) } });
+    return store.recordPrimaryBinding(call.id, binding);
   }
 
   async function endWaitingCall(call: BrokerCall): Promise<void> {

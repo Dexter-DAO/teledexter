@@ -33,6 +33,7 @@ export type InboundJournalEvent =
   | { type: 'context'; context: PrimaryCall; observedAt?: string };
 
 const time = z.string().datetime({ offset: true });
+const primaryResultId = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
 export const inboundWaitPolicySchema = z.object({ version: z.literal(1),
   waitMs: z.number().int().safe().positive(), mediaGraceMs: z.number().int().safe().positive() }).strict();
 const journalSchema = z.object({
@@ -195,15 +196,17 @@ export function reduceInboundJournal(call: BrokerCall, event: InboundJournalEven
     journal.remote = { ...journal.remote!, state: 'bound', callState: 'closed' } as RecoverInboundResult;
     next.primaryClosed = { bindingId: receipt.bindingId, callSid: receipt.callSid, state: 'closed' };
   } else if (event.type === 'context') {
-    const context = event.context;
+    const context = structuredClone(event.context);
     if (stopped() || next.primaryClosed || journal.remote?.state !== 'bound' || journal.remote.callState !== 'open'
         || context.state !== 'open' || context.bindingId !== journal.remote.bindingId || context.callSid !== next.callSid
         || context.callAssignmentRef || !journal.mediaStartBy || Date.parse(at) >= Date.parse(journal.mediaStartBy))
       throw new Error('Inbound private context unavailable');
-    if (!context.context || typeof context.context.displayName !== 'string' || !Array.isArray(context.context.messages)
+    if (!context.context || !primaryResultId.safeParse(context.context.primaryDexterId).success || !primaryResultId.safeParse(context.context.threadId).success
+        || typeof context.context.displayName !== 'string' || !Array.isArray(context.context.messages)
         || context.context.messages.some(message => !['user', 'assistant'].includes(message.role) || typeof message.text !== 'string'))
       throw new Error('Invalid inbound private context');
     next.primary = { bindingId: context.bindingId, name: context.context.displayName,
+      primaryDexterId: context.context.primaryDexterId, threadId: context.context.threadId,
       context: context.context.messages.map(message => `${message.role}: ${message.text}`).join('\n').slice(-8_000) };
   } else throw new Error('Unknown inbound journal transition');
   validateInboundJournal(next);
