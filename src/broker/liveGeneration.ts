@@ -436,6 +436,7 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
           throw new LiveGenerationError('publication_generation_changed');
         return result;
       });
+    },
     appendAudio(frame: GenerationInputAudio): 'sent' | 'buffered' | 'refused' {
       if (stopped || now() >= Date.parse(clocks.callDeadlineAt)) { problem('input_after_call_deadline'); return 'refused'; }
       if (inputBlocked) return 'refused';
