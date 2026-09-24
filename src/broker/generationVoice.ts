@@ -1,11 +1,16 @@
-import { createPrimaryBackend, liveResultChunks, type BrokerDelegationRecord, type PrimaryBackend } from './backend.js';
+import { createPrimaryBackend, liveResultChunks, withCallerAdmission, type BrokerDelegationRecord, type PrimaryBackend } from './backend.js';
 import { createLiveGenerationController, LIVE_GENERATION_STARTUP_MS, type GenerationHandle, type GenerationPublication, type LiveGenerationAttachment } from './liveGeneration.js';
 import { prepareEligibleHistory } from './eligibleHistory.js';
-import { eligibleAssociatedDeliveryResponseSchema, type EligibleContextClient, type EligibleContextBinding } from './eligibleContext.js';
+import { eligibleAssociatedDeliveryResponseSchema, eligibleDeliveryResponseSchema,
+  type EligibleContextClient, type EligibleContextBinding } from './eligibleContext.js';
 import type { PrimaryApiClient } from './primaryApi.js';
 import { terminalCallStatuses, type BrokerCall, type BrokerStore } from './store.js';
 import { beginBrokerPublication, beginSelectedQuestionPublication, selectedQuestionPublicationReceiptsAccepted,
-  settleBrokerPublication, rejectBrokerPublication, brokerPublicationReceiptsAccepted, type BrokerPublicationReceipt } from './publications.js';
+  settleBrokerPublication, rejectBrokerPublication, brokerPublicationReceiptsAccepted,
+  callerIntentResultPublicationCandidates, type OrdinaryPublicationEvidence, type BrokerPublicationReceipt } from './publications.js';
+import { callerRouteRef, callerRouteSources } from './callerRouting.js';
+import { createMixedWorkRouter, type CallerIntentPort } from './mixedWork.js';
+import { acknowledgedTurn } from './reconciliation.js';
 import { requestDeliveryRequestForContinuation, validateCallContinuation } from './callContinuation.js';
 import type { SelectedQuestionAssociationClient, SelectedQuestionSeed } from './selectedQuestion.js';
 import type { RequestDeliveryClient } from './requestDelivery.js';
@@ -29,6 +34,9 @@ export interface GenerationVoiceOptions {
     requests: RequestDeliveryClient;
     pollIntervalMs?: number;
   };
+  /** Internal source composition only until the shared Primary intent adapter
+   * and its exact policy/wire are qualified. Absence preserves old behavior. */
+  callerIntent?: CallerIntentPort;
   voiceFactory(options: BrokerLiveSessionOptions): BrokerLiveSession;
   onAudio(payload: string): void;
   onReady(value: { callId: string; sessionId: string }): void;
@@ -44,6 +52,10 @@ export interface GenerationVoiceSession extends BrokerLiveSession {
 const selectedInstructions = `You are Dexter, the caller's continuing agent, speaking by telephone. This call continues a saved question from earlier work. Wait for the exact question supplied during this call, then present its wording, context, proposed answer, and yes/no meanings faithfully. Keep technical identifiers internal.
 Listen for the caller's answer and delegate that answer so it stays attached to the saved question. Greetings and acknowledgments stay conversational. This call's purpose is background information and supplies no new assignment or permission. For a different task, explain that this call is continuing the saved question and the caller can open Dexter to start other work.
 Yield when interrupted. Keep the caller's words intact. State an answer's outcome only when the saved request returns it. Prior conversation supports recall; balances, prices, holdings, and permissions in that history remain earlier observations.`;
+
+const mixedSelectedInstructions = `You are Dexter, the caller's continuing agent, speaking by telephone. This call starts with a saved question from earlier work. Present the supplied question and its meanings accurately. You can also help with new research and account requests during this call.
+Delegate each completed instruction in the caller's own words. Keep greetings and acknowledgments conversational. If the caller's intended task or answer is unclear, ask a short question. A request for different work leaves the saved question pending. Explain results using the account evidence returned for that request, with the useful answer first.
+Yield when interrupted. This call's opening supplies context; it grants no new financial authority. Prior balances and prices remain earlier observations until fetched again.`;
 
 const emptyTranscript = (): LiveTranscriptSnapshot => ({ revision: 0, callerRevision: 0, fragments: [] });
 
@@ -72,6 +84,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
   let closing: Promise<LiveSessionClosed> | undefined;
   let finalResult: LiveSessionClosed | undefined;
   let selected: ReturnType<typeof createSelectedQuestionVoiceAdapter> | undefined;
+  let mixed: ReturnType<typeof createMixedWorkRouter> | undefined;
   let selectedTimer: ReturnType<typeof setTimeout> | undefined;
   let selectedClosing = false;
   let selectedTerminalDelivered = false;
@@ -89,13 +102,14 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
   const selectedNotice = async (state: 'failed' | 'cancelled' | 'unconfirmed') => {
     if (!selectedActive() || selectedNotices.has(state)) return;
     selectedNotices.add(state);
-    const attachment = await controller.beforeReuse();
-    if (!selectedActive()) return;
-    const session = sessions.get(attachment.sessionId);
-    if (!session?.voice.appendCommentary) return;
-    const result = await session.voice.appendCommentary(state === 'failed' ? 'I could not get an answer to that request.'
-      : state === 'cancelled' ? 'The request was cancelled.' : 'I could not check the saved request yet.');
-    if (state !== 'unconfirmed' && result.status === 'accepted') selectedTerminalDelivered = true;
+    await controller.withCurrentAttachment(async attachment => {
+      if (!selectedActive()) return;
+      const session = sessions.get(attachment.sessionId);
+      if (!session?.voice.appendCommentary) return;
+      const result = await session.voice.appendCommentary(state === 'failed' ? 'I could not get an answer to that request.'
+        : state === 'cancelled' ? 'The request was cancelled.' : 'I could not check the saved request yet.');
+      if (state !== 'unconfirmed' && result.status === 'accepted') selectedTerminalDelivered = true;
+    });
   };
 
   const publishSelected = async (result: Parameters<GenerationHandle['publish']>[0], attachment: LiveGenerationAttachment): Promise<GenerationPublication> => {
@@ -107,7 +121,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
     const interrupted = (): LiveDelivery['status'] | undefined => !selectedActive() ? 'closed'
       : controller.snapshot().deliveryAttachment?.generationId !== attachment.generationId
         || session.voice.getTranscript().callerRevision !== start.callerRevision || lastSpeechAt !== spokenAt
-        || ('question' in result.delivery && Boolean(selected?.pendingSourceCount())) ? 'stale' : undefined;
+        || ('question' in result.delivery && Boolean(selected?.pendingSourceCount() || mixed?.pendingSourceCount())) ? 'stale' : undefined;
     let chunks: string[];
     try { chunks = liveResultChunks(result.delivery.text); }
     catch {
@@ -156,7 +170,8 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
   };
 
   const publishText = async (entry: BrokerDelegationRecord, attachment: LiveGenerationAttachment,
-    text: string, kind: 'progress' | 'result', updateId: string): Promise<GenerationPublication> => {
+    text: string, kind: 'progress' | 'result', updateId: string,
+    evidence?: OrdinaryPublicationEvidence['response']): Promise<GenerationPublication> => {
     const session = sessions.get(attachment.sessionId);
     if (!session?.voice.appendCommentary) throw new Error('commentary_transport_unavailable');
     const start = session.voice.getTranscript();
@@ -193,7 +208,8 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
         expectedCallerRevision: start.callerRevision };
       const identity = { callId: initialCall.id, callSid: binding.callSid, bindingId: binding.bindingId,
         sessionId: attachment.sessionId, ...(entry.sessionId !== attachment.sessionId ? { sourceSessionId: entry.sessionId } : {}) };
-      const intent = beginBrokerPublication(options.store, identity, entry.requestId, update, snapshot);
+      const intent = beginBrokerPublication(options.store, identity, entry.requestId, update, snapshot,
+        evidence ? { response: evidence, chunkIndex: index } : undefined);
       // Unknown submissions lack a confirmed run. Their fixed local status carries no related-request authority.
       if (intent && !intent.created) receipt = intent.record.outcome
         ? { eventId: intent.record.outcome.eventId, status: intent.record.outcome.status,
@@ -230,10 +246,11 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
       delivery = outcome.publication ?? { eventId: '', status: 'unconfirmed', reason: outcome.response.delivery.state === 'unavailable'
         ? outcome.response.delivery.reason : 'publication_unconfirmed' };
     } else {
-      attachment = await controller.beforeReuse();
       const text = update?.text ?? (entry.status === 'failed' ? 'I could not get an answer to that request.'
         : entry.status === 'cancelled' ? 'The request was cancelled.' : 'I am checking the saved request status.');
-      delivery = await publishText(entry, attachment, text, update?.kind ?? 'result', update?.id ?? `${entry.requestId}_${entry.status}`);
+      const published = await controller.withCurrentAttachment(async currentAttachment => ({ attachment: currentAttachment,
+        delivery: await publishText(entry, currentAttachment, text, update?.kind ?? 'result', update?.id ?? `${entry.requestId}_${entry.status}`) }));
+      attachment = published.attachment; delivery = published.delivery;
     }
     const segment = controller.snapshot().segments.find(value => value.generationId === attachment.generationId)!;
     return { delivery, publicationReceipts: delivery.publicationReceipts, sessionId: attachment.sessionId, snapshot: sessions.get(attachment.sessionId)?.voice.getTranscript(),
@@ -296,7 +313,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
         try {
           voice = options.voiceFactory({ apiKey: options.apiKey, callId: initialCall.id, voice: options.voice,
             eligibleHistory: prepared,
-            instructions: continuation ? selectedInstructions : brokerInstructions({ direction: initialCall.direction, purpose: initialCall.purpose,
+            instructions: continuation ? (options.callerIntent ? mixedSelectedInstructions : selectedInstructions) : brokerInstructions({ direction: initialCall.direction, purpose: initialCall.purpose,
               registeredAssignment: input.allowOpening && !initialCall.voiceOpening && Boolean(initialCall.callAssignment),
               ...(initialCall.callAssignment?.origin === 'authenticated_hark_delivery' ? { watch: initialCall.callAssignment.value.hark } : {}),
               name: input.context.context.displayName }),
@@ -310,7 +327,8 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
               try {
                 if (continuation) {
                   if (!selected || !selectedActive()) throw new Error('selected_question_not_ready');
-                  await selected.delegate(request, channel);
+                  if (mixed) await mixed.delegate(request, channel);
+                  else await selected.delegate(request, channel);
                 } else await backend.delegate(request, channel);
               }
               finally { pending.get(request)?.resolve(); pending.delete(request); }
@@ -330,10 +348,21 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
               sessionId = value.sessionId;
               backend = createPrimaryBackend({ callId: initialCall.id, callSid: binding.callSid, bindingId: binding.bindingId,
                 api: options.primary, store: options.store, sourceSessionId: sessionId, watchUntilCallEnds: true,
-                admissionSettled(request) { pending.get(request)?.resolve(); pending.delete(request); },
+                admissionSettled(request) { pending.get(request)?.resolve(); pending.delete(request); mixed?.admissionSettled(request); },
                 lastCallerSpeechAt: () => sourceSpeechAt,
-                ...(continuation ? { selectedQuestionSources: () => selectedQuestionSourceAnchors(call()) }
-                  : { observation: { signal: observer.signal, publish } }) });
+                ...(continuation ? { selectedQuestionSources: () => selectedQuestionSourceAnchors(call()) } : {}),
+                ...(continuation && options.callerIntent ? { callerRouteSources: () => callerRouteSources(call()) } : {}),
+                callerRouteCaptureAccepted(sourceId, receipt) {
+                  const route = call().callerRouting?.records.find(value => value.frozen.turn.sourceEventId === sourceId);
+                  if (route) options.store.captureCallerRoute(initialCall.id, callerRouteRef(route), receipt);
+                },
+                resolveCallerTaskReference(route) {
+                  if (route.decision?.kind !== 'task' || !route.decision.contextReference) return;
+                  const ref = route.decision.contextReference;
+                  return callerIntentResultPublicationCandidates(call(), route.frozen.sessionId)
+                    .find(candidate => candidate.id === ref.id && candidate.digest === ref.digest)?.reference;
+                },
+                observation: { signal: observer.signal, publish } });
               const record = { voice, backend, firstSample: undefined as number | undefined };
               sessions.set(sessionId, record);
               ready = true; clearTimeout(startTimer); input.signal.removeEventListener('abort', cancelStart);
@@ -351,15 +380,25 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
                 async publish(result) {
                   const attachment = controller.snapshot().deliveryAttachment;
                   if (!attachment || attachment.sessionId !== sessionId) return closedDelivery();
-                  if (continuation) return publishSelected(result, attachment);
                   const entries = Object.values(call().delegations) as BrokerDelegationRecord[];
                   const entry = entries.find(value => value.requestId === result.requestId || (value.reconciliation?.outcome === 'admitted'
                     && value.reconciliation.canonicalRequestId === result.requestId));
+                  if (result.deliveryAssociation !== undefined) {
+                    if (!continuation || entry
+                      || result.requestId !== continuation.originalRequestId
+                      || result.deliveryAssociation.execution.requestId !== result.requestId)
+                      throw new Error('generation_result_ownership_conflict');
+                    return publishSelected(result, attachment);
+                  }
                   if (!entry) throw new Error('generation_result_request_unknown');
                   if ('question' in result.delivery && (entry.currentQuestionId !== result.delivery.question.id
                     || entry.questions?.[result.delivery.question.id]?.question.runId !== result.delivery.question.runId))
                     throw new Error('generation_question_identity_changed');
-                  return publishText(entry, attachment, result.delivery.text, 'result', `${entry.requestId}_${result.delivery.source.messageId}`);
+                  const evidence = result.delivery.source.kind === 'assistant'
+                    ? eligibleDeliveryResponseSchema.parse({ bindingId: binding.bindingId, callSid: binding.callSid,
+                      requestId: result.requestId, version: result.version, delivery: result.delivery }) : undefined;
+                  return publishText(entry, attachment, result.delivery.text, 'result',
+                    `${entry.requestId}_${result.delivery.source.messageId}`, evidence);
                 },
                 close(reason) { backend!.persistAcousticEvidence(); return voice.close(reason); },
               });
@@ -403,7 +442,14 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
       loadVoiceEvidence: () => call().selectedQuestionVoice,
       persistVoiceEvidence: value => { options.store.recordSelectedQuestionVoice(saved.id, value); },
       active: selectedActive, association: options.selectedQuestion.association, requests: options.selectedQuestion.requests,
-      capture: (bindingId, turn) => options.primary.captureTurn(bindingId, turn),
+      async capture(bindingId, turn) {
+        const route = call().callerRouting?.records.find(value => value.frozen.turn.sourceEventId === turn.sourceEventId);
+        if (route?.capture) return acknowledgedTurn(bindingId, turn, route.capture);
+        const receipt = await options.primary.captureTurn(bindingId, turn);
+        if (route) options.store.captureCallerRoute(initialCall.id, callerRouteRef(route), receipt);
+        return receipt;
+      },
+      withCallerAdmission: operation => withCallerAdmission(options.store, initialCall.id, operation),
       freezer: { async freeze(request, channel, usedSourceIds) {
         const source = sessions.get(request.sessionId);
         if (!source) throw new Error('selected_question_source_missing');
@@ -413,6 +459,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
         const generation = controller.snapshot().segments.find(segment => segment.sessionId === request.sessionId);
         const pending = generation ? admissions.get(generation.generationId) : undefined;
         pending?.get(request)?.resolve(); pending?.delete(request);
+        mixed?.admissionSettled(request);
       },
       async deliver(journal, target) {
         const outcome = await controller.deliver(journal.request.originalRequestId, target, journal);
@@ -434,7 +481,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
       if (!selectedActive() || !selected) return;
       try {
         if (first) await selected.host.start();
-        else if (selected.pendingSourceCount() === 0) {
+        else if (selected.pendingSourceCount() === 0 && !mixed?.pendingSourceCount()) {
           const result = await selected.host.poll();
           if (result.state === 'failed' || result.state === 'cancelled') await selectedNotice(result.state);
         }
@@ -453,9 +500,51 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
   };
 
   const stopSelected = () => {
+    mixed?.stop();
     selectedClosing = true; clearTimeout(selectedTimer); selectedTimer = undefined;
     selected?.stop();
   };
+
+  if (continuation && options.callerIntent) mixed = createMixedWorkRouter({ callId: initialCall.id,
+    store: options.store, intent: options.callerIntent, capture: options.primary,
+    active: sessionId => selectedActive() && controller.snapshot().deliveryAttachment?.sessionId === sessionId,
+    freezer: { freeze(request, channel, used) {
+      const backend = sessions.get(request.sessionId)?.backend;
+      if (!backend) throw new Error('caller_route_source_missing');
+      return backend.freezeCallerTurn(request, channel, used);
+    } },
+    resolutionInput(request) {
+      const segment = controller.snapshot().segments.find(value => value.sessionId === request.sessionId);
+      const backend = sessions.get(request.sessionId)?.backend;
+      if (!segment || !backend) throw new Error('caller_route_source_missing');
+      return { version: segment.version,
+        publicationSequence: call().publications?.records.at(-1)?.publicationSequence ?? 0,
+        questions: [...backend.questionTargets(request.sessionId), ...(selected?.questionTargets(request.sessionId) ?? [])],
+        references: callerIntentResultPublicationCandidates(call(), request.sessionId).map(({ id, digest }) => ({ id, digest })) };
+    },
+    async admit(request, ref, decision, channel) {
+      const backend = sessions.get(request.sessionId)?.backend;
+      if (!backend) throw new Error('caller_route_source_missing');
+      if (decision.kind === 'task') await backend.delegateFrozenTask(request, ref, channel);
+      else if (decision.kind === 'answer' && decision.target.kind === 'ordinary') await backend.answerFrozenQuestion(request, ref, channel);
+      else if (decision.kind === 'answer' && selected) await selected.answerFrozen(request, ref, channel);
+      else throw new Error('caller_route_admission_unavailable');
+    },
+    async clarify(request, reason) {
+      await controller.withCurrentAttachment(async attached => {
+        if (!selectedActive() || attached.sessionId !== request.sessionId) return;
+        const text = reason === 'mixed_intent' ? 'Please give me the answer and the new task separately.'
+          : reason === 'unavailable' ? 'I could not work out that request. Please say what you want me to do.'
+          : 'Are you answering the saved question, or asking me to do something else?';
+        await sessions.get(attached.sessionId)?.voice.appendCommentary?.(text);
+      });
+    },
+    admissionSettled(request) {
+      const generation = controller.snapshot().segments.find(value => value.sessionId === request.sessionId);
+      const pending = generation && admissions.get(generation.generationId);
+      pending?.get(request)?.resolve(); pending?.delete(request);
+    },
+  });
 
   // Starting is asynchronous so the server installs its call owner before any callbacks run.
   queueMicrotask(() => { void controller.start().then(attachment => {
@@ -465,7 +554,15 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
   return {
     async prepareSelectedCloseout() {
       stopSelected();
-      if (selected) return selected.prepareCloseout();
+      const routed = await mixed?.prepareCloseout();
+      if (selected) {
+        const result = await selected.prepareCloseout();
+        if (!routed) return result;
+        const pendingAdmissions = result.pendingAdmissions + routed.pendingAdmissions;
+        const pendingCaptures = result.pendingCaptures + routed.pendingCaptures;
+        return { ...result, pendingAdmissions, pendingCaptures,
+          ready: result.ready && pendingAdmissions === 0 && pendingCaptures === 0 };
+      }
       if (continuation && options.selectedQuestion) return createSelectedQuestionRecovery({ callId: initialCall.id,
         store: options.store, primary: options.primary, requests: options.selectedQuestion.requests }).prepareCloseout();
       return { pendingAdmissions: 0, pendingCaptures: 0, pendingReplies: 0, ready: true };
@@ -480,8 +577,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
     },
     appendContext: async () => ({ eventId: '', status: 'rejected', reason: 'eligible_context_required' }),
     async appendInstructions(text) {
-      const attachment = await controller.beforeReuse();
-      return sessions.get(attachment.sessionId)!.voice.appendInstructions(text);
+      return controller.withCurrentAttachment(attachment => sessions.get(attachment.sessionId)!.voice.appendInstructions(text));
     },
     async interruptPlayback(instruction) {
       const attachment = await controller.beforeReuse();

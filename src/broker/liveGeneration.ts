@@ -424,6 +424,18 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
     bufferedAudioBytes: () => queuedBytes,
     start: () => serial(beforeReuse),
     beforeReuse: () => serial(beforeReuse),
+    /** Keep a complete status publication inside the same queue as exact result
+     * delivery. Calling beforeReuse and publishing later permits another result
+     * to interleave between chunks of a question. The callback must not recurse
+     * into this controller's queued methods. */
+    withCurrentAttachment<T>(publish: (current: LiveGenerationAttachment) => Promise<T>): Promise<T> {
+      return serial(async () => {
+        const current = await beforeReuse();
+        const result = await publish(current);
+        if (attachment().generationId !== current.generationId)
+          throw new LiveGenerationError('publication_generation_changed');
+        return result;
+      });
     appendAudio(frame: GenerationInputAudio): 'sent' | 'buffered' | 'refused' {
       if (stopped || now() >= Date.parse(clocks.callDeadlineAt)) { problem('input_after_call_deadline'); return 'refused'; }
       if (inputBlocked) return 'refused';

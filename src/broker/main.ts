@@ -4,6 +4,7 @@ import { createBrokerServer } from './server.js';
 import { createEligibleContextClient } from './eligibleContext.js';
 import { createSelectedQuestionAssociationClient } from './selectedQuestion.js';
 import { createRequestDeliveryClient } from './requestDelivery.js';
+import { createPrimaryCallerIntentClient } from './callerIntentClient.js';
 import { safeFailure } from './phone.js';
 
 dotenv.config({ path: process.env.BROKER_ENV_FILE || '.env' });
@@ -17,6 +18,13 @@ try {
         phoneServiceSecret: config.phoneServiceSecret }),
       requests: createRequestDeliveryClient({ apiBaseUrl: config.apiBaseUrl,
         phoneServiceSecret: config.phoneServiceSecret }),
+    },
+    callerIntent: {
+      client: createPrimaryCallerIntentClient({ apiBaseUrl: config.apiBaseUrl,
+        phoneServiceSecret: config.phoneServiceSecret }),
+      // The API further bounds inference by current runtime policy and the
+      // immutable original call deadline; this is only the host wait ceiling.
+      timeoutMs: 10_000,
     },
   });
   let stopping = false;

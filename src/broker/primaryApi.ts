@@ -4,6 +4,7 @@ import { phoneCallAssignmentSchema, phoneCallAssignmentRefSchema, sameCallAssign
 export type { PhoneCallAssignment, PhoneCallAssignmentRef } from './assignment.js';
 import { rawSubmissionDigest, turnBodyDigest, type PhoneNonAdmissionProof } from './reconciliation.js';
 import { canonicalJson } from '../outbound/canonical.js';
+import { associatedResultReferenceSchema, orderedAssociatedResultReference, type AssociatedResultReference } from './associatedResult.js';
 import {
   inboundBeginIdentitySchema, inboundOutcomeSchema, recoverInboundResultSchema,
   consumeInboundApprovalSchema, closeConsumedInboundAttachmentSchema,
@@ -54,6 +55,7 @@ export interface PrimarySubmission {
   relatedPrimaryRequestId?: string;
   referenceOrigin?: 'broker_status_publication';
   callAssignmentRef?: PhoneCallAssignmentRef;
+  associatedResultReference?: AssociatedResultReference;
 }
 
 export interface PrimaryTurn {
@@ -209,7 +211,11 @@ function createTransport(options: PrimaryApiOptions) {
   const fetcher = options.fetch ?? globalThis.fetch;
 
   return async (method: 'GET' | 'POST', path: string,
-    body?: unknown, headers?: Record<string, string>, expectedStatus = 200, harkCallAssignment = false): Promise<unknown> => {
+    body?: unknown, headers?: Record<string, string>, expectedStatus: number | readonly number[] = 200,
+    harkCallAssignment = false, control?: {
+      signal?: AbortSignal; validateResponse?: (status: number, body: unknown) => void;
+    }): Promise<unknown> => {
+    if (control?.signal?.aborted) throw new PrimaryApiError('request_failed');
     let serialized: string | undefined;
     if (body !== undefined) {
       try { serialized = JSON.stringify(body); }
@@ -224,6 +230,14 @@ function createTransport(options: PrimaryApiOptions) {
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
     let timedOut = false;
     let timer: ReturnType<typeof setTimeout>;
+    let rejectAbort: (error: PrimaryApiError) => void = () => {};
+    const aborted = new Promise<never>((_resolve, reject) => { rejectAbort = reject; });
+    const stop = () => {
+      controller.abort();
+      void reader?.cancel().catch(() => {});
+      rejectAbort(new PrimaryApiError('request_failed'));
+    };
+    control?.signal?.addEventListener('abort', stop, { once: true });
     const deadline = new Promise<never>((_resolve, reject) => {
       timer = setTimeout(() => {
         timedOut = true;
@@ -285,15 +299,20 @@ function createTransport(options: PrimaryApiOptions) {
           ? remote.data.error : undefined;
         throw new PrimaryApiError('http_error', response.status, safeRemote);
       }
-      if (response.status !== expectedStatus) throw new PrimaryApiError('invalid_response', response.status);
+      if (!(typeof expectedStatus === 'number' ? response.status === expectedStatus : expectedStatus.includes(response.status)))
+        throw new PrimaryApiError('invalid_response', response.status);
+      if (control?.validateResponse) {
+        try { control.validateResponse(response.status, decoded); }
+        catch { throw new PrimaryApiError('invalid_response', response.status); }
+      }
       return decoded;
     };
-    try { return await Promise.race([request(), deadline]); }
+    try { return await Promise.race([request(), deadline, aborted]); }
     catch (error) {
       if (timedOut) throw new PrimaryApiError('request_timeout');
       if (error instanceof PrimaryApiError) throw error;
       throw new PrimaryApiError('request_failed');
-    } finally { clearTimeout(timer!); }
+    } finally { clearTimeout(timer!); control?.signal?.removeEventListener('abort', stop); }
   };
 }
 
@@ -371,7 +390,9 @@ const submissionSchema = z.object({
   text: sourceText,
   relatedPrimaryRequestId: uuid.optional(), referenceOrigin: z.literal('broker_status_publication').optional(),
   callAssignmentRef: phoneCallAssignmentRefSchema.optional(),
-}).strict().refine(value => (value.relatedPrimaryRequestId === undefined) === (value.referenceOrigin === undefined));
+  associatedResultReference: associatedResultReferenceSchema.optional(),
+}).strict().refine(value => (value.relatedPrimaryRequestId === undefined) === (value.referenceOrigin === undefined))
+  .refine(value => value.associatedResultReference === undefined || value.relatedPrimaryRequestId === undefined);
 const turnSchema = z.object({
   sourceEventId: uuid, revision, itemId, role: z.enum(['user', 'assistant']), text: sourceText, occurredAt: timestamp,
 }).strict();
@@ -711,6 +732,8 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
       parse(uuid, requestId, 'invalid_request');
       const parsed = parse(submissionSchema, input, 'invalid_request');
       if (parsed.relatedPrimaryRequestId === requestId) throw new PrimaryApiError('invalid_request');
+      if (parsed.associatedResultReference && (!options.contextProtocol
+        || parsed.associatedResultReference.originalRequestId === requestId)) throw new PrimaryApiError('invalid_request');
       const reference = parsed.relatedPrimaryRequestId === undefined ? {} : {
         relatedPrimaryRequestId: parsed.relatedPrimaryRequestId, referenceOrigin: parsed.referenceOrigin };
       const existing = calls.get(bindingId);
@@ -720,8 +743,10 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
       }
       const { role, ...source } = parsed.source;
       return decodeResult(await request('POST', '/requests', { bindingId, source, role, text: parsed.text, ...reference,
-        ...(parsed.callAssignmentRef === undefined ? {} : { callAssignmentRef: parsed.callAssignmentRef }) },
-        { ...headers, 'Idempotency-Key': requestId }, 202), bindingId, requestId, true);
+        ...(parsed.callAssignmentRef === undefined ? {} : { callAssignmentRef: parsed.callAssignmentRef }),
+        ...(parsed.associatedResultReference === undefined ? {} : {
+          associatedResultReference: orderedAssociatedResultReference(parsed.associatedResultReference) }) },
+        { ...headers, ...(parsed.associatedResultReference ? contextHeaders : {}), 'Idempotency-Key': requestId }, 202), bindingId, requestId, true);
     },
     async result(bindingId, requestId) {
       const headers = bindingHeaders(bindingId);
@@ -733,6 +758,8 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
       parse(uuid, requestId, 'invalid_request');
       const parsed = parse(submissionSchema, input, 'invalid_request');
       if (parsed.relatedPrimaryRequestId === requestId) throw new PrimaryApiError('invalid_request');
+      if (parsed.associatedResultReference && (!options.contextProtocol
+        || parsed.associatedResultReference.originalRequestId === requestId)) throw new PrimaryApiError('invalid_request');
       const reference = parsed.relatedPrimaryRequestId === undefined ? {} : {
         relatedPrimaryRequestId: parsed.relatedPrimaryRequestId, referenceOrigin: parsed.referenceOrigin };
       const known = calls.get(bindingId);
@@ -741,9 +768,13 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
         if (!sameCallAssignmentRef(parsed.callAssignmentRef, known.callAssignmentRef)) throw new PrimaryApiError('identity_mismatch');
       }
       const { role, ...source } = parsed.source;
+      const body = parsed.associatedResultReference === undefined ? { bindingId, role, text: parsed.text, source, ...reference,
+        ...(parsed.callAssignmentRef === undefined ? {} : { callAssignmentRef: parsed.callAssignmentRef }) }
+        : { bindingId, source, role, text: parsed.text,
+          ...(parsed.callAssignmentRef === undefined ? {} : { callAssignmentRef: parsed.callAssignmentRef }),
+          associatedResultReference: orderedAssociatedResultReference(parsed.associatedResultReference) };
       const result = parse(reconciliationSchema, await request('POST', `/requests/${requestId}/reconcile`,
-        { bindingId, role, text: parsed.text, source, ...reference,
-          ...(parsed.callAssignmentRef === undefined ? {} : { callAssignmentRef: parsed.callAssignmentRef }) }, headers), 'invalid_response');
+        body, { ...headers, ...(parsed.associatedResultReference ? contextHeaders : {}) }), 'invalid_response');
       same(result.bindingId, bindingId); same(result.requestId, requestId);
       if (result.outcome === 'admitted') {
         return { ...result, result: decodeResult(result.result, bindingId, result.canonicalRequestId, false) };

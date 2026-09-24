@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { PrimaryClosedCall, PrimarySubmission, PrimaryTurn, PrimaryTurnReceipt } from './primaryApi.js';
+import { orderedAssociatedResultReference } from './associatedResult.js';
 
 export interface PhoneNonAdmissionProof {
   schemaVersion: 1;
@@ -29,7 +30,9 @@ export function rawSubmissionDigest(bindingId: string, input: PrimarySubmission)
     ...(input.relatedPrimaryRequestId === undefined ? {} : { relatedPrimaryRequestId: input.relatedPrimaryRequestId,
       referenceOrigin: input.referenceOrigin }),
     ...(input.callAssignmentRef === undefined ? {} : { callAssignmentRef: {
-      assignmentId: input.callAssignmentRef.assignmentId, revision: input.callAssignmentRef.revision, digest: input.callAssignmentRef.digest } }) });
+      assignmentId: input.callAssignmentRef.assignmentId, revision: input.callAssignmentRef.revision, digest: input.callAssignmentRef.digest } }),
+    ...(input.associatedResultReference === undefined ? {} : {
+      associatedResultReference: orderedAssociatedResultReference(input.associatedResultReference) }) });
 }
 export function acknowledgedTurn(bindingId: string, turn: PrimaryTurn, receipt: PrimaryTurnReceipt): AcknowledgedTurnReceipt {
   if (receipt.bindingId !== bindingId || receipt.sourceEventId !== turn.sourceEventId

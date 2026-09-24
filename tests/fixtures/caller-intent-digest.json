@@ -1,0 +1,151 @@
+{
+  "operationId": "00000011-0000-4000-8000-000000000000",
+  "bindingId": "00000001-0000-4000-8000-000000000000",
+  "input": {
+    "v": "phone.caller-intent.v1",
+    "source": {
+      "callSid": "CAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "sourceEventId": "00000012-0000-4000-8000-000000000000",
+      "itemId": "item_1",
+      "revision": 1,
+      "receivedAt": "2026-09-24T17:00:00.000Z",
+      "role": "user",
+      "text": "  Keep café and café separate.\nThen answer.  "
+    },
+    "generationId": "00000013-0000-4000-8000-000000000000",
+    "sourceSessionId": "session opaque 1",
+    "brokerInputDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "presentationDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "callDeadlineAt": "2026-09-24T17:00:30.000Z",
+    "version": {
+      "ownerPrincipalId": "00000014-0000-4000-8000-000000000000",
+      "primaryDexterId": "00000015-0000-4000-8000-000000000000",
+      "threadId": "00000016-0000-4000-8000-000000000000",
+      "contextEpoch": "4",
+      "threadEventSequence": "27",
+      "digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    },
+    "questions": [
+      {
+        "kind": "ordinary",
+        "execution": {
+          "bindingId": "00000001-0000-4000-8000-000000000000",
+          "requestId": "00000003-0000-4000-8000-000000000000",
+          "runId": "00000004-0000-4000-8000-000000000000"
+        },
+        "question": {
+          "id": "00000005-0000-4000-8000-000000000000",
+          "revision": 1
+        },
+        "presentationId": "q-first"
+      },
+      {
+        "kind": "selected",
+        "execution": {
+          "bindingId": "00000002-0000-4000-8000-000000000000",
+          "requestId": "00000006-0000-4000-8000-000000000000",
+          "runId": "00000007-0000-4000-8000-000000000000"
+        },
+        "question": {
+          "id": "00000008-0000-4000-8000-000000000000",
+          "revision": 1
+        },
+        "presentationId": "q-selected",
+        "deliveryAssociationId": "00000009-0000-4000-8000-000000000000"
+      }
+    ],
+    "results": [
+      {
+        "kind": "ordinary",
+        "execution": {
+          "bindingId": "00000001-0000-4000-8000-000000000000",
+          "requestId": "0000000a-0000-4000-8000-000000000000",
+          "runId": "0000000b-0000-4000-8000-000000000000"
+        },
+        "assistantMessageId": "0000000c-0000-4000-8000-000000000000",
+        "presentationId": "r-first"
+      },
+      {
+        "kind": "selected",
+        "execution": {
+          "bindingId": "00000002-0000-4000-8000-000000000000",
+          "requestId": "0000000d-0000-4000-8000-000000000000",
+          "runId": "0000000e-0000-4000-8000-000000000000"
+        },
+        "assistantMessageId": "0000000f-0000-4000-8000-000000000000",
+        "presentationId": "r-selected",
+        "deliveryAssociationId": "00000010-0000-4000-8000-000000000000"
+      }
+    ]
+  },
+  "ordered": [
+    "dexter-phone-caller-intent-input/v1",
+    "00000011-0000-4000-8000-000000000000",
+    "00000001-0000-4000-8000-000000000000",
+    [
+      "CAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "00000012-0000-4000-8000-000000000000",
+      "item_1",
+      1,
+      "2026-09-24T17:00:00.000Z",
+      "user",
+      "  Keep café and café separate.\nThen answer.  "
+    ],
+    "00000013-0000-4000-8000-000000000000",
+    "session opaque 1",
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "2026-09-24T17:00:30.000Z",
+    [
+      "00000014-0000-4000-8000-000000000000",
+      "00000015-0000-4000-8000-000000000000",
+      "00000016-0000-4000-8000-000000000000",
+      "4",
+      "27",
+      "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    ],
+    [
+      [
+        "ordinary",
+        "00000001-0000-4000-8000-000000000000",
+        "00000003-0000-4000-8000-000000000000",
+        "00000004-0000-4000-8000-000000000000",
+        "00000005-0000-4000-8000-000000000000",
+        1,
+        "q-first",
+        null
+      ],
+      [
+        "selected",
+        "00000002-0000-4000-8000-000000000000",
+        "00000006-0000-4000-8000-000000000000",
+        "00000007-0000-4000-8000-000000000000",
+        "00000008-0000-4000-8000-000000000000",
+        1,
+        "q-selected",
+        "00000009-0000-4000-8000-000000000000"
+      ]
+    ],
+    [
+      [
+        "ordinary",
+        "00000001-0000-4000-8000-000000000000",
+        "0000000a-0000-4000-8000-000000000000",
+        "0000000b-0000-4000-8000-000000000000",
+        "0000000c-0000-4000-8000-000000000000",
+        "r-first",
+        null
+      ],
+      [
+        "selected",
+        "00000002-0000-4000-8000-000000000000",
+        "0000000d-0000-4000-8000-000000000000",
+        "0000000e-0000-4000-8000-000000000000",
+        "0000000f-0000-4000-8000-000000000000",
+        "r-selected",
+        "00000010-0000-4000-8000-000000000000"
+      ]
+    ]
+  ],
+  "inputDigest": "1df334e42080de13b1e5a16470e8a9d1c0e30cf211577e8b1bb6ae0d2daa206c"
+}

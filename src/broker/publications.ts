@@ -1,8 +1,11 @@
 import { createHash } from 'node:crypto';
+import { orderedAssociatedResultReference, type AssociatedResultReference } from './associatedResult.js';
 import { z } from 'zod';
 import { canonicalJson } from '../outbound/canonical.js';
 import { liveResultChunks } from './backend.js';
-import { eligibleAssociatedDeliveryResponseSchema } from './eligibleContext.js';
+import { eligibleAssociatedDeliveryResponseSchema, eligibleDeliveryResponseSchema } from './eligibleContext.js';
+import { callerIntentResultSchema, type CallerIntentDecision, type CallerIntentResult } from './callerIntentContract.js';
+import type { BrokerDelegationRecord } from './backend.js';
 import type { LiveBackendUpdate, LiveDelivery, LiveTranscriptSnapshot } from '../live/types.js';
 import { terminalCallStatuses, type BrokerCall, type BrokerStore } from './store.js';
 
@@ -27,6 +30,8 @@ export interface BrokerPublicationRecord extends BrokerPublicationIdentity {
   transcriptSequence: number;
   /** Exact associated API response and its complete, ordered speech rendering. */
   selectedDelivery?: SelectedQuestionPublication;
+  /** Present only when the host published this exact attributed API result. */
+  ordinaryDelivery?: OrdinaryPublicationEvidence;
   outcome?: { eventId: string; status: LiveDelivery['status']; callerRevision: number; transcriptSequence: number };
 }
 export interface BrokerPublicationReceipt {
@@ -39,6 +44,17 @@ export interface SelectedQuestionPublication {
   response: z.infer<typeof eligibleAssociatedDeliveryResponseSchema>;
   chunkIndex: number;
   chunkCount: number;
+}
+export interface OrdinaryPublicationEvidence {
+  response: z.infer<typeof eligibleDeliveryResponseSchema>;
+  chunkIndex: number;
+  chunkCount: number;
+}
+export interface CallerIntentResultPublicationCandidate {
+  id: string;
+  digest: string;
+  reference: NonNullable<Extract<CallerIntentDecision, { kind: 'task' }>['reference']>;
+  candidate: CallerIntentResult;
 }
 
 /** Recheck every accepted chunk, including rejection received before receipt persistence. */
@@ -71,9 +87,12 @@ const sameCall = (call: BrokerCall, identity: BrokerPublicationIdentity) => call
 const journal = (call: BrokerCall): BrokerPublicationJournal => call.publications ?? { records: [], rejections: [] };
 
 function requestMatches(call: BrokerCall, identity: BrokerPublicationIdentity, requestId: string): boolean {
-  const entry = call.delegations[requestId] as undefined | (BrokerCall['delegations'][string] & Partial<BrokerPublicationIdentity> & {
-    primaryResult?: { requestId: string; bindingId: string; state: string };
-  });
+  const entry = call.delegations[requestId] as BrokerDelegationRecord | undefined;
+  const reconciliation = entry?.reconciliation;
+  const canonicalRequestId = reconciliation?.outcome === 'admitted' ? reconciliation.canonicalRequestId : requestId;
+  const aliasMatches = reconciliation?.outcome !== 'admitted' || (reconciliation.requestId === requestId
+    && reconciliation.bindingId === identity.bindingId && reconciliation.result.requestId === canonicalRequestId
+    && reconciliation.result.bindingId === identity.bindingId);
   return Boolean(entry && uuid.test(requestId) && entry.requestId === requestId
     && entry.callId === call.id && entry.callSid === call.callSid && entry.bindingId === call.primary?.bindingId
     && (identity.sourceSessionId === undefined
@@ -82,7 +101,7 @@ function requestMatches(call: BrokerCall, identity: BrokerPublicationIdentity, r
         && Boolean(call.liveGenerations?.segments.some(segment => segment.sessionId === identity.sourceSessionId))
         && Boolean(call.liveGenerations?.segments.some(segment => segment.sessionId === identity.sessionId)))
     && admitted.has(entry.status)
-    && entry.primaryResult?.requestId === requestId && entry.primaryResult.bindingId === identity.bindingId
+    && aliasMatches && entry.primaryResult?.requestId === canonicalRequestId && entry.primaryResult.bindingId === identity.bindingId
     && entry.primaryResult.state === entry.status);
 }
 
@@ -99,6 +118,49 @@ const selectedPublicationSchema = z.object({
     callerRevision: z.number().int().safe().nonnegative(), transcriptSequence: z.number().int().safe().nonnegative() }).strict().optional(),
 }).strict();
 const equal = (a: unknown, b: unknown) => canonicalJson(a) === canonicalJson(b);
+const ordinaryPublicationSchema = selectedPublicationSchema.omit({ selectedDelivery: true }).extend({
+  sourceSessionId: z.string().min(1).max(200).optional(),
+  requestState: z.literal('completed'),
+  ordinaryDelivery: z.object({ response: eligibleDeliveryResponseSchema,
+    chunkIndex: z.number().int().safe().nonnegative(), chunkCount: z.number().int().safe().positive() }).strict(),
+}).strict();
+
+function ordinaryPublicationMatches(call: BrokerCall, input: BrokerPublicationRecord, current: boolean): boolean {
+  const parsed = ordinaryPublicationSchema.safeParse(input);
+  if (!parsed.success) return false;
+  const record = parsed.data, saved = record.ordinaryDelivery, response = saved.response, delivery = response.delivery;
+  const entry = call.delegations[record.requestId] as BrokerDelegationRecord | undefined;
+  const generations = call.liveGenerations;
+  const segment = generations?.segments.find(item => item.sessionId === record.sessionId);
+  const result = entry?.primaryResult;
+  if (!segment || !generations || !requestMatches(call, record, record.requestId)
+    || record.callId !== call.id || record.callSid !== call.callSid || record.bindingId !== call.primary?.bindingId
+    || response.bindingId !== record.bindingId || response.callSid !== record.callSid
+    || result?.state !== 'completed' || response.requestId !== result.requestId
+    || delivery.state !== 'ready' || delivery.source.kind !== 'assistant' || 'question' in delivery
+    || delivery.source.messageId !== result.assistant.messageId
+    || delivery.source.provenance.eventId !== result.assistant.eventId || delivery.source.eventSequence !== result.assistant.sequence
+    || !equal(response.version, segment.version)
+    || response.version.ownerPrincipalId !== generations.binding.ownerPrincipalId
+    || response.version.primaryDexterId !== generations.binding.primaryDexterId
+    || response.version.threadId !== generations.binding.threadId
+    || generations.binding.bindingId !== record.bindingId || generations.binding.callSid !== record.callSid
+    || generations.callId !== record.callId) return false;
+  if (current && (!active(call) || call.finalized || !sameCall(call, record) || generations.phase !== 'active'
+    || segment.state !== 'active' || generations.deliveryAttachment?.generationId !== segment.generationId
+    || generations.deliveryAttachment.sessionId !== segment.sessionId
+    || Date.now() >= Date.parse(generations.clocks.callDeadlineAt))) return false;
+  let chunks: string[];
+  try { chunks = liveResultChunks(delivery.text); } catch { return false; }
+  return saved.chunkCount === chunks.length && saved.chunkIndex < chunks.length
+    && record.textDigest === createHash('sha256').update(chunks[saved.chunkIndex]!, 'utf8').digest('hex');
+}
+
+function attributedPublicationMatches(call: BrokerCall, record: BrokerPublicationRecord, current: boolean): boolean {
+  if (record.selectedDelivery !== undefined && record.ordinaryDelivery !== undefined) return false;
+  return record.ordinaryDelivery !== undefined ? ordinaryPublicationMatches(call, record, current)
+    : selectedPublicationMatches(call, record, current);
+}
 
 /** The association carries original execution identity. The publication itself
  * belongs to the current delivery generation; it creates no local delegation. */
@@ -137,15 +199,114 @@ function selectedPublicationMatches(call: BrokerCall, input: BrokerPublicationRe
     && record.textDigest === createHash('sha256').update(chunks[saved.chunkIndex]!, 'utf8').digest('hex');
 }
 
+/** An earlier-call result keeps its original execution identity. This list
+ * records accepted publication commands, never heard speech or owner consent. */
+export function associatedResultPublicationCandidates(call: BrokerCall, sessionId: string): Array<{
+  id: string; digest: string; reference: AssociatedResultReference;
+}> {
+  const candidates = new Map<string, { id: string; digest: string; reference: AssociatedResultReference }>();
+  for (const record of call.publications?.records ?? []) {
+    const response = record.selectedDelivery?.response;
+    if (!response || record.sessionId !== sessionId || response.delivery.state !== 'ready'
+      || response.delivery.source.kind !== 'assistant' || 'question' in response.delivery
+      || !selectedPublicationMatches(call, record, false)) continue;
+    const reference = orderedAssociatedResultReference({ v: 'phone.associated-result-reference.v1',
+      deliveryAssociationId: response.deliveryAssociation.id, originalRequestId: response.deliveryAssociation.execution.requestId,
+      assistantMessageId: response.delivery.source.messageId });
+    const group = (call.publications?.records ?? []).filter(item => item.sessionId === sessionId
+      && item.selectedDelivery && equal(item.selectedDelivery.response, response));
+    const chunks = record.selectedDelivery!.chunkCount;
+    // Each candidate comes from one complete publication attempt. Do not stitch
+    // earlier partial/rejected attempts into a completed later presentation.
+    const prefix = record.updateId.replace(/_\d+$/, '_');
+    const attempt = group.filter(item => item.updateId.startsWith(prefix)).sort((a, b) =>
+      a.selectedDelivery!.chunkIndex - b.selectedDelivery!.chunkIndex);
+    const receipts = attempt.map(item => ({ publicationSequence: item.publicationSequence,
+      sessionId: item.sessionId, eventId: item.outcome?.eventId ?? '' }));
+    if (attempt.length !== chunks || attempt.some((item, index) => item.selectedDelivery!.chunkIndex !== index)
+      || !selectedQuestionPublicationReceiptsAccepted(call, response, sessionId, receipts)) continue;
+    const id = `associated:${reference.deliveryAssociationId}:${reference.assistantMessageId}`;
+    const digest = createHash('sha256').update(canonicalJson({ reference, receipts })).digest('hex');
+    candidates.set(id, { id, digest, reference });
+  }
+  return [...candidates.values()];
+}
+
+/** Fresh inputs include every distinct published result, in journal order.
+ * Historical lookup retains each complete attempt by its own immutable ID. */
+export function callerIntentResultPublicationCandidates(call: BrokerCall, sessionId: string,
+  options: { historical?: boolean } = {}): CallerIntentResultPublicationCandidate[] {
+  const saved = journal(call), generations = call.liveGenerations;
+  const segment = generations?.segments.find(item => item.sessionId === sessionId);
+  if (!segment || (!options.historical && (!active(call) || call.finalized || call.liveSessionId !== sessionId
+    || generations?.phase !== 'active' || segment.state !== 'active'
+    || generations.deliveryAttachment?.sessionId !== sessionId
+    || generations.deliveryAttachment.generationId !== segment.generationId
+    || Date.now() >= Date.parse(generations.clocks.callDeadlineAt)))) return [];
+  if (saved.records.some((record, index) => record.publicationSequence !== index + 1))
+    throw new Error('invalid_publication_order');
+  const candidates: CallerIntentResultPublicationCandidate[] = [], covered = new Set<string>();
+  for (const record of saved.records) {
+    const evidence = record.ordinaryDelivery ?? record.selectedDelivery;
+    if (!evidence || record.sessionId !== sessionId || evidence.chunkIndex !== 0
+      || !attributedPublicationMatches(call, record, false)) continue;
+    const response = evidence.response;
+    if (response.delivery.state !== 'ready' || response.delivery.source.kind !== 'assistant'
+      || 'question' in response.delivery || record.requestState !== 'completed') continue;
+    const match = /^(.*)_0$/.exec(record.updateId);
+    if (!match) continue;
+    const selected = record.selectedDelivery !== undefined;
+    const attempt = saved.records.filter(item => {
+      const value = selected ? item.selectedDelivery : item.ordinaryDelivery;
+      return value !== undefined && item.sessionId === sessionId && equal(value.response, response)
+        && item.updateId.replace(/_\d+$/, '') === match[1];
+    });
+    const receipts = attempt.map(item => ({ publicationSequence: item.publicationSequence,
+      sessionId: item.sessionId, eventId: item.outcome?.eventId ?? '' }));
+    const receiptCall = options.historical ? { ...call, publications: { records: saved.records, rejections: [] } } : call;
+    if (attempt.length !== evidence.chunkCount
+      || !brokerPublicationReceiptsAccepted(receiptCall, record.requestId, sessionId, receipts)
+      || attempt.some((item, index) => {
+        const value = selected ? item.selectedDelivery! : item.ordinaryDelivery!;
+        return value.chunkIndex !== index || value.chunkCount !== evidence.chunkCount
+          || item.updateId !== `${match[1]}_${index}` || item.callerRevision !== record.callerRevision
+          || !attributedPublicationMatches(call, item, false)
+          || item.outcome!.callerRevision !== item.callerRevision
+          || item.outcome!.transcriptSequence < item.transcriptSequence
+          || saved.records.some(other => other !== item && other.sessionId === sessionId
+            && other.outcome?.eventId === item.outcome!.eventId);
+      })) continue;
+    const messageId = response.delivery.source.messageId;
+    const association = record.selectedDelivery?.response.deliveryAssociation;
+    const execution = association?.execution ?? { bindingId: response.bindingId,
+      requestId: response.requestId, runId: response.delivery.source.provenance.runId };
+    const id = `${selected ? 'associated' : 'ordinary'}:${association?.id ?? response.requestId}:${messageId}:${record.publicationSequence}`;
+    const candidate: CallerIntentResult = callerIntentResultSchema.parse({ kind: selected ? 'selected' : 'ordinary',
+      execution, assistantMessageId: messageId, presentationId: id,
+      ...(association ? { deliveryAssociationId: association.id } : {}) });
+    const reference: CallerIntentResultPublicationCandidate['reference'] = association
+      ? { kind: 'associated', associatedResultReference: orderedAssociatedResultReference({
+        v: 'phone.associated-result-reference.v1', deliveryAssociationId: association.id,
+        originalRequestId: association.execution.requestId, assistantMessageId: messageId }) }
+      : { kind: 'ordinary', relatedPrimaryRequestId: response.requestId, referenceOrigin: 'broker_status_publication' };
+    const identity = canonicalJson([candidate.kind, execution, messageId, association?.id ?? null]);
+    if (!options.historical && covered.has(identity)) continue;
+    covered.add(identity);
+    const digest = createHash('sha256').update(canonicalJson({ reference, candidate, records: attempt })).digest('hex');
+    candidates.push({ id, digest, reference, candidate });
+  }
+  return candidates;
+}
+
 /** Historical rejection stays append-only. Existing ordinary journals do not
  * gain new fields or selected-call restrictions when this branch is absent. */
 export function validateSelectedQuestionPublications(call: BrokerCall, previous?: BrokerCall): void {
   const saved = journal(call), before = previous && journal(previous);
-  const selected = saved.records.filter(record => record.selectedDelivery !== undefined);
-  const oldSelected = before?.records.filter(record => record.selectedDelivery !== undefined) ?? [];
+  const selected = saved.records.filter(record => record.selectedDelivery !== undefined || record.ordinaryDelivery !== undefined);
+  const oldSelected = before?.records.filter(record => record.selectedDelivery !== undefined || record.ordinaryDelivery !== undefined) ?? [];
   if (!selected.length && !oldSelected.length) return;
   if (saved.records.some((record, index) => record.publicationSequence !== index + 1)
-    || selected.some(record => !selectedPublicationMatches(call, record, false))) throw new Error('selected_publication_identity_changed');
+    || selected.some(record => !attributedPublicationMatches(call, record, false))) throw new Error('selected_publication_identity_changed');
   for (const record of selected) {
     const receipt = record.outcome;
     if (receipt?.status === 'accepted' && (!commandId(receipt.eventId) || receipt.callerRevision !== record.callerRevision
@@ -166,7 +327,7 @@ export function validateSelectedQuestionPublications(call: BrokerCall, previous?
   }
   for (const record of selected.filter(item => !oldSelected.some(old => old.publicationSequence === item.publicationSequence))) {
     if (record.publicationSequence <= before.records.length || record.outcome !== undefined
-      || !selectedPublicationMatches(call, record, true)) throw new Error('selected_publication_requires_current_intent');
+      || !attributedPublicationMatches(call, record, true)) throw new Error('selected_publication_requires_current_intent');
   }
 }
 
@@ -221,15 +382,27 @@ export function selectedQuestionPublicationReceiptsAccepted(call: BrokerCall,
 
 /** The intent is durable before the caller of this function sends commentary. */
 export function beginBrokerPublication(store: Store, identity: BrokerPublicationIdentity, requestId: string,
-  update: LiveBackendUpdate, snapshot: LiveTranscriptSnapshot): { record: BrokerPublicationRecord; created: boolean } | undefined {
+  update: LiveBackendUpdate, snapshot: LiveTranscriptSnapshot,
+  ordinaryDelivery?: Pick<OrdinaryPublicationEvidence, 'response' | 'chunkIndex'>): { record: BrokerPublicationRecord; created: boolean } | undefined {
   const call = store.get(identity.callId);
   if (!call || !active(call) || !sameCall(call, identity) || !requestMatches(call, identity, requestId)
       || update.speak !== true || !['progress', 'result'].includes(update.kind) || !commandId(update.id)
       || update.expectedCallerRevision !== snapshot.callerRevision) return undefined;
   const saved = journal(call);
+  let evidence: OrdinaryPublicationEvidence | undefined;
+  if (ordinaryDelivery !== undefined) {
+    const response = eligibleDeliveryResponseSchema.parse(ordinaryDelivery.response);
+    if (response.delivery.state !== 'ready' || response.delivery.source.kind !== 'assistant'
+      || 'question' in response.delivery || update.kind !== 'result') throw new Error('ordinary_publication_source_changed');
+    const chunks = liveResultChunks(response.delivery.text), index = ordinaryDelivery.chunkIndex;
+    if (!Number.isSafeInteger(index) || index < 0 || index >= chunks.length || chunks[index] !== update.text)
+      throw new Error('ordinary_publication_render_changed');
+    evidence = { response, chunkIndex: index, chunkCount: chunks.length };
+  }
   const intent = { ...identity, updateId: update.id, requestId, requestState: call.delegations[requestId].status,
     kind: update.kind, speak: true as const, textDigest: createHash('sha256').update(update.text, 'utf8').digest('hex'),
-    callerRevision: snapshot.callerRevision, transcriptSequence: sequence(snapshot) };
+    callerRevision: snapshot.callerRevision, transcriptSequence: sequence(snapshot),
+    ...(evidence ? { ordinaryDelivery: evidence } : {}) };
   const previous = saved.records.find(record => record.sessionId === identity.sessionId && record.updateId === update.id);
   if (previous) {
     // Transcript progress does not alter the original publication frontier on retry.
@@ -241,6 +414,7 @@ export function beginBrokerPublication(store: Store, identity: BrokerPublication
   const ordinal = saved.records.length + 1;
   if (saved.records.some((record, index) => record.publicationSequence !== index + 1)) throw new Error('invalid_publication_order');
   const record: BrokerPublicationRecord = { ...intent, publicationSequence: ordinal };
+  if (evidence && !ordinaryPublicationMatches(call, record, true)) throw new Error('ordinary_publication_identity_changed');
   store.update(call.id, { publications: { ...saved, records: [...saved.records, record] } });
   return { record, created: true };
 }

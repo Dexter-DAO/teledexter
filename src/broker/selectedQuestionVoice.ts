@@ -8,10 +8,13 @@ import { acknowledgedTurn } from './reconciliation.js';
 import { parseRequestDeliveryJournal, type RequestDeliveryClient, type RequestDeliveryJournal } from './requestDelivery.js';
 import { createSelectedQuestionHost, type SelectedQuestionAnswer, type SelectedQuestionHostOptions,
   type SelectedQuestionJournal, type SelectedQuestionSeed } from './selectedQuestion.js';
-import { replyInputSchema, type PrimaryApiClient, type PrimaryTurn, type PrimaryTurnReceipt } from './primaryApi.js';
+import { PrimaryApiError, replyInputSchema, type PrimaryApiClient, type PrimaryTurn, type PrimaryTurnReceipt } from './primaryApi.js';
 import type { GenerationDeliveryOutcome } from './liveGeneration.js';
 import { terminalCallStatuses, type BrokerCall, type BrokerStore } from './store.js';
 import type { LiveBackendChannel, LiveDelegationRequest, LiveTranscriptSnapshot } from '../live/types.js';
+import { frozenCallerTurnSchema as frozenSchema, type CallerTurnFreezer, type FrozenCallerTurn } from './callerTurn.js';
+import { requireCallerRoute, requireCallerRouteDispatch, CallerRouteExpiredError, getCallerRouteBySource, callerRoutePresentationDigest,
+  type CallerQuestionTarget, type CallerRouteRef } from './callerRouting.js';
 
 const uuid = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
 const nonnegative = z.number().finite().nonnegative();
@@ -19,37 +22,11 @@ const sequence = z.number().int().safe().nonnegative();
 const time = z.iso.datetime({ offset: true });
 const same = (a: unknown, b: unknown) => canonicalJson(a) === canonicalJson(b);
 const textDigest = (text: string) => createHash('sha256').update(text, 'utf8').digest('hex');
-const fail = (code: string): never => { throw new Error(code); };
+function fail(code: string): never { throw new Error(code); }
 
-/** Returned only by the existing backend's completedCallerGroups/stableContext
- * admission path. Audio offsets provide ordering; firstEventId owns source identity. */
-export interface FrozenSelectedCallerTurn {
-  sessionId: string;
-  firstEventId: string;
-  callerRevision: number;
-  firstSequence: number;
-  lastSequence: number;
-  startMs: number;
-  endMs: number;
-  audioThroughMs: number;
-  observedSpeechAtMs: number;
-  turn: PrimaryTurn;
-}
-export interface SelectedCallerTurnFreezer {
-  /** No submit/reply/capture HTTP. Use existing completion checks and the call's
-   * admission lock; exclude these exact saved source IDs without changing captions. */
-  freeze(request: LiveDelegationRequest, channel: LiveBackendChannel,
-    usedSourceIds: readonly string[]): Promise<FrozenSelectedCallerTurn | undefined>;
-}
-
-const frozenSchema = z.object({ sessionId: z.string().min(1).max(200), firstEventId: z.string().min(1),
-  callerRevision: sequence, firstSequence: sequence.positive(), lastSequence: sequence.positive(),
-  startMs: nonnegative, endMs: nonnegative, audioThroughMs: nonnegative, observedSpeechAtMs: nonnegative,
-  turn: z.object({ sourceEventId: uuid, revision: z.literal(1), itemId: z.string().min(1),
-    role: z.literal('user'), text: z.string().refine(value => value.trim().length > 0 && [...value].length <= 4000
-      && !value.includes('\0') && !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(value)),
-    occurredAt: time }).strict(),
-}).strict().refine(value => value.lastSequence >= value.firstSequence && value.endMs >= value.startMs);
+/** Compatibility aliases; both admission paths use the same raw-source schema. */
+export type FrozenSelectedCallerTurn = FrozenCallerTurn;
+export type SelectedCallerTurnFreezer = CallerTurnFreezer;
 const publicationSchema = z.object({ publicationSequence: sequence.positive(), sessionId: z.string().min(1).max(200),
   eventId: z.string().regex(/^[a-zA-Z0-9_.:-]{1,200}$/) }).strict();
 const presentationSchema = z.object({ id: uuid, associationId: uuid, generationId: uuid,
@@ -261,6 +238,8 @@ export interface SelectedQuestionVoiceOptions extends Omit<SelectedQuestionHostO
   deliver(journal: RequestDeliveryJournal, target: EligibleDeliveryTarget): Promise<SelectedQuestionDeliveryObservation>;
   /** Called only after a durable host admission or a definite refusal. */
   admissionSettled?(request: LiveDelegationRequest): void;
+  /** Same store/call mutex used by the backend; frozen admission never refreezes. */
+  withCallerAdmission?<T>(operation: () => Promise<T>): Promise<T>;
 }
 
 export interface SelectedQuestionCloseout {
@@ -357,6 +336,12 @@ export function createSelectedQuestionVoiceAdapter(options: SelectedQuestionVoic
     return !!source && !!presentation && same(presentation.response.deliveryAssociation, journal.association)
       && publicationsAccepted(options.readCall(), presentation);
   };
+  const intentAllowsDispatch = (answer: SelectedQuestionAnswer): boolean => {
+    const call = options.readCall(), sourceEventId = answer.input.source.sourceEventId;
+    if (!getCallerRouteBySource(call, sourceEventId)) return true;
+    try { requireCallerRouteDispatch(call, sourceEventId, now()); return true; }
+    catch { return false; }
+  };
   const capture = async (bindingId: string, turn: PrimaryTurn) => {
     const index = evidence.sources.findIndex(s => same(s.frozen.turn, turn));
     if (index < 0 || bindingId !== options.seed.delivery.bindingId) fail('selected_voice_source_unknown');
@@ -368,13 +353,27 @@ export function createSelectedQuestionVoiceAdapter(options: SelectedQuestionVoic
     return receipt;
   };
   const host = createSelectedQuestionHost({ ...options, capture,
+    requests: { ...options.requests, reply(journal) {
+      const sourceEventId = journal.reply?.input.source.sourceEventId;
+      const call = options.readCall();
+      if (sourceEventId && getCallerRouteBySource(call, sourceEventId)) {
+        try { requireCallerRouteDispatch(call, sourceEventId, now()); }
+        catch (error) {
+          // This adapter has not called HTTP. The existing reducer preserves a
+          // definite local refusal even if the durable dispatch marker was saved.
+          if (error instanceof CallerRouteExpiredError) throw new PrimaryApiError('invalid_request');
+          throw error;
+        }
+      }
+      return options.requests.reply(journal);
+    } },
     persist(journal) {
       options.persist(journal);
       const admitted = new Set(journal.questions.flatMap(q => q.admissions.map(a => a.answer.input.source.sourceEventId)));
       for (const [request, sourceId] of pending) if (sourceId && admitted.has(sourceId)) settle(request);
     },
-    replyIsQualified: (journal, answer) => current(answer.sourceSessionId) && valid(journal, answer),
-    admittedReplyIsValid: valid,
+    replyIsQualified: (journal, answer) => current(answer.sourceSessionId) && valid(journal, answer) && intentAllowsDispatch(answer),
+    admittedReplyIsValid: (journal, answer) => valid(journal, answer) && intentAllowsDispatch(answer),
     async deliver(journal, target) {
       const observation = await options.deliver(journal, target);
       if (target.kind !== 'question') return;
@@ -394,31 +393,53 @@ export function createSelectedQuestionVoiceAdapter(options: SelectedQuestionVoic
   const stop = () => {
     const state = host.stop(); for (const request of pending.keys()) settle(request); return state;
   };
-  return {
-    host,
-    evidence: () => structuredClone(evidence),
-    pendingSourceCount: () => pending.size,
-    async delegate(request: LiveDelegationRequest, channel: LiveBackendChannel): Promise<void> {
+  const questionTargets = (sessionId: string): CallerQuestionTarget[] => {
+    if (!current(sessionId)) return [];
+    const state = host.snapshot(), slot = state.questions.at(-1), association = slot?.record?.base.association;
+    if (state.stoppedAt || !slot || !association || slot.admissions.some(admission => !admission.localRefusal
+      && (admission.attemptSequence === undefined || slot.record!.attempts[admission.attemptSequence - 1]?.state !== 'refused'))) return [];
+    const presentation = evidence.presentations.filter(p => p.associationId === association.id && p.sessionId === sessionId).at(-1);
+    const delivery = presentation?.response.delivery;
+    if (!presentation || !delivery || delivery.state !== 'ready' || !('question' in delivery)
+      || delivery.question.state !== 'pending' || Date.parse(delivery.question.expiresAt) <= now()
+      || !publicationsAccepted(options.readCall(), presentation)) return [];
+    return [{ kind: 'selected', bindingId: association.execution.bindingId, requestId: association.execution.requestId,
+      runId: association.execution.runId, questionId: association.question.id, questionRevision: association.question.revision,
+      associationId: association.id, presentationDigest: callerRoutePresentationDigest(presentation) }];
+  };
+  const admit = async (request: LiveDelegationRequest, channel: LiveBackendChannel, routeRef?: CallerRouteRef): Promise<void> => {
       preparingSources.add(request);
       pending.set(request, undefined);
       try {
-        if (request.callId !== options.seed.deliveryCall.callId || !current(request.sessionId) || channel.signal.aborted)
-          fail('selected_voice_source_inactive');
+        const route = routeRef ? requireCallerRoute(options.readCall(), request, routeRef, 'selected_answer', 'recover') : undefined;
+        if (request.callId !== options.seed.deliveryCall.callId || channel.signal.aborted
+          || (!routeRef && !current(request.sessionId))) fail('selected_voice_source_inactive');
+        const target = route?.decision?.kind === 'answer' && route.decision.target.kind === 'selected' ? route.decision.target : undefined;
+        if (routeRef && !target) fail('caller_route_kind_mismatch');
         const replay = evidence.sources.find(s => s.answer.sourceSessionId === request.sessionId && s.answer.delegationId === request.delegationId);
         if (replay) {
           if (replay.delegationRequestId !== request.requestId) fail('selected_voice_delegation_changed');
+          if (route && (!same(replay.frozen, route.frozen) || replay.answer.questionId !== target!.questionId
+            || !evidence.presentations.some(p => p.id === replay.answer.presentationId
+              && callerRoutePresentationDigest(p) === target!.presentationDigest))) fail('caller_route_question_changed');
           preparingSources.delete(request);
           pending.set(request, replay.frozen.turn.sourceEventId); await host.answer(replay.answer); return;
         }
+        if (routeRef) requireCallerRoute(options.readCall(), request, routeRef, 'selected_answer');
+        if (!current(request.sessionId)) fail('selected_voice_source_inactive');
         const slot = host.snapshot().questions.at(-1)!;
         if (!slot.record?.base.association) fail('selected_voice_question_unassociated');
         const journal = slot.record.base;
         // Selection is scoped to this exact question association and current generation.
         const presentations = evidence.presentations.filter(p => p.associationId === journal.association!.id
           && p.sessionId === request.sessionId);
-        const presentation = presentations.at(-1);
+        const presentation = target ? presentations.find(p => callerRoutePresentationDigest(p) === target.presentationDigest)
+          : presentations.at(-1);
+        if (target && !questionTargets(request.sessionId).some(candidate => same(candidate, target)))
+          fail('caller_route_question_changed');
         if (!presentation || !publicationsAccepted(options.readCall(), presentation)) fail('selected_voice_question_not_presented');
-        const frozenValue = await options.freezer.freeze(request, channel, evidence.sources.map(s => s.frozen.turn.sourceEventId));
+        const frozenValue = route ? route.frozen
+          : await options.freezer.freeze(request, channel, evidence.sources.map(s => s.frozen.turn.sourceEventId));
         if (!frozenValue) fail('selected_voice_turn_unqualified');
         const frozen = frozenSchema.parse(frozenValue);
         const call = options.readCall(), segment = call.liveGenerations!.segments.find(s => s.sessionId === request.sessionId)!;
@@ -436,6 +457,7 @@ export function createSelectedQuestionVoiceAdapter(options: SelectedQuestionVoic
             journal.request.originalRequestId, journal.target.question.id, sourceId), ...literalPhoneAnswer(frozen.turn.text) } });
         const answer: SelectedQuestionAnswer = { questionId: journal.target.question.id, input,
           sourceSessionId: request.sessionId, delegationId: request.delegationId, presentationId: presentation.id };
+        if (routeRef) requireCallerRoute(options.readCall(), request, routeRef, 'selected_answer');
         // Stop may win after this save: the raw source remains a capture obligation.
         save({ ...evidence, sources: [...evidence.sources, { answer, frozen, delegationRequestId: request.requestId }] });
         preparingSources.delete(request);
@@ -443,7 +465,19 @@ export function createSelectedQuestionVoiceAdapter(options: SelectedQuestionVoic
         if (channel.signal.aborted) fail('selected_voice_source_inactive');
         await host.answer(answer);
       } finally { preparingSources.delete(request); settle(request); }
+  };
+  return {
+    host,
+    evidence: () => structuredClone(evidence),
+    pendingSourceCount: () => pending.size,
+    delegate(request: LiveDelegationRequest, channel: LiveBackendChannel): Promise<void> {
+      return admit(request, channel);
     },
+    answerFrozen(request: LiveDelegationRequest, route: CallerRouteRef, channel: LiveBackendChannel): Promise<void> {
+      if (!options.withCallerAdmission) return Promise.reject(new Error('caller_route_admission_lock_required'));
+      return options.withCallerAdmission(() => admit(request, channel, route));
+    },
+    questionTargets,
     stop,
     async prepareCloseout(): Promise<SelectedQuestionCloseout> {
       stop();

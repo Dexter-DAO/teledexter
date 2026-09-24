@@ -9,6 +9,10 @@ import { createPrimaryBackend } from './backend.js';
 import { eligiblePhoneCallSchema, type EligibleContextClient } from './eligibleContext.js';
 import { createGenerationVoice, type GenerationVoiceOptions, type GenerationVoiceSession } from './generationVoice.js';
 import { createSelectedQuestionRecovery, selectedQuestionSourceAnchors } from './selectedQuestionVoice.js';
+import { recoverCallerRouteCaptures } from './mixedWork.js';
+import { createCallerIntentResolver } from './callerIntentResolver.js';
+import type { CallerIntentClient } from './callerIntentClient.js';
+import { callerRouteRef, callerRouteSources } from './callerRouting.js';
 import { newPhoneCallControlSchema } from './assignment.js';
 import { assertCallContinuationReplay, callContinuationPatch, CallContinuationError, type CallContinuation } from './callContinuation.js';
 import { callRequestIdFromLookupPath, callRequestReceiptFailure, readCallRequestReceipt } from './callRequestReceipt.js';
@@ -75,6 +79,8 @@ export interface BrokerServerOptions {
   eligibleContext?: EligibleContextClient;
   /** Explicit successor composition; ordinary and Hark calls omit this selection. */
   selectedQuestion?: GenerationVoiceOptions['selectedQuestion'];
+  /** Same-call new work uses the shared Primary decision port and original call budget. */
+  callerIntent?: { client: CallerIntentClient; timeoutMs: number };
   provider?: ReturnType<typeof Twilio>;
   voiceFactory?: (options: BrokerLiveSessionOptions) => BrokerLiveSession;
   probe?: typeof probeLive;
@@ -179,6 +185,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
           if (!(await recovery.prepareCloseout()).ready) return;
         }
       }
+      if (current.callerRouting && await recoverCallerRouteCaptures({ callId: current.id, store, primary })) return;
       if (current.callSid && current.liveSessionId) {
         const segments = current.liveGenerations?.segments.filter(segment => segment.sessionId);
         const sources = segments?.length ? segments.map(segment => ({ sessionId: segment.sessionId!,
@@ -192,6 +199,11 @@ export function createBrokerServer(options: BrokerServerOptions) {
         for (const source of sources) {
           const recovery = createPrimaryBackend({ callId: current.id, callSid: current.callSid,
             bindingId, api: primary, store, ...(segments ? { sourceSessionId: source.sessionId } : {}),
+            callerRouteSources: () => callerRouteSources(store.get(current.id)!),
+            callerRouteCaptureAccepted(sourceId, receipt) {
+              const record = store.get(current.id)?.callerRouting?.records.find(value => value.frozen.turn.sourceEventId === sourceId);
+              if (record) store.captureCallerRoute(current.id, callerRouteRef(record), receipt);
+            },
             ...(current.continuation ? { selectedQuestionSources: () => selectedQuestionSourceAnchors(store.get(current.id)!) } : {}) });
           recoveries.push(recovery);
           if (!current.primaryClosed) await recovery.prepareCloseout();
@@ -729,6 +741,9 @@ export function createBrokerServer(options: BrokerServerOptions) {
           live = options.eligibleContext ? createGenerationVoice({ call: store.get(call.id)!, callDeadlineAt,
             apiKey: config.apiKey, voice: config.voice, store, primary, context: options.eligibleContext, voiceFactory,
             ...(options.selectedQuestion ? { selectedQuestion: options.selectedQuestion } : {}),
+            ...(call.continuation && options.callerIntent ? { callerIntent: createCallerIntentResolver({
+              callId: call.id, store, client: options.callerIntent.client, timeoutMs: options.callerIntent.timeoutMs,
+            }) } : {}),
             onAudio: payload => voiceOptions.onAudio(payload, { deliveryId: 'generation_host_audio' }),
             onReady: voiceOptions.onReady, onClosed: voiceOptions.onClosed,
             onPlaybackClear: () => voiceOptions.onPlaybackClear?.('application_interrupt'),

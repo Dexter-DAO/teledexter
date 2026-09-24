@@ -15,12 +15,18 @@ import type { InboundBeginIdentity } from './inboundContract.js';
 import type { PrimaryCall } from './primaryApi.js';
 import { primaryHarkReceiptBindingFromCall, reducePrimaryHarkReceiptOutbox, validatePrimaryHarkReceiptOutbox,
   type PrimaryHarkReceiptBinding, type PrimaryHarkReceiptCommand, type PrimaryHarkReceiptOutbox } from './harkPrimaryReceiptOutbox.js';
-import type { BrokerDelegationRecord } from './backend.js';
+import { validateBrokerAdmissionRefusals, type BrokerDelegationRecord } from './backend.js';
 import { liveGenerationJournalSchema, type LiveGenerationJournal } from './liveGeneration.js';
 import { callContinuationPatch, assertCallContinuationReplay, requestDeliveryRequestForContinuation, validateCallContinuation, type CallContinuation } from './callContinuation.js';
 import { assertSelectedQuestionJournalUpdate, parseSelectedQuestionJournal, type SelectedQuestionJournal } from './selectedQuestion.js';
 
 import { parseSelectedQuestionVoiceEvidence, validateSelectedQuestionVoiceCall, type SelectedQuestionVoiceEvidence } from './selectedQuestionVoice.js';
+
+import { prepareCallerRouting, decideCallerRouting, captureCallerRouting, validateCallerRouting,
+  prepareCallerIntent, recordCallerIntentResponse,
+  type CallerRoutingJournal, type CallerRoutePreparation, type CallerRouteRecord, type CallerRouteRef, type CallerRouteDecision } from './callerRouting.js';
+import type { PrimaryTurnReceipt } from './primaryApi.js';
+import type { CallerIntentInput, CallerIntentResponse } from './callerIntentContract.js';
 
 import type { CallRequestJournalAvailability } from './callRequestReceipt.js';
 
@@ -43,6 +49,7 @@ export interface BrokerCall {
   continuation?: CallContinuation;
   selectedQuestion?: SelectedQuestionJournal;
   selectedQuestionVoice?: SelectedQuestionVoiceEvidence;
+  callerRouting?: CallerRoutingJournal;
   primary?: { bindingId: string; name: string | null; context: string; callAssignmentRef?: PhoneCallAssignmentRef;
     primaryDexterId?: string; threadId?: string };
   liveSessionId?: string; transcript?: unknown; transcriptRevision?: number;
@@ -208,9 +215,10 @@ function validateSelectedQuestionCall(call: BrokerCall, previous?: BrokerCall): 
   if (!previous) return;
   const before = previous.selectedQuestion;
   if (!before) {
+    const attachment = generations.deliveryAttachment;
     if (selectedQuestionCallStopped(call) || generations.phase !== 'active' || source.state !== 'active'
-      || generations.deliveryAttachment?.sessionId !== source.sessionId
-      || generations.deliveryAttachment.generationId !== source.generationId
+      || !attachment || attachment.sessionId !== source.sessionId
+      || attachment.generationId !== source.generationId
       || journal.stoppedAt || journal.questions.length !== 1 || journal.questions[0]!.record
       || journal.questions[0]!.admissions.length !== 0)
       throw new Error('Selected question requires its active initial generation');
@@ -344,6 +352,8 @@ function validateBrokerState(state: State): void {
     validateGenerations(call);
     validateSelectedQuestionCall(call);
     validateSelectedVoice(call);
+    validateCallerRouting(call);
+    validateBrokerAdmissionRefusals(call);
     validateHarkJournal(call);
     validateHarkDispatch(call);
     validateInboundJournal(call);
@@ -393,6 +403,11 @@ export class BrokerStore {
   private persist(next: State) {
     if (this.closed) throw new Error('Broker store is closed');
     if (this.persistenceUncertain) throw new Error('Broker journal write outcome is uncertain');
+    // All write paths share this guard, including selected replies and ordinary queue updates.
+    for (const [id, call] of Object.entries(next.calls)) {
+      validateCallerRouting(call, this.state?.calls[id]);
+      validateBrokerAdmissionRefusals(call, this.state?.calls[id]);
+    }
     try { durablyReplaceJsonFile(this.file, JSON.stringify(next), fs, this.parent); }
     catch (error) {
       // A post-rename failure can leave next on disk and the old state in memory.
@@ -461,6 +476,7 @@ export class BrokerStore {
   }
 
   reserve(input: Pick<BrokerCall, 'requestId' | 'direction' | 'purpose' | 'number'> & { callSid?: string; continuation?: CallContinuation }, origin?: 'authenticated_broker_control'): { call: BrokerCall; existing: boolean } {
+    if (Object.prototype.hasOwnProperty.call(input, 'callerRouting')) throw new Error('Caller routing requires an admitted call');
     if (Object.prototype.hasOwnProperty.call(input, 'callAssignment')) throw new Error('Assignment must originate from control reservation');
     if (Object.prototype.hasOwnProperty.call(input, 'selectedQuestion') || Object.prototype.hasOwnProperty.call(input, 'selectedQuestionVoice')) throw new Error('Selected question requires an admitted call');
     const { continuation, ...ordinary } = input;
@@ -605,12 +621,69 @@ export class BrokerStore {
     return structuredClone(selectedQuestionVoice);
   }
 
-  update(id: string, patch: Partial<Omit<BrokerCall, 'id' | 'requestId' | 'number' | 'direction' | 'purpose' | 'createdAt' | 'callAssignment' | 'continuation' | 'selectedQuestion' | 'selectedQuestionVoice' | 'harkJournal' | 'harkDispatch' | 'inbound'>>): BrokerCall {
+  /** Exact frozen source and resolver inputs are durable before classification. */
+  prepareCallerRoute(id: string, input: CallerRoutePreparation): CallerRouteRecord {
+    const previous = this.state.calls[id];
+    if (!previous) throw new Error('Unknown broker call');
+    const { journal, record } = prepareCallerRouting(previous, structuredClone(input));
+    if (canonicalJson(previous.callerRouting) !== canonicalJson(journal))
+      this.saveHarkCall({ ...previous, callerRouting: journal, updatedAt: new Date().toISOString() });
+    return structuredClone(record);
+  }
+
+  decideCallerRoute(id: string, ref: CallerRouteRef,
+    response: { inputDigest: string; decision: CallerRouteDecision }): CallerRouteRecord {
+    const previous = this.state.calls[id];
+    if (!previous) throw new Error('Unknown broker call');
+    const journal = decideCallerRouting(previous, ref, structuredClone(response));
+    if (canonicalJson(previous.callerRouting) !== canonicalJson(journal))
+      this.saveHarkCall({ ...previous, callerRouting: journal, updatedAt: new Date().toISOString() });
+    return structuredClone(journal.records.find(record => record.frozen.turn.sourceEventId === ref.sourceEventId)!);
+  }
+
+  prepareCallerIntent(id: string, ref: CallerRouteRef,
+    operation: { operationId: string; input: CallerIntentInput }): CallerRouteRecord {
+    const previous = this.state.calls[id];
+    if (!previous) throw new Error('Unknown broker call');
+    const journal = prepareCallerIntent(previous, ref, structuredClone(operation));
+    if (canonicalJson(previous.callerRouting) !== canonicalJson(journal))
+      this.saveHarkCall({ ...previous, callerRouting: journal, updatedAt: new Date().toISOString() });
+    const record = journal.records.find(record => record.frozen.turn.sourceEventId === ref.sourceEventId);
+    if (!record) throw new Error('caller_route_not_found');
+    return structuredClone(record);
+  }
+
+  recordCallerIntentResponse(id: string, ref: CallerRouteRef, response: CallerIntentResponse): CallerRouteRecord {
+    const previous = this.state.calls[id];
+    if (!previous) throw new Error('Unknown broker call');
+    const journal = recordCallerIntentResponse(previous, ref, structuredClone(response));
+    if (canonicalJson(previous.callerRouting) !== canonicalJson(journal))
+      this.saveHarkCall({ ...previous, callerRouting: journal, updatedAt: new Date().toISOString() });
+    const record = journal.records.find(record => record.frozen.turn.sourceEventId === ref.sourceEventId);
+    if (!record) throw new Error('caller_route_not_found');
+    return structuredClone(record);
+  }
+
+  captureCallerRoute(id: string, ref: CallerRouteRef, receipt: PrimaryTurnReceipt): CallerRouteRecord {
+    const previous = this.state.calls[id];
+    if (!previous) throw new Error('Unknown broker call');
+    const journal = captureCallerRouting(previous, ref, structuredClone(receipt));
+    if (canonicalJson(previous.callerRouting) !== canonicalJson(journal))
+      this.saveHarkCall({ ...previous, callerRouting: journal, updatedAt: new Date().toISOString() });
+    return structuredClone(journal.records.find(record => record.frozen.turn.sourceEventId === ref.sourceEventId)!);
+  }
+
+  update(id: string, patch: Partial<Omit<BrokerCall, 'id' | 'requestId' | 'number' | 'direction' | 'purpose' | 'createdAt' | 'callAssignment' | 'continuation' | 'selectedQuestion' | 'selectedQuestionVoice' | 'callerRouting' | 'harkJournal' | 'harkDispatch' | 'inbound'>>): BrokerCall {
     const previous = this.state.calls[id];
     if (!previous) throw new Error('Unknown broker call');
     // Runtime callers can bypass Omit. Check the same property snapshot that
     // will be persisted, so accessors cannot change a value after validation.
     const nextPatch = { ...patch };
+    if (Object.prototype.hasOwnProperty.call(nextPatch, 'callerRouting')) {
+      if (canonicalJson((nextPatch as Partial<BrokerCall>).callerRouting) !== canonicalJson(previous.callerRouting))
+        throw new Error('Caller routing requires an explicit transition');
+      delete (nextPatch as Partial<BrokerCall>).callerRouting;
+    }
     if (Object.prototype.hasOwnProperty.call(nextPatch, 'selectedQuestionVoice')) {
       if (canonicalJson((nextPatch as Partial<BrokerCall>).selectedQuestionVoice) !== canonicalJson(previous.selectedQuestionVoice))
         throw new Error('Selected question voice evidence requires an explicit transition');

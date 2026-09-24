@@ -1,0 +1,506 @@
+[
+  {
+    "name": "absent",
+    "bindingId": "11111111-1111-4111-8111-111111111111",
+    "input": {
+      "source": {
+        "callSid": "CA11111111111111111111111111111111",
+        "itemId": "item_caller_1",
+        "sourceEventId": "33333333-3333-4333-8333-333333333333",
+        "revision": 1,
+        "receivedAt": "2026-09-21T21:00:00.000Z",
+        "role": "user"
+      },
+      "text": " Hello.\t"
+    },
+    "rawJson": "{\"bindingId\":\"11111111-1111-4111-8111-111111111111\",\"callSid\":\"CA11111111111111111111111111111111\",\"itemId\":\"item_caller_1\",\"sourceEventId\":\"33333333-3333-4333-8333-333333333333\",\"revision\":1,\"receivedAt\":\"2026-09-21T21:00:00.000Z\",\"role\":\"user\",\"text\":\" Hello.\\t\"}",
+    "rawDigest": "32e446574a52e25b817e9fdf149cc61d929914e06fc25cee11d927577d875269",
+    "renderedJson": "{\"bindingId\":\"11111111-1111-4111-8111-111111111111\",\"callSid\":\"CA11111111111111111111111111111111\",\"itemId\":\"item_caller_1\",\"sourceEventId\":\"33333333-3333-4333-8333-333333333333\",\"revision\":1,\"receivedAt\":\"2026-09-21T21:00:00.000Z\",\"role\":\"user\",\"text\":\" Hello.\\t\",\"primaryRendering\":{\"text\":\"Hello.\",\"projection\":{\"kind\":\"derived\"}}}",
+    "renderedDigest": "c2c2d09ab62eabbacd0094ee55f3f07069f18a029dd7b2ad382b728453ad64b1",
+    "submitBody": {
+      "bindingId": "11111111-1111-4111-8111-111111111111",
+      "source": {
+        "callSid": "CA11111111111111111111111111111111",
+        "itemId": "item_caller_1",
+        "sourceEventId": "33333333-3333-4333-8333-333333333333",
+        "revision": 1,
+        "receivedAt": "2026-09-21T21:00:00.000Z"
+      },
+      "role": "user",
+      "text": " Hello.\t"
+    },
+    "originalReconcileBody": {
+      "bindingId": "11111111-1111-4111-8111-111111111111",
+      "source": {
+        "callSid": "CA11111111111111111111111111111111",
+        "itemId": "item_caller_1",
+        "sourceEventId": "33333333-3333-4333-8333-333333333333",
+        "revision": 1,
+        "receivedAt": "2026-09-21T21:00:00.000Z"
+      },
+      "role": "user",
+      "text": " Hello.\t"
+    },
+    "expectedClosedCallProofRawSubmissionDigest": "32e446574a52e25b817e9fdf149cc61d929914e06fc25cee11d927577d875269",
+    "qualification": "literal preimage fixture only; no API or database operation executed"
+  },
+  {
+    "name": "publication",
+    "bindingId": "11111111-1111-4111-8111-111111111111",
+    "input": {
+      "source": {
+        "callSid": "CA11111111111111111111111111111111",
+        "itemId": "item_caller_1",
+        "sourceEventId": "33333333-3333-4333-8333-333333333333",
+        "revision": 1,
+        "receivedAt": "2026-09-21T21:00:00.000Z",
+        "role": "user"
+      },
+      "text": " Hello.\t",
+      "relatedPrimaryRequestId": "66666666-6666-4666-8666-666666666666",
+      "referenceOrigin": "broker_status_publication"
+    },
+    "rawJson": "{\"bindingId\":\"11111111-1111-4111-8111-111111111111\",\"callSid\":\"CA11111111111111111111111111111111\",\"itemId\":\"item_caller_1\",\"sourceEventId\":\"33333333-3333-4333-8333-333333333333\",\"revision\":1,\"receivedAt\":\"2026-09-21T21:00:00.000Z\",\"role\":\"user\",\"text\":\" Hello.\\t\",\"relatedPrimaryRequestId\":\"66666666-6666-4666-8666-666666666666\",\"referenceOrigin\":\"broker_status_publication\"}",
+    "rawDigest": "68120e7a04b8280feab1c28530b96950ad415becaa0a7f216cc8353dc5b7d686",
+    "renderedJson": "{\"bindingId\":\"11111111-1111-4111-8111-111111111111\",\"callSid\":\"CA11111111111111111111111111111111\",\"itemId\":\"item_caller_1\",\"sourceEventId\":\"33333333-3333-4333-8333-333333333333\",\"revision\":1,\"receivedAt\":\"2026-09-21T21:00:00.000Z\",\"role\":\"user\",\"text\":\" Hello.\\t\",\"relatedPrimaryRequestId\":\"66666666-6666-4666-8666-666666666666\",\"referenceOrigin\":\"broker_status_publication\",\"primaryRendering\":{\"text\":\"Hello.\",\"projection\":{\"kind\":\"derived\"}}}",
+    "renderedDigest": "5e24b8246db895eef5de020c3b74598b8d948bf0f0e8ecc70e92d1a59eeb27e5",
+    "submitBody": {
+      "bindingId": "11111111-1111-4111-8111-111111111111",
+      "source": {
+        "callSid": "CA11111111111111111111111111111111",
+        "itemId": "item_caller_1",
+        "sourceEventId": "33333333-3333-4333-8333-333333333333",
+        "revision": 1,
+        "receivedAt": "2026-09-21T21:00:00.000Z"
+      },
+      "role": "user",
+      "text": " Hello.\t",
+      "relatedPrimaryRequestId": "66666666-6666-4666-8666-666666666666",
+      "referenceOrigin": "broker_status_publication"
+    },
+    "originalReconcileBody": {
+      "bindingId": "11111111-1111-4111-8111-111111111111",
+      "source": {
+        "callSid": "CA11111111111111111111111111111111",
+        "itemId": "item_caller_1",
+        "sourceEventId": "33333333-3333-4333-8333-333333333333",
+        "revision": 1,
+        "receivedAt": "2026-09-21T21:00:00.000Z"
+      },
+      "role": "user",
+      "text": " Hello.\t",
+      "relatedPrimaryRequestId": "66666666-6666-4666-8666-666666666666",
+      "referenceOrigin": "broker_status_publication"
+    },
+    "expectedClosedCallProofRawSubmissionDigest": "68120e7a04b8280feab1c28530b96950ad415becaa0a7f216cc8353dc5b7d686",
+    "qualification": "literal preimage fixture only; no API or database operation executed"
+  },
+  {
+    "name": "assignment",
+    "bindingId": "11111111-1111-4111-8111-111111111111",
+    "input": {
+      "source": {
+        "callSid": "CA11111111111111111111111111111111",
+        "itemId": "item_caller_1",
+        "sourceEventId": "33333333-3333-4333-8333-333333333333",
+        "revision": 1,
+        "receivedAt": "2026-09-21T21:00:00.000Z",
+        "role": "user"
+      },
+      "text": " Hello.\t",
+      "callAssignmentRef": {
+        "assignmentId": "22222222-2222-4222-8222-222222222222",
+        "revision": 1,
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    "rawJson": "{\"bindingId\":\"11111111-1111-4111-8111-111111111111\",\"callSid\":\"CA11111111111111111111111111111111\",\"itemId\":\"item_caller_1\",\"sourceEventId\":\"33333333-3333-4333-8333-333333333333\",\"revision\":1,\"receivedAt\":\"2026-09-21T21:00:00.000Z\",\"role\":\"user\",\"text\":\" Hello.\\t\",\"callAssignmentRef\":{\"assignmentId\":\"22222222-2222-4222-8222-222222222222\",\"revision\":1,\"digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}",
+    "rawDigest": "01133f7c7ad855dfe5a6a7a5353ac92c01a67511c1e95677dd5f1c662857ac7a",
+    "renderedJson": "{\"bindingId\":\"11111111-1111-4111-8111-111111111111\",\"callSid\":\"CA11111111111111111111111111111111\",\"itemId\":\"item_caller_1\",\"sourceEventId\":\"33333333-3333-4333-8333-333333333333\",\"revision\":1,\"receivedAt\":\"2026-09-21T21:00:00.000Z\",\"role\":\"user\",\"text\":\" Hello.\\t\",\"callAssignmentRef\":{\"assignmentId\":\"22222222-2222-4222-8222-222222222222\",\"revision\":1,\"digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"primaryRendering\":{\"text\":\"Hello.\",\"projection\":{\"kind\":\"derived\"}}}",
+    "renderedDigest": "f5950d8945051cb47fb57f862fdb62a068c79e93e07316a7345368c0d6069544",
+    "submitBody": {
+      "bindingId": "11111111-1111-4111-8111-111111111111",
+      "source": {
+        "callSid": "CA11111111111111111111111111111111",
+        "itemId": "item_caller_1",
+        "sourceEventId": "33333333-3333-4333-8333-333333333333",
+        "revision": 1,
+        "receivedAt": "2026-09-21T21:00:00.000Z"
+      },
+      "role": "user",
+      "text": " Hello.\t",
+      "callAssignmentRef": {
+        "assignmentId": "22222222-2222-4222-8222-222222222222",
+        "revision": 1,
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    "originalReconcileBody": {
+      "bindingId": "11111111-1111-4111-8111-111111111111",
+      "source": {
+        "callSid": "CA11111111111111111111111111111111",
+        "itemId": "item_caller_1",
+        "sourceEventId": "33333333-3333-4333-8333-333333333333",
+        "revision": 1,
+        "receivedAt": "2026-09-21T21:00:00.000Z"
+      },
+      "role": "user",
+      "text": " Hello.\t",
+      "callAssignmentRef": {
+        "assignmentId": "22222222-2222-4222-8222-222222222222",
+        "revision": 1,
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    "expectedClosedCallProofRawSubmissionDigest": "01133f7c7ad855dfe5a6a7a5353ac92c01a67511c1e95677dd5f1c662857ac7a",
+    "qualification": "literal preimage fixture only; no API or database operation executed"
+  },
+  {
+    "name": "both",
+    "bindingId": "11111111-1111-4111-8111-111111111111",
+    "input": {
+      "source": {
+        "callSid": "CA11111111111111111111111111111111",
+        "itemId": "item_caller_1",
+        "sourceEventId": "33333333-3333-4333-8333-333333333333",
+        "revision": 1,
+        "receivedAt": "2026-09-21T21:00:00.000Z",
+        "role": "user"
+      },
+      "text": " Hello.\t",
+      "relatedPrimaryRequestId": "66666666-6666-4666-8666-666666666666",
+      "referenceOrigin": "broker_status_publication",
+      "callAssignmentRef": {
+        "assignmentId": "22222222-2222-4222-8222-222222222222",
+        "revision": 1,
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    "rawJson": "{\"bindingId\":\"11111111-1111-4111-8111-111111111111\",\"callSid\":\"CA11111111111111111111111111111111\",\"itemId\":\"item_caller_1\",\"sourceEventId\":\"33333333-3333-4333-8333-333333333333\",\"revision\":1,\"receivedAt\":\"2026-09-21T21:00:00.000Z\",\"role\":\"user\",\"text\":\" Hello.\\t\",\"relatedPrimaryRequestId\":\"66666666-6666-4666-8666-666666666666\",\"referenceOrigin\":\"broker_status_publication\",\"callAssignmentRef\":{\"assignmentId\":\"22222222-2222-4222-8222-222222222222\",\"revision\":1,\"digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}",
+    "rawDigest": "42c169da063f625fbf208cb91f32b6e193b72ef1592529cf451b67c484053eb5",
+    "renderedJson": "{\"bindingId\":\"11111111-1111-4111-8111-111111111111\",\"callSid\":\"CA11111111111111111111111111111111\",\"itemId\":\"item_caller_1\",\"sourceEventId\":\"33333333-3333-4333-8333-333333333333\",\"revision\":1,\"receivedAt\":\"2026-09-21T21:00:00.000Z\",\"role\":\"user\",\"text\":\" Hello.\\t\",\"relatedPrimaryRequestId\":\"66666666-6666-4666-8666-666666666666\",\"referenceOrigin\":\"broker_status_publication\",\"callAssignmentRef\":{\"assignmentId\":\"22222222-2222-4222-8222-222222222222\",\"revision\":1,\"digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"primaryRendering\":{\"text\":\"Hello.\",\"projection\":{\"kind\":\"derived\"}}}",
+    "renderedDigest": "a9f2fcbcbe576998738f9e7f011ba07d5b96e8a4d5121b5f37ef614d597a6255",
+    "submitBody": {
+      "bindingId": "11111111-1111-4111-8111-111111111111",
+      "source": {
+        "callSid": "CA11111111111111111111111111111111",
+        "itemId": "item_caller_1",
+        "sourceEventId": "33333333-3333-4333-8333-333333333333",
+        "revision": 1,
+        "receivedAt": "2026-09-21T21:00:00.000Z"
+      },
+      "role": "user",
+      "text": " Hello.\t",
+      "relatedPrimaryRequestId": "66666666-6666-4666-8666-666666666666",
+      "referenceOrigin": "broker_status_publication",
+      "callAssignmentRef": {
+        "assignmentId": "22222222-2222-4222-8222-222222222222",
+        "revision": 1,
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    "originalReconcileBody": {
+      "bindingId": "11111111-1111-4111-8111-111111111111",
+      "source": {
+        "callSid": "CA11111111111111111111111111111111",
+        "itemId": "item_caller_1",
+        "sourceEventId": "33333333-3333-4333-8333-333333333333",
+        "revision": 1,
+        "receivedAt": "2026-09-21T21:00:00.000Z"
+      },
+      "role": "user",
+      "text": " Hello.\t",
+      "relatedPrimaryRequestId": "66666666-6666-4666-8666-666666666666",
+      "referenceOrigin": "broker_status_publication",
+      "callAssignmentRef": {
+        "assignmentId": "22222222-2222-4222-8222-222222222222",
+        "revision": 1,
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    "expectedClosedCallProofRawSubmissionDigest": "42c169da063f625fbf208cb91f32b6e193b72ef1592529cf451b67c484053eb5",
+    "qualification": "literal preimage fixture only; no API or database operation executed"
+  },
+  {
+    "name": "associated",
+    "bindingId": "11111111-1111-4111-8111-111111111111",
+    "input": {
+      "source": {
+        "callSid": "CA11111111111111111111111111111111",
+        "itemId": "item_caller_1",
+        "sourceEventId": "33333333-3333-4333-8333-333333333333",
+        "revision": 1,
+        "receivedAt": "2026-09-21T21:00:00.000Z",
+        "role": "user"
+      },
+      "text": " Hello.\t",
+      "associatedResultReference": {
+        "v": "phone.associated-result-reference.v1",
+        "deliveryAssociationId": "77777777-7777-4777-8777-777777777777",
+        "originalRequestId": "66666666-6666-4666-8666-666666666666",
+        "assistantMessageId": "88888888-8888-4888-8888-888888888888"
+      }
+    },
+    "rawJson": "{\"bindingId\":\"11111111-1111-4111-8111-111111111111\",\"callSid\":\"CA11111111111111111111111111111111\",\"itemId\":\"item_caller_1\",\"sourceEventId\":\"33333333-3333-4333-8333-333333333333\",\"revision\":1,\"receivedAt\":\"2026-09-21T21:00:00.000Z\",\"role\":\"user\",\"text\":\" Hello.\\t\",\"associatedResultReference\":{\"v\":\"phone.associated-result-reference.v1\",\"deliveryAssociationId\":\"77777777-7777-4777-8777-777777777777\",\"originalRequestId\":\"66666666-6666-4666-8666-666666666666\",\"assistantMessageId\":\"88888888-8888-4888-8888-888888888888\"}}",
+    "rawDigest": "438efbcdb1473db9f61cb1f901310df1170d04dbea9f02d02e835b3bb7a7afbe",
+    "renderedJson": "{\"bindingId\":\"11111111-1111-4111-8111-111111111111\",\"callSid\":\"CA11111111111111111111111111111111\",\"itemId\":\"item_caller_1\",\"sourceEventId\":\"33333333-3333-4333-8333-333333333333\",\"revision\":1,\"receivedAt\":\"2026-09-21T21:00:00.000Z\",\"role\":\"user\",\"text\":\" Hello.\\t\",\"associatedResultReference\":{\"v\":\"phone.associated-result-reference.v1\",\"deliveryAssociationId\":\"77777777-7777-4777-8777-777777777777\",\"originalRequestId\":\"66666666-6666-4666-8666-666666666666\",\"assistantMessageId\":\"88888888-8888-4888-8888-888888888888\"},\"primaryRendering\":{\"text\":\"Hello.\",\"projection\":{\"kind\":\"derived\"}}}",
+    "renderedDigest": "97adcb32babd6a1fe4b374a9daa5925c5e8ee6c92205f7eafcc11368a15d207b",
+    "submitBody": {
+      "bindingId": "11111111-1111-4111-8111-111111111111",
+      "source": {
+        "callSid": "CA11111111111111111111111111111111",
+        "itemId": "item_caller_1",
+        "sourceEventId": "33333333-3333-4333-8333-333333333333",
+        "revision": 1,
+        "receivedAt": "2026-09-21T21:00:00.000Z"
+      },
+      "role": "user",
+      "text": " Hello.\t",
+      "associatedResultReference": {
+        "v": "phone.associated-result-reference.v1",
+        "deliveryAssociationId": "77777777-7777-4777-8777-777777777777",
+        "originalRequestId": "66666666-6666-4666-8666-666666666666",
+        "assistantMessageId": "88888888-8888-4888-8888-888888888888"
+      }
+    },
+    "originalReconcileBody": {
+      "bindingId": "11111111-1111-4111-8111-111111111111",
+      "source": {
+        "callSid": "CA11111111111111111111111111111111",
+        "itemId": "item_caller_1",
+        "sourceEventId": "33333333-3333-4333-8333-333333333333",
+        "revision": 1,
+        "receivedAt": "2026-09-21T21:00:00.000Z"
+      },
+      "role": "user",
+      "text": " Hello.\t",
+      "associatedResultReference": {
+        "v": "phone.associated-result-reference.v1",
+        "deliveryAssociationId": "77777777-7777-4777-8777-777777777777",
+        "originalRequestId": "66666666-6666-4666-8666-666666666666",
+        "assistantMessageId": "88888888-8888-4888-8888-888888888888"
+      }
+    },
+    "expectedClosedCallProofRawSubmissionDigest": "438efbcdb1473db9f61cb1f901310df1170d04dbea9f02d02e835b3bb7a7afbe",
+    "qualification": "literal preimage fixture only; no API or database operation executed"
+  },
+  {
+    "name": "associated-exact-text",
+    "bindingId": "11111111-1111-4111-8111-111111111111",
+    "input": {
+      "source": {
+        "callSid": "CA11111111111111111111111111111111",
+        "itemId": "item_caller_1",
+        "sourceEventId": "33333333-3333-4333-8333-333333333333",
+        "revision": 1,
+        "receivedAt": "2026-09-21T21:00:00.000Z",
+        "role": "user"
+      },
+      "text": "Hello.",
+      "associatedResultReference": {
+        "v": "phone.associated-result-reference.v1",
+        "deliveryAssociationId": "77777777-7777-4777-8777-777777777777",
+        "originalRequestId": "66666666-6666-4666-8666-666666666666",
+        "assistantMessageId": "88888888-8888-4888-8888-888888888888"
+      }
+    },
+    "rawJson": "{\"bindingId\":\"11111111-1111-4111-8111-111111111111\",\"callSid\":\"CA11111111111111111111111111111111\",\"itemId\":\"item_caller_1\",\"sourceEventId\":\"33333333-3333-4333-8333-333333333333\",\"revision\":1,\"receivedAt\":\"2026-09-21T21:00:00.000Z\",\"role\":\"user\",\"text\":\"Hello.\",\"associatedResultReference\":{\"v\":\"phone.associated-result-reference.v1\",\"deliveryAssociationId\":\"77777777-7777-4777-8777-777777777777\",\"originalRequestId\":\"66666666-6666-4666-8666-666666666666\",\"assistantMessageId\":\"88888888-8888-4888-8888-888888888888\"}}",
+    "rawDigest": "319ee5a45fe1234658cadcbdc6f7cdef3ccfa8351d2f206cd8ddd73fad2e3d6f",
+    "renderedJson": "{\"bindingId\":\"11111111-1111-4111-8111-111111111111\",\"callSid\":\"CA11111111111111111111111111111111\",\"itemId\":\"item_caller_1\",\"sourceEventId\":\"33333333-3333-4333-8333-333333333333\",\"revision\":1,\"receivedAt\":\"2026-09-21T21:00:00.000Z\",\"role\":\"user\",\"text\":\"Hello.\",\"associatedResultReference\":{\"v\":\"phone.associated-result-reference.v1\",\"deliveryAssociationId\":\"77777777-7777-4777-8777-777777777777\",\"originalRequestId\":\"66666666-6666-4666-8666-666666666666\",\"assistantMessageId\":\"88888888-8888-4888-8888-888888888888\"}}",
+    "renderedDigest": "319ee5a45fe1234658cadcbdc6f7cdef3ccfa8351d2f206cd8ddd73fad2e3d6f",
+    "submitBody": {
+      "bindingId": "11111111-1111-4111-8111-111111111111",
+      "source": {
+        "callSid": "CA11111111111111111111111111111111",
+        "itemId": "item_caller_1",
+        "sourceEventId": "33333333-3333-4333-8333-333333333333",
+        "revision": 1,
+        "receivedAt": "2026-09-21T21:00:00.000Z"
+      },
+      "role": "user",
+      "text": "Hello.",
+      "associatedResultReference": {
+        "v": "phone.associated-result-reference.v1",
+        "deliveryAssociationId": "77777777-7777-4777-8777-777777777777",
+        "originalRequestId": "66666666-6666-4666-8666-666666666666",
+        "assistantMessageId": "88888888-8888-4888-8888-888888888888"
+      }
+    },
+    "originalReconcileBody": {
+      "bindingId": "11111111-1111-4111-8111-111111111111",
+      "source": {
+        "callSid": "CA11111111111111111111111111111111",
+        "itemId": "item_caller_1",
+        "sourceEventId": "33333333-3333-4333-8333-333333333333",
+        "revision": 1,
+        "receivedAt": "2026-09-21T21:00:00.000Z"
+      },
+      "role": "user",
+      "text": "Hello.",
+      "associatedResultReference": {
+        "v": "phone.associated-result-reference.v1",
+        "deliveryAssociationId": "77777777-7777-4777-8777-777777777777",
+        "originalRequestId": "66666666-6666-4666-8666-666666666666",
+        "assistantMessageId": "88888888-8888-4888-8888-888888888888"
+      }
+    },
+    "expectedClosedCallProofRawSubmissionDigest": "319ee5a45fe1234658cadcbdc6f7cdef3ccfa8351d2f206cd8ddd73fad2e3d6f",
+    "qualification": "literal preimage fixture only; no API or database operation executed"
+  },
+  {
+    "name": "associated-assignment",
+    "bindingId": "11111111-1111-4111-8111-111111111111",
+    "input": {
+      "source": {
+        "callSid": "CA11111111111111111111111111111111",
+        "itemId": "item_caller_1",
+        "sourceEventId": "33333333-3333-4333-8333-333333333333",
+        "revision": 1,
+        "receivedAt": "2026-09-21T21:00:00.000Z",
+        "role": "user"
+      },
+      "text": " Hello.\t",
+      "callAssignmentRef": {
+        "assignmentId": "22222222-2222-4222-8222-222222222222",
+        "revision": 1,
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "associatedResultReference": {
+        "v": "phone.associated-result-reference.v1",
+        "deliveryAssociationId": "77777777-7777-4777-8777-777777777777",
+        "originalRequestId": "66666666-6666-4666-8666-666666666666",
+        "assistantMessageId": "88888888-8888-4888-8888-888888888888"
+      }
+    },
+    "rawJson": "{\"bindingId\":\"11111111-1111-4111-8111-111111111111\",\"callSid\":\"CA11111111111111111111111111111111\",\"itemId\":\"item_caller_1\",\"sourceEventId\":\"33333333-3333-4333-8333-333333333333\",\"revision\":1,\"receivedAt\":\"2026-09-21T21:00:00.000Z\",\"role\":\"user\",\"text\":\" Hello.\\t\",\"callAssignmentRef\":{\"assignmentId\":\"22222222-2222-4222-8222-222222222222\",\"revision\":1,\"digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"associatedResultReference\":{\"v\":\"phone.associated-result-reference.v1\",\"deliveryAssociationId\":\"77777777-7777-4777-8777-777777777777\",\"originalRequestId\":\"66666666-6666-4666-8666-666666666666\",\"assistantMessageId\":\"88888888-8888-4888-8888-888888888888\"}}",
+    "rawDigest": "ddc6ddb0f4da2142fa52db840ab3722c175cc9a32ab732e7d14517097a0e5bfc",
+    "renderedJson": "{\"bindingId\":\"11111111-1111-4111-8111-111111111111\",\"callSid\":\"CA11111111111111111111111111111111\",\"itemId\":\"item_caller_1\",\"sourceEventId\":\"33333333-3333-4333-8333-333333333333\",\"revision\":1,\"receivedAt\":\"2026-09-21T21:00:00.000Z\",\"role\":\"user\",\"text\":\" Hello.\\t\",\"callAssignmentRef\":{\"assignmentId\":\"22222222-2222-4222-8222-222222222222\",\"revision\":1,\"digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"associatedResultReference\":{\"v\":\"phone.associated-result-reference.v1\",\"deliveryAssociationId\":\"77777777-7777-4777-8777-777777777777\",\"originalRequestId\":\"66666666-6666-4666-8666-666666666666\",\"assistantMessageId\":\"88888888-8888-4888-8888-888888888888\"},\"primaryRendering\":{\"text\":\"Hello.\",\"projection\":{\"kind\":\"derived\"}}}",
+    "renderedDigest": "550534ef5703cb37e2215bcd7d663d40383d1d28effd80d9d66b257a6b14caab",
+    "submitBody": {
+      "bindingId": "11111111-1111-4111-8111-111111111111",
+      "source": {
+        "callSid": "CA11111111111111111111111111111111",
+        "itemId": "item_caller_1",
+        "sourceEventId": "33333333-3333-4333-8333-333333333333",
+        "revision": 1,
+        "receivedAt": "2026-09-21T21:00:00.000Z"
+      },
+      "role": "user",
+      "text": " Hello.\t",
+      "callAssignmentRef": {
+        "assignmentId": "22222222-2222-4222-8222-222222222222",
+        "revision": 1,
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "associatedResultReference": {
+        "v": "phone.associated-result-reference.v1",
+        "deliveryAssociationId": "77777777-7777-4777-8777-777777777777",
+        "originalRequestId": "66666666-6666-4666-8666-666666666666",
+        "assistantMessageId": "88888888-8888-4888-8888-888888888888"
+      }
+    },
+    "originalReconcileBody": {
+      "bindingId": "11111111-1111-4111-8111-111111111111",
+      "source": {
+        "callSid": "CA11111111111111111111111111111111",
+        "itemId": "item_caller_1",
+        "sourceEventId": "33333333-3333-4333-8333-333333333333",
+        "revision": 1,
+        "receivedAt": "2026-09-21T21:00:00.000Z"
+      },
+      "role": "user",
+      "text": " Hello.\t",
+      "callAssignmentRef": {
+        "assignmentId": "22222222-2222-4222-8222-222222222222",
+        "revision": 1,
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "associatedResultReference": {
+        "v": "phone.associated-result-reference.v1",
+        "deliveryAssociationId": "77777777-7777-4777-8777-777777777777",
+        "originalRequestId": "66666666-6666-4666-8666-666666666666",
+        "assistantMessageId": "88888888-8888-4888-8888-888888888888"
+      }
+    },
+    "expectedClosedCallProofRawSubmissionDigest": "ddc6ddb0f4da2142fa52db840ab3722c175cc9a32ab732e7d14517097a0e5bfc",
+    "qualification": "literal preimage fixture only; no API or database operation executed"
+  },
+  {
+    "name": "associated-assignment-exact-text",
+    "bindingId": "11111111-1111-4111-8111-111111111111",
+    "input": {
+      "source": {
+        "callSid": "CA11111111111111111111111111111111",
+        "itemId": "item_caller_1",
+        "sourceEventId": "33333333-3333-4333-8333-333333333333",
+        "revision": 1,
+        "receivedAt": "2026-09-21T21:00:00.000Z",
+        "role": "user"
+      },
+      "text": "Hello.",
+      "callAssignmentRef": {
+        "assignmentId": "22222222-2222-4222-8222-222222222222",
+        "revision": 1,
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "associatedResultReference": {
+        "v": "phone.associated-result-reference.v1",
+        "deliveryAssociationId": "77777777-7777-4777-8777-777777777777",
+        "originalRequestId": "66666666-6666-4666-8666-666666666666",
+        "assistantMessageId": "88888888-8888-4888-8888-888888888888"
+      }
+    },
+    "rawJson": "{\"bindingId\":\"11111111-1111-4111-8111-111111111111\",\"callSid\":\"CA11111111111111111111111111111111\",\"itemId\":\"item_caller_1\",\"sourceEventId\":\"33333333-3333-4333-8333-333333333333\",\"revision\":1,\"receivedAt\":\"2026-09-21T21:00:00.000Z\",\"role\":\"user\",\"text\":\"Hello.\",\"callAssignmentRef\":{\"assignmentId\":\"22222222-2222-4222-8222-222222222222\",\"revision\":1,\"digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"associatedResultReference\":{\"v\":\"phone.associated-result-reference.v1\",\"deliveryAssociationId\":\"77777777-7777-4777-8777-777777777777\",\"originalRequestId\":\"66666666-6666-4666-8666-666666666666\",\"assistantMessageId\":\"88888888-8888-4888-8888-888888888888\"}}",
+    "rawDigest": "4e7f7b6beecb60f00030466d76ebe4102c3e9ea09c70c8f0b2ed9016bfad8731",
+    "renderedJson": "{\"bindingId\":\"11111111-1111-4111-8111-111111111111\",\"callSid\":\"CA11111111111111111111111111111111\",\"itemId\":\"item_caller_1\",\"sourceEventId\":\"33333333-3333-4333-8333-333333333333\",\"revision\":1,\"receivedAt\":\"2026-09-21T21:00:00.000Z\",\"role\":\"user\",\"text\":\"Hello.\",\"callAssignmentRef\":{\"assignmentId\":\"22222222-2222-4222-8222-222222222222\",\"revision\":1,\"digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"associatedResultReference\":{\"v\":\"phone.associated-result-reference.v1\",\"deliveryAssociationId\":\"77777777-7777-4777-8777-777777777777\",\"originalRequestId\":\"66666666-6666-4666-8666-666666666666\",\"assistantMessageId\":\"88888888-8888-4888-8888-888888888888\"}}",
+    "renderedDigest": "4e7f7b6beecb60f00030466d76ebe4102c3e9ea09c70c8f0b2ed9016bfad8731",
+    "submitBody": {
+      "bindingId": "11111111-1111-4111-8111-111111111111",
+      "source": {
+        "callSid": "CA11111111111111111111111111111111",
+        "itemId": "item_caller_1",
+        "sourceEventId": "33333333-3333-4333-8333-333333333333",
+        "revision": 1,
+        "receivedAt": "2026-09-21T21:00:00.000Z"
+      },
+      "role": "user",
+      "text": "Hello.",
+      "callAssignmentRef": {
+        "assignmentId": "22222222-2222-4222-8222-222222222222",
+        "revision": 1,
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "associatedResultReference": {
+        "v": "phone.associated-result-reference.v1",
+        "deliveryAssociationId": "77777777-7777-4777-8777-777777777777",
+        "originalRequestId": "66666666-6666-4666-8666-666666666666",
+        "assistantMessageId": "88888888-8888-4888-8888-888888888888"
+      }
+    },
+    "originalReconcileBody": {
+      "bindingId": "11111111-1111-4111-8111-111111111111",
+      "source": {
+        "callSid": "CA11111111111111111111111111111111",
+        "itemId": "item_caller_1",
+        "sourceEventId": "33333333-3333-4333-8333-333333333333",
+        "revision": 1,
+        "receivedAt": "2026-09-21T21:00:00.000Z"
+      },
+      "role": "user",
+      "text": "Hello.",
+      "callAssignmentRef": {
+        "assignmentId": "22222222-2222-4222-8222-222222222222",
+        "revision": 1,
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "associatedResultReference": {
+        "v": "phone.associated-result-reference.v1",
+        "deliveryAssociationId": "77777777-7777-4777-8777-777777777777",
+        "originalRequestId": "66666666-6666-4666-8666-666666666666",
+        "assistantMessageId": "88888888-8888-4888-8888-888888888888"
+      }
+    },
+    "expectedClosedCallProofRawSubmissionDigest": "4e7f7b6beecb60f00030466d76ebe4102c3e9ea09c70c8f0b2ed9016bfad8731",
+    "qualification": "literal preimage fixture only; no API or database operation executed"
+  }
+]

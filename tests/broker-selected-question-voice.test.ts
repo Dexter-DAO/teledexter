@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createHash } from 'node:crypto';
-import { brokerIdentity, liveResultChunks } from '../src/broker/backend.js';
+import { brokerIdentity, liveResultChunks, withCallerAdmission } from '../src/broker/backend.js';
+import { prepareCallerRouting, prepareCallerIntent, recordCallerIntentResponse, decideCallerRouting, callerRouteRef,
+  callerIntentQuestionForTarget, callerRoutePresentationDigest, type CallerRouteDecision,
+  type CallerQuestionTarget } from '../src/broker/callerRouting.js';
+import { callerIntentInputDigest, type CallerIntentInput, type CallerIntentResponse } from '../src/broker/callerIntentContract.js';
 import { createSelectedQuestionVoiceAdapter, assertSelectedQuestionVoiceEvidenceUpdate,
   assertSelectedQuestionVoiceScope, parseSelectedQuestionVoiceEvidence, selectedQuestionPresentation,
   validateSelectedQuestionVoiceCall,
@@ -191,6 +195,155 @@ function fixture() {
     setText(value: string) { questionText = value; }, setTime(value: number) { clock = value; },
     frozen: () => structuredClone(frozen!), changeFrozen(value: Partial<FrozenSelectedCallerTurn>) { frozen = { ...frozen!, ...value }; } };
 }
+
+function persistRoute(h: ReturnType<typeof fixture>, request: LiveDelegationRequest,
+  decision: CallerRouteDecision, questions: CallerQuestionTarget[]) {
+  if (decision.kind === 'task') assert.equal(decision.contextReference, undefined);
+  assert.ok(['task', 'answer'].includes(decision.kind));
+  const current = h.call.liveGenerations!.segments.find(segment => segment.sessionId === request.sessionId)!;
+  const prepared = prepareCallerRouting(h.call, { frozen: h.frozen(),
+    delegation: { sessionId: request.sessionId, delegationId: request.delegationId,
+      requestId: request.requestId, offsetMs: request.offsetMs },
+    resolutionInput: { version: current.version, questions, references: [],
+      publicationSequence: h.call.publications!.records.length } });
+  h.call.callerRouting = prepared.journal;
+  const ref = callerRouteRef(prepared.record);
+  const record = prepared.record, frozen = record.frozen;
+  const input: CallerIntentInput = { v: 'phone.caller-intent.v1', source: { callSid: h.call.callSid!,
+    sourceEventId: frozen.turn.sourceEventId, itemId: frozen.turn.itemId, revision: 1,
+    receivedAt: frozen.turn.occurredAt, role: 'user', text: frozen.turn.text }, generationId: current.generationId,
+    sourceSessionId: request.sessionId, brokerInputDigest: record.inputDigest,
+    presentationDigest: callerRoutePresentationDigest(record.resolutionInput), callDeadlineAt: seed.callDeadlineAt,
+    version: current.version, questions: questions.map(callerIntentQuestionForTarget), results: [] };
+  const operationId = brokerIdentity('test-caller-intent', h.call.id, frozen.turn.sourceEventId);
+  h.call.callerRouting = prepareCallerIntent(h.call, ref, { operationId, input });
+  const clock = h.options.now!();
+  const response: CallerIntentResponse = { v: 'phone.caller-intent.v1', operationId, bindingId: seed.delivery.bindingId,
+    inputDigest: callerIntentInputDigest(operationId, seed.delivery.bindingId, input), brokerInputDigest: record.inputDigest,
+    presentationDigest: input.presentationDigest, generationId: current.generationId, sourceSessionId: request.sessionId,
+    callDeadlineAt: seed.callDeadlineAt, questions: input.questions, results: [], version: input.version,
+    reservedAt: new Date(clock).toISOString(), validUntil: new Date(Math.min(clock + 10_000, Date.parse(seed.callDeadlineAt))).toISOString(),
+    state: 'resolved', decision: decision.kind === 'answer' ? { kind: 'answer', target: callerIntentQuestionForTarget(decision.target) }
+      : decision.kind === 'task' ? { kind: 'task' } : { kind: 'conversation' } };
+  h.call.callerRouting = recordCallerIntentResponse(h.call, ref, response);
+  h.call.callerRouting = decideCallerRouting(h.call, ref, { inputDigest: ref.inputDigest, decision });
+  return ref;
+}
+
+test('routed selected answer consumes its persisted frozen source without calling the freezer', async t => {
+  t.mock.method(Date, 'now', () => milliseconds);
+  const h = fixture();
+  h.options.withCallerAdmission = fn => withCallerAdmission(h.call, h.call.id, fn);
+  h.hooks.persistVoice = value => { h.call.selectedQuestionVoice = structuredClone(value); };
+  h.hooks.freezer = async () => { throw new Error('Frozen admission must not select caller speech again'); };
+  const adapter = h.create(); await adapter.host.start();
+  const targets = adapter.questionTargets(h.call.liveSessionId!); assert.equal(targets.length, 1);
+  const request = h.caller(' Yes.\t');
+  const ref = persistRoute(h, request, { kind: 'answer', target: targets[0] }, targets);
+  await adapter.answerFrozen(request, ref, h.channel);
+  await adapter.answerFrozen(request, ref, h.channel);
+  assert.equal(h.posts.length, 1); assert.equal(h.captures.length, 1);
+  assert.equal(h.posts[0].reply!.input.text, ' Yes.\t');
+  assert.equal(h.posts[0].target.execution.bindingId, uuid(9));
+  assert.deepEqual(h.call.delegations, {});
+});
+
+test('task intent cannot enter the selected answer port even after the complete question was published', async t => {
+  t.mock.method(Date, 'now', () => milliseconds);
+  const h = fixture();
+  h.options.withCallerAdmission = fn => withCallerAdmission(h.call, h.call.id, fn);
+  h.hooks.persistVoice = value => { h.call.selectedQuestionVoice = structuredClone(value); };
+  const adapter = h.create(); await adapter.host.start();
+  const targets = adapter.questionTargets(h.call.liveSessionId!);
+  const request = h.caller('Buy ten dollars of NVDA.');
+  const ref = persistRoute(h, request, { kind: 'task' }, targets);
+  await assert.rejects(adapter.answerFrozen(request, ref, h.channel), /caller_route_decision_mismatch/);
+  assert.equal(h.posts.length, 0); assert.equal(h.captures.length, 0);
+  assert.equal(h.voice().sources.length, 0);
+});
+
+test('routed selected source survives rotation for capture but cannot freshly answer from its old presentation', async t => {
+  t.mock.method(Date, 'now', () => milliseconds);
+  const h = fixture();
+  h.options.withCallerAdmission = fn => withCallerAdmission(h.call, h.call.id, fn);
+  h.hooks.persistVoice = value => { h.call.selectedQuestionVoice = structuredClone(value); };
+  const adapter = h.create(); await adapter.host.start();
+  const targets = adapter.questionTargets(h.call.liveSessionId!);
+  const request = h.caller('Yes.');
+  const ref = persistRoute(h, request, { kind: 'answer', target: targets[0] }, targets);
+  const raw = h.frozen(); h.rotate();
+  await assert.rejects(adapter.answerFrozen(request, ref, h.channel), /caller_route_stale_source/);
+  assert.equal(h.posts.length, 0);
+  assert.deepEqual(h.call.callerRouting!.records[0].frozen, raw);
+  assert.deepEqual(adapter.questionTargets(h.call.liveSessionId!), []);
+});
+
+test('routed q1 and q2 answers retain separate exact associations and replay their original source', async t => {
+  t.mock.method(Date, 'now', () => milliseconds);
+  const h = fixture();
+  h.options.withCallerAdmission = fn => withCallerAdmission(h.call, h.call.id, fn);
+  h.hooks.persistVoice = value => { h.call.selectedQuestionVoice = structuredClone(value); };
+  const adapter = h.create(); await adapter.host.start();
+  const firstTargets = adapter.questionTargets(h.call.liveSessionId!), first = h.caller('Yes.');
+  const firstRef = persistRoute(h, first, { kind: 'answer', target: firstTargets[0] }, firstTargets);
+  await adapter.answerFrozen(first, firstRef, h.channel);
+  const q1 = structuredClone(h.saved().questions[0]);
+  h.hooks.result = async () => ({ ...question(uuid(17)), state: 'waiting_for_reply', deliveryAssociation: association(uuid(7)) });
+  h.hooks.question = async journal => question(journal.target.question.id, journal.target.question.id === uuid(7) ? 'answered' : 'pending');
+  await adapter.host.poll();
+  const secondTargets = adapter.questionTargets(h.call.liveSessionId!);
+  assert.equal(secondTargets[0].questionId, uuid(17));
+  const second = h.caller('No.', 4000, milliseconds + 6000);
+  const secondRef = persistRoute(h, second, { kind: 'answer', target: secondTargets[0] }, secondTargets);
+  await adapter.answerFrozen(second, secondRef, h.channel);
+  await adapter.answerFrozen(first, firstRef, h.channel);
+  assert.deepEqual(h.saved().questions[0], q1); assert.equal(h.posts.length, 2);
+  assert.equal(h.posts[0].target.question.id, uuid(7)); assert.equal(h.posts[1].target.question.id, uuid(17));
+  assert.deepEqual(h.posts[0].target.execution, h.posts[1].target.execution);
+  assert.notEqual(h.posts[0].association!.id, h.posts[1].association!.id);
+  assert.notEqual(h.posts[0].reply!.input.source.sourceEventId, h.posts[1].reply!.input.source.sourceEventId);
+});
+
+test('selected answer expiry during capture retains the original receipt and refuses the first POST', async t => {
+  t.mock.method(Date, 'now', () => milliseconds);
+  const h = fixture();
+  h.options.withCallerAdmission = fn => withCallerAdmission(h.call, h.call.id, fn);
+  h.hooks.persistVoice = value => { h.call.selectedQuestionVoice = structuredClone(value); };
+  const adapter = h.create(); await adapter.host.start();
+  const targets = adapter.questionTargets(h.call.liveSessionId!), request = h.caller('Yes.');
+  const ref = persistRoute(h, request, { kind: 'answer', target: targets[0] }, targets);
+  const intent = structuredClone(h.call.callerRouting!.records[0].intent!);
+  h.hooks.capture = async turn => { h.setTime(Date.parse(intent.response!.validUntil)); return receipt(turn); };
+  await adapter.answerFrozen(request, ref, h.channel);
+  assert.equal(h.posts.length, 0); assert.equal(h.captures.length, 1);
+  assert.equal(h.saved().questions[0].admissions[0].localRefusal?.code, 'presentation_invalidated');
+  assert.deepEqual(h.call.callerRouting!.records[0].intent, intent);
+  await adapter.answerFrozen(request, ref, h.channel);
+  assert.equal(h.posts.length, 0); assert.equal(h.captures.length, 1);
+});
+
+test('selected expiry during dispatch-marker persistence is a local refusal with zero HTTP POSTs', async t => {
+  t.mock.method(Date, 'now', () => milliseconds);
+  const h = fixture();
+  h.options.withCallerAdmission = fn => withCallerAdmission(h.call, h.call.id, fn);
+  h.hooks.persistVoice = value => { h.call.selectedQuestionVoice = structuredClone(value); };
+  const adapter = h.create(); await adapter.host.start();
+  const targets = adapter.questionTargets(h.call.liveSessionId!), request = h.caller('Yes.');
+  const ref = persistRoute(h, request, { kind: 'answer', target: targets[0] }, targets);
+  const intent = structuredClone(h.call.callerRouting!.records[0].intent!);
+  const persist = h.options.persist;
+  h.options.persist = value => {
+    persist(value);
+    if (value.questions.at(-1)!.record?.attempts.at(-1)?.state === 'dispatching') h.setTime(Date.parse(intent.response!.validUntil));
+  };
+  await adapter.answerFrozen(request, ref, h.channel);
+  assert.equal(h.posts.length, 0); assert.equal(h.captures.length, 1);
+  const attempt = h.saved().questions[0].record!.attempts[0];
+  assert.equal(attempt.state, 'refused'); assert.equal(attempt.dispatches, 1);
+  assert.equal(attempt.refusal?.kind, 'first_attempt_refusal');
+  if (attempt.refusal?.kind === 'first_attempt_refusal') assert.equal(attempt.refusal.origin, 'local_validation');
+  assert.deepEqual(h.call.callerRouting!.records[0].intent, intent);
+});
 
 test('explicit caller source and acknowledged capture reply to selected original run without ordinary submission', async () => {
   const h = fixture(), adapter = h.create(); await adapter.host.start();

@@ -120,6 +120,44 @@ test('generation start pins the current eligible version and original clocks bef
   await h.controller.stop();
 });
 
+test('status publication cannot interleave inside an exact result publication', async () => {
+  const h = harness(); await h.controller.start();
+  const release = pending<void>(), order: string[] = [];
+  const original = h.sessions[0].handle.publish;
+  h.sessions[0].handle.publish = async value => {
+    order.push('question first chunk');
+    await release.promise;
+    order.push('question final chunk');
+    return original(value);
+  };
+  const result = h.controller.deliver(requestId, { kind: 'assistant', messageId });
+  await until(() => order.length === 1);
+  const notice = h.controller.withCurrentAttachment(async attached => {
+    assert.equal(attached.sessionId, 'session_1');
+    order.push('ordinary task progress');
+    return { status: 'accepted' };
+  });
+  await Promise.resolve();
+  assert.deepEqual(order, ['question first chunk']);
+  release.resolve(); await Promise.all([result, notice]);
+  assert.deepEqual(order, ['question first chunk', 'question final chunk', 'ordinary task progress']);
+  await h.controller.stop();
+});
+
+test('queued status uses the current replacement and is refused after call stop', async () => {
+  const h = harness(); await h.controller.start();
+  h.advanceVersion();
+  const seen: string[] = [];
+  await h.controller.withCurrentAttachment(async attached => { seen.push(attached.sessionId); });
+  assert.deepEqual(seen, ['session_2']);
+  assert.deepEqual(h.controller.snapshot().clocks, clocks);
+  const stop = h.controller.stop();
+  await assert.rejects(h.controller.withCurrentAttachment(async () => { seen.push('after stop'); }),
+    (error: unknown) => error instanceof LiveGenerationError && error.code === 'call_stopped');
+  await stop;
+  assert.deepEqual(seen, ['session_2']);
+});
+
 test('first inbound media requires a saved host observation within the original grace', async () => {
   const { mediaStartedAt: _started, ...unobserved } = clocks;
   for (const invalid of [unobserved,
