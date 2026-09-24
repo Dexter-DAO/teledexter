@@ -4,7 +4,9 @@ import { z } from 'zod';
 import { canonicalJson } from '../outbound/canonical.js';
 import { liveResultChunks } from './backend.js';
 import { eligibleAssociatedDeliveryResponseSchema, eligibleDeliveryResponseSchema } from './eligibleContext.js';
-import { callerIntentResultSchema, type CallerIntentDecision, type CallerIntentResult } from './callerIntentContract.js';
+import { callerIntentResultSchema, type CallerIntentDecision, type CallerIntentResult,
+  type CallerIntentResultCoverage } from './callerIntentContract.js';
+import { liveGenerationJournalSchema } from './liveGeneration.js';
 import type { BrokerDelegationRecord } from './backend.js';
 import type { LiveBackendUpdate, LiveDelivery, LiveTranscriptSnapshot } from '../live/types.js';
 import { terminalCallStatuses, type BrokerCall, type BrokerStore } from './store.js';
@@ -296,6 +298,114 @@ export function callerIntentResultPublicationCandidates(call: BrokerCall, sessio
     candidates.push({ id, digest, reference, candidate });
   }
   return candidates;
+}
+
+export type CallerIntentResultInventoryErrorCode = 'caller_result_inventory_inactive'
+  | 'caller_result_inventory_invalid' | 'caller_result_inventory_unverifiable';
+export class CallerIntentResultInventoryError extends Error {
+  constructor(readonly code: CallerIntentResultInventoryErrorCode) { super(code); }
+}
+export interface CallerIntentResultPublicationInventory {
+  candidates: CallerIntentResultPublicationCandidate[];
+  resultCoverage: CallerIntentResultCoverage;
+}
+
+const inventoryRecordSchema = selectedPublicationSchema.omit({ selectedDelivery: true }).extend({
+  requestState: z.enum(['queued', 'running', 'waiting_for_reply', 'completed', 'failed', 'cancelled']),
+  kind: z.enum(['progress', 'result']), sourceSessionId: z.string().min(1).max(200).optional(),
+  ordinaryDelivery: z.unknown().optional(), selectedDelivery: z.unknown().optional(),
+}).strict();
+const inventoryJournalSchema = z.object({ records: z.array(inventoryRecordSchema),
+  rejections: z.array(z.object({ sessionId: z.string().min(1).max(200), eventId: z.string().refine(commandId),
+    code: z.string().refine(commandId) }).strict()),
+}).strict();
+function resultInventoryIdentity(candidate: CallerIntentResult): string {
+  return canonicalJson([candidate.kind, candidate.execution, candidate.assistantMessageId,
+    candidate.kind === 'selected' ? candidate.deliveryAssociationId : null]);
+}
+
+/** Fresh v2 inventory certifies the entire current-session result set. Unknown evidence refuses
+ * classification; overflow retains every internal anchor and lets the API caller send results:[].
+ * The historical v1 helper above remains unchanged and never gains this fresh-admission policy. */
+export function callerIntentResultPublicationInventory(call: BrokerCall, sessionId: string): CallerIntentResultPublicationInventory {
+  function refuse(code: CallerIntentResultInventoryErrorCode): never { throw new CallerIntentResultInventoryError(code); }
+  try {
+    if (!active(call) || call.finalized || !call.primary || call.liveSessionId !== sessionId)
+      refuse('caller_result_inventory_inactive');
+    const generations = liveGenerationJournalSchema.parse(call.liveGenerations);
+    const segment = generations.segments.find(value => value.sessionId === sessionId);
+    if (!segment || generations.phase !== 'active' || segment.state !== 'active'
+      || generations.deliveryAttachment?.sessionId !== sessionId
+      || generations.deliveryAttachment.generationId !== segment.generationId
+      || Date.now() >= Date.parse(generations.clocks.callDeadlineAt)) refuse('caller_result_inventory_inactive');
+    if (generations.callId !== call.id || generations.binding.bindingId !== call.primary.bindingId
+      || generations.binding.callSid !== call.callSid || generations.binding.primaryDexterId !== call.primary.primaryDexterId
+      || generations.binding.threadId !== call.primary.threadId) refuse('caller_result_inventory_invalid');
+    const saved = call.publications === undefined ? { records: [], rejections: [] } : call.publications;
+    inventoryJournalSchema.parse(saved);
+    const sessions = new Set(generations.segments.map(value => value.sessionId).filter(value => value !== undefined));
+    const commands = new Set<string>();
+    for (const [index, record] of saved.records.entries()) {
+      if (record.publicationSequence !== index + 1 || record.callId !== call.id || record.callSid !== call.callSid
+        || record.bindingId !== call.primary.bindingId || !sessions.has(record.sessionId)
+        || (record.sourceSessionId !== undefined && !sessions.has(record.sourceSessionId))) refuse('caller_result_inventory_invalid');
+      if ((record.ordinaryDelivery !== undefined || record.selectedDelivery !== undefined)
+        && !attributedPublicationMatches(call, record, false)) refuse('caller_result_inventory_invalid');
+      if (record.ordinaryDelivery === undefined && record.selectedDelivery === undefined
+        && !requestMatches(call, record, record.requestId)) refuse('caller_result_inventory_invalid');
+      if (record.outcome?.status === 'accepted') {
+        const command = canonicalJson([record.sessionId, record.outcome.eventId]);
+        if (!commandId(record.outcome.eventId) || commands.has(command)
+          || record.outcome.callerRevision !== record.callerRevision
+          || record.outcome.transcriptSequence < record.transcriptSequence) refuse('caller_result_inventory_invalid');
+        commands.add(command);
+      }
+    }
+    const tombstones = new Set<string>();
+    for (const rejection of saved.rejections) {
+      const key = canonicalJson([rejection.sessionId, rejection.eventId]);
+      if (tombstones.has(key) || !sessions.has(rejection.sessionId)
+        || !saved.records.some(record => record.sessionId === rejection.sessionId
+          && (!record.outcome || record.outcome.eventId === rejection.eventId))) refuse('caller_result_inventory_invalid');
+      tombstones.add(key);
+    }
+    const candidates = callerIntentResultPublicationCandidates(call, sessionId);
+    const identities = new Set(candidates.map(value => resultInventoryIdentity(value.candidate)));
+    for (const record of saved.records) {
+      if (record.sessionId !== sessionId || record.kind !== 'result' || record.requestState !== 'completed') continue;
+      if (record.outcome?.status === 'rejected' || (record.outcome
+        && tombstones.has(canonicalJson([sessionId, record.outcome.eventId])))) continue;
+      const evidence = record.ordinaryDelivery ?? record.selectedDelivery;
+      if (!evidence) refuse('caller_result_inventory_unverifiable');
+      const response = evidence.response, association = record.selectedDelivery?.response.deliveryAssociation;
+      if (response.delivery.state !== 'ready' || response.delivery.source.kind !== 'assistant')
+        refuse('caller_result_inventory_unverifiable');
+      const identity = canonicalJson([association ? 'selected' : 'ordinary', association?.execution ?? {
+        bindingId: response.bindingId, requestId: response.requestId, runId: response.delivery.source.provenance.runId,
+      }, response.delivery.source.messageId, association?.id ?? null]);
+      // Partial attempts cannot be stitched together. A complete earlier/later attempt of this
+      // same result may prove the identity; its own full receipt set supplies the candidate.
+      if (!identities.has(identity)) refuse('caller_result_inventory_unverifiable');
+    }
+    const messages = new Set<string>(), requests = new Map<string, string>(), runs = new Map<string, string>(), associations = new Map<string, string>();
+    for (const { candidate } of candidates) {
+      const execution = candidate.execution, requestScope = canonicalJson([execution.bindingId, execution.runId]);
+      const runScope = canonicalJson([execution.bindingId, execution.requestId]);
+      const associationScope = canonicalJson([execution.bindingId, execution.requestId, execution.runId]);
+      if (messages.has(candidate.assistantMessageId)
+        || (requests.has(execution.requestId) && requests.get(execution.requestId) !== requestScope)
+        || (runs.has(execution.runId) && runs.get(execution.runId) !== runScope)
+        || (candidate.kind === 'selected' && associations.has(candidate.deliveryAssociationId)
+          && associations.get(candidate.deliveryAssociationId) !== associationScope)) refuse('caller_result_inventory_invalid');
+      messages.add(candidate.assistantMessageId); requests.set(execution.requestId, requestScope); runs.set(execution.runId, runScope);
+      if (candidate.kind === 'selected') associations.set(candidate.deliveryAssociationId, associationScope);
+    }
+    const count = candidates.length;
+    return { candidates, resultCoverage: count <= 7 ? { state: 'complete', count } : { state: 'overflow', count } };
+  } catch (error) {
+    if (error instanceof CallerIntentResultInventoryError) throw error;
+    return refuse('caller_result_inventory_invalid');
+  }
 }
 
 /** Historical rejection stays append-only. Existing ordinary journals do not

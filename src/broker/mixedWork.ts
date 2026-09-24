@@ -83,6 +83,13 @@ export function createMixedWorkRouter(options: MixedWorkOptions) {
   };
   const run = async (request: LiveDelegationRequest, channel: LiveBackendChannel) => {
     let record = await prepare(request, channel);
+    if (!record.decision && record.resolutionInput.classificationRefusal) {
+      // Preserve the exact frozen source before any local clarification/capture.
+      // An unverified inventory never reaches classification as an empty one.
+      record = options.store.decideCallerRoute(options.callId, callerRouteRef(record), {
+        inputDigest: record.inputDigest, decision: { kind: 'clarify', reason: 'unavailable' },
+      });
+    }
     if (!record.decision && !stopping && !channel.signal.aborted && options.active(request.sessionId)) {
       const abort = new AbortController(); resolutionAborts.add(abort);
       const stopped = () => abort.abort(new Error('caller_route_source_inactive'));

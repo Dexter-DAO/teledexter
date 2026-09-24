@@ -7,7 +7,8 @@ import type { PrimaryApiClient } from './primaryApi.js';
 import { terminalCallStatuses, type BrokerCall, type BrokerStore } from './store.js';
 import { beginBrokerPublication, beginSelectedQuestionPublication, selectedQuestionPublicationReceiptsAccepted,
   settleBrokerPublication, rejectBrokerPublication, brokerPublicationReceiptsAccepted,
-  callerIntentResultPublicationCandidates, type OrdinaryPublicationEvidence, type BrokerPublicationReceipt } from './publications.js';
+  callerIntentResultPublicationCandidates, callerIntentResultPublicationInventory, CallerIntentResultInventoryError,
+  type OrdinaryPublicationEvidence, type BrokerPublicationReceipt } from './publications.js';
 import { callerRouteRef, callerRouteSources } from './callerRouting.js';
 import { createMixedWorkRouter, type CallerIntentPort } from './mixedWork.js';
 import { acknowledgedTurn } from './reconciliation.js';
@@ -522,10 +523,17 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
       const segment = controller.snapshot().segments.find(value => value.sessionId === request.sessionId);
       const backend = sessions.get(request.sessionId)?.backend;
       if (!segment || !backend) throw new Error('caller_route_source_missing');
-      return { version: segment.version,
+      const context = { version: segment.version,
         publicationSequence: call().publications?.records.at(-1)?.publicationSequence ?? 0,
-        questions: [...backend.questionTargets(request.sessionId), ...(selected?.questionTargets(request.sessionId) ?? [])],
-        references: callerIntentResultPublicationCandidates(call(), request.sessionId).map(({ id, digest }) => ({ id, digest })) };
+        questions: [...backend.questionTargets(request.sessionId), ...(selected?.questionTargets(request.sessionId) ?? [])] };
+      try {
+        const inventory = callerIntentResultPublicationInventory(call(), request.sessionId);
+        return { ...context, resultCoverage: inventory.resultCoverage,
+          references: inventory.candidates.map(({ id, digest }) => ({ id, digest })) };
+      } catch (error) {
+        if (!(error instanceof CallerIntentResultInventoryError)) throw error;
+        return { ...context, references: [], classificationRefusal: error.code };
+      }
     },
     async admit(request, ref, decision, channel) {
       const backend = sessions.get(request.sessionId)?.backend;

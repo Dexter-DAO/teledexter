@@ -212,24 +212,26 @@ function persistRoute(h: ReturnType<typeof fixture>, request: LiveDelegationRequ
   const prepared = prepareCallerRouting(h.call, { frozen: h.frozen(),
     delegation: { sessionId: request.sessionId, delegationId: request.delegationId,
       requestId: request.requestId, offsetMs: request.offsetMs },
-    resolutionInput: { version: current.version, questions, references: [],
+    resolutionInput: { version: current.version, questions, references: [], resultCoverage: { state: 'complete', count: 0 },
       publicationSequence: h.call.publications!.records.length } });
   h.call.callerRouting = prepared.journal;
   const ref = callerRouteRef(prepared.record);
   const record = prepared.record, frozen = record.frozen;
-  const input: CallerIntentInput = { v: 'phone.caller-intent.v1', source: { callSid: h.call.callSid!,
+  const input: CallerIntentInput = { v: 'phone.caller-intent.v2', source: { callSid: h.call.callSid!,
     sourceEventId: frozen.turn.sourceEventId, itemId: frozen.turn.itemId, revision: 1,
     receivedAt: frozen.turn.occurredAt, role: 'user', text: frozen.turn.text }, generationId: current.generationId,
     sourceSessionId: request.sessionId, brokerInputDigest: record.inputDigest,
     presentationDigest: callerRoutePresentationDigest(record.resolutionInput), callDeadlineAt: seed.callDeadlineAt,
-    version: current.version, questions: questions.map(callerIntentQuestionForTarget), results: [] };
+    version: current.version, questions: questions.map(callerIntentQuestionForTarget), results: [],
+    resultCoverage: { state: 'complete', count: 0 } };
   const operationId = brokerIdentity('test-caller-intent', h.call.id, frozen.turn.sourceEventId);
   h.call.callerRouting = prepareCallerIntent(h.call, ref, { operationId, input });
   const clock = h.options.now!();
-  const response: CallerIntentResponse = { v: 'phone.caller-intent.v1', operationId, bindingId: seed.delivery.bindingId,
+  const response: CallerIntentResponse = { v: 'phone.caller-intent.v2', operationId, bindingId: seed.delivery.bindingId,
     inputDigest: callerIntentInputDigest(operationId, seed.delivery.bindingId, input), brokerInputDigest: record.inputDigest,
     presentationDigest: input.presentationDigest, generationId: current.generationId, sourceSessionId: request.sessionId,
     callDeadlineAt: seed.callDeadlineAt, questions: input.questions, results: [], version: input.version,
+    resultCoverage: input.resultCoverage, resultContextCoverage: { state: 'complete' },
     reservedAt: new Date(clock).toISOString(), validUntil: new Date(Math.min(clock + 10_000, Date.parse(seed.callDeadlineAt))).toISOString(),
     state: 'resolved', decision: decision.kind === 'answer' ? { kind: 'answer', target: callerIntentQuestionForTarget(decision.target) }
       : decision.kind === 'task' ? { kind: 'task' } : { kind: 'conversation' } };

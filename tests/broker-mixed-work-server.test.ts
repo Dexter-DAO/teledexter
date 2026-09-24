@@ -9,7 +9,7 @@ import { createBrokerServer } from '../src/broker/server.js';
 import { BrokerStore } from '../src/broker/store.js';
 import { brokerIdentity, type BrokerDelegationRecord } from '../src/broker/backend.js';
 import { createPrimaryCallerIntentClient } from '../src/broker/callerIntentClient.js';
-import { callerIntentInputDigest, type CallerIntentInput, type CallerIntentDecision,
+import { callerIntentV2InputSchema, callerIntentInputDigest, type CallerIntentInput, type CallerIntentDecision,
   type CallerIntentResponse } from '../src/broker/callerIntentContract.js';
 import { streamToken } from '../src/broker/phone.js';
 import { turnBodyDigest } from '../src/broker/reconciliation.js';
@@ -176,7 +176,7 @@ async function fixture(t: test.TestContext, options: { ordinaryQuestion?: boolea
       assert.equal(headers.get('X-Dexter-Binding-Id'), bindingId);
       assert.equal(headers.get('X-Dexter-Phone-Context-Version'), 'memory-eligible-v1');
       assert.match(headers.get('authorization') ?? '', /^Bearer [a-f0-9]{64}$/);
-      const input = JSON.parse(String(init?.body)) as CallerIntentInput;
+      const input = callerIntentV2InputSchema.parse(JSON.parse(String(init?.body)));
       intentPosts.push({ operationId, input: structuredClone(input), method: init!.method! });
       const saved = store.get(call.id)!.callerRouting!.records.find(record => record.intent?.operationId === operationId)!;
       assert.ok(saved); assert.deepEqual(saved.intent!.input, input); assert.equal(saved.decision, undefined);
@@ -195,6 +195,8 @@ async function fixture(t: test.TestContext, options: { ordinaryQuestion?: boolea
         inputDigest: callerIntentInputDigest(operationId, bindingId, input), brokerInputDigest: input.brokerInputDigest,
         presentationDigest: input.presentationDigest, generationId: input.generationId, sourceSessionId: input.sourceSessionId,
         callDeadlineAt: input.callDeadlineAt, questions: input.questions, results: input.results, version: input.version,
+        resultCoverage: input.resultCoverage, resultContextCoverage: input.resultCoverage.state === 'complete'
+          ? { state: 'complete' } : { state: 'unavailable', reason: 'inventory_overflow' },
         reservedAt, validUntil: new Date(Math.min(Date.parse(input.callDeadlineAt), Date.parse(reservedAt) + 10_000)).toISOString(),
         state: 'resolved', decision };
       const hold = intentHolds.shift();

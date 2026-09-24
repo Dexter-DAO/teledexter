@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { ZodError } from 'zod';
 import { createPrimaryCallerIntentClient } from '../src/broker/callerIntentClient.js';
 import { callerIntentInputDigest, callerIntentInputSchema, callerIntentResponseSchema, validateCallerIntentResponse,
-  type CallerIntentInput, type CallerIntentResponse } from '../src/broker/callerIntentContract.js';
+  type CallerIntentV1Input, type CallerIntentV1Response, type CallerIntentV2Input, type CallerIntentV2Response } from '../src/broker/callerIntentContract.js';
 import { PrimaryApiError } from '../src/broker/primaryApi.js';
 
 const id = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
@@ -12,18 +12,19 @@ const bindingId = id(1), operationId = id(2);
 const issue = (message: string, path?: Array<string | number>) => (error: unknown) =>
   error instanceof ZodError && error.issues.some(value => value.code === 'custom' && value.message === message
     && (path === undefined || JSON.stringify(value.path) === JSON.stringify(path)));
-const input = (): CallerIntentInput => ({ v: 'phone.caller-intent.v1',
+const input = (): CallerIntentV2Input => ({ v: 'phone.caller-intent.v2',
   source: { callSid: `CA${'a'.repeat(32)}`, sourceEventId: id(3), itemId: 'live_turn_1',
     revision: 1, receivedAt: '2026-09-24T12:00:00.000Z', role: 'user', text: ' Research Apple.\t' },
   generationId: id(4), sourceSessionId: 'voice_session', brokerInputDigest: 'a'.repeat(64),
   presentationDigest: 'b'.repeat(64), callDeadlineAt: '2026-09-24T12:05:00.000Z',
   version: { ownerPrincipalId: id(5), primaryDexterId: id(6), threadId: id(7),
-    contextEpoch: '10', threadEventSequence: '22', digest: 'c'.repeat(64) }, questions: [], results: [] });
-function response(value = input()): CallerIntentResponse {
+    contextEpoch: '10', threadEventSequence: '22', digest: 'c'.repeat(64) }, questions: [], results: [], resultCoverage: { state: 'complete', count: 0 } });
+function response(value = input()): CallerIntentV2Response {
   return { v: value.v, operationId, bindingId, inputDigest: callerIntentInputDigest(operationId, bindingId, value),
     brokerInputDigest: value.brokerInputDigest, presentationDigest: value.presentationDigest,
     generationId: value.generationId, sourceSessionId: value.sourceSessionId, callDeadlineAt: value.callDeadlineAt,
     questions: value.questions, results: value.results, version: value.version,
+    resultCoverage: value.resultCoverage, resultContextCoverage: { state: 'complete' },
     reservedAt: '2026-09-24T12:00:01.000Z', validUntil: '2026-09-24T12:00:11.000Z', state: 'pending' };
 }
 
@@ -97,11 +98,11 @@ test('an already stopped call cannot start an intent HTTP request', async () => 
 
 // Exact bytes copied from the shared API literal fixture (SHA-256 100dd00f...).
 // The expected digest is external to the Broker implementation under test.
-const literal: { operationId: string; bindingId: string; input: CallerIntentInput; inputDigest: string } =
+const literal: { operationId: string; bindingId: string; input: CallerIntentV1Input; inputDigest: string } =
   JSON.parse(readFileSync(new URL('./fixtures/caller-intent-digest.json', import.meta.url), 'utf8'));
 const literalInput = () => structuredClone(literal.input);
-const literalDigest = (value: CallerIntentInput) => callerIntentInputDigest(literal.operationId, literal.bindingId, value);
-function literalPending(value = literalInput()): CallerIntentResponse {
+const literalDigest = (value: CallerIntentV1Input) => callerIntentInputDigest(literal.operationId, literal.bindingId, value);
+function literalPending(value = literalInput()): CallerIntentV1Response {
   return { v: value.v, operationId: literal.operationId, bindingId: literal.bindingId, inputDigest: literalDigest(value),
     brokerInputDigest: value.brokerInputDigest, presentationDigest: value.presentationDigest,
     generationId: value.generationId, sourceSessionId: value.sourceSessionId, callDeadlineAt: value.callDeadlineAt,
@@ -121,7 +122,7 @@ test('Broker exported digest matches the shared literal and preserves its exact 
 });
 
 test('raw Unicode, whitespace, timestamp spelling and candidate order each affect the Broker digest', () => {
-  const mutations: Array<(value: CallerIntentInput) => void> = [
+  const mutations: Array<(value: CallerIntentV1Input) => void> = [
     value => { value.source.text = value.source.text.normalize('NFC'); },
     value => { value.source.text = value.source.text.trim(); },
     value => { value.source.text = value.source.text.replace('\n', ' '); },
@@ -235,4 +236,49 @@ test('task references select only an offered ordinary result or exact associated
     assert.throws(() => validateLiteral({ ...literalPending(), state: 'resolved', decision: { kind: 'task', reference } }),
       issue('Task reference was not supplied', ['decision', 'reference']));
   }
+});
+
+
+test('historical v1 recovery remains one exact GET with no coverage upcast', async () => {
+  const value = literalInput(), saved = literalPending();
+  let requests = 0;
+  const client = createPrimaryCallerIntentClient({ apiBaseUrl: 'https://api.example.test',
+    phoneServiceSecret: 'x'.repeat(40), fetch: async (url, init) => {
+      requests++; assert.equal(init?.method, 'GET'); assert.equal(init?.body, undefined);
+      assert.ok(String(url).endsWith(`/calls/${literal.bindingId}/caller-intents/${literal.operationId}`));
+      return Response.json(saved);
+    } });
+  const receipt = await client.recover(literal.bindingId, literal.operationId, value);
+  assert.deepEqual(receipt, saved); assert.equal(receipt.v, 'phone.caller-intent.v1');
+  assert.equal(Object.hasOwn(receipt, 'resultCoverage'), false); assert.equal(requests, 1);
+});
+
+test('a saved v1 input or missing v2 coverage cannot start a fresh POST', async () => {
+  let requests = 0;
+  const client = createPrimaryCallerIntentClient({ apiBaseUrl: 'https://api.example.test',
+    phoneServiceSecret: 'x'.repeat(40), fetch: async () => { requests++; throw new Error('forbidden'); } });
+  const { resultCoverage: omitted, ...missingCoverage } = input();
+  for (const value of [literalInput(), missingCoverage, { ...literalInput(), resultCoverage: { state: 'complete', count: 2 } }]) {
+    // Runtime inputs can bypass TypeScript. The real client must reject before transport.
+    await assert.rejects(Reflect.apply(client.submit, client, [literal.bindingId, literal.operationId, value]),
+      (error: unknown) => error instanceof PrimaryApiError && error.code === 'invalid_request');
+  }
+  assert.equal(requests, 0);
+});
+
+test('GET refuses a response from a different wire version instead of upcasting history', async () => {
+  const modern = input();
+  const legacy = { ...modern, v: 'phone.caller-intent.v1' as const };
+  const { resultCoverage: omitted, ...savedInput } = legacy;
+  const saved = { ...response(), v: 'phone.caller-intent.v1',
+    inputDigest: callerIntentInputDigest(operationId, bindingId, savedInput) };
+  const { resultCoverage: ignored, resultContextCoverage: ignoredContext, ...savedBody } = saved;
+  let requests = 0;
+  const client = createPrimaryCallerIntentClient({ apiBaseUrl: 'https://api.example.test',
+    phoneServiceSecret: 'x'.repeat(40), fetch: async (_url, init) => {
+      requests++; assert.equal(init?.method, 'GET'); return Response.json(savedBody);
+    } });
+  await assert.rejects(client.recover(bindingId, operationId, modern),
+    (error: unknown) => error instanceof PrimaryApiError && error.code === 'invalid_response');
+  assert.equal(requests, 1);
 });

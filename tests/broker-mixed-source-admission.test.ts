@@ -10,7 +10,7 @@ import { callerRouteRef, callerRoutingSourceAnchors, getCallerRouteBySource, cal
 import { callerIntentInputDigest, type CallerIntentInput, type CallerIntentDecision, type CallerIntentResponse } from '../src/broker/callerIntentContract.js';
 import type { FrozenCallerTurn } from '../src/broker/callerTurn.js';
 import { beginBrokerPublication, beginSelectedQuestionPublication, settleBrokerPublication, rejectBrokerPublication,
-  callerIntentResultPublicationCandidates } from '../src/broker/publications.js';
+  callerIntentResultPublicationCandidates, callerIntentResultPublicationInventory } from '../src/broker/publications.js';
 import { createRequestDeliveryJournal, retainRequestDeliveryAssociation, createRequestDeliveryQuestionRecord,
   PHONE_REQUEST_DELIVERY_VERSION } from '../src/broker/requestDelivery.js';
 import type { SelectedQuestionSeed } from '../src/broker/selectedQuestion.js';
@@ -156,29 +156,32 @@ async function fixture(t: TestContext, selectedResult = false) {
       const value = offered.find(value => value.id === reference.id && value.digest === reference.digest);
       assert.ok(value); return value;
     });
-    const input: CallerIntentInput = { v: 'phone.caller-intent.v1', source: { callSid,
+    const input: CallerIntentInput = { v: 'phone.caller-intent.v2', source: { callSid,
       sourceEventId: record.frozen.turn.sourceEventId, itemId: record.frozen.turn.itemId, revision: 1,
       receivedAt: record.frozen.turn.occurredAt, role: 'user', text: record.frozen.turn.text },
       generationId: record.scope.generationId, sourceSessionId: sessionId, brokerInputDigest: record.inputDigest,
       presentationDigest: callerRoutePresentationDigest(record.resolutionInput), callDeadlineAt: current.liveGenerations!.clocks.callDeadlineAt,
       version: record.resolutionInput.version, questions: record.resolutionInput.questions.map(callerIntentQuestionForTarget),
-      results: selected.map(value => value.candidate) };
+      resultCoverage: record.resolutionInput.resultCoverage!,
+      results: record.resolutionInput.resultCoverage!.state === 'overflow' ? [] : selected.map(value => value.candidate) };
     const operationId = brokerIdentity('test-caller-intent', initial.id, ref.sourceEventId);
     store.prepareCallerIntent(initial.id, ref, { operationId, input });
     const resolved: CallerIntentDecision = decision.kind === 'answer' ? { kind: 'answer', target: callerIntentQuestionForTarget(decision.target) }
       : decision.kind === 'task' ? { kind: 'task', ...(decision.contextReference ? {
         reference: selected.find(value => value.id === decision.contextReference!.id)!.reference } : {}) }
       : decision.kind === 'conversation' ? { kind: 'conversation' } : { kind: 'clarify', reason: 'invalid_output' };
-    const response: CallerIntentResponse = { v: 'phone.caller-intent.v1', operationId, bindingId,
+    const response: CallerIntentResponse = { v: 'phone.caller-intent.v2', operationId, bindingId,
       inputDigest: callerIntentInputDigest(operationId, bindingId, input), brokerInputDigest: record.inputDigest,
       presentationDigest: input.presentationDigest, generationId: input.generationId, sourceSessionId: sessionId,
       callDeadlineAt: input.callDeadlineAt, questions: input.questions, results: input.results, version: input.version,
+      resultCoverage: input.resultCoverage, resultContextCoverage: input.resultCoverage.state === 'overflow'
+        ? { state: 'unavailable', reason: 'inventory_overflow' } : { state: 'complete' },
       reservedAt: new Date(clock).toISOString(), validUntil: new Date(Math.min(clock + 10_000, Date.parse(input.callDeadlineAt))).toISOString(),
       state: 'resolved', decision: resolved };
     store.recordCallerIntentResponse(initial.id, ref, response);
     store.decideCallerRoute(initial.id, ref, { inputDigest: ref.inputDigest, decision });
   };
-  const route = (text: string, decision?: CallerRouteDecision, targets: CallerQuestionTarget[] = [], references: Array<{ id: string; digest: string }> = []) => {
+  const route = (text: string, decision?: CallerRouteDecision, targets: CallerQuestionTarget[] = [], references?: Array<{ id: string; digest: string }>) => {
     sequence++; const startMs = (sequence - 1) * 1400 + 1, endMs = startMs + 20, firstEventId = `caller_${sequence}`;
     snapshot.fragments.push({ role: 'user', eventId: firstEventId, text, startMs, endMs, sequence });
     snapshot.revision = snapshot.callerRevision = sequence;
@@ -192,9 +195,13 @@ async function fixture(t: TestContext, selectedResult = false) {
         occurredAt: new Date(Date.parse(initial.createdAt) + startMs).toISOString() } };
     const request: LiveDelegationRequest = { callId: initial.id, sessionId, delegationId: `delegate_${sequence}`,
       requestId: `provider_request_${sequence}`, offsetMs: endMs, transcript: structuredClone(snapshot) };
+    const inventory = callerIntentResultPublicationInventory(current, sessionId);
+    const fullReferences = inventory.candidates.map(({ id, digest }) => ({ id, digest }));
+    if (references) assert.deepEqual(references, fullReferences, 'the fixture must offer the full current publication inventory');
     const record = store.prepareCallerRoute(initial.id, { frozen,
       delegation: { sessionId, delegationId: request.delegationId, requestId: request.requestId, offsetMs: request.offsetMs },
-      resolutionInput: { version, questions: targets, references, publicationSequence: current.publications?.records.length ?? 0 } });
+      resolutionInput: { version, questions: targets, references: fullReferences, resultCoverage: inventory.resultCoverage,
+        publicationSequence: current.publications?.records.at(-1)?.publicationSequence ?? 0 } });
     const ref = callerRouteRef(record);
     if (decision) resolve(ref, decision);
     return { request, ref, frozen };

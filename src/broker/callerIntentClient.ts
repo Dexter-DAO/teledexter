@@ -1,9 +1,9 @@
 import { createPrimaryApiTransport, PrimaryApiError, type PrimaryApiOptions } from './primaryApi.js';
-import { callerIntentInputSchema, callerIntentInputDigest, validateCallerIntentResponse,
-  type CallerIntentInput, type CallerIntentResponse } from './callerIntentContract.js';
+import { callerIntentInputSchema, callerIntentV2InputSchema, callerIntentInputDigest, validateCallerIntentResponse,
+  type CallerIntentInput, type CallerIntentV2Input, type CallerIntentResponse } from './callerIntentContract.js';
 
 export interface CallerIntentClient {
-  submit(bindingId: string, operationId: string, input: CallerIntentInput, signal?: AbortSignal): Promise<CallerIntentResponse>;
+  submit(bindingId: string, operationId: string, input: CallerIntentV2Input, signal?: AbortSignal): Promise<CallerIntentResponse>;
   recover(bindingId: string, operationId: string, input: CallerIntentInput, signal?: AbortSignal): Promise<CallerIntentResponse>;
 }
 
@@ -15,7 +15,7 @@ export function createPrimaryCallerIntentClient(options: PrimaryApiOptions): Cal
     value: CallerIntentInput, signal?: AbortSignal): Promise<CallerIntentResponse> => {
     let input: CallerIntentInput;
     try {
-      input = callerIntentInputSchema.parse(value);
+      input = method === 'POST' ? callerIntentV2InputSchema.parse(value) : callerIntentInputSchema.parse(value);
       // Validates canonical path identities before constructing the URL.
       callerIntentInputDigest(operationId, bindingId, input);
     } catch { throw new PrimaryApiError('invalid_request'); }

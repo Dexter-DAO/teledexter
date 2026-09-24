@@ -5,8 +5,8 @@ import { frozenCallerTurnSchema, type FrozenCallerTurn } from './callerTurn.js';
 import { historyVersionSchema } from './eligibleContext.js';
 import { acknowledgedTurn, originalTurn } from './reconciliation.js';
 import { brokerPublicationReceiptsAccepted, selectedQuestionPublicationReceiptsAccepted,
-  callerIntentResultPublicationCandidates } from './publications.js';
-import { callerIntentOperationSchema, callerIntentInputSchema, validateCallerIntentResponse,
+  callerIntentResultPublicationCandidates, callerIntentResultPublicationInventory } from './publications.js';
+import { callerIntentOperationSchema, callerIntentInputSchema, callerIntentResultCoverageSchema, validateCallerIntentResponse,
   type CallerIntentOperation, type CallerIntentInput, type CallerIntentQuestion, type CallerIntentResponse } from './callerIntentContract.js';
 import type { BrokerCall } from './store.js';
 import type { BrokerDelegationRecord } from './backend.js';
@@ -37,7 +37,18 @@ const referenceSchema = z.object({ id: name, digest }).strict();
 export type CallerTaskContextReference = z.infer<typeof referenceSchema>;
 export const callerResolutionInputSchema = z.object({ version: historyVersionSchema,
   publicationSequence: z.number().int().safe().nonnegative(),
-  questions: z.array(callerQuestionTargetSchema), references: z.array(referenceSchema) }).strict();
+  questions: z.array(callerQuestionTargetSchema), references: z.array(referenceSchema),
+  // Absent on retained v1 or explicit local refusal; old bytes stay intact.
+  resultCoverage: callerIntentResultCoverageSchema.optional(),
+  // Local source preservation when a complete inventory cannot be established.
+  // This is never a caller-intent input or a claim of empty result coverage.
+  classificationRefusal: z.enum(['caller_result_inventory_inactive', 'caller_result_inventory_invalid',
+    'caller_result_inventory_unverifiable']).optional() }).strict().superRefine((value, ctx) => {
+    if (value.resultCoverage && value.resultCoverage.count !== value.references.length)
+      ctx.addIssue({ code: 'custom', path: ['resultCoverage'], message: 'Full publication inventory differs from coverage' });
+    if (value.classificationRefusal && (value.resultCoverage !== undefined || value.references.length !== 0))
+      ctx.addIssue({ code: 'custom', path: ['classificationRefusal'], message: 'Unverified inventory cannot carry result coverage' });
+  });
 export const callerRouteDecisionSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('task'), contextReference: referenceSchema.optional() }).strict(),
   z.object({ kind: z.literal('answer'), target: callerQuestionTargetSchema }).strict(),
@@ -65,7 +76,9 @@ export const callerRouteRef = (record: CallerRouteRecord): CallerRouteRef => ({
   sourceEventId: record.frozen.turn.sourceEventId, inputDigest: record.inputDigest,
 });
 const inputDigest = (record: Omit<CallerRouteRecord, 'inputDigest' | 'decision' | 'capture' | 'intent'>) =>
-  callerRoutePresentationDigest(['broker.caller-routing-input.v1', record.scope, record.delegation, record.frozen, record.resolutionInput]);
+  callerRoutePresentationDigest([record.resolutionInput.resultCoverage || record.resolutionInput.classificationRefusal
+    ? 'broker.caller-routing-input.v2' : 'broker.caller-routing-input.v1',
+    record.scope, record.delegation, record.frozen, record.resolutionInput]);
 
 export function callerIntentQuestionForTarget(target: CallerQuestionTarget): CallerIntentQuestion {
   const execution = { bindingId: target.bindingId, requestId: target.requestId, runId: target.runId };
@@ -85,8 +98,14 @@ function validateIntentRecord(record: CallerRouteRecord): void {
     || input.brokerInputDigest !== record.inputDigest
     || input.presentationDigest !== callerRoutePresentationDigest(record.resolutionInput)
     || !same(input.version, record.resolutionInput.version)
-    || !same(input.questions, record.resolutionInput.questions.map(callerIntentQuestionForTarget))
-    || input.results.length !== record.resolutionInput.references.length) fail('caller_intent_input_changed');
+    || !same(input.questions, record.resolutionInput.questions.map(callerIntentQuestionForTarget))) fail('caller_intent_input_changed');
+  const coverage = record.resolutionInput.resultCoverage;
+  if (input.v === 'phone.caller-intent.v2') {
+    if (!coverage || !same(input.resultCoverage, coverage)
+      || (coverage.state === 'complete' ? input.results.length !== record.resolutionInput.references.length : input.results.length !== 0))
+      fail('caller_intent_input_changed');
+  } else if (coverage !== undefined || input.results.length !== record.resolutionInput.references.length)
+    fail('caller_intent_input_changed');
   if (intent.response) validateCallerIntentResponse(record.scope.bindingId, intent.operationId, input, intent.response);
 }
 
@@ -107,11 +126,24 @@ function validateIntentCandidates(call: BrokerCall, record: CallerRouteRecord, h
   if (!intent) return;
   if (intent.input.callDeadlineAt !== call.liveGenerations?.clocks.callDeadlineAt) fail('caller_intent_deadline_changed');
   const candidates = callerIntentResultPublicationCandidates(call, record.frozen.sessionId, { historical });
+  const coverage = record.resolutionInput.resultCoverage;
+  if (!historical && intent.input.v === 'phone.caller-intent.v2') {
+    const inventory = callerIntentResultPublicationInventory(call, record.frozen.sessionId);
+    if (!same(coverage, inventory.resultCoverage)
+      || !same(record.resolutionInput.references, inventory.candidates.map(({ id, digest }) => ({ id, digest }))))
+      fail('caller_intent_candidate_coverage_changed');
+  }
   let lastIndex = -1;
+  const identities = new Set<string>();
   for (const [index, ref] of record.resolutionInput.references.entries()) {
     const found = candidates.findIndex(value => value.id === ref.id && value.digest === ref.digest);
     const candidate = candidates[found];
-    if (!candidate || found <= lastIndex || !same(candidate.candidate, intent.input.results[index])) fail('caller_intent_candidate_changed');
+    if (!candidate || found <= lastIndex
+      || (coverage?.state !== 'overflow' && !same(candidate.candidate, intent.input.results[index]))) fail('caller_intent_candidate_changed');
+    const c = candidate.candidate;
+    const identity = canonicalJson([c.kind, c.execution, c.assistantMessageId, c.kind === 'selected' ? c.deliveryAssociationId : null]);
+    if (coverage && identities.has(identity)) fail('caller_intent_candidate_changed');
+    identities.add(identity);
     lastIndex = found;
   }
   const decision = record.decision, response = intent.response;
@@ -149,6 +181,10 @@ export function requireCallerRouteDispatch(call: BrokerCall, sourceEventId: stri
   const record = getCallerRouteBySource(call, sourceEventId), response = record?.intent?.response;
   if (!record || !record.decision || !['task', 'answer'].includes(record.decision.kind) || response?.state !== 'resolved')
     fail('caller_route_intent_unresolved');
+  // This function gates a first HTTP dispatch only. Saved admitted or unknown
+  // work is recovered by its existing downstream identity before reaching it.
+  if (record.intent?.input.v !== 'phone.caller-intent.v2' || response.v !== 'phone.caller-intent.v2')
+    fail('caller_intent_legacy_dispatch_refused');
   validateActionReceipt(record);
   if (call.endedAt || call.finalized || call.primaryClosed || ['completed', 'busy', 'no-answer', 'canceled', 'failed'].includes(call.status)
     || !call.liveGenerations || call.liveGenerations.phase === 'stopped') fail('caller_route_stale_source');
@@ -170,6 +206,9 @@ export function parseCallerRoutingJournal(value: unknown): CallerRoutingJournal 
       fail('caller_route_identity_changed');
     sources.add(frozen.turn.sourceEventId); delegations.add(key); requests.add(delegation.requestId);
     const decision = record.decision;
+    if (resolutionInput.classificationRefusal && (record.intent
+      || (decision && (decision.kind !== 'clarify' || decision.reason !== 'unavailable'))))
+      fail('caller_route_inventory_refused');
     if (decision?.kind === 'answer' && !resolutionInput.questions.some(q => same(q, decision.target)))
       fail('caller_route_target_not_offered');
     if (decision?.kind === 'task' && decision.contextReference
@@ -318,6 +357,7 @@ export function validateCallerRouting(call: BrokerCall, previous?: BrokerCall): 
     }
     if (previous && old && !old.intent && record.intent) {
       if (old.decision || record.intent.response) fail('caller_intent_input_not_durable');
+      if (record.intent.input.v !== 'phone.caller-intent.v2') fail('caller_intent_legacy_dispatch_refused');
       currentSource(call, record);
       for (const target of record.resolutionInput.questions) currentTarget(call, target, frozen.sessionId);
       validateIntentCandidates(call, record, false);
@@ -369,7 +409,9 @@ export function prepareCallerIntent(call: BrokerCall, value: CallerRouteRef,
   operation: { operationId: string; input: CallerIntentInput }): CallerRoutingJournal {
   const ref = callerRouteRefSchema.parse(value), all = records(call), record = all.find(r => same(callerRouteRef(r), ref));
   if (!record) fail('caller_route_not_found');
-  const intent = z.object({ operationId: uuid, input: callerIntentInputSchema }).strict().parse(operation);
+  if (record.resolutionInput.classificationRefusal) fail('caller_route_inventory_refused');
+  const intent = callerIntentOperationSchema.parse(
+    z.object({ operationId: uuid, input: callerIntentInputSchema }).strict().parse(operation));
   if (record.intent) {
     if (record.intent.operationId !== intent.operationId || !same(record.intent.input, intent.input)) fail('caller_intent_operation_changed');
     if (!call.callerRouting) fail('caller_route_not_found');
@@ -389,8 +431,9 @@ export function recordCallerIntentResponse(call: BrokerCall, value: CallerRouteR
     if (!call.callerRouting) fail('caller_route_not_found');
     return call.callerRouting;
   }
+  const nextIntent = callerIntentOperationSchema.parse({ ...intent, response });
   const journal: CallerRoutingJournal = { v: 'broker.caller-routing.v1', records: all.map(r => r === record
-    ? { ...r, intent: { ...intent, response } } : r) };
+    ? { ...r, intent: nextIntent } : r) };
   validateCallerRouting({ ...call, callerRouting: journal }, call);
   return journal;
 }

@@ -10,12 +10,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { BrokerStore, type BrokerCall } from '../src/broker/store.js';
 import { brokerIdentity, type BrokerDelegationRecord, type BrokerQuestionRecord } from '../src/broker/backend.js';
-import { beginBrokerPublication, beginSelectedQuestionPublication, settleBrokerPublication, rejectBrokerPublication, callerIntentResultPublicationCandidates,
+import { beginBrokerPublication, beginSelectedQuestionPublication, settleBrokerPublication, rejectBrokerPublication, callerIntentResultPublicationCandidates, callerIntentResultPublicationInventory,
   type OrdinaryPublicationEvidence } from '../src/broker/publications.js';
 import { callerRouteRef, findCallerRoute, requireCallerRoute, callerRouteUsedSourceIds, callerRoutingSourceAnchors,
   callerRoutePendingCaptures, callerQuestionPresentationDigest, type CallerRoutePreparation,
   callerIntentQuestionForTarget, requireCallerRouteDispatch, CallerRouteExpiredError,
-  type CallerQuestionTarget, type CallerRouteDecision } from '../src/broker/callerRouting.js';
+  type CallerQuestionTarget, type CallerRouteDecision, type CallerRouteRecord } from '../src/broker/callerRouting.js';
 import { callerIntentInputDigest, type CallerIntentInput, type CallerIntentResponse, type CallerIntentDecision } from '../src/broker/callerIntentContract.js';
 import { turnBodyDigest } from '../src/broker/reconciliation.js';
 import type { PrimaryTurnReceipt, PrimaryQuestion } from '../src/broker/primaryApi.js';
@@ -55,33 +55,46 @@ function fixture(t: TestContext, selected = false) {
       occurredAt: new Date(Date.parse(at) + 1000).toISOString() } };
   const request: LiveDelegationRequest = { callId: call.id, sessionId: session, delegationId: 'delegate_1',
     requestId: 'live_request_1', offsetMs: 2100, transcript: store.get(call.id)!.liveGenerations!.segments[0]!.transcript };
-  const input = (): CallerRoutePreparation => ({ delegation: { sessionId: request.sessionId, delegationId: request.delegationId,
-    requestId: request.requestId, offsetMs: request.offsetMs }, frozen: structuredClone(frozen),
-    resolutionInput: { version, publicationSequence: store.get(call.id)!.publications?.records.at(-1)?.publicationSequence ?? 0,
-      questions: [], references: [] } });
+  const input = (): CallerRoutePreparation => {
+    const current = store.get(call.id)!, inventory = callerIntentResultPublicationInventory(current, session);
+    return { delegation: { sessionId: request.sessionId, delegationId: request.delegationId,
+      requestId: request.requestId, offsetMs: request.offsetMs }, frozen: structuredClone(frozen),
+      resolutionInput: { version, publicationSequence: current.publications?.records.at(-1)?.publicationSequence ?? 0,
+        questions: [], references: inventory.candidates.map(({ id, digest }) => ({ id, digest })),
+        resultCoverage: inventory.resultCoverage } };
+  };
   const read = () => store.get(call.id)!;
   const prepare = (value = input()) => store.prepareCallerRoute(call.id, value);
-  const intentInput = (record = read().callerRouting!.records[0]!): CallerIntentInput => ({
-    v: 'phone.caller-intent.v1', source: { callSid: sid, sourceEventId: record.frozen.turn.sourceEventId,
-      itemId: record.frozen.turn.itemId, revision: 1, receivedAt: record.frozen.turn.occurredAt,
-      role: 'user', text: record.frozen.turn.text }, generationId: record.scope.generationId,
-    sourceSessionId: record.frozen.sessionId, brokerInputDigest: record.inputDigest,
-    presentationDigest: callerQuestionPresentationDigest(record.resolutionInput),
-    callDeadlineAt: read().liveGenerations!.clocks.callDeadlineAt, version: record.resolutionInput.version,
-    questions: record.resolutionInput.questions.map(callerIntentQuestionForTarget),
-    results: record.resolutionInput.references.map(ref => {
-      const candidate = callerIntentResultPublicationCandidates(read(), record.frozen.sessionId)
-        .find(value => value.id === ref.id && value.digest === ref.digest);
-      assert.ok(candidate); return candidate.candidate;
-    }),
-  });
+  const intentInput = (record = read().callerRouting!.records[0]!): CallerIntentInput => {
+    const coverage = record.resolutionInput.resultCoverage;
+    const fields = { source: { callSid: sid, sourceEventId: record.frozen.turn.sourceEventId,
+        itemId: record.frozen.turn.itemId, revision: 1 as const, receivedAt: record.frozen.turn.occurredAt,
+        role: 'user' as const, text: record.frozen.turn.text }, generationId: record.scope.generationId,
+      sourceSessionId: record.frozen.sessionId, brokerInputDigest: record.inputDigest,
+      presentationDigest: callerQuestionPresentationDigest(record.resolutionInput),
+      callDeadlineAt: read().liveGenerations!.clocks.callDeadlineAt, version: record.resolutionInput.version,
+      questions: record.resolutionInput.questions.map(callerIntentQuestionForTarget),
+      results: coverage?.state === 'overflow' ? [] : record.resolutionInput.references.map(ref => {
+        const candidate = callerIntentResultPublicationCandidates(read(), record.frozen.sessionId)
+          .find(value => value.id === ref.id && value.digest === ref.digest);
+        assert.ok(candidate); return candidate.candidate;
+      }),
+    };
+    // Only explicitly retained fixtures omit coverage and keep their v1 bytes.
+    return coverage ? { v: 'phone.caller-intent.v2', ...fields, resultCoverage: coverage }
+      : { v: 'phone.caller-intent.v1', ...fields };
+  };
   const prepareIntent = (record = read().callerRouting!.records[0]!, value = intentInput(record), operationId = uuid(95)) =>
     store.prepareCallerIntent(call.id, callerRouteRef(record), { operationId, input: value });
   const intentResponse = (record = read().callerRouting!.records[0]!, decision?: CallerIntentDecision,
     reservedAt = new Date().toISOString()): CallerIntentResponse => {
     assert.ok(record.intent);
     const value = record.intent.input;
-    const fields = { v: 'phone.caller-intent.v1' as const, operationId: record.intent.operationId, bindingId,
+    const versionFields = value.v === 'phone.caller-intent.v2'
+      ? { v: value.v, resultCoverage: value.resultCoverage, resultContextCoverage: value.resultCoverage.state === 'overflow'
+        ? { state: 'unavailable' as const, reason: 'inventory_overflow' as const } : { state: 'complete' as const } }
+      : { v: value.v };
+    const fields = { ...versionFields, operationId: record.intent.operationId, bindingId,
       inputDigest: callerIntentInputDigest(record.intent.operationId, bindingId, value), brokerInputDigest: value.brokerInputDigest,
       presentationDigest: value.presentationDigest, generationId: value.generationId, sourceSessionId: value.sourceSessionId,
       callDeadlineAt: value.callDeadlineAt, questions: value.questions, results: value.results,
@@ -197,6 +210,65 @@ function transport(f: ReturnType<typeof fixture>, fetcher: NonNullable<Parameter
       phoneServiceSecret: 'x'.repeat(40), fetch: fetcher }) });
 }
 
+// Load a retained v1 operation as a historical disk fixture. Fresh store methods
+// deliberately cannot prepare a new v1 operation.
+function restoreLegacyOperation(f: ReturnType<typeof fixture>) {
+  const input = f.input(); delete input.resolutionInput.resultCoverage;
+  const record = f.prepare(input), value = f.intentInput(record);
+  assert.equal(value.v, 'phone.caller-intent.v1');
+  const saved: CallerRouteRecord = { ...record, intent: { operationId: operationId(f, record), input: value } };
+  const disk = JSON.parse(f.bytes()); disk.calls[f.call.id].callerRouting.records = [saved];
+  f.store().close(); fs.writeFileSync(path.join(f.directory, 'calls.json'), JSON.stringify(disk));
+  f.restart(); return saved;
+}
+
+for (const code of ['caller_result_inventory_inactive', 'caller_result_inventory_invalid', 'caller_result_inventory_unverifiable'] as const)
+  test(`local ${code} remains durable and refuses resolver HTTP instead of claiming an empty inventory`, async t => {
+    const f = fixture(t), input = f.input(); delete input.resolutionInput.resultCoverage;
+    input.resolutionInput.classificationRefusal = code;
+    const record = f.prepare(input), saved = f.bytes(); let calls = 0;
+    assert.throws(() => buildCallerIntentInput(f.read(), record), /inventory_refused/);
+    await assert.rejects(invoke(f, transport(f, async () => { calls++; throw new Error('forbidden'); })), /inventory_refused/);
+    assert.equal(calls, 0); assert.equal(f.bytes(), saved);
+    assert.equal(f.read().callerRouting!.records[0]!.intent, undefined);
+    assert.deepEqual(f.read().callerRouting!.records[0]!.frozen, f.frozen);
+    assert.equal(f.read().callerRouting!.records[0]!.resolutionInput.resultCoverage, undefined);
+    assert.equal(callerRoutePendingCaptures(f.read()), 1); assert.deepEqual(f.read().delegations, {});
+    f.restart(); assert.equal(f.bytes(), saved);
+  });
+
+test('a never-dispatched historical v1 source is refused before a new intent POST', async t => {
+  const f = fixture(t), input = f.input(); delete input.resolutionInput.resultCoverage;
+  const record = f.prepare(input), saved = f.bytes(); let calls = 0;
+  assert.throws(() => f.prepareIntent(record, f.intentInput(record)), /legacy_dispatch_refused/);
+  const resolver = transport(f, async () => { calls++; throw new Error('forbidden'); });
+  await assert.rejects(invoke(f, resolver), /legacy_dispatch_refused/);
+  assert.equal(calls, 0); assert.equal(f.bytes(), saved);
+  assert.equal(f.read().callerRouting!.records[0]!.intent, undefined);
+  assert.equal(f.read().callerRouting!.records[0]!.resolutionInput.resultCoverage, undefined);
+  assert.deepEqual(f.read().delegations, {});
+});
+
+test('unknown historical v1 intent recovers by exact GET and cannot authorize a fresh downstream dispatch', async t => {
+  const f = fixture(t), saved = restoreLegacyOperation(f), methods: string[] = [];
+  const response = f.intentResponse(saved, { kind: 'task' });
+  const resolver = transport(f, async (url, init) => {
+    methods.push(init!.method!); assert.equal(init!.body, undefined);
+    assert.ok(String(url).endsWith(`/calls/${bindingId}/caller-intents/${saved.intent!.operationId}`));
+    assert.deepEqual(f.read().callerRouting!.records[0]!.intent!.input, saved.intent!.input);
+    return Response.json(response);
+  });
+  await assert.rejects(invoke(f, resolver), /legacy_dispatch_refused/);
+  assert.deepEqual(methods, ['GET']);
+  const retained = f.read().callerRouting!.records[0]!;
+  assert.deepEqual(retained.intent!.response, response); assert.equal(retained.decision, undefined);
+  assert.deepEqual(retained.intent!.input, saved.intent!.input);
+  assert.equal(retained.resolutionInput.resultCoverage, undefined); assert.deepEqual(f.read().delegations, {});
+  const bytes = f.bytes(); f.restart(); assert.equal(f.bytes(), bytes);
+  await assert.rejects(invoke(f, transport(f, async () => { throw new Error('no repeat HTTP'); })), /legacy_dispatch_refused/);
+  assert.equal(f.bytes(), bytes);
+});
+
 // These cases author a full durable-store/client crossing. Fetch is the sole
 // HTTP boundary; they do not qualify semantic model accuracy or latency.
 test('raw source and exact operation are durable before POST; full receipt precedes a task decision', async t => {
@@ -208,6 +280,8 @@ test('raw source and exact operation are durable before POST; full receipt prece
     assert.equal(saved.intent.response, undefined); assert.equal(saved.decision, undefined);
     assert.deepEqual(JSON.parse(String(init?.body)), saved.intent.input);
     assert.equal(saved.intent.input.source.text, ' Research Apple.\t');
+    assert.equal(saved.intent.input.v, 'phone.caller-intent.v2');
+    assert.deepEqual(saved.intent.input.resultCoverage, { state: 'complete', count: 0 });
     assert.equal(new Headers(init?.headers).get('Idempotency-Key'), saved.intent.operationId);
     return Response.json(f.intentResponse(f.read().callerRouting!.records[0]!, { kind: 'task' }));
   });
@@ -443,20 +517,54 @@ test('selected result retains its original execution and exact association when 
   assert.deepEqual(f.read().delegations, {}, 'publication does not manufacture a current-call execution');
 });
 
-test('three results refuse before POST without truncation', async t => {
-  const f = fixture(t); for (const n of [100, 110, 120]) publishedResult(f, n).publish(1);
-  const candidates = callerIntentResultPublicationCandidates(f.read(), session), input = f.input();
-  input.resolutionInput.references = candidates.map(({ id, digest }) => ({ id, digest })); f.prepare(input);
-  let calls = 0; const resolver = transport(f, async () => { calls++; throw new Error('forbidden'); });
-  await assert.rejects(invoke(f, resolver)); assert.equal(calls, 0);
-  assert.equal(f.read().callerRouting!.records[0]!.intent, undefined);
+test('seven results reach v2 in journal order with complete coverage and no truncation', async t => {
+  const f = fixture(t); for (const n of [100, 110, 120, 130, 140, 150, 160]) publishedResult(f, n).publish(1);
+  const candidates = callerIntentResultPublicationCandidates(f.read(), session), record = f.prepare();
+  assert.equal(candidates.length, 7);
+  let calls = 0; const resolver = transport(f, async (_url, init) => {
+    calls++; const input = JSON.parse(String(init!.body));
+    assert.equal(input.v, 'phone.caller-intent.v2');
+    assert.deepEqual(input.resultCoverage, { state: 'complete', count: 7 });
+    assert.deepEqual(input.results, candidates.map(value => value.candidate));
+    return Response.json(f.intentResponse(f.read().callerRouting!.records[0]!, { kind: 'task', reference: candidates[6]!.reference }));
+  });
+  const result = await invoke(f, resolver);
+  assert.deepEqual(result.decision, { kind: 'task', contextReference: record.resolutionInput.references[6] });
+  assert.equal(calls, 1);
+  assert.deepEqual(f.read().callerRouting!.records[0]!.intent!.input.results, candidates.map(value => value.candidate));
+});
+
+test('eight results retain the full internal inventory while v2 reports overflow with no partial API results', async t => {
+  const f = fixture(t); for (const n of [100, 110, 120, 130, 140, 150, 160, 170]) publishedResult(f, n).publish(1);
+  const candidates = callerIntentResultPublicationCandidates(f.read(), session), record = f.prepare();
+  assert.equal(candidates.length, 8);
+  let calls = 0; const resolver = transport(f, async (_url, init) => {
+    calls++; const input = JSON.parse(String(init!.body));
+    assert.equal(input.v, 'phone.caller-intent.v2');
+    assert.deepEqual(input.resultCoverage, { state: 'overflow', count: 8 });
+    assert.deepEqual(input.results, []);
+    assert.deepEqual(f.read().callerRouting!.records[0]!.resolutionInput.references,
+      candidates.map(({ id, digest }) => ({ id, digest })));
+    return Response.json(f.intentResponse(f.read().callerRouting!.records[0]!, { kind: 'clarify', reason: 'candidate_unavailable' }));
+  });
+  const result = await invoke(f, resolver);
+  assert.deepEqual(result.decision, { kind: 'clarify', reason: 'unavailable' });
+  f.store().decideCallerRoute(f.call.id, callerRouteRef(record), result);
+  const saved = f.bytes(); f.restart(); assert.equal(f.bytes(), saved); assert.equal(calls, 1);
+  assert.deepEqual(f.read().callerRouting!.records[0]!.resolutionInput.references,
+    candidates.map(({ id, digest }) => ({ id, digest })));
+  const response = f.read().callerRouting!.records[0]!.intent!.response!;
+  assert.equal(response.v, 'phone.caller-intent.v2');
+  if (response.v === 'phone.caller-intent.v2') assert.deepEqual(response.resultContextCoverage,
+    { state: 'unavailable', reason: 'inventory_overflow' });
   assert.equal(callerRoutePendingCaptures(f.read()), 1);
 });
 
 test('an incomplete saved candidate offer is refused without choosing by recency', async t => {
   const f = fixture(t); publishedResult(f, 100).publish(1); publishedResult(f, 110).publish(1);
   const candidates = callerIntentResultPublicationCandidates(f.read(), session), input = f.input();
-  input.resolutionInput.references = candidates.slice(1).map(({ id, digest }) => ({ id, digest })); f.prepare(input);
+  input.resolutionInput.references = candidates.slice(1).map(({ id, digest }) => ({ id, digest }));
+  input.resolutionInput.resultCoverage = { state: 'complete', count: input.resolutionInput.references.length }; f.prepare(input);
   let calls = 0; const resolver = transport(f, async () => { calls++; throw new Error('forbidden'); });
   await assert.rejects(invoke(f, resolver), /candidate_coverage_changed/);
   assert.equal(calls, 0); assert.equal(f.read().callerRouting!.records[0]!.intent, undefined);

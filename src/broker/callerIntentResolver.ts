@@ -1,11 +1,11 @@
 import { canonicalJson } from '../outbound/canonical.js';
 import { brokerIdentity, withCallerAdmission } from './backend.js';
-import { callerIntentInputSchema, type CallerIntentInput, type CallerIntentDecision } from './callerIntentContract.js';
+import { callerIntentV2InputSchema, type CallerIntentV2Input, type CallerIntentDecision } from './callerIntentContract.js';
 import type { CallerIntentClient } from './callerIntentClient.js';
 import { callerIntentQuestionForTarget, callerRoutePresentationDigest, callerRouteRef,
   decideCallerRouting, getCallerRouteBySource, validateCallerRouting,
   type CallerRouteDecision, type CallerRouteRecord } from './callerRouting.js';
-import { callerIntentResultPublicationCandidates } from './publications.js';
+import { callerIntentResultPublicationCandidates, callerIntentResultPublicationInventory } from './publications.js';
 import type { CallerIntentPort } from './mixedWork.js';
 import type { BrokerCall, BrokerStore } from './store.js';
 
@@ -29,25 +29,29 @@ function current(call: BrokerCall, record: CallerRouteRecord, deadline: string):
 }
 
 /** Build the exact frozen input. Candidate coverage is never shortened to fit. */
-export function buildCallerIntentInput(call: BrokerCall, record: CallerRouteRecord): CallerIntentInput {
+export function buildCallerIntentInput(call: BrokerCall, record: CallerRouteRecord): CallerIntentV2Input {
   validateCallerRouting(call);
   const saved = getCallerRouteBySource(call, record.frozen.turn.sourceEventId);
   if (!saved || !same(immutableRoute(saved), immutableRoute(record))) refuse('caller_intent_route_changed');
+  if (record.resolutionInput.classificationRefusal) refuse('caller_route_inventory_refused');
   const deadline = call.liveGenerations?.clocks.callDeadlineAt;
   if (!deadline) refuse('caller_intent_deadline_missing');
   current(call, record, deadline);
-  const candidates = callerIntentResultPublicationCandidates(call, record.frozen.sessionId);
-  if (!same(candidates.map(({ id, digest }) => ({ id, digest })), record.resolutionInput.references))
+  const inventory = callerIntentResultPublicationInventory(call, record.frozen.sessionId);
+  const { candidates, resultCoverage } = inventory;
+  if (!record.resolutionInput.resultCoverage) refuse('caller_intent_legacy_dispatch_refused');
+  if (!same(candidates.map(({ id, digest }) => ({ id, digest })), record.resolutionInput.references)
+    || !same(resultCoverage, record.resolutionInput.resultCoverage))
     refuse('caller_intent_candidate_coverage_changed');
   const turn = record.frozen.turn;
-  return callerIntentInputSchema.parse({ v: 'phone.caller-intent.v1',
+  return callerIntentV2InputSchema.parse({ v: 'phone.caller-intent.v2',
     source: { callSid: record.scope.callSid, sourceEventId: turn.sourceEventId, itemId: turn.itemId,
       revision: turn.revision, receivedAt: turn.occurredAt, role: turn.role, text: turn.text },
     generationId: record.scope.generationId, sourceSessionId: record.frozen.sessionId,
     brokerInputDigest: record.inputDigest, presentationDigest: callerRoutePresentationDigest(record.resolutionInput),
     callDeadlineAt: deadline, version: record.resolutionInput.version,
     questions: record.resolutionInput.questions.map(callerIntentQuestionForTarget),
-    results: candidates.map(candidate => candidate.candidate) });
+    resultCoverage, results: resultCoverage.state === 'complete' ? candidates.map(candidate => candidate.candidate) : [] });
 }
 
 function routeDecision(call: BrokerCall, record: CallerRouteRecord, decision: CallerIntentDecision): CallerRouteDecision {
@@ -81,7 +85,7 @@ export interface CallerIntentResolverOptions {
   callId: string;
   store: BrokerStore;
   client: CallerIntentClient;
-  /** Explicit host wait, bounded by the fixed v1 decision budget and call deadline. */
+  /** Explicit host wait, bounded by the fixed decision budget and call deadline. */
   timeoutMs: number;
 }
 
@@ -136,13 +140,15 @@ export function createCallerIntentResolver(options: CallerIntentResolverOptions)
       if (response?.state !== 'resolved') {
         // A saved operation might have reached the API. Even a recovered404
         // cannot cause a second POST or a replacement operation ID.
-        const operation = prepared.submit ? options.client.submit.bind(options.client) : options.client.recover.bind(options.client);
         alive();
         const beforeHttp = load(input.record);
         if (beforeHttp.saved.decision) return { inputDigest: beforeHttp.saved.inputDigest, decision: beforeHttp.saved.decision };
         current(beforeHttp.call, prepared.record, input.callDeadlineAt);
-        response = await Promise.race([operation(prepared.record.scope.bindingId, intent.operationId,
-          structuredClone(intent.input), controller.signal), interrupted]);
+        if (prepared.submit && intent.input.v !== 'phone.caller-intent.v2') refuse('caller_intent_legacy_dispatch_refused');
+        const operation = prepared.submit && intent.input.v === 'phone.caller-intent.v2'
+          ? options.client.submit(prepared.record.scope.bindingId, intent.operationId, structuredClone(intent.input), controller.signal)
+          : options.client.recover(prepared.record.scope.bindingId, intent.operationId, structuredClone(intent.input), controller.signal);
+        response = await Promise.race([operation, interrupted]);
       }
       const exactResponse = response;
       return await Promise.race([withCallerAdmission(options.store, options.callId, () => {
@@ -156,6 +162,8 @@ export function createCallerIntentResolver(options: CallerIntentResolverOptions)
         current(call, saved, input.callDeadlineAt);
         const receipt = saved.intent?.response;
         if (!receipt || receipt.state !== 'resolved') refuse('caller_intent_pending');
+        if (saved.intent?.input.v !== 'phone.caller-intent.v2' || receipt.v !== 'phone.caller-intent.v2')
+          refuse('caller_intent_legacy_dispatch_refused');
         if (Date.now() >= Date.parse(receipt.validUntil)) refuse('caller_intent_expired');
         const decision = routeDecision(call, saved, receipt.decision);
         // Reuse the journal's target/receipt/frontier checks without saving a
