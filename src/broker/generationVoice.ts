@@ -450,6 +450,11 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
         return receipt;
       },
       withCallerAdmission: operation => withCallerAdmission(options.store, initialCall.id, operation),
+      assertFrozenCallerSpeechCurrent(frozen) {
+        const source = sessions.get(frozen.sessionId);
+        if (!source) throw new Error('selected_question_source_missing');
+        source.backend.assertFrozenCallerSpeechCurrent(frozen);
+      },
       freezer: { async freeze(request, channel, usedSourceIds) {
         const source = sessions.get(request.sessionId);
         if (!source) throw new Error('selected_question_source_missing');

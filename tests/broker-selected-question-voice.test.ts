@@ -6,6 +6,7 @@ import { prepareCallerRouting, prepareCallerIntent, recordCallerIntentResponse, 
   callerIntentQuestionForTarget, callerRoutePresentationDigest, type CallerRouteDecision,
   type CallerQuestionTarget } from '../src/broker/callerRouting.js';
 import { callerIntentInputDigest, type CallerIntentInput, type CallerIntentResponse } from '../src/broker/callerIntentContract.js';
+import { assertFrozenCallerSpeechCurrent } from '../src/broker/callerTurn.js';
 import { createSelectedQuestionVoiceAdapter, assertSelectedQuestionVoiceEvidenceUpdate,
   assertSelectedQuestionVoiceScope, parseSelectedQuestionVoiceEvidence, selectedQuestionPresentation,
   validateSelectedQuestionVoiceCall,
@@ -66,6 +67,9 @@ function fixture() {
   let clock = milliseconds;
   let snapshot = empty();
   let frozen: FrozenSelectedCallerTurn | undefined;
+  let acoustic: { sessionId: string; audioThroughMs: number | undefined; observedSpeechAtMs: number | undefined } = {
+    sessionId: seed.deliveryCall.sessionId, audioThroughMs: undefined, observedSpeechAtMs: undefined,
+  };
   const abort = new AbortController();
   const events: string[] = [], captures: PrimaryTurn[] = [], posts: RequestDeliveryJournal[] = [];
   const associations: string[] = [], deliveries: SelectedQuestionDeliveryObservation[] = [], admissions: string[] = [];
@@ -137,6 +141,7 @@ function fixture() {
       assert.ok(!frozen || !used.includes(frozen.turn.sourceEventId));
       return hooks.freezer ? hooks.freezer() : structuredClone(frozen);
     } },
+    assertFrozenCallerSpeechCurrent: source => assertFrozenCallerSpeechCurrent(source, acoustic),
     admissionSettled(request) {
       admissions.push(request.delegationId); events.push('admission-settled'); hooks.admit?.();
     },
@@ -177,6 +182,7 @@ function fixture() {
       audioThroughMs: startMs + 300, observedSpeechAtMs: observedAt,
       turn: { sourceEventId, revision: 1, itemId: `live-turn-${sourceEventId}`, role: 'user', text,
         occurredAt: new Date(milliseconds + segment.inputFirstSample / 8 + startMs).toISOString() } };
+    acoustic = { sessionId, audioThroughMs: frozen.audioThroughMs, observedSpeechAtMs: observedAt };
     const request: LiveDelegationRequest = { callId: call.id, sessionId, delegationId: `delegation_${eventId}`,
       requestId: `local_${eventId}`, offsetMs: startMs + 250, transcript: structuredClone(snapshot) };
     return request;
@@ -189,10 +195,12 @@ function fixture() {
     generations.segments.push({ generationId, ordinal, sessionId, createdAt: new Date(clock).toISOString(),
       readyAt: new Date(clock).toISOString(), state: 'active', version, pageDigest: 'b'.repeat(64), transcript: empty(), outputDiscarded: false });
     call.liveSessionId = sessionId; snapshot = empty(); frozen = undefined;
+    acoustic = { sessionId, audioThroughMs: undefined, observedSpeechAtMs: undefined };
   };
   return { options, call, hooks, events, captures, posts, associations, deliveries, admissions, channel, caller, rotate,
     create: () => createSelectedQuestionVoiceAdapter(options), saved: () => structuredClone(saved!), voice: () => structuredClone(voice!),
     setText(value: string) { questionText = value; }, setTime(value: number) { clock = value; },
+    addSpeechWithoutCaption() { acoustic = { ...acoustic, audioThroughMs: (acoustic.audioThroughMs ?? 0) + 20 }; },
     frozen: () => structuredClone(frozen!), changeFrozen(value: Partial<FrozenSelectedCallerTurn>) { frozen = { ...frozen!, ...value }; } };
 }
 
@@ -246,6 +254,49 @@ test('routed selected answer consumes its persisted frozen source without callin
   assert.equal(h.posts[0].reply!.input.text, ' Yes.\t');
   assert.equal(h.posts[0].target.execution.bindingId, uuid(9));
   assert.deepEqual(h.call.delegations, {});
+});
+
+test('routed selected answer rechecks speech after a queued host operation before saving admission', { timeout: 4000 }, async t => {
+  t.mock.method(Date, 'now', () => milliseconds);
+  const h = fixture();
+  h.options.withCallerAdmission = fn => withCallerAdmission(h.call, h.call.id, fn);
+  const sourceSaved = deferred<void>(), pollEntered = deferred<void>(), releasePoll = deferred<void>();
+  h.hooks.persistVoice = value => {
+    h.call.selectedQuestionVoice = structuredClone(value);
+    if (value.sources.length) sourceSaved.resolve();
+  };
+  const adapter = h.create(); await adapter.host.start();
+  const targets = adapter.questionTargets(h.call.liveSessionId!), request = h.caller(' Yes.\t');
+  const ref = persistRoute(h, request, { kind: 'answer', target: targets[0] }, targets);
+  const original = structuredClone(h.call.callerRouting), raw = h.frozen();
+  h.hooks.result = async () => {
+    pollEntered.resolve(); await releasePoll.promise;
+    return { ...question(), state: 'waiting_for_reply' };
+  };
+  const poll = adapter.host.poll();
+  let answer: Promise<unknown> | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const bound = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error('Selected host acoustic handshake timed out')), 1500);
+  });
+  try {
+    await Promise.race([pollEntered.promise, bound, poll.then(() => { throw new Error('Poll did not hold'); })]);
+    answer = adapter.answerFrozen(request, ref, h.channel).then(() => undefined, error => error);
+    await Promise.race([sourceSaved.promise, bound, answer.then(error => { throw error ?? new Error('Answer ended before source save'); })]);
+    assert.equal(h.voice().sources.length, 1);
+    assert.deepEqual(h.saved().questions[0].admissions, []);
+    h.addSpeechWithoutCaption(); // Same wall-clock millisecond, unchanged transcript and intent.
+    releasePoll.resolve(); await Promise.race([poll, bound]);
+    const error = await Promise.race([answer, bound]);
+    assert.ok(error instanceof Error); assert.equal(error.message, 'selected_question_reply_unqualified');
+    assert.deepEqual(h.saved().questions[0].admissions, []);
+    assert.equal(h.posts.length, 0); assert.equal(h.captures.length, 0);
+    assert.deepEqual(h.voice().sources[0].frozen, raw);
+    assert.deepEqual(h.call.callerRouting, original);
+  } finally {
+    releasePoll.resolve(); clearTimeout(timer);
+    await Promise.allSettled([poll, ...(answer ? [answer] : [])]);
+  }
 });
 
 test('task intent cannot enter the selected answer port even after the complete question was published', async t => {

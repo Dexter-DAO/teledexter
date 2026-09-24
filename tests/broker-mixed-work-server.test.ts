@@ -18,7 +18,8 @@ import { createRequestDeliveryJournal, retainRequestDeliveryAssociation, PHONE_R
   type RequestDeliveryQuestionResult, type RequestDeliveryResult } from '../src/broker/requestDelivery.js';
 import type { BrokerConfig } from '../src/broker/config.js';
 import type { EligibleContextClient, EligiblePhoneCall } from '../src/broker/eligibleContext.js';
-import type { PrimaryApiClient, PrimarySubmission, PrimaryTurn } from '../src/broker/primaryApi.js';
+import type { PrimaryApiClient, PrimarySubmission, PrimaryTurn, PrimaryQuestionResult,
+  PrimaryReplyInput, PrimaryResult } from '../src/broker/primaryApi.js';
 import type { BrokerLiveSession, BrokerLiveSessionOptions, LiveBackendChannel,
   LiveDelegationRequest, LiveTranscriptSnapshot } from '../src/live/types.js';
 
@@ -40,15 +41,20 @@ async function until(predicate: () => boolean, label: string) {
   const deadline = Date.now() + 6000;
   while (!predicate()) { assert.ok(Date.now() < deadline, `Timed out: ${label}`); await pause(10); }
 }
-type IntentOutcome = 'task' | 'selected_answer' | 'ambiguous' | 'lost';
+type IntentOutcome = 'task' | 'ordinary_answer' | 'selected_answer' | 'ambiguous' | 'lost';
 
-async function fixture(t: test.TestContext) {
+async function fixture(t: test.TestContext, options: { ordinaryQuestion?: boolean } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-mixed-server-'));
   const store = new BrokerStore(directory);
   let ws: WebSocket | undefined, closeHost: (() => Promise<void>) | undefined;
+  const activeDelegations = new Set<Promise<void>>();
+  const releases = new Set<() => void>();
+  const intentHolds: Array<{ enter(): void; wait: Promise<void> }> = [];
   t.after(async () => {
+    for (const release of releases) release();
     ws?.terminate();
     if (closeHost) await bounded(closeHost(), 'broker cleanup');
+    await bounded(Promise.allSettled([...activeDelegations]), 'delegation cleanup');
     store.close(); fs.rmSync(directory, { recursive: true, force: true });
   });
   const config: BrokerConfig = { host: '127.0.0.1', port: 3213, publicOrigin: 'https://phone.example.test',
@@ -70,6 +76,7 @@ async function fixture(t: test.TestContext) {
     delivery: { bindingId, callSid }, execution: { bindingId: executionBinding, requestId: originalRequest, runId },
     question: { id: questionId, revision: 1 }, createdAt };
   const taskPosts: Array<{ requestId: string; input: PrimarySubmission }> = [], replyPosts: RequestDeliveryJournal[] = [];
+  const ordinaryReplyPosts: Array<{ requestId: string; questionId: string; input: PrimaryReplyInput }> = [];
   const captures: PrimaryTurn[] = [], intentPosts: Array<{ operationId: string; input: CallerIntentInput; method: string }> = [];
   const outcomes: IntentOutcome[] = [], suppliedOutcomes: IntentOutcome[] = [];
   let answered: RequestDeliveryJournal | undefined, providerEnds = 0;
@@ -96,10 +103,34 @@ async function fixture(t: test.TestContext) {
     },
   };
   const forbidden = async () => { throw new Error('Unexpected external API operation'); };
-  const taskResult = (requestId: string) => ({ bindingId, requestId, state: 'completed' as const,
+  const ordinaryQuestionId = id(25), ordinaryRunId = id(26);
+  let ordinaryAnswer: PrimaryReplyInput | undefined;
+  const ordinaryQuestion = (requestId: string): PrimaryQuestionResult => ({ bindingId, requestId,
+    state: ordinaryAnswer ? 'running' : 'waiting_for_reply', question: {
+      id: ordinaryQuestionId, revision: 1, runId: ordinaryRunId, threadId, agent: { id: primaryId, name: 'Dexter' },
+      state: ordinaryAnswer ? 'answered' : 'pending', runState: ordinaryAnswer ? 'running' : 'waiting_for_reply',
+      question: 'Include the filing comparison?', context: 'Research only.', proposedAnswer: 'Compare the filings.',
+      yesMeaning: 'Compare the filings.', noMeaning: 'Leave out the filings.', createdAt, expiresAt,
+      reply: ordinaryAnswer ? { ...ordinaryAnswer.reply, interpretedAnswer: 'Compare the filings.',
+        receivedAt: new Date().toISOString() } : null } });
+  const completedTask = (requestId: string) => ({ bindingId, requestId, state: 'completed' as const,
     assistant: { messageId: id(20), eventId: id(21), sequence: '2', text: 'The new research is saved.' } });
+  const taskResult = (requestId: string): PrimaryResult => options.ordinaryQuestion && !ordinaryAnswer
+    ? { ...ordinaryQuestion(requestId), state: 'waiting_for_reply' } : completedTask(requestId);
   const primary: PrimaryApiClient = { readiness: forbidden, openCall: forbidden, getContext: forbidden,
-    reconcile: forbidden, question: forbidden, reply: forbidden,
+    reconcile: forbidden,
+    async question(receivedBinding, requestId, receivedQuestion) {
+      assert.ok(options.ordinaryQuestion); assert.equal(receivedBinding, bindingId);
+      assert.equal(requestId, taskPosts[0]!.requestId); assert.equal(receivedQuestion, ordinaryQuestionId);
+      return ordinaryQuestion(requestId);
+    },
+    async reply(receivedBinding, requestId, receivedQuestion, input) {
+      assert.ok(options.ordinaryQuestion); assert.equal(receivedBinding, bindingId);
+      assert.equal(requestId, taskPosts[0]!.requestId); assert.equal(receivedQuestion, ordinaryQuestionId);
+      ordinaryReplyPosts.push({ requestId, questionId: receivedQuestion, input: structuredClone(input) });
+      ordinaryAnswer = structuredClone(input);
+      return { ...ordinaryQuestion(requestId), replayed: false };
+    },
     async submit(receivedBinding, requestId, input) {
       assert.equal(receivedBinding, bindingId); assert.notEqual(requestId, originalRequest);
       taskPosts.push({ requestId, input: structuredClone(input) }); return taskResult(requestId);
@@ -124,11 +155,17 @@ async function fixture(t: test.TestContext) {
             question: questionResponse(journal).question, source: { kind: 'question', messageId: id(22), eventSequence: '1',
               provenance: { messageCreatedAt: createdAt, eventId: id(23), eventOccurredAt: createdAt, runId } } } };
       }
-      assert.ok(taskPosts.some(post => post.requestId === requestId)); assert.equal(input.source.kind, 'assistant');
+      assert.ok(taskPosts.some(post => post.requestId === requestId));
+      if (options.ordinaryQuestion && input.source.kind === 'question') return { bindingId, callSid, requestId,
+        version: input.version, delivery: { state: 'ready', text: 'Include the filing comparison? Yes compares the filings. No leaves them out.',
+          question: ordinaryQuestion(requestId).question, source: { kind: 'question', messageId: id(27), eventSequence: '2',
+            provenance: { messageCreatedAt: createdAt, eventId: id(28), eventOccurredAt: createdAt, runId: ordinaryRunId } } } };
+      assert.equal(input.source.kind, 'assistant');
       return { bindingId, callSid, requestId, version: input.version,
-        delivery: { state: 'ready', text: taskResult(requestId).assistant.text,
+        delivery: { state: 'ready', text: completedTask(requestId).assistant.text,
           source: { kind: 'assistant', messageId: id(20), eventSequence: '2', provenance: {
-            messageCreatedAt: createdAt, eventId: id(21), eventOccurredAt: createdAt, runId: id(24) } } } };
+            messageCreatedAt: createdAt, eventId: id(21), eventOccurredAt: createdAt,
+            runId: options.ordinaryQuestion ? ordinaryRunId : id(24) } } } };
     },
   };
   const client = createPrimaryCallerIntentClient({ apiBaseUrl: config.apiBaseUrl, phoneServiceSecret: config.phoneServiceSecret,
@@ -150,7 +187,7 @@ async function fixture(t: test.TestContext) {
       if (outcome === 'task') decision = { kind: 'task' };
       else if (outcome === 'ambiguous') decision = { kind: 'clarify', reason: 'ambiguous_target' };
       else {
-        const target = input.questions.find(candidate => candidate.kind === 'selected'); assert.ok(target);
+        const target = input.questions.find(candidate => candidate.kind === (outcome === 'ordinary_answer' ? 'ordinary' : 'selected')); assert.ok(target);
         decision = { kind: 'answer', target };
       }
       const reservedAt = new Date().toISOString();
@@ -160,6 +197,8 @@ async function fixture(t: test.TestContext) {
         callDeadlineAt: input.callDeadlineAt, questions: input.questions, results: input.results, version: input.version,
         reservedAt, validUntil: new Date(Math.min(Date.parse(input.callDeadlineAt), Date.parse(reservedAt) + 10_000)).toISOString(),
         state: 'resolved', decision };
+      const hold = intentHolds.shift();
+      if (hold) { hold.enter(); await hold.wait; }
       return Response.json(response);
     } });
   const voices: Array<{ options: BrokerLiveSessionOptions; caption: LiveTranscriptSnapshot; channel: LiveBackendChannel;
@@ -209,11 +248,22 @@ async function fixture(t: test.TestContext) {
     mediaFormat: { encoding: 'audio/x-mulaw', sampleRate: 8000, channels: 1 } } }));
   const currentCall = () => store.get(call.id)!;
   await until(() => currentCall().selectedQuestionVoice?.presentations.length === 1, 'selected question presentation');
+  const audio = (silent: boolean) => ws!.send(JSON.stringify({ event: 'media', streamSid,
+    media: { track: 'inbound', payload: Buffer.alloc(160, silent ? 255 : 0).toString('base64') } }));
+  const mediaOnly = async (silent: boolean) => {
+    const voice = voices.at(-1)!, count = voice.input.length;
+    audio(silent); await until(() => voice.input.length === count + 1, 'additional audio accepted');
+  };
+  const holdNextIntent = () => {
+    let enter!: () => void, release!: () => void;
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    const wait = new Promise<void>(resolve => { release = resolve; });
+    releases.add(release); intentHolds.push({ enter, wait });
+    return { entered, release };
+  };
   const say = async (text: string, outcome: IntentOutcome, startMs = 0) => {
     await pause(5); const voice = voices.at(-1)!;
     const frames = startMs / 20; assert.equal(Number.isInteger(frames), true);
-    const audio = (silent: boolean) => ws!.send(JSON.stringify({ event: 'media', streamSid,
-      media: { track: 'inbound', payload: Buffer.alloc(160, silent ? 255 : 0).toString('base64') } }));
     for (let index = voice.input.length; index < frames; index++) audio(true);
     audio(false); await until(() => voice.input.length === frames + 1, 'caller audio');
     const sequence = voice.caption.revision + 1;
@@ -223,11 +273,16 @@ async function fixture(t: test.TestContext) {
     const request: LiveDelegationRequest = { callId: call.id, sessionId: currentCall().liveSessionId!,
       delegationId: `delegate_${sequence}`, requestId: `provider_${sequence}`, offsetMs: startMs + 20,
       transcript: structuredClone(voice.caption) };
-    const delegate = () => bounded(voice.options.backend.delegate(request, voice.channel), 'explicit caller delegation');
-    return { request, delegate };
+    const start = () => {
+      const work = voice.options.backend.delegate(request, voice.channel); activeDelegations.add(work);
+      void work.then(() => activeDelegations.delete(work), () => activeDelegations.delete(work));
+      return work;
+    };
+    const delegate = () => bounded(start(), 'explicit caller delegation');
+    return { request, delegate, start };
   };
   return { call, currentCall, say, voices, taskPosts, replyPosts, captures, intentPosts, suppliedOutcomes,
-    providerEnds: () => providerEnds };
+    ordinaryReplyPosts, ordinaryQuestionId, holdNextIntent, mediaOnly, providerEnds: () => providerEnds };
 }
 
 test('actual selected server routes a new task and then an exact answer without consuming the pending question as task consent', { timeout: 15_000 }, async t => {
@@ -280,4 +335,125 @@ for (const outcome of ['ambiguous', 'lost'] as const) {
     assert.equal(f.currentCall().selectedQuestion!.questions[0]!.record!.attempts.length, 0);
     assert.deepEqual(f.currentCall().delegations, {}); assert.equal(f.providerEnds(), 0);
   });
+}
+
+// X-MIXED-001: captions can lag behind accepted caller audio while the HTTP
+// intent request is outstanding. Exercise each fresh admission through the
+// actual host, then distinguish added silence from another speech frame.
+for (const route of ['task', 'ordinary_answer', 'selected_answer'] as const) {
+  for (const duringIntent of ['unchanged', 'silence', 'speech'] as const) {
+    test(`held intent ${route} with ${duringIntent} audio rechecks the frozen speech before fresh dispatch`,
+      { timeout: 20_000 }, async t => {
+        const f = await fixture(t, { ordinaryQuestion: route === 'ordinary_answer' });
+        let ordinaryRequest: string | undefined;
+        if (route === 'ordinary_answer') {
+          const seed = await f.say('Compare the filings.', 'task');
+          let seedError: unknown;
+          void seed.start().catch(error => { seedError = error; });
+          await until(() => {
+            if (seedError) throw seedError;
+            ordinaryRequest = f.taskPosts[0]?.requestId;
+            const entry = ordinaryRequest && f.currentCall().delegations[ordinaryRequest] as BrokerDelegationRecord | undefined;
+            return Boolean(entry && entry.status === 'waiting_for_reply'
+              && entry.questions?.[f.ordinaryQuestionId]?.presentation?.publicationReceipts?.length);
+          }, 'ordinary question accepted publication');
+          assert.equal(f.taskPosts.length, 1);
+          assert.equal(f.ordinaryReplyPosts.length, 0);
+          assert.equal(f.voices[0]!.comments.some(text => text.includes('Include the filing comparison?')), true);
+        }
+        const taskCount = f.taskPosts.length, intentCount = f.intentPosts.length;
+        const raw = route === 'task' ? ' Research Apple.\t' : ' Yes.\t';
+        const speech = await f.say(raw, route, route === 'ordinary_answer' ? 1400 : 0);
+        const held = f.holdNextIntent();
+        let completed = false;
+        const result = speech.start().then(() => { completed = true; return undefined; }, error => { completed = true; return error; });
+        try {
+          await bounded(Promise.race([held.entered, result.then(error => {
+            throw error ?? new Error('Delegation ended before the held intent HTTP request');
+          })]), 'intent HTTP entered with durable frozen source');
+          const voice = f.voices.at(-1)!, caption = structuredClone(voice.caption);
+          const saved = f.currentCall().callerRouting!.records.at(-1)!;
+          const frozen = structuredClone(saved.frozen), input = structuredClone(saved.intent!.input);
+          const publicationSequence = f.currentCall().publications!.records.at(-1)!.publicationSequence;
+          const inputNextSample = f.currentCall().liveGenerations!.inputNextSample;
+          const frames = voice.input.length;
+          assert.equal(completed, false);
+          assert.equal(saved.intent!.response, undefined);
+          assert.equal(saved.decision, undefined);
+          assert.equal(f.intentPosts.length, intentCount + 1);
+          assert.equal(input.source.text, raw);
+          assert.equal(frozen.audioThroughMs, route === 'ordinary_answer' ? 1420 : 20);
+          if (route === 'ordinary_answer') {
+            assert.equal(input.questions.length, 2);
+            const target = input.questions.find(value => value.kind === 'ordinary')!;
+            assert.equal(target.execution.bindingId, bindingId);
+            assert.equal(target.execution.requestId, ordinaryRequest);
+            assert.equal(target.question.id, f.ordinaryQuestionId);
+            assert.ok(input.questions.some(value => value.kind === 'selected' && value.question.id === questionId));
+          }
+          if (duringIntent !== 'unchanged') await f.mediaOnly(duringIntent === 'silence');
+          assert.equal(voice.input.length, frames + (duringIntent === 'unchanged' ? 0 : 1));
+          assert.equal(f.currentCall().liveGenerations!.inputNextSample,
+            inputNextSample + (duringIntent === 'unchanged' ? 0 : 160));
+          assert.deepEqual(voice.caption, caption, 'the provider has not emitted a revised caption');
+          const segment = f.currentCall().liveGenerations!.segments.find(value => value.sessionId === speech.request.sessionId)!;
+          assert.deepEqual(segment.transcript, caption);
+          assert.equal(f.currentCall().publications!.records.at(-1)!.publicationSequence, publicationSequence);
+          assert.equal(completed, false);
+          assert.equal(f.taskPosts.length, taskCount);
+          assert.equal(f.replyPosts.length, 0);
+          assert.equal(f.ordinaryReplyPosts.length, 0);
+          held.release();
+          const error = await bounded(result, 'fresh route after held intent response');
+          const retained = f.currentCall().callerRouting!.records.find(value => value.inputDigest === saved.inputDigest)!;
+          assert.deepEqual(retained.frozen, frozen);
+          assert.deepEqual(retained.intent!.input, input);
+          assert.equal(retained.intent!.response?.state, 'resolved', 'the acoustic guard sees a completed intent response');
+          assert.equal(retained.decision?.kind, route === 'task' ? 'task' : 'answer');
+          if (duringIntent === 'speech') {
+            assert.ok(error instanceof Error);
+            assert.equal(error.message, 'caller_route_acoustic_changed');
+            assert.equal(f.taskPosts.length, taskCount);
+            assert.equal(f.replyPosts.length, 0);
+            assert.equal(f.ordinaryReplyPosts.length, 0);
+            assert.equal(Object.values(f.currentCall().delegations).some(value =>
+              (value as BrokerDelegationRecord).submission.source.sourceEventId === frozen.turn.sourceEventId), false);
+            assert.deepEqual(f.currentCall().selectedQuestion!.questions[0]!.admissions, []);
+            assert.deepEqual(f.currentCall().selectedQuestionVoice!.sources, []);
+            if (ordinaryRequest) {
+              const question = (f.currentCall().delegations[ordinaryRequest] as BrokerDelegationRecord).questions![f.ordinaryQuestionId]!;
+              assert.equal(question.reply, undefined);
+              assert.deepEqual(question.refusedReplies ?? [], []);
+            }
+            const replayError = await bounded(speech.start().then(() => undefined, failure => failure), 'stale acoustic replay refusal');
+            assert.ok(replayError instanceof Error); assert.equal(replayError.message, 'caller_route_acoustic_changed');
+          } else {
+            assert.equal(error, undefined);
+            assert.equal(f.taskPosts.length, taskCount + (route === 'task' ? 1 : 0));
+            assert.equal(f.replyPosts.length, route === 'selected_answer' ? 1 : 0);
+            assert.equal(f.ordinaryReplyPosts.length, route === 'ordinary_answer' ? 1 : 0);
+            if (route === 'ordinary_answer') {
+              assert.equal(f.ordinaryReplyPosts[0]!.requestId, ordinaryRequest);
+              assert.equal(f.ordinaryReplyPosts[0]!.questionId, f.ordinaryQuestionId);
+              assert.equal(f.ordinaryReplyPosts[0]!.input.text, raw);
+              assert.equal(f.ordinaryReplyPosts[0]!.input.source.sourceEventId, frozen.turn.sourceEventId);
+              assert.deepEqual(f.currentCall().selectedQuestion!.questions[0]!.admissions, []);
+            }
+            if (route === 'selected_answer') {
+              assert.deepEqual(f.replyPosts[0]!.target.execution, associationExecution());
+              assert.equal(f.replyPosts[0]!.reply!.input.text, raw);
+            }
+            // Once this exact source has a durable downstream admission, later
+            // speech cannot turn its replay into another admission or block it.
+            await f.mediaOnly(false);
+            await speech.delegate();
+          }
+          assert.equal(f.intentPosts.length, intentCount + 1, 'exact replay never asks for another classification');
+          assert.equal(f.taskPosts.length, taskCount + (duringIntent !== 'speech' && route === 'task' ? 1 : 0));
+          assert.equal(f.replyPosts.length, duringIntent !== 'speech' && route === 'selected_answer' ? 1 : 0);
+          assert.equal(f.ordinaryReplyPosts.length, duringIntent !== 'speech' && route === 'ordinary_answer' ? 1 : 0);
+          assert.equal(f.providerEnds(), 0);
+        } finally { held.release(); }
+      });
+  }
 }

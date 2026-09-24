@@ -23,6 +23,17 @@ export interface CallerTurnFreezer {
     usedSourceIds: readonly string[]): Promise<FrozenCallerTurn | undefined>;
 }
 
+/** Read from the source backend immediately before fresh admission, under its
+ * existing call lock. Non-silent input advances these values before captions.
+ * Silence and later delivery generations cannot substitute a source frontier. */
+export function assertFrozenCallerSpeechCurrent(frozen: FrozenCallerTurn, current: {
+  sessionId: string; audioThroughMs: number | undefined; observedSpeechAtMs: number | undefined;
+}): void {
+  if (current.sessionId !== frozen.sessionId || current.audioThroughMs !== frozen.audioThroughMs
+    || current.observedSpeechAtMs !== frozen.observedSpeechAtMs)
+    throw new Error('caller_route_acoustic_changed');
+}
+
 const uuid = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
 const nonnegative = z.number().finite().nonnegative();
 const sequence = z.number().int().safe().nonnegative();

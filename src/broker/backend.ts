@@ -9,7 +9,7 @@ import { brokerCallAssignmentSchema, phoneCallAssignmentRefSchema } from './assi
 import { preparePrimaryHarkOutcomePatch, primaryHarkReceiptBindingFromCall } from './harkPrimaryReceiptOutbox.js';
 import type { LiveBackendUpdate, LiveDelivery } from '../live/types.js';
 import { acknowledgedTurn, originalTurn, rawSubmissionDigest, turnBodyDigest, validateNonAdmissionProof, type AcknowledgedTurnReceipt } from './reconciliation.js';
-import type { FrozenCallerTurn } from './callerTurn.js';
+import { assertFrozenCallerSpeechCurrent, type FrozenCallerTurn } from './callerTurn.js';
 import { requireCallerRoute, requireCallerRouteDispatch, CallerRouteExpiredError, getCallerRouteBySource,
   callerRoutePresentationDigest, type CallerQuestionTarget, type CallerRouteRef, type CallerRouteRecord } from './callerRouting.js';
 import { canonicalJson } from '../outbound/canonical.js';
@@ -70,6 +70,8 @@ export interface PrimaryBackend extends BrokerLiveBackend {
   /** Freeze existing completed caller speech without submitting, replying or capturing. */
   freezeCallerTurn(request: LiveDelegationRequest, channel: LiveBackendChannel,
     usedSourceIds: readonly string[]): Promise<FrozenCallerTurn | undefined>;
+  /** Call only under the shared admission lock for a not-yet-admitted frozen source. */
+  assertFrozenCallerSpeechCurrent(frozen: FrozenCallerTurn): void;
   /** Retain quiet-time completion evidence without uploading provisional speech. */
   observeTranscript(snapshot: LiveTranscriptSnapshot): void;
   /** Host-observed acoustic speech time, in Date.now() milliseconds. */
@@ -704,6 +706,9 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     return Date.parse(origin) + (generation?.inputFirstSample ?? 0) / 8;
   };
   const speechTime = () => options.lastCallerSpeechAt?.() ?? lastSpeechAt;
+  const assertFrozenSpeech = (frozen: FrozenCallerTurn) => assertFrozenCallerSpeechCurrent(frozen, {
+    sessionId: currentSession(), audioThroughMs: acousticSpans.at(-1)?.endMs, observedSpeechAtMs: speechTime(),
+  });
   const selectedSources = (sessionId: string): readonly SelectedQuestionSourceAnchor[] => {
     const merged = new Map<string, CallerSourceAnchor>();
     for (const source of [...options.selectedQuestionSources?.() ?? [], ...options.callerRouteSources?.() ?? []]) {
@@ -941,6 +946,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     const queued = all.find(entry => entry.deferredTurns?.some(turn => turn.sourceEventId === frozen.turn.sourceEventId));
     if (queued) return queued;
     if (channel.signal.aborted || options.observation?.signal.aborted) return;
+    assertFrozenSpeech(frozen);
     const route = requireCallerRoute(boundCall(request.sessionId), request, ref, 'task');
     if (route.decision?.kind !== 'task') throw new Error('caller_route_kind_mismatch');
     const submission = frozenSubmission(frozen);
@@ -961,6 +967,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       }
       requireCallerRoute(boundCall(request.sessionId), request, ref, 'task');
       if (channel.signal.aborted || options.observation?.signal.aborted) return;
+      assertFrozenSpeech(frozen);
       all = entries(request.sessionId, true);
     }
     const active = all.find(entry => !terminal(entry.status))
@@ -1006,6 +1013,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       throw new Error('caller_route_question_changed');
     if (replyAttempts(record).some(reply => reply.input.source.sourceEventId === frozen.turn.sourceEventId)) return entry;
     if (channel.signal.aborted || options.observation?.signal.aborted) return;
+    assertFrozenSpeech(frozen);
     requireCallerRoute(boundCall(request.sessionId), request, ref, 'ordinary_answer');
     const presentation = record.presentation;
     if (!questionTargets(request.sessionId).some(candidate => canonicalJson(candidate) === canonicalJson(target))
@@ -1656,6 +1664,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
   };
   return {
     freezeCallerTurn,
+    assertFrozenCallerSpeechCurrent: assertFrozenSpeech,
     observeTranscript(snapshot) {
       if (options.store.get(options.callId)?.endedAt) return;
       if (observedTranscript?.callerRevision === snapshot.callerRevision) return;

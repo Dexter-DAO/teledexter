@@ -240,6 +240,8 @@ export interface SelectedQuestionVoiceOptions extends Omit<SelectedQuestionHostO
   admissionSettled?(request: LiveDelegationRequest): void;
   /** Same store/call mutex used by the backend; frozen admission never refreezes. */
   withCallerAdmission?<T>(operation: () => Promise<T>): Promise<T>;
+  /** Routed fresh admission uses the same source backend's non-silent frontier. */
+  assertFrozenCallerSpeechCurrent?(frozen: FrozenCallerTurn): void;
 }
 
 export interface SelectedQuestionCloseout {
@@ -342,6 +344,13 @@ export function createSelectedQuestionVoiceAdapter(options: SelectedQuestionVoic
     try { requireCallerRouteDispatch(call, sourceEventId, now()); return true; }
     catch { return false; }
   };
+  const freshSourceIsCurrent = (answer: SelectedQuestionAnswer): boolean => {
+    if (!getCallerRouteBySource(options.readCall(), answer.input.source.sourceEventId)) return true;
+    const source = sourceFor(answer);
+    if (!source || !options.assertFrozenCallerSpeechCurrent) return false;
+    try { options.assertFrozenCallerSpeechCurrent(source.frozen); return true; }
+    catch { return false; }
+  };
   const capture = async (bindingId: string, turn: PrimaryTurn) => {
     const index = evidence.sources.findIndex(s => same(s.frozen.turn, turn));
     if (index < 0 || bindingId !== options.seed.delivery.bindingId) fail('selected_voice_source_unknown');
@@ -372,7 +381,8 @@ export function createSelectedQuestionVoiceAdapter(options: SelectedQuestionVoic
       const admitted = new Set(journal.questions.flatMap(q => q.admissions.map(a => a.answer.input.source.sourceEventId)));
       for (const [request, sourceId] of pending) if (sourceId && admitted.has(sourceId)) settle(request);
     },
-    replyIsQualified: (journal, answer) => current(answer.sourceSessionId) && valid(journal, answer) && intentAllowsDispatch(answer),
+    replyIsQualified: (journal, answer) => current(answer.sourceSessionId) && valid(journal, answer)
+      && intentAllowsDispatch(answer) && freshSourceIsCurrent(answer),
     admittedReplyIsValid: (journal, answer) => valid(journal, answer) && intentAllowsDispatch(answer),
     async deliver(journal, target) {
       const observation = await options.deliver(journal, target);
@@ -458,6 +468,10 @@ export function createSelectedQuestionVoiceAdapter(options: SelectedQuestionVoic
         const answer: SelectedQuestionAnswer = { questionId: journal.target.question.id, input,
           sourceSessionId: request.sessionId, delegationId: request.delegationId, presentationId: presentation.id };
         if (routeRef) requireCallerRoute(options.readCall(), request, routeRef, 'selected_answer');
+        if (routeRef) {
+          if (!options.assertFrozenCallerSpeechCurrent) fail('caller_route_acoustic_guard_required');
+          options.assertFrozenCallerSpeechCurrent(frozen);
+        }
         // Stop may win after this save: the raw source remains a capture obligation.
         save({ ...evidence, sources: [...evidence.sources, { answer, frozen, delegationRequestId: request.requestId }] });
         preparingSources.delete(request);
