@@ -395,7 +395,7 @@ test('a refused associated task allows the already queued ordinary successor to 
   const parent = h.entries()[0];
   h.completedSubmits();
   h.results.set(parent.requestId, { requestId: parent.requestId, bindingId: h.bindingId, state: 'completed',
-    assistant: { messageId: id(70), eventId: id(71), sequence: '2', text: 'Comparison saved.' } });
+    assistant: { messageId: id(70), eventId: id(71), sequence: '1', text: 'Comparison saved.' } });
   await h.backend.delegateFrozenTask(first.request, first.ref, h.channel);
   assert.equal(h.posts.length, 3); assert.deepEqual(h.posts.map(value => value.text), [first.frozen.turn.text, refused.frozen.turn.text, next.frozen.turn.text]);
   assert.equal(h.entries().find(entry => entry.submission.source.sourceEventId === refused.ref.sourceEventId)!.status, 'admission_refused');
@@ -456,7 +456,7 @@ test('an expired queued source releases a later fresh source without changing ei
   await h.backend.delegateFrozenTask(next.request, next.ref, h.channel);
   const parent = h.entries()[0]; h.completedSubmits();
   h.results.set(parent.requestId, { requestId: parent.requestId, bindingId: h.bindingId, state: 'completed',
-    assistant: { messageId: id(72), eventId: id(73), sequence: '2', text: 'Comparison saved.' } });
+    assistant: { messageId: id(72), eventId: id(73), sequence: '1', text: 'Comparison saved.' } });
   await h.backend.delegateFrozenTask(first.request, first.ref, h.channel);
   assert.deepEqual(h.posts.map(input => input.text), [first.frozen.turn.text, next.frozen.turn.text]);
   const local = h.entries().find(entry => entry.submission.source.sourceEventId === expired.ref.sourceEventId)!;
