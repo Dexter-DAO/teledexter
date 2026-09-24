@@ -1,5 +1,7 @@
 import { z } from 'zod';
 import { validateCallContinuation, type CallContinuationContext } from './callContinuation.js';
+import { outboundSettlementFromObservation, type OutboundObservationCall } from './outboundObservation.js';
+import { outboundRetryOfSchema, outboundRetryOfPatch, outboundSettlementSchema } from './outboundSettlement.js';
 
 export const CALL_REQUEST_RECEIPT_NAMESPACE = 'dexter-broker-call-request/v1';
 export const PHONE_OWNER_CALL_PURPOSE = 'Discuss the selected saved question.';
@@ -12,7 +14,10 @@ export const callRequestStateSchema = z.enum(['prepared', 'dialing', 'queued', '
   'completed', 'busy', 'no-answer', 'canceled', 'failed', 'unknown']);
 export const callRequestCallSchema = z.object({ id: wireUuid, requestId: wireUuid,
   direction: z.literal('outbound'), purpose: z.literal(PHONE_OWNER_CALL_PURPOSE),
-  continuation: callRequestContinuationSchema, status: callRequestStateSchema }).strict();
+  continuation: callRequestContinuationSchema, status: callRequestStateSchema,
+  retryOf: outboundRetryOfSchema.optional(), outboundSettlement: outboundSettlementSchema.optional() }).strict()
+  .refine(value => !value.outboundSettlement || (value.outboundSettlement.callId === value.id
+    && value.outboundSettlement.requestId === value.requestId), { message: 'Saved settlement identity differs' });
 export const callRequestReceiptSchema = z.object({ schemaVersion: z.literal(1),
   namespace: z.literal(CALL_REQUEST_RECEIPT_NAMESPACE), requestId: wireUuid, call: callRequestCallSchema })
   .strict().refine(value => value.requestId === value.call.requestId,
@@ -86,8 +91,14 @@ export function readCallRequestReceipt(port: CallRequestJournalPort, requestId: 
     || call.harkJournal !== undefined || call.harkDispatch !== undefined || call.harkReceiptOutbox !== undefined
     || (object(call.callAssignment) && call.callAssignment.origin === 'authenticated_hark_delivery'))
     throw new CallRequestReceiptError('call_request_conflict');
+  let transport: ReturnType<typeof outboundSettlementFromObservation>;
+  try { transport = outboundSettlementFromObservation(call as unknown as OutboundObservationCall); }
+  catch { return unavailable(); }
+  let retry: ReturnType<typeof outboundRetryOfPatch>;
+  try { retry = outboundRetryOfPatch(call.retryOf); } catch { return unavailable(); }
   const projected = { id: call.id, requestId: call.requestId, direction: call.direction,
-    purpose: call.purpose, continuation: call.continuation, status: call.status };
+    purpose: call.purpose, continuation: call.continuation, status: call.status, ...retry,
+    ...(transport === undefined ? {} : { outboundSettlement: transport }) };
   // These malformed selected records cannot come from the promised validated
   // source. Preserve storage uncertainty rather than treating corruption as absence.
   if (!callRequestCallSchema.safeParse(projected).success) return unavailable();

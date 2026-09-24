@@ -29,6 +29,11 @@ import type { PrimaryTurnReceipt } from './primaryApi.js';
 import type { CallerIntentInput, CallerIntentResponse } from './callerIntentContract.js';
 
 import type { CallRequestJournalAvailability } from './callRequestReceipt.js';
+import { createOutboundObservation, reduceOutboundObservation, validateSelectedOutboundObservation,
+  type OutboundObservation, type OutboundObservationEvent, type OutboundProviderIdentity } from './outboundObservation.js';
+import { assertOutboundRetryReplay, outboundRetryOfPatch, OutboundRetryError,
+  type OutboundRetryOf, type OutboundRetrySuccessor } from './outboundSettlement.js';
+import { prepareOutboundRetry, validateOutboundRetries } from './outboundRetry.js';
 
 export type CallStatus = 'prepared' | 'dialing' | 'queued' | 'ringing' | 'in-progress' | 'completed' | 'busy' | 'no-answer' | 'canceled' | 'failed' | 'unknown';
 export const terminalCallStatuses = new Set<CallStatus>(['completed', 'busy', 'no-answer', 'canceled', 'failed']);
@@ -50,6 +55,9 @@ export interface BrokerCall {
   selectedQuestion?: SelectedQuestionJournal;
   selectedQuestionVoice?: SelectedQuestionVoiceEvidence;
   callerRouting?: CallerRoutingJournal;
+  outboundObservation?: OutboundObservation;
+  retryOf?: OutboundRetryOf;
+  retrySuccessor?: OutboundRetrySuccessor;
   primary?: { bindingId: string; name: string | null; context: string; callAssignmentRef?: PhoneCallAssignmentRef;
     primaryDexterId?: string; threadId?: string };
   liveSessionId?: string; transcript?: unknown; transcriptRevision?: number;
@@ -358,7 +366,9 @@ function validateBrokerState(state: State): void {
     validateHarkDispatch(call);
     validateInboundJournal(call);
     validateHarkReceiptCall(call);
+    validateSelectedOutboundObservation(call);
   }
+  validateOutboundRetries(state.calls);
 }
 
 /** One process owns call admission. Provider dispatch always follows a durable state write. */
@@ -407,7 +417,9 @@ export class BrokerStore {
     for (const [id, call] of Object.entries(next.calls)) {
       validateCallerRouting(call, this.state?.calls[id]);
       validateBrokerAdmissionRefusals(call, this.state?.calls[id]);
+      validateSelectedOutboundObservation(call, this.state?.calls[id]);
     }
+    validateOutboundRetries(next.calls, this.state?.calls);
     try { durablyReplaceJsonFile(this.file, JSON.stringify(next), fs, this.parent); }
     catch (error) {
       // A post-rename failure can leave next on disk and the old state in memory.
@@ -476,6 +488,8 @@ export class BrokerStore {
   }
 
   reserve(input: Pick<BrokerCall, 'requestId' | 'direction' | 'purpose' | 'number'> & { callSid?: string; continuation?: CallContinuation }, origin?: 'authenticated_broker_control'): { call: BrokerCall; existing: boolean } {
+    for (const field of ['outboundObservation', 'retryOf', 'retrySuccessor'])
+      if (Object.hasOwn(input, field)) throw new OutboundRetryError('call_request_conflict');
     if (Object.prototype.hasOwnProperty.call(input, 'callerRouting')) throw new Error('Caller routing requires an admitted call');
     if (Object.prototype.hasOwnProperty.call(input, 'callAssignment')) throw new Error('Assignment must originate from control reservation');
     if (Object.prototype.hasOwnProperty.call(input, 'selectedQuestion') || Object.prototype.hasOwnProperty.call(input, 'selectedQuestionVoice')) throw new Error('Selected question requires an admitted call');
@@ -499,6 +513,57 @@ export class BrokerStore {
     validateSelectedVoice(call);
     this.persist({ version: 1, calls: { ...this.state.calls, [call.id]: call } });
     return { call: structuredClone(call), existing: false };
+  }
+
+  /** New selected calls bind provider identity before any asynchronous readiness or dial work.
+   * A retry child and its predecessor edge use the same durable replacement. */
+  reserveSelectedOutbound(input: Pick<BrokerCall, 'requestId' | 'purpose' | 'number'> & {
+    continuation: CallContinuation; retryOf?: OutboundRetryOf;
+  }, providerIdentity: OutboundProviderIdentity): { call: BrokerCall; existing: boolean } {
+    if (this.readCallRequestJournal().state !== 'available') throw new OutboundRetryError('call_request_unavailable');
+    const retry = outboundRetryOfPatch(input.retryOf);
+    const continuation = callContinuationPatch(input.continuation).continuation;
+    if (!continuation) throw new OutboundRetryError('call_request_conflict');
+    const existing = Object.values(this.state.calls).find(call => call.requestId === input.requestId);
+    if (existing) {
+      assertOutboundRetryReplay(existing.retryOf, retry.retryOf);
+      try { assertCallContinuationReplay(existing.continuation, continuation); }
+      catch { throw new OutboundRetryError('call_request_conflict'); }
+      if (existing.direction !== 'outbound' || existing.purpose !== input.purpose || existing.number !== input.number
+        || existing.callAssignment?.origin !== 'authenticated_broker_control')
+        throw new OutboundRetryError('call_request_conflict');
+      // Historical recovery retains its old absence/identity; no new instrumentation or admission.
+      return { call: structuredClone(existing), existing: true };
+    }
+    const now = new Date().toISOString(), id = randomUUID();
+    const call: BrokerCall = { id, requestId: input.requestId, direction: 'outbound', purpose: input.purpose,
+      number: input.number, continuation, ...retry, status: 'prepared', createdAt: now, updatedAt: now, delegations: {},
+      callAssignment: { origin: 'authenticated_broker_control', value: phoneCallAssignmentSchema.parse({
+        assignmentId: input.requestId, brokerCallId: id, revision: 1, purpose: input.purpose }) } };
+    validateAssignment(call);
+    call.outboundObservation = createOutboundObservation(call, providerIdentity);
+    let calls = { ...this.state.calls, [id]: call };
+    if (call.retryOf) {
+      const prepared = prepareOutboundRetry(this.state.calls, { ...call, retryOf: call.retryOf });
+      calls = { ...this.state.calls, [prepared.predecessor.id]: prepared.predecessor, [id]: prepared.child };
+    }
+    this.persist({ version: 1, calls });
+    return { call: structuredClone(this.state.calls[id]!), existing: false };
+  }
+
+  /** No provider operation is authorized until this transition's durable write succeeds. */
+  observeSelectedOutbound(id: string, event: OutboundObservationEvent): BrokerCall {
+    if (this.readCallRequestJournal().state !== 'available') throw new OutboundRetryError('call_request_unavailable');
+    const previous = this.state.calls[id];
+    if (!previous) throw new OutboundRetryError('call_request_unavailable');
+    const observation = reduceOutboundObservation(previous, event);
+    if (observation.accepted && Object.values(this.state.calls).some(call => call.id !== id
+      && call.callSid === observation.accepted!.callSid)) throw new OutboundRetryError('call_request_unavailable');
+    const call: BrokerCall = { ...previous, outboundObservation: observation, updatedAt: event.observedAt,
+      ...(observation.accepted ? { callSid: observation.accepted.callSid } : {}),
+      ...(event.type === 'dispatch_started' ? { status: 'dialing' as const } : {}) };
+    this.persist({ version: 1, calls: { ...this.state.calls, [id]: call } });
+    return structuredClone(call);
   }
 
   /** Only the API's resolved Hark snapshot supplies this reservation. */
@@ -673,12 +738,18 @@ export class BrokerStore {
     return structuredClone(journal.records.find(record => record.frozen.turn.sourceEventId === ref.sourceEventId)!);
   }
 
-  update(id: string, patch: Partial<Omit<BrokerCall, 'id' | 'requestId' | 'number' | 'direction' | 'purpose' | 'createdAt' | 'callAssignment' | 'continuation' | 'selectedQuestion' | 'selectedQuestionVoice' | 'callerRouting' | 'harkJournal' | 'harkDispatch' | 'inbound'>>): BrokerCall {
+  update(id: string, patch: Partial<Omit<BrokerCall, 'id' | 'requestId' | 'number' | 'direction' | 'purpose' | 'createdAt' | 'callAssignment' | 'continuation' | 'selectedQuestion' | 'selectedQuestionVoice' | 'callerRouting' | 'harkJournal' | 'harkDispatch' | 'inbound' | 'outboundObservation' | 'retryOf' | 'retrySuccessor'>>): BrokerCall {
     const previous = this.state.calls[id];
     if (!previous) throw new Error('Unknown broker call');
     // Runtime callers can bypass Omit. Check the same property snapshot that
     // will be persisted, so accessors cannot change a value after validation.
     const nextPatch = { ...patch };
+    for (const key of ['outboundObservation', 'retryOf', 'retrySuccessor'] as const) {
+      if (!Object.hasOwn(nextPatch, key)) continue;
+      if (canonicalJson((nextPatch as Partial<BrokerCall>)[key]) !== canonicalJson(previous[key]))
+        throw new OutboundRetryError('call_request_conflict');
+      delete (nextPatch as Partial<BrokerCall>)[key];
+    }
     if (Object.prototype.hasOwnProperty.call(nextPatch, 'callerRouting')) {
       if (canonicalJson((nextPatch as Partial<BrokerCall>).callerRouting) !== canonicalJson(previous.callerRouting))
         throw new Error('Caller routing requires an explicit transition');

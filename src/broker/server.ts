@@ -13,6 +13,10 @@ import { recoverCallerRouteCaptures } from './mixedWork.js';
 import { createCallerIntentResolver } from './callerIntentResolver.js';
 import type { CallerIntentClient } from './callerIntentClient.js';
 import { callerRouteRef, callerRouteSources } from './callerRouting.js';
+import { outboundAcceptedIdentitySchema, outboundSettlementFromObservation,
+  type OutboundAcceptedIdentity } from './outboundObservation.js';
+import { outboundRetryOfSchema, outboundRetryOfPatch, OutboundRetryError,
+  type OutboundRetryOf } from './outboundSettlement.js';
 import { newPhoneCallControlSchema } from './assignment.js';
 import { assertCallContinuationReplay, callContinuationPatch, CallContinuationError, type CallContinuation } from './callContinuation.js';
 import { callRequestIdFromLookupPath, callRequestReceiptFailure, readCallRequestReceipt } from './callRequestReceipt.js';
@@ -39,6 +43,11 @@ import { authorizedControl, callTwiml, fallbackTwiml, inputSpeechEnergy, mediaSt
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const CALL_SID = /^CA[0-9a-f]{32}$/i;
 const providerStates = new Set<CallStatus>(['queued', 'ringing', 'in-progress', 'completed', 'busy', 'no-answer', 'canceled', 'failed']);
+function selectedTransportFields(call: BrokerCall) {
+  const settlement = outboundSettlementFromObservation(call);
+  return { ...outboundRetryOfPatch(call.retryOf),
+    ...(settlement === undefined ? {} : { outboundSettlement: settlement }) };
+}
 
 function json(response: ServerResponse, status: number, value: unknown) {
   response.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
@@ -61,6 +70,7 @@ const publicCall = (call: BrokerCall) => ({
   primaryClosePending: call.primaryClosePending ?? false, transcriptCapture: call.transcriptCapture,
   callback: call.callback,
   ...callContinuationPatch(call.continuation),
+  ...selectedTransportFields(call),
   metrics: call.metrics, delegationCount: Object.keys(call.delegations).length,
   ...(call.callAssignment?.origin === 'authenticated_hark_delivery' ? { watchDelivery: {
     deliveryId: call.callAssignment.value.hark.deliveryId,
@@ -122,8 +132,10 @@ export function createBrokerServer(options: BrokerServerOptions) {
   // A restart recovers only the durable captures and reply-read obligations.
   const selectedHosts = new Map<string, GenerationVoiceSession>();
   let accepting = true;
-  const providerFinished = (call: BrokerCall) => call.callSid && call.callAssignment?.origin === 'authenticated_hark_delivery'
-    ? Boolean(call.harkJournal?.ended) : terminalCallStatuses.has(call.status);
+  const providerFinished = (call: BrokerCall) => call.outboundObservation
+    ? outboundSettlementFromObservation(call)?.state === 'settled'
+    : call.callSid && call.callAssignment?.origin === 'authenticated_hark_delivery'
+      ? Boolean(call.harkJournal?.ended) : terminalCallStatuses.has(call.status);
   const needsHarkTiming = (call: BrokerCall) => call.harkJournal?.ended?.providerStatus === 'completed' && !call.harkJournal.ended.timing;
   const flushHark = async () => {
     try { await harkLifecycle?.flush(); }
@@ -138,12 +150,32 @@ export function createBrokerServer(options: BrokerServerOptions) {
       return store.update(id, { status, ...(terminalCallStatuses.has(status) ? { endedAt: observedAt } : {}) });
     return store.observeHarkProvider(id, status, observedAt, timing);
   }
-  function observeProviderRecord(call: BrokerCall, observed: { status: string; sid?: string; accountSid?: string; from?: string; to?: string }): BrokerCall {
+  function selectedProviderObservation(call: BrokerCall, identity: OutboundAcceptedIdentity,
+    terminal?: { status: string; source: 'signed_status_callback' | 'authenticated_fetch' | 'authenticated_update'; evidenceDigest: string }): BrokerCall {
+    if (!call.outboundObservation) return call;
+    const checked = outboundAcceptedIdentitySchema.parse(identity);
+    const base = { callId: call.id, requestId: call.requestId, observedAt: new Date().toISOString(), identity: checked };
+    if (terminal && terminalCallStatuses.has(terminal.status as CallStatus)) {
+      const providerStatus = terminal.status as 'completed' | 'busy' | 'no-answer' | 'canceled' | 'failed';
+      return store.observeSelectedOutbound(call.id, { ...base, type: 'provider_terminal', providerStatus,
+        source: terminal.source, evidenceDigest: terminal.evidenceDigest });
+    }
+    return store.observeSelectedOutbound(call.id, { ...base, type: 'provider_accepted' });
+  }
+  function observeProviderRecord(call: BrokerCall, observed: { status: string; sid?: string; accountSid?: string; from?: string; to?: string },
+    source: 'authenticated_fetch' | 'authenticated_update'): BrokerCall {
     if (!providerStates.has(observed.status as CallStatus)) throw new Error('invalid_provider_call_state');
     const hark = call.callAssignment?.origin === 'authenticated_hark_delivery';
     if (hark && observed.sid !== undefined && observed.sid !== call.callSid) throw new Error('provider_call_identity_mismatch');
     const bound = observed.sid === call.callSid && observed.accountSid === config.twilioAccountSid
       && observed.from === config.from && observed.to === call.number;
+    if (call.outboundObservation) {
+      const identity = outboundAcceptedIdentitySchema.parse({ callSid: observed.sid, accountSid: observed.accountSid,
+        from: observed.from, to: observed.to });
+      const evidenceDigest = sha256Hex(JSON.stringify(['broker.provider-observation/v1', source,
+        call.id, call.requestId, identity.accountSid, identity.callSid, identity.from, identity.to, observed.status]));
+      selectedProviderObservation(call, identity, { status: observed.status, source, evidenceDigest });
+    }
     // Callback arrival and restart time describe an observation, not call duration.
     const timing = hark && bound ? harkProviderTiming(observed) : undefined;
     return observeProviderState(call.id, observed.status as HarkProviderStatus, timing);
@@ -254,7 +286,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
   }
 
   async function requestOutbound(input: { requestId: string; purpose: string; to: string; callbackFor?: string;
-    origin?: 'authenticated_broker_control'; continuation?: CallContinuation }): Promise<{ replayed: boolean; call: BrokerCall }> {
+    origin?: 'authenticated_broker_control'; continuation?: CallContinuation; retryOf?: OutboundRetryOf }): Promise<{ replayed: boolean; call: BrokerCall }> {
     const to = input.to;
     if (!accepting || !UUID.test(input.requestId) || !config.allowedTo.includes(to)) throw new Error('call_not_available');
     if (input.callbackFor) {
@@ -262,8 +294,10 @@ export function createBrokerServer(options: BrokerServerOptions) {
       if (!inbound || inbound.direction !== 'inbound' || inbound.number !== to || !terminalCallStatuses.has(inbound.status)
         || inbound.callback?.requestId !== input.requestId || inbound.callback.state !== 'requested') throw new Error('callback_identity_mismatch');
     }
-    const reservation = store.reserve({ requestId: input.requestId, direction: 'outbound', purpose: input.purpose.trim(), number: to,
-      ...callContinuationPatch(input.continuation) }, input.origin);
+    const reservation = input.continuation ? store.reserveSelectedOutbound({ requestId: input.requestId,
+      purpose: input.purpose.trim(), number: to, continuation: input.continuation, ...outboundRetryOfPatch(input.retryOf) },
+      { accountSid: config.twilioAccountSid, from: config.from, to })
+      : store.reserve({ requestId: input.requestId, direction: 'outbound', purpose: input.purpose.trim(), number: to }, input.origin);
     return dialReserved(reservation);
   }
 
@@ -281,6 +315,8 @@ export function createBrokerServer(options: BrokerServerOptions) {
     const to = call.number;
     sessionCalls.add(call.id);
     if (dialing.has(to) || store.list().some(other => other.id !== call.id && other.number === to && !providerFinished(other))) {
+      if (call.outboundObservation) store.observeSelectedOutbound(call.id, { type: 'never_dispatched',
+        callId: call.id, requestId: call.requestId, observedAt: new Date().toISOString(), reason: 'call_already_open' });
       store.update(call.id, { status: 'canceled', failure: { code: 'call_already_open', message: 'Another call for this person needs to finish first' } });
       throw Object.assign(new Error('Another call is already open'), { code: 'call_already_open' });
     }
@@ -295,14 +331,24 @@ export function createBrokerServer(options: BrokerServerOptions) {
         if (!readiness.eligible) throw Object.assign(new Error('The account is not ready for this call'), { code: readiness.reason });
         await probe({ apiKey: config.apiKey, voice: config.voice, model: config.model });
       }
-      catch (error) { store.update(call.id, { status: 'failed', failure: safeFailure(error) }); throw error; }
-      if (!accepting) { store.update(call.id, { status: 'canceled' }); throw new Error('service_shutting_down'); }
+      catch (error) {
+        if (call.outboundObservation) store.observeSelectedOutbound(call.id, { type: 'never_dispatched',
+          callId: call.id, requestId: call.requestId, observedAt: new Date().toISOString(), reason: 'preflight_refused' });
+        store.update(call.id, { status: 'failed', failure: safeFailure(error) }); throw error;
+      }
+      if (!accepting) {
+        if (call.outboundObservation) store.observeSelectedOutbound(call.id, { type: 'never_dispatched',
+          callId: call.id, requestId: call.requestId, observedAt: new Date().toISOString(), reason: 'service_stopping' });
+        store.update(call.id, { status: 'canceled' }); throw new Error('service_shutting_down');
+      }
       if (call.callAssignment?.origin === 'authenticated_hark_delivery'
           && Date.parse(call.callAssignment.value.hark.expiresAt) <= Date.now()) {
         store.update(call.id, { status: 'canceled', failure: { code: 'hark_event_expired', message: 'The saved watch event has expired' } });
         throw new HarkAssignmentError(403, 'hark_event_expired');
       }
       if (hark) store.beginHarkDispatch(call.id, new Date().toISOString());
+      else if (call.outboundObservation) store.observeSelectedOutbound(call.id, { type: 'dispatch_started',
+        callId: call.id, requestId: call.requestId, observedAt: new Date().toISOString() });
       else store.update(call.id, { status: 'dialing' });
       let providerResponded = false;
       try {
@@ -315,6 +361,8 @@ export function createBrokerServer(options: BrokerServerOptions) {
         providerResponded = true;
         if (!CALL_SID.test(created.sid)) throw new Error('invalid_provider_call_id');
         if (hark) store.acceptHarkDispatch(call.id, created.sid, new Date().toISOString());
+        else if (call.outboundObservation) selectedProviderObservation(store.get(call.id)!, outboundAcceptedIdentitySchema.parse({
+          callSid: created.sid, accountSid: created.accountSid, from: created.from, to: created.to }));
         else store.update(call.id, { callSid: created.sid });
         const saved = observeProviderState(call.id, 'queued');
         return { replayed: false, call: saved };
@@ -323,6 +371,11 @@ export function createBrokerServer(options: BrokerServerOptions) {
         // A transport error must not erase that receipt or regress terminal state.
         const saved = store.get(call.id)!;
         if (hark && saved.harkDispatch?.state === 'provider_accepted' && saved.callSid) {
+          if (!providerResponded) return { replayed: true, call: saved };
+          store.update(call.id, { failure: safeFailure(error) });
+          throw error;
+        }
+        if (saved.outboundObservation?.accepted && saved.callSid) {
           if (!providerResponded) return { replayed: true, call: saved };
           store.update(call.id, { failure: safeFailure(error) });
           throw error;
@@ -345,7 +398,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
     try {
       const ended = await provider.calls(call.callSid).update({ status: 'completed' });
       const current = store.get(call.id)!;
-      if (ended.status === 'completed') observeProviderRecord(current, ended);
+      if (ended.status === 'completed') observeProviderRecord(current, ended, 'authenticated_update');
       else store.update(call.id, { status: 'unknown' });
     } catch (error) { store.update(call.id, { failure: safeFailure(error) }); }
   }
@@ -445,7 +498,9 @@ export function createBrokerServer(options: BrokerServerOptions) {
         if (typeof input.requestId !== 'string' || !UUID.test(input.requestId)
           || typeof input.purpose !== 'string' || !input.purpose.trim() || input.purpose.length > 1500
           || (input.to !== undefined && !isPhoneNumber(input.to))
-          || Object.keys(input).some(key => !['requestId', 'purpose', 'to', 'continuation'].includes(key))) return json(response, 400, { error: 'invalid_call_request' });
+          || Object.keys(input).some(key => !['requestId', 'purpose', 'to', 'continuation', 'retryOf'].includes(key))
+          || (input.retryOf !== undefined && (!input.continuation || !outboundRetryOfSchema.safeParse(input.retryOf).success)))
+          return json(response, 400, { error: 'invalid_call_request' });
         const to = input.to as string | undefined ?? (config.allowedTo.length === 1 ? config.allowedTo[0] : undefined);
         if (!to || !config.allowedTo.includes(to)) return json(response, 403, { error: 'recipient_not_authorized' });
         const saved = store.list().find(call => call.requestId === input.requestId);
@@ -461,12 +516,18 @@ export function createBrokerServer(options: BrokerServerOptions) {
           if (selected.continuation && !saved && (!options.eligibleContext || !options.selectedQuestion))
             return json(response, 503, { error: 'call_continuation_unavailable' });
           const result = await requestOutbound({ requestId: input.requestId, purpose: input.purpose.trim(), to,
-            origin: 'authenticated_broker_control', ...selected });
+            origin: 'authenticated_broker_control', ...selected, ...outboundRetryOfPatch(input.retryOf) });
           return json(response, result.replayed ? 200 : 201, { replayed: result.replayed, call: publicCall(result.call) });
         } catch (error) {
-          if (error instanceof CallContinuationError) return json(response,
-            error.code === 'invalid_call_continuation' ? 400 : 409, { error: error.code });
+          if (error instanceof OutboundRetryError) return json(response,
+            error.code === 'call_request_unavailable' ? 503 : 409, { error: error.code });
+          if (error instanceof CallContinuationError) {
+            if (error.code !== 'invalid_call_continuation' && (input.retryOf !== undefined || saved?.retryOf !== undefined))
+              return json(response, 409, { error: 'call_request_conflict' });
+            return json(response, error.code === 'invalid_call_continuation' ? 400 : 409, { error: error.code });
+          }
           if ((error as { code?: string }).code === 'call_already_open') return json(response, 409, { error: 'call_already_open' });
+          if (input.continuation) return json(response, 503, { error: 'call_request_unavailable' });
           throw error;
         }
       }
@@ -478,7 +539,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
           const observed = await provider.calls(call.callSid).fetch();
           if ((call.direction === 'outbound' && (observed.to !== call.number || observed.from !== config.from))
             || (call.direction === 'inbound' && (observed.from !== call.number || observed.to !== config.from))) throw new Error('provider_call_identity_mismatch');
-          if (providerStates.has(observed.status as CallStatus)) observeProviderRecord(call, observed);
+          if (providerStates.has(observed.status as CallStatus)) observeProviderRecord(call, observed, 'authenticated_fetch');
           const reconciled = store.get(call.id)!;
           if ((terminalCallStatuses.has(reconciled.status) || reconciled.primaryClosePending) && active.has(call.id)) await active.get(call.id)!.stop('provider_terminal');
           else if (terminalCallStatuses.has(reconciled.status) || reconciled.primaryClosePending) {
@@ -493,7 +554,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
         else if (!providerFinished(call)) {
           store.update(call.id, { endedAt: call.endedAt ?? new Date().toISOString() });
           const ended = await provider.calls(call.callSid).update({ status: 'completed' });
-          if (ended.status === 'completed') observeProviderRecord(call, ended);
+          if (ended.status === 'completed') observeProviderRecord(call, ended, 'authenticated_update');
           else store.update(call.id, { status: 'unknown', endedAt: new Date().toISOString() });
           await closePrimary(call);
         }
@@ -559,7 +620,14 @@ export function createBrokerServer(options: BrokerServerOptions) {
           || (saved.direction === 'inbound' && (params.To !== config.from || params.From !== saved.number))
           || (saved.direction === 'inbound' && match?.[1] === 'answer')
           || (saved.callSid && saved.callSid !== params.CallSid)) return json(response, 403, { error: 'call_identity_mismatch' });
-      if (!saved.callSid && saved.harkDispatch) {
+      if (saved.outboundObservation) {
+        const identity = outboundAcceptedIdentitySchema.parse({ accountSid: params.AccountSid, callSid: params.CallSid,
+          from: params.From, to: params.To });
+        const statusCallback = genericStatus || match?.[1] === 'status';
+        call = selectedProviderObservation(saved, identity, statusCallback ? { status: params.CallStatus,
+          source: 'signed_status_callback', evidenceDigest: sha256Hex(JSON.stringify([
+            'broker.provider-status-callback/v1', proof.url, Object.keys(proof.params).sort().map(key => [key, proof.params[key]])])) } : undefined);
+      } else if (!saved.callSid && saved.harkDispatch) {
         if (saved.harkDispatch.state !== 'dispatch_started') return json(response, 403, { error: 'call_not_dispatched' });
         call = store.acceptHarkDispatch(saved.id, params.CallSid, new Date().toISOString());
       } else call = saved.callSid ? saved : store.update(saved.id, { callSid: params.CallSid });
@@ -649,11 +717,11 @@ export function createBrokerServer(options: BrokerServerOptions) {
           if (reason !== 'provider_terminal' && saved && !providerFinished(saved)) {
             if (reason === 'voice_unavailable') {
               const spoken = await provider.calls(call.callSid!).update({ twiml: fallbackTwiml('My voice connection stopped working. Please try me again shortly.') });
-              if (providerStates.has(spoken.status as CallStatus)) observeProviderRecord(saved, spoken);
+              if (providerStates.has(spoken.status as CallStatus)) observeProviderRecord(saved, spoken, 'authenticated_update');
               else store.update(call.id, { status: 'unknown' });
             } else {
               const ended = await provider.calls(call.callSid!).update({ status: 'completed' });
-              if (ended.status === 'completed') observeProviderRecord(saved, ended);
+              if (ended.status === 'completed') observeProviderRecord(saved, ended, 'authenticated_update');
               else store.update(call.id, { status: 'unknown' });
             }
           }
@@ -808,7 +876,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
           // Media may have connected while the provider lookup was pending.
           if (active.has(call.id) || claimed.has(call.id)) {
             if (terminalCallStatuses.has(observed.status as CallStatus) && active.has(call.id)) {
-              observeProviderRecord(call, observed);
+              observeProviderRecord(call, observed, 'authenticated_fetch');
               await active.get(call.id)!.stop('provider_terminal');
             }
             continue;
@@ -816,13 +884,13 @@ export function createBrokerServer(options: BrokerServerOptions) {
           const current = store.get(call.id)!;
           store.update(call.id, { endedAt: current.endedAt ?? new Date().toISOString() });
           if (terminalCallStatuses.has(observed.status as CallStatus)) {
-            observeProviderRecord(call, observed);
+            observeProviderRecord(call, observed, 'authenticated_fetch');
           } else if (providerFinished(current)) {
             // A delayed provider read cannot reopen a terminal call or add time.
             continue;
           } else {
             const ended = await provider.calls(call.callSid).update({ status: 'completed' });
-            if (ended.status === 'completed') observeProviderRecord(call, ended);
+            if (ended.status === 'completed') observeProviderRecord(call, ended, 'authenticated_update');
             else store.update(call.id, { status: 'unknown', endedAt: new Date().toISOString() });
           }
           await closePrimary(store.get(call.id)!);
@@ -856,7 +924,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
       if (!call?.callSid || providerFinished(call)) continue;
       try {
         const ended = await provider.calls(call.callSid).update({ status: 'completed' });
-        if (ended.status === 'completed') observeProviderRecord(call, ended);
+        if (ended.status === 'completed') observeProviderRecord(call, ended, 'authenticated_update');
         else store.update(id, { status: 'unknown', endedAt: new Date().toISOString() });
         await closePrimary(call);
       } catch (error) { store.update(id, { status: 'unknown', failure: safeFailure(error) }); }

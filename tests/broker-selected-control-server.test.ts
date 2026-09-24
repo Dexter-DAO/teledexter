@@ -32,8 +32,10 @@ async function fixture(t: test.TestContext, mode: 'ready' | 'missing-context' | 
     assert.deepEqual(disk.calls[saved.id].continuation, expected.continuation);
     assert.equal(disk.calls[saved.id].callAssignment.origin, 'authenticated_broker_control');
   };
-  const calls = Object.assign(() => ({ async update() { return { status: 'completed' }; }, fetch: forbidden }), {
-    async create() { seen.dial++; persisted(); if (mode === 'unknown') throw new Error('lost provider reply'); return { sid: callSid }; },
+  const providerIdentity = { sid: callSid, accountSid: config.twilioAccountSid, from: config.from, to: config.allowedTo[0]! };
+  const calls = Object.assign(() => ({ async update() { return { ...providerIdentity, status: 'completed' }; }, fetch: forbidden }), {
+    async create() { seen.dial++; persisted(); if (mode === 'unknown') throw new Error('lost provider reply');
+      return { ...providerIdentity, status: 'queued' }; },
   });
   const options: BrokerServerOptions = { config, store,
     primary: { async readiness() { seen.readiness++; persisted(); return { eligible: true }; },
