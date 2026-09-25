@@ -145,8 +145,14 @@ async function fixture(t: TestContext, selectedResult = false) {
               eventId: entry.primaryResult.assistant.eventId, eventOccurredAt: initial.createdAt, runId: id(7) } } } } } : undefined;
       const intent = beginBrokerPublication(store, { callId: current.id, callSid, bindingId, sessionId }, entry.requestId,
         rendering, snapshot, ordinaryDelivery)!;
-      const delivery = { eventId: `append_${intent.record.publicationSequence}`, status: 'accepted' as const };
+      const delivery = { eventId: `append_${intent.record.publicationSequence}`, status: 'accepted' as const,
+        observedCallerRevision: snapshot.callerRevision,
+        observedTranscriptSequence: Math.max(0, ...snapshot.fragments.map(fragment => fragment.sequence)) };
       settleBrokerPublication(store, intent.record, delivery, snapshot, false);
+      assert.deepEqual(store.get(initial.id)!.publications!.records.find(record =>
+        record.publicationSequence === intent.record.publicationSequence)!.outcome,
+        { eventId: delivery.eventId, status: 'accepted', callerRevision: delivery.observedCallerRevision,
+          transcriptSequence: delivery.observedTranscriptSequence }, 'fixture publication must retain its exact accepted frontier');
       return { delivery, sessionId, snapshot: structuredClone(snapshot), inputThroughMs: snapshot.fragments.at(-1)?.endMs ?? 0,
         publicationReceipts: [{ publicationSequence: intent.record.publicationSequence, sessionId, eventId: delivery.eventId }] };
     } },
@@ -269,7 +275,9 @@ test('a late question publication rejection removes the candidate and prevents f
   const h = await fixture(t); h.pendingQuestion();
   const first = h.route('Compare these companies.', { kind: 'task' });
   await h.backend.delegateFrozenTask(first.request, first.ref, h.channel);
-  const targets = h.backend.questionTargets(h.sessionId), answer = h.route('Yes.', { kind: 'answer', target: targets[0] }, targets);
+  const targets = h.backend.questionTargets(h.sessionId);
+  assert.equal(targets.length, 1, 'the accepted question must be offered before its late rejection');
+  const answer = h.route('Yes.', { kind: 'answer', target: targets[0] }, targets);
   const publication = h.store.get(h.callId)!.publications!.records.at(-1)!;
   rejectBrokerPublication(h.store, { callId: h.callId, callSid: publication.callSid, bindingId: h.bindingId,
     sessionId: h.sessionId }, publication.outcome!.eventId, 'provider_error');
@@ -295,7 +303,8 @@ test('an offered associated context reference is required, frozen in the submiss
 test('an explicitly selected ordinary result reference is frozen from its complete publication without an associated reference', async t => {
   const h = await fixture(t), first = h.route('Research AMD.', { kind: 'task' });
   await h.backend.delegateFrozenTask(first.request, first.ref, h.channel);
-  const candidate = callerIntentResultPublicationCandidates(h.store.get(h.callId)!, h.sessionId)[0]; assert.ok(candidate);
+  const candidate = callerIntentResultPublicationCandidates(h.store.get(h.callId)!, h.sessionId)[0];
+  assert.ok(candidate, 'the accepted ordinary result must be offered before its explicit reference');
   assert.equal(candidate.reference.kind, 'ordinary');
   const reference = { id: candidate.id, digest: candidate.digest };
   const next = h.route('Explain the risks in that result.', { kind: 'task', contextReference: reference }, [], [reference]);
