@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
 import test from 'node:test';
+import fs from 'node:fs';
 import {
   createPrimaryApiClient, PrimaryApiError,
   type PrimaryApiOptions, type PrimaryProviderProof, type PrimarySubmission,
@@ -30,6 +31,71 @@ const proof: PrimaryProviderProof = {
 const submission: PrimarySubmission = { source: {
   callSid, itemId: 'item_caller_1', sourceEventId, revision: 1, receivedAt: when, role: 'user',
 }, text: 'Tell me my current portfolio.' };
+
+test('associated-result frozen wire preserves all eight literal digests and exact new submit/reconcile bodies', async () => {
+  const fixtures = JSON.parse(fs.readFileSync(new URL('./fixtures/associated-result-digests.json', import.meta.url), 'utf8')) as Array<{
+    name: string; bindingId: string; input: PrimarySubmission; rawDigest: string;
+    submitBody: unknown; originalReconcileBody: unknown;
+  }>;
+  assert.equal(fixtures.length, 8);
+  for (const fixture of fixtures) {
+    assert.equal(rawSubmissionDigest(fixture.bindingId, fixture.input), fixture.rawDigest, fixture.name);
+    if (!fixture.input.associatedResultReference) continue;
+    const turn = originalTurn(fixture.input);
+    const proof = { schemaVersion: 1, kind: 'phone_closed_call_non_admission', callSid,
+      source: { itemId: turn.itemId, sourceEventId: turn.sourceEventId, revision: 1, receivedAt: turn.occurredAt },
+      rawSubmissionDigest: fixture.rawDigest,
+      turn: { recordId: turn.sourceEventId, revisionRecordId: eventId, bodyDigest: turnBodyDigest(turn) }, closedAt: when };
+    const h = harness([json({ ...completed, replayed: false }, 202), json({ outcome: 'not_admitted', bindingId, requestId, proof })], {
+      contextProtocol: { version: 'memory-eligible-v1', parse() { throw new Error('No context response in this fixture'); } },
+    });
+    await h.client.submit(bindingId, requestId, fixture.input);
+    await h.client.reconcile(bindingId, requestId, fixture.input);
+    assert.deepEqual(JSON.parse(String(h.requests[0].init.body)), fixture.submitBody);
+    assert.deepEqual(JSON.parse(String(h.requests[1].init.body)), fixture.originalReconcileBody);
+    assert.equal(h.requests[0].init.body, h.requests[1].init.body, 'new variant retains identical complete wire body');
+    for (const request of h.requests) assert.equal(new Headers(request.init.headers).get('X-Dexter-Phone-Context-Version'), 'memory-eligible-v1');
+    assert.equal(turnBodyDigest(turn), turnBodyDigest(originalTurn({ ...fixture.input, associatedResultReference: undefined })));
+    const missingRef = { ...proof, rawSubmissionDigest: rawSubmissionDigest(bindingId, { ...fixture.input, associatedResultReference: undefined }) };
+    const invalid = harness([json({ outcome: 'not_admitted', bindingId, requestId, proof: missingRef })], {
+      contextProtocol: { version: 'memory-eligible-v1', parse() { throw new Error('No context response in this fixture'); } },
+    });
+    await assert.rejects(invalid.client.reconcile(bindingId, requestId, fixture.input), code('identity_mismatch'));
+  }
+});
+
+test('associated-result rejects mixed references, unknown fields, noncanonical IDs and missing protocol before HTTP', async () => {
+  const reference = { v: 'phone.associated-result-reference.v1', deliveryAssociationId: eventId,
+    originalRequestId: messageId, assistantMessageId: primaryDexterId };
+  const bad = [
+    { associatedResultReference: { ...reference, action: 'sell' } },
+    { associatedResultReference: { ...reference, originalRequestId: requestId } },
+    { associatedResultReference: { ...reference, deliveryAssociationId: 'AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA' } },
+    { associatedResultReference: reference, relatedPrimaryRequestId: messageId, referenceOrigin: 'broker_status_publication' },
+  ];
+  for (const fields of bad) {
+    const h = harness([], { contextProtocol: { version: 'memory-eligible-v1', parse() { throw new Error('No context'); } } });
+    await assert.rejects(h.client.submit(bindingId, requestId, { ...submission, ...fields } as PrimarySubmission), code('invalid_request'));
+    await assert.rejects(h.client.reconcile(bindingId, requestId, { ...submission, ...fields } as PrimarySubmission), code('invalid_request'));
+    assert.equal(h.requests.length, 0);
+  }
+  const legacy = harness([]);
+  await assert.rejects(legacy.client.submit(bindingId, requestId, { ...submission, associatedResultReference: reference } as PrimarySubmission), code('invalid_request'));
+  assert.equal(legacy.requests.length, 0);
+});
+
+test('associated-result typed refusals retain original remote classification without client retry', async () => {
+  for (const remoteCode of ['delivery_association_mismatch', 'associated_result_unavailable']) {
+    const h = harness([json({ error: { code: remoteCode, retryable: false } }, 409)], {
+      contextProtocol: { version: 'memory-eligible-v1', parse() { throw new Error('No context'); } },
+    });
+    await assert.rejects(h.client.submit(bindingId, requestId, { ...submission, associatedResultReference: {
+      v: 'phone.associated-result-reference.v1', deliveryAssociationId: eventId,
+      originalRequestId: messageId, assistantMessageId: primaryDexterId } }),
+    (error: unknown) => error instanceof PrimaryApiError && error.status === 409 && error.remoteCode === remoteCode && error.retryable === false);
+    assert.equal(h.requests.length, 1);
+  }
+});
 
 test('publication reference is paired, preserved verbatim in submit and reconciliation, and digest-bound', async () => {
   const input: PrimarySubmission = { ...submission, text: ' Then review it.\t',

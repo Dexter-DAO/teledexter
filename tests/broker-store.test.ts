@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { BrokerStore, type BrokerCall } from '../src/broker/store.js';
+import type { PrimaryCall } from '../src/broker/primaryApi.js';
 
 function fixture(t: test.TestContext) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-store-test-'));
@@ -13,6 +14,93 @@ function fixture(t: test.TestContext) {
   return { store, directory };
 }
 const input = () => ({ requestId: randomUUID(), direction: 'outbound' as const, purpose: 'Test the account connection', number: '+12025550123' });
+
+function returnedBinding(callSid: string): PrimaryCall {
+  return { bindingId: randomUUID(), callSid, state: 'open', context: {
+    primaryDexterId: randomUUID(), threadId: randomUUID(), displayName: 'Dexter',
+    messages: [{ id: randomUUID(), role: 'assistant', text: 'Your saved account answer.' }],
+  } };
+}
+
+test('API binding result identifiers survive restart and cannot move to another binding or conversation', t => {
+  const { store, directory } = fixture(t);
+  const call = store.reserve({ ...input(), callSid: `CA${'1'.repeat(32)}` }).call;
+  const response = returnedBinding(call.callSid!);
+  const saved = store.recordPrimaryBinding(call.id, response);
+  assert.equal(saved.primary?.primaryDexterId, response.context.primaryDexterId);
+  assert.equal(saved.primary?.threadId, response.context.threadId);
+  assert.equal(saved.primary?.context, 'assistant: Your saved account answer.');
+  const file = path.join(directory, 'calls.json');
+  const bytes = fs.readFileSync(file, 'utf8');
+  store.close(); const resumed = new BrokerStore(directory); t.after(() => resumed.close());
+  assert.deepEqual(resumed.get(call.id), saved);
+  assert.equal(fs.readFileSync(file, 'utf8'), bytes);
+  for (const changed of [
+    { ...response, bindingId: randomUUID() },
+    { ...response, context: { ...response.context, primaryDexterId: randomUUID() } },
+    { ...response, context: { ...response.context, threadId: randomUUID() } },
+  ]) assert.throws(() => resumed.recordPrimaryBinding(call.id, changed), /cannot change/);
+  for (const primary of [undefined, { ...saved.primary!, primaryDexterId: undefined, threadId: undefined },
+    { ...saved.primary!, threadId: randomUUID() }]) {
+    assert.throws(() => resumed.update(call.id, { primary }), /identity requires|cannot change/);
+  }
+  assert.equal(fs.readFileSync(file, 'utf8'), bytes);
+  const refreshed = resumed.recordPrimaryBinding(call.id, { ...response, context: {
+    ...response.context, messages: [{ id: randomUUID(), role: 'assistant', text: 'A newer account answer.' }],
+  } });
+  assert.equal(refreshed.primary?.threadId, response.context.threadId);
+  assert.equal(refreshed.primary?.context, 'assistant: A newer account answer.');
+});
+
+test('legacy binding reads preserve bytes and missing identifiers require an actual binding response', t => {
+  const { store, directory } = fixture(t);
+  const call = store.reserve({ ...input(), callSid: `CA${'2'.repeat(32)}` }).call;
+  const response = returnedBinding(call.callSid!);
+  const legacy = store.update(call.id, { primary: { bindingId: response.bindingId, name: 'Dexter', context: 'Retained history' } });
+  store.close();
+  const file = path.join(directory, 'calls.json');
+  const bytes = JSON.stringify({ version: 1, calls: { [call.id]: legacy } }, null, 2) + '\n';
+  fs.writeFileSync(file, bytes);
+  const resumed = new BrokerStore(directory); t.after(() => resumed.close());
+  assert.deepEqual(resumed.get(call.id), legacy);
+  assert.equal(fs.readFileSync(file, 'utf8'), bytes);
+  assert.throws(() => resumed.update(call.id, { primary: { ...legacy.primary!,
+    primaryDexterId: response.context.primaryDexterId, threadId: response.context.threadId } }), /API binding response/);
+  assert.throws(() => resumed.update(call.id, { primary: { ...legacy.primary!, bindingId: randomUUID() } }), /binding cannot change/);
+  assert.equal(fs.readFileSync(file, 'utf8'), bytes);
+  const enriched = resumed.recordPrimaryBinding(call.id, response);
+  assert.equal(enriched.primary?.bindingId, legacy.primary?.bindingId);
+  assert.equal(enriched.primary?.primaryDexterId, response.context.primaryDexterId);
+  assert.equal(enriched.primary?.threadId, response.context.threadId);
+});
+
+test('wrong-call, closed, or incomplete API context cannot introduce result identifiers', t => {
+  const { store, directory } = fixture(t);
+  const call = store.reserve({ ...input(), callSid: `CA${'3'.repeat(32)}` }).call;
+  const response = returnedBinding(call.callSid!);
+  const bytes = fs.readFileSync(path.join(directory, 'calls.json'), 'utf8');
+  for (const changed of [
+    { ...response, callSid: `CA${'4'.repeat(32)}` }, { ...response, state: 'closed' },
+    { ...response, context: { ...response.context, primaryDexterId: undefined } },
+    { ...response, context: { ...response.context, threadId: 'not-a-thread' } },
+  ]) assert.throws(() => store.recordPrimaryBinding(call.id, changed as PrimaryCall));
+  assert.deepEqual(store.get(call.id), call);
+  assert.equal(fs.readFileSync(path.join(directory, 'calls.json'), 'utf8'), bytes);
+});
+
+for (const incomplete of ['primaryDexterId', 'threadId'] as const) {
+  test(`restart refuses a saved result identity missing ${incomplete} without rewriting it`, t => {
+    const { store, directory } = fixture(t);
+    const call = store.reserve({ ...input(), callSid: `CA${'5'.repeat(32)}` }).call;
+    const saved = store.recordPrimaryBinding(call.id, returnedBinding(call.callSid!));
+    store.close(); delete saved.primary![incomplete];
+    const file = path.join(directory, 'calls.json');
+    const bytes = JSON.stringify({ version: 1, calls: { [call.id]: saved } });
+    fs.writeFileSync(file, bytes);
+    assert.throws(() => new BrokerStore(directory), /Invalid Primary result identity/);
+    assert.equal(fs.readFileSync(file, 'utf8'), bytes);
+  });
+}
 
 test('call reservation and uncertain dispatch survive restart without redial', t => {
   const { store, directory } = fixture(t);

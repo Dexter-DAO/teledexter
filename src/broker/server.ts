@@ -6,18 +6,34 @@ import { createBrokerLiveSession, type BrokerLiveSession, type BrokerLiveSession
 import type { LiveTranscriptSnapshot } from '../live/session.js';
 import { createPrimaryApiClient, type PrimaryApiClient } from './primaryApi.js';
 import { createPrimaryBackend } from './backend.js';
+import { eligiblePhoneCallSchema, type EligibleContextClient } from './eligibleContext.js';
+import { createGenerationVoice, type GenerationVoiceOptions, type GenerationVoiceSession } from './generationVoice.js';
+import { createSelectedQuestionRecovery, selectedQuestionSourceAnchors } from './selectedQuestionVoice.js';
+import { recoverCallerRouteCaptures } from './mixedWork.js';
+import { createCallerIntentResolver } from './callerIntentResolver.js';
+import type { CallerIntentClient } from './callerIntentClient.js';
+import { callerRouteRef, callerRouteSources } from './callerRouting.js';
+import { outboundAcceptedIdentitySchema, outboundSettlementFromObservation,
+  type OutboundAcceptedIdentity } from './outboundObservation.js';
+import { outboundRetryOfSchema, outboundRetryOfPatch, OutboundRetryError,
+  type OutboundRetryOf } from './outboundSettlement.js';
 import { newPhoneCallControlSchema } from './assignment.js';
+import { assertCallContinuationReplay, callContinuationPatch, CallContinuationError, type CallContinuation } from './callContinuation.js';
+import { callRequestIdFromLookupPath, callRequestReceiptFailure, readCallRequestReceipt } from './callRequestReceipt.js';
 import { authorizedHarkIngress } from './harkAuth.js';
 import { OutboundAlertRequestSchema } from '../outbound/contract.js';
 import { canonicalJson, sha256Hex } from '../outbound/canonical.js';
 import { createHarkAssignmentResolver, HarkAssignmentError, type HarkAssignmentResolver } from './harkResolver.js';
 import { createHarkLifecycleDelivery } from './harkLifecycle.js';
+import { createPrimaryHarkReceiptDispatcher, createPrimaryHarkReceiptSender,
+  type PrimaryHarkReceiptSender } from './harkPrimaryReceiptDelivery.js';
 import { type HarkEndedTiming, type HarkProviderStatus } from './harkJournal.js';
 import { harkProviderTiming } from './harkTiming.js';
 import type { deliverHarkStatus } from './harkStatusDelivery.js';
 import type { deliverHarkBilling } from './harkBillingDelivery.js';
 import { rejectBrokerPublication } from './publications.js';
 import { createCallbackFlow } from './callback.js';
+import { createInboundFlow } from './inbound.js';
 import { type BrokerConfig, isPhoneNumber } from './config.js';
 import { BrokerStore, type BrokerCall, type CallStatus, terminalCallStatuses } from './store.js';
 import { brokerInstructions, brokerHistory, brokerOpening } from './instructions.js';
@@ -27,6 +43,11 @@ import { authorizedControl, callTwiml, fallbackTwiml, inputSpeechEnergy, mediaSt
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const CALL_SID = /^CA[0-9a-f]{32}$/i;
 const providerStates = new Set<CallStatus>(['queued', 'ringing', 'in-progress', 'completed', 'busy', 'no-answer', 'canceled', 'failed']);
+function selectedTransportFields(call: BrokerCall) {
+  const settlement = outboundSettlementFromObservation(call);
+  return { ...outboundRetryOfPatch(call.retryOf),
+    ...(settlement === undefined ? {} : { outboundSettlement: settlement }) };
+}
 
 function json(response: ServerResponse, status: number, value: unknown) {
   response.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
@@ -48,6 +69,8 @@ const publicCall = (call: BrokerCall) => ({
   voiceOpening: call.voiceOpening,
   primaryClosePending: call.primaryClosePending ?? false, transcriptCapture: call.transcriptCapture,
   callback: call.callback,
+  ...callContinuationPatch(call.continuation),
+  ...selectedTransportFields(call),
   metrics: call.metrics, delegationCount: Object.keys(call.delegations).length,
   ...(call.callAssignment?.origin === 'authenticated_hark_delivery' ? { watchDelivery: {
     deliveryId: call.callAssignment.value.hark.deliveryId,
@@ -62,18 +85,31 @@ export interface BrokerServerOptions {
   config: BrokerConfig;
   store?: BrokerStore;
   primary?: PrimaryApiClient;
+  /** Coordinated successor composition. Omission retains the legacy transport contract. */
+  eligibleContext?: EligibleContextClient;
+  /** Explicit successor composition; ordinary and Hark calls omit this selection. */
+  selectedQuestion?: GenerationVoiceOptions['selectedQuestion'];
+  /** Same-call new work uses the shared Primary decision port and original call budget. */
+  callerIntent?: { client: CallerIntentClient; timeoutMs: number };
   provider?: ReturnType<typeof Twilio>;
   voiceFactory?: (options: BrokerLiveSessionOptions) => BrokerLiveSession;
   probe?: typeof probeLive;
   resolveHarkAssignment?: HarkAssignmentResolver;
   harkStatusSender?: typeof deliverHarkStatus;
   harkBillingSender?: typeof deliverHarkBilling;
+  harkPrimaryReceiptSender?: PrimaryHarkReceiptSender;
+  /** Explicit composition point for the chosen owner approval surface. Omitted in current production startup. */
+  inboundAttachment?: {
+    waitingResponse(input: { callId: string; continuationUrl: string; attachmentId?: string; expiresAt?: string }): string;
+  };
 }
 
 export function createBrokerServer(options: BrokerServerOptions) {
   const { config } = options;
   const store = options.store ?? new BrokerStore(config.stateDir);
-  const primary = options.primary ?? createPrimaryApiClient({ apiBaseUrl: config.apiBaseUrl, phoneServiceSecret: config.phoneServiceSecret });
+  const primary = options.primary ?? createPrimaryApiClient({ apiBaseUrl: config.apiBaseUrl, phoneServiceSecret: config.phoneServiceSecret,
+    ...(options.eligibleContext ? { contextProtocol: { version: 'memory-eligible-v1' as const,
+      parse: (value: unknown) => eligiblePhoneCallSchema.parse(value) } } : {}) });
   const provider = options.provider ?? Twilio(config.twilioAccountSid, config.twilioAuthToken, { autoRetry: false, timeout: 15_000 });
   const voiceFactory = options.voiceFactory ?? createBrokerLiveSession;
   const probe = options.probe ?? probeLive;
@@ -82,6 +118,9 @@ export function createBrokerServer(options: BrokerServerOptions) {
   const harkLifecycle = config.harkApiBaseUrl && config.harkCallbackSigningSecret
     ? createHarkLifecycleDelivery({ store, apiBaseUrl: config.harkApiBaseUrl, signingSecret: config.harkCallbackSigningSecret,
       statusSender: options.harkStatusSender, billingSender: options.harkBillingSender }) : undefined;
+  const harkReceipts = createPrimaryHarkReceiptDispatcher({ store,
+    send: options.harkPrimaryReceiptSender ?? createPrimaryHarkReceiptSender({
+      apiBaseUrl: config.apiBaseUrl, phoneServiceSecret: config.phoneServiceSecret }) });
   const active = new Map<string, { stop(reason: string): Promise<void> }>();
   const dialing = new Set<string>();
   const harkDispatching = new Set<string>();
@@ -89,13 +128,20 @@ export function createBrokerServer(options: BrokerServerOptions) {
   const pendingRequests = new Set<Promise<void>>();
   const sessionCalls = new Set<string>();
   const closingBindings = new Map<string, Promise<void>>();
+  // Keep a stopped host until its already-observed source preparation settles.
+  // A restart recovers only the durable captures and reply-read obligations.
+  const selectedHosts = new Map<string, GenerationVoiceSession>();
   let accepting = true;
-  const providerFinished = (call: BrokerCall) => call.callSid && call.callAssignment?.origin === 'authenticated_hark_delivery'
-    ? Boolean(call.harkJournal?.ended) : terminalCallStatuses.has(call.status);
+  const providerFinished = (call: BrokerCall) => call.outboundObservation
+    ? outboundSettlementFromObservation(call)?.state === 'settled'
+    : call.callSid && call.callAssignment?.origin === 'authenticated_hark_delivery'
+      ? Boolean(call.harkJournal?.ended) : terminalCallStatuses.has(call.status);
   const needsHarkTiming = (call: BrokerCall) => call.harkJournal?.ended?.providerStatus === 'completed' && !call.harkJournal.ended.timing;
   const flushHark = async () => {
     try { await harkLifecycle?.flush(); }
     catch (error) { console.error('[dexter-broker] Hark callback journal unavailable', { code: safeFailure(error).code }); }
+    try { await harkReceipts.flush(); }
+    catch (error) { console.error('[dexter-broker] Hark receipt journal unavailable', { code: safeFailure(error).code }); }
   };
   function observeProviderState(id: string, status: HarkProviderStatus, timing?: HarkEndedTiming): BrokerCall {
     const call = store.get(id)!;
@@ -104,12 +150,32 @@ export function createBrokerServer(options: BrokerServerOptions) {
       return store.update(id, { status, ...(terminalCallStatuses.has(status) ? { endedAt: observedAt } : {}) });
     return store.observeHarkProvider(id, status, observedAt, timing);
   }
-  function observeProviderRecord(call: BrokerCall, observed: { status: string; sid?: string; accountSid?: string; from?: string; to?: string }): BrokerCall {
+  function selectedProviderObservation(call: BrokerCall, identity: OutboundAcceptedIdentity,
+    terminal?: { status: string; source: 'signed_status_callback' | 'authenticated_fetch' | 'authenticated_update'; evidenceDigest: string }): BrokerCall {
+    if (!call.outboundObservation) return call;
+    const checked = outboundAcceptedIdentitySchema.parse(identity);
+    const base = { callId: call.id, requestId: call.requestId, observedAt: new Date().toISOString(), identity: checked };
+    if (terminal && terminalCallStatuses.has(terminal.status as CallStatus)) {
+      const providerStatus = terminal.status as 'completed' | 'busy' | 'no-answer' | 'canceled' | 'failed';
+      return store.observeSelectedOutbound(call.id, { ...base, type: 'provider_terminal', providerStatus,
+        source: terminal.source, evidenceDigest: terminal.evidenceDigest });
+    }
+    return store.observeSelectedOutbound(call.id, { ...base, type: 'provider_accepted' });
+  }
+  function observeProviderRecord(call: BrokerCall, observed: { status: string; sid?: string; accountSid?: string; from?: string; to?: string },
+    source: 'authenticated_fetch' | 'authenticated_update'): BrokerCall {
     if (!providerStates.has(observed.status as CallStatus)) throw new Error('invalid_provider_call_state');
     const hark = call.callAssignment?.origin === 'authenticated_hark_delivery';
     if (hark && observed.sid !== undefined && observed.sid !== call.callSid) throw new Error('provider_call_identity_mismatch');
     const bound = observed.sid === call.callSid && observed.accountSid === config.twilioAccountSid
       && observed.from === config.from && observed.to === call.number;
+    if (call.outboundObservation) {
+      const identity = outboundAcceptedIdentitySchema.parse({ callSid: observed.sid, accountSid: observed.accountSid,
+        from: observed.from, to: observed.to });
+      const evidenceDigest = sha256Hex(JSON.stringify(['broker.provider-observation/v1', source,
+        call.id, call.requestId, identity.accountSid, identity.callSid, identity.from, identity.to, observed.status]));
+      selectedProviderObservation(call, identity, { status: observed.status, source, evidenceDigest });
+    }
     // Callback arrival and restart time describe an observation, not call duration.
     const timing = hark && bound ? harkProviderTiming(observed) : undefined;
     return observeProviderState(call.id, observed.status as HarkProviderStatus, timing);
@@ -119,8 +185,19 @@ export function createBrokerServer(options: BrokerServerOptions) {
     requestOutbound: input => requestOutbound(input).then(result => result.call),
   });
 
+  const inbound = createInboundFlow({ config, store, primary,
+    fetchCall: sid => provider.calls(sid).fetch(), closeBound: async call => {
+      // Media may have started while a provider/account read was in flight.
+      // Its owner must finalize Live and capture before closing account admission.
+      const media = active.get(call.id);
+      if (media) await media.stop(terminalCallStatuses.has(call.status) ? 'provider_terminal' : call.inbound?.localStop?.reason ?? 'attachment_stopped');
+      else await closePrimary(store.get(call.id)!);
+    } });
+
   function closePrimary(call: BrokerCall): Promise<void> {
-    if (!call.primary) return Promise.resolve();
+    const inboundBound = call.inbound?.remote?.state === 'bound' ? call.inbound.remote : undefined;
+    const bindingId = call.primary?.bindingId ?? inboundBound?.bindingId;
+    if (!bindingId) return Promise.resolve();
     const existing = closingBindings.get(call.id);
     if (existing) return existing;
     store.update(call.id, { primaryClosePending: true });
@@ -128,43 +205,88 @@ export function createBrokerServer(options: BrokerServerOptions) {
       // Closing admission first would make an unacknowledged, never-accepted turn
       // impossible to recover. Reconcile the exact journal before closing it.
       const current = store.get(call.id)!;
-      let recovery: ReturnType<typeof createPrimaryBackend> | undefined;
-      if (current.callSid && current.liveSessionId) {
-        recovery = createPrimaryBackend({ callId: current.id, callSid: current.callSid,
-          bindingId: current.primary!.bindingId, api: primary, store });
-        if (!current.primaryClosed) await recovery.prepareCloseout();
-        const flushed = await recovery.flushPendingCaptures();
-        let pendingCount = flushed.pending;
-        let unsupported = flushed.unsupported;
-        if (current.transcriptCapture?.state === 'pending' && current.transcript) {
-          const captured = await recovery.captureCompletedTurns(current.transcript as LiveTranscriptSnapshot, current.transcriptCapture);
-          pendingCount = captured.pending;
-          unsupported = [...new Set([...unsupported, ...captured.unsupported])];
+      const recoveries: ReturnType<typeof createPrimaryBackend>[] = [];
+      if (current.continuation) {
+        const host = selectedHosts.get(current.id);
+        if (host) {
+          if (!(await host.prepareSelectedCloseout()).ready) return;
+        } else if (current.selectedQuestion || current.selectedQuestionVoice) {
+          if (!options.selectedQuestion) throw new Error('selected_question_recovery_unavailable');
+          const recovery = createSelectedQuestionRecovery({ callId: current.id, store, primary,
+            requests: options.selectedQuestion.requests });
+          if (!(await recovery.prepareCloseout()).ready) return;
         }
-        if (current.transcriptCapture) store.update(call.id, { transcriptCapture: {
-          ...current.transcriptCapture, state: pendingCount ? 'pending' : 'complete', pending: pendingCount, unsupported,
+      }
+      if (current.callerRouting && await recoverCallerRouteCaptures({ callId: current.id, store, primary })) return;
+      if (current.callSid && current.liveSessionId) {
+        const segments = current.liveGenerations?.segments.filter(segment => segment.sessionId);
+        const sources = segments?.length ? segments.map(segment => ({ sessionId: segment.sessionId!,
+          transcript: segment.transcript, proof: { sessionFinalized: segment.providerFinalized === true && segment.transcriptPersisted === true,
+            // Rotation clears queued output. A socket close never proves a whole assistant turn was heard.
+            assistantPlaybackComplete: false } }))
+          : [{ sessionId: current.liveSessionId, transcript: current.transcript as LiveTranscriptSnapshot | undefined,
+            proof: current.transcriptCapture }];
+        let pendingCount = 0;
+        const unsupported: string[] = [];
+        for (const source of sources) {
+          const recovery = createPrimaryBackend({ callId: current.id, callSid: current.callSid,
+            bindingId, api: primary, store, ...(segments ? { sourceSessionId: source.sessionId } : {}),
+            callerRouteSources: () => callerRouteSources(store.get(current.id)!),
+            callerRouteCaptureAccepted(sourceId, receipt) {
+              const record = store.get(current.id)?.callerRouting?.records.find(value => value.frozen.turn.sourceEventId === sourceId);
+              if (record) store.captureCallerRoute(current.id, callerRouteRef(record), receipt);
+            },
+            ...(current.continuation ? { selectedQuestionSources: () => selectedQuestionSourceAnchors(store.get(current.id)!) } : {}) });
+          recoveries.push(recovery);
+          if (!current.primaryClosed) await recovery.prepareCloseout();
+          const flushed = await recovery.flushPendingCaptures();
+          let sourcePending = flushed.pending;
+          unsupported.push(...flushed.unsupported);
+          if (source.transcript && source.proof) {
+            const captured = await recovery.captureCompletedTurns(source.transcript, source.proof);
+            sourcePending = captured.pending;
+            unsupported.push(...captured.unsupported);
+          }
+          pendingCount += sourcePending;
+        }
+        if (current.transcriptCapture || segments) store.update(call.id, { transcriptCapture: {
+          state: pendingCount ? 'pending' : 'complete', pending: pendingCount, unsupported: [...new Set(unsupported)],
+          assistantPlaybackComplete: segments ? false : current.transcriptCapture?.assistantPlaybackComplete ?? false,
+          sessionFinalized: segments ? segments.every(segment => segment.providerFinalized === true)
+            : current.transcriptCapture?.sessionFinalized ?? false,
         } });
-        if (recovery.closeoutPending()) return;
+        if (recoveries.some(recovery => recovery.closeoutPending())) return;
       }
       let closed = store.get(call.id)!.primaryClosed;
       if (!closed) {
-        closed = await primary.close(call.primary!.bindingId);
-        if (closed.bindingId !== call.primary!.bindingId || closed.callSid !== call.callSid || closed.state !== 'closed')
-          throw new Error('closed_call_identity_mismatch');
-        store.update(call.id, { primaryClosed: closed });
+        if (inboundBound) {
+          if (!primary.closeInbound) throw new Error('inbound_api_unavailable');
+          store.transitionInbound(call.id, { type: 'close_requested', observedAt: new Date().toISOString() });
+          const receipt = await primary.closeInbound(inboundBound.attachmentId, {
+            begin: call.inbound!.begin, approvalRef: inboundBound.approvalRef, bindingId,
+          });
+          closed = store.transitionInbound(call.id, { type: 'closure', receipt }).primaryClosed!;
+        } else {
+          closed = await primary.close(bindingId);
+          if (closed.bindingId !== bindingId || closed.callSid !== call.callSid || closed.state !== 'closed')
+            throw new Error('closed_call_identity_mismatch');
+          store.update(call.id, { primaryClosed: closed });
+        }
       }
-      if (recovery && (await recovery.reconcileClosedRequests(closed)).pending) return;
+      for (const recovery of recoveries) if ((await recovery.reconcileClosedRequests(closed)).pending) return;
       const captured = store.get(call.id)!.transcriptCapture;
       if (captured) store.update(call.id, { transcriptCapture: { ...captured, state: 'complete', pending: 0,
         unsupported: captured.unsupported.filter(reason => reason !== 'source_admission_unknown') } });
       store.update(call.id, { primaryClosePending: false });
+      selectedHosts.delete(call.id);
     })().catch(error => { store.update(call.id, { failure: safeFailure(error) }); })
       .finally(() => closingBindings.delete(call.id));
     closingBindings.set(call.id, pending);
     return pending;
   }
 
-  async function requestOutbound(input: { requestId: string; purpose: string; to: string; callbackFor?: string; origin?: 'authenticated_broker_control' }): Promise<{ replayed: boolean; call: BrokerCall }> {
+  async function requestOutbound(input: { requestId: string; purpose: string; to: string; callbackFor?: string;
+    origin?: 'authenticated_broker_control'; continuation?: CallContinuation; retryOf?: OutboundRetryOf }): Promise<{ replayed: boolean; call: BrokerCall }> {
     const to = input.to;
     if (!accepting || !UUID.test(input.requestId) || !config.allowedTo.includes(to)) throw new Error('call_not_available');
     if (input.callbackFor) {
@@ -172,7 +294,10 @@ export function createBrokerServer(options: BrokerServerOptions) {
       if (!inbound || inbound.direction !== 'inbound' || inbound.number !== to || !terminalCallStatuses.has(inbound.status)
         || inbound.callback?.requestId !== input.requestId || inbound.callback.state !== 'requested') throw new Error('callback_identity_mismatch');
     }
-    const reservation = store.reserve({ requestId: input.requestId, direction: 'outbound', purpose: input.purpose.trim(), number: to }, input.origin);
+    const reservation = input.continuation ? store.reserveSelectedOutbound({ requestId: input.requestId,
+      purpose: input.purpose.trim(), number: to, continuation: input.continuation, ...outboundRetryOfPatch(input.retryOf) },
+      { accountSid: config.twilioAccountSid, from: config.from, to })
+      : store.reserve({ requestId: input.requestId, direction: 'outbound', purpose: input.purpose.trim(), number: to }, input.origin);
     return dialReserved(reservation);
   }
 
@@ -190,6 +315,8 @@ export function createBrokerServer(options: BrokerServerOptions) {
     const to = call.number;
     sessionCalls.add(call.id);
     if (dialing.has(to) || store.list().some(other => other.id !== call.id && other.number === to && !providerFinished(other))) {
+      if (call.outboundObservation) store.observeSelectedOutbound(call.id, { type: 'never_dispatched',
+        callId: call.id, requestId: call.requestId, observedAt: new Date().toISOString(), reason: 'call_already_open' });
       store.update(call.id, { status: 'canceled', failure: { code: 'call_already_open', message: 'Another call for this person needs to finish first' } });
       throw Object.assign(new Error('Another call is already open'), { code: 'call_already_open' });
     }
@@ -204,14 +331,24 @@ export function createBrokerServer(options: BrokerServerOptions) {
         if (!readiness.eligible) throw Object.assign(new Error('The account is not ready for this call'), { code: readiness.reason });
         await probe({ apiKey: config.apiKey, voice: config.voice, model: config.model });
       }
-      catch (error) { store.update(call.id, { status: 'failed', failure: safeFailure(error) }); throw error; }
-      if (!accepting) { store.update(call.id, { status: 'canceled' }); throw new Error('service_shutting_down'); }
+      catch (error) {
+        if (call.outboundObservation) store.observeSelectedOutbound(call.id, { type: 'never_dispatched',
+          callId: call.id, requestId: call.requestId, observedAt: new Date().toISOString(), reason: 'preflight_refused' });
+        store.update(call.id, { status: 'failed', failure: safeFailure(error) }); throw error;
+      }
+      if (!accepting) {
+        if (call.outboundObservation) store.observeSelectedOutbound(call.id, { type: 'never_dispatched',
+          callId: call.id, requestId: call.requestId, observedAt: new Date().toISOString(), reason: 'service_stopping' });
+        store.update(call.id, { status: 'canceled' }); throw new Error('service_shutting_down');
+      }
       if (call.callAssignment?.origin === 'authenticated_hark_delivery'
           && Date.parse(call.callAssignment.value.hark.expiresAt) <= Date.now()) {
         store.update(call.id, { status: 'canceled', failure: { code: 'hark_event_expired', message: 'The saved watch event has expired' } });
         throw new HarkAssignmentError(403, 'hark_event_expired');
       }
       if (hark) store.beginHarkDispatch(call.id, new Date().toISOString());
+      else if (call.outboundObservation) store.observeSelectedOutbound(call.id, { type: 'dispatch_started',
+        callId: call.id, requestId: call.requestId, observedAt: new Date().toISOString() });
       else store.update(call.id, { status: 'dialing' });
       let providerResponded = false;
       try {
@@ -224,6 +361,8 @@ export function createBrokerServer(options: BrokerServerOptions) {
         providerResponded = true;
         if (!CALL_SID.test(created.sid)) throw new Error('invalid_provider_call_id');
         if (hark) store.acceptHarkDispatch(call.id, created.sid, new Date().toISOString());
+        else if (call.outboundObservation) selectedProviderObservation(store.get(call.id)!, outboundAcceptedIdentitySchema.parse({
+          callSid: created.sid, accountSid: created.accountSid, from: created.from, to: created.to }));
         else store.update(call.id, { callSid: created.sid });
         const saved = observeProviderState(call.id, 'queued');
         return { replayed: false, call: saved };
@@ -232,6 +371,11 @@ export function createBrokerServer(options: BrokerServerOptions) {
         // A transport error must not erase that receipt or regress terminal state.
         const saved = store.get(call.id)!;
         if (hark && saved.harkDispatch?.state === 'provider_accepted' && saved.callSid) {
+          if (!providerResponded) return { replayed: true, call: saved };
+          store.update(call.id, { failure: safeFailure(error) });
+          throw error;
+        }
+        if (saved.outboundObservation?.accepted && saved.callSid) {
           if (!providerResponded) return { replayed: true, call: saved };
           store.update(call.id, { failure: safeFailure(error) });
           throw error;
@@ -246,10 +390,46 @@ export function createBrokerServer(options: BrokerServerOptions) {
   async function bind(call: BrokerCall, proof: ProviderCallProof): Promise<BrokerCall> {
     const binding = await primary.openCall(proof, call.callAssignment?.value);
     if (binding.callSid !== call.callSid || binding.state !== 'open') throw new Error('primary_call_identity_mismatch');
-    const context = binding.context;
-    const text = context.messages.map(message => `${message.role}: ${message.text}`).join('\n');
-    return store.update(call.id, { primary: { bindingId: binding.bindingId, name: context.displayName, context: text.slice(-8_000),
-      ...(binding.callAssignmentRef === undefined ? {} : { callAssignmentRef: binding.callAssignmentRef }) } });
+    return store.recordPrimaryBinding(call.id, binding);
+  }
+
+  async function endWaitingCall(call: BrokerCall): Promise<void> {
+    if (!call.callSid || active.has(call.id) || claimed.has(call.id) || providerFinished(call)) return;
+    try {
+      const ended = await provider.calls(call.callSid).update({ status: 'completed' });
+      const current = store.get(call.id)!;
+      if (ended.status === 'completed') observeProviderRecord(current, ended, 'authenticated_update');
+      else store.update(call.id, { status: 'unknown' });
+    } catch (error) { store.update(call.id, { failure: safeFailure(error) }); }
+  }
+
+  async function inboundResponse(call: BrokerCall, response: ServerResponse): Promise<void> {
+    call = store.get(call.id)!;
+    if (!options.inboundAttachment || !accepting) inbound.stopLocal(call.id, 'service_unavailable');
+    if (call.inbound?.localStop || call.endedAt || terminalCallStatuses.has(call.status) || !options.inboundAttachment || !accepting) {
+      // Hanging up this HTTP leg and closing its account attachment have separate receipts.
+      xml(response, '<Response><Hangup/></Response>');
+      await inbound.stop(call.id, call.inbound?.localStop?.reason ?? 'provider_terminal').catch(error => {
+        store.update(call.id, { failure: safeFailure(error) });
+      });
+      return;
+    }
+    if (call.mediaStartedAt || active.has(call.id) || claimed.has(call.id)) return json(response, 409, { error: 'media_already_started' });
+    if (inbound.mediaAllowed(call)) return xml(response,
+      callTwiml(config.publicOrigin, call.id, streamToken(config.controlToken, call.id, call.callSid!)));
+    const remote = call.inbound!.remote;
+    try {
+      const rendered = options.inboundAttachment!.waitingResponse({ callId: call.id,
+        continuationUrl: `${config.publicOrigin}/broker/inbound/${call.id}/continue`,
+        ...(remote && remote.state !== 'absent' ? { attachmentId: remote.attachmentId } : {}),
+        ...(remote && 'expiresAt' in remote && remote.expiresAt ? { expiresAt: remote.expiresAt } : {}),
+      });
+      return xml(response, rendered);
+    } catch (error) {
+      store.update(call.id, { failure: safeFailure(error) });
+      await inbound.stop(call.id, 'approval_surface_unavailable').catch(() => {});
+      return xml(response, '<Response><Hangup/></Response>');
+    }
   }
 
   async function handle(request: IncomingMessage, response: ServerResponse) {
@@ -293,6 +473,22 @@ export function createBrokerServer(options: BrokerServerOptions) {
       }
     }
     if (route.startsWith('/internal/broker/')) {
+      // Receipt recovery remains available while new-call admission is stopped.
+      if (request.method === 'GET' && route.startsWith('/internal/broker/call-requests')) {
+        const receiptJson = (status: number, value: unknown) => {
+          response.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'private, no-store' });
+          response.end(JSON.stringify(value));
+        };
+        if (!authorizedControl(request.headers.authorization, config.controlToken))
+          return receiptJson(401, { error: 'unauthorized' });
+        try {
+          const requestId = callRequestIdFromLookupPath(route);
+          return receiptJson(200, readCallRequestReceipt(store, requestId));
+        } catch (error) {
+          const failure = callRequestReceiptFailure(error);
+          return receiptJson(failure.status, failure.body);
+        }
+      }
       if (!authorizedControl(request.headers.authorization, config.controlToken)) return json(response, 401, { error: 'unauthorized' });
       if (request.method === 'GET' && route === '/internal/broker/calls') return json(response, 200, { calls: store.list().slice(0, 50).map(publicCall) });
       if (request.method !== 'POST' || !accepting) return json(response, 405, { error: 'unavailable' });
@@ -302,7 +498,9 @@ export function createBrokerServer(options: BrokerServerOptions) {
         if (typeof input.requestId !== 'string' || !UUID.test(input.requestId)
           || typeof input.purpose !== 'string' || !input.purpose.trim() || input.purpose.length > 1500
           || (input.to !== undefined && !isPhoneNumber(input.to))
-          || Object.keys(input).some(key => !['requestId', 'purpose', 'to'].includes(key))) return json(response, 400, { error: 'invalid_call_request' });
+          || Object.keys(input).some(key => !['requestId', 'purpose', 'to', 'continuation', 'retryOf'].includes(key))
+          || (input.retryOf !== undefined && (!input.continuation || !outboundRetryOfSchema.safeParse(input.retryOf).success)))
+          return json(response, 400, { error: 'invalid_call_request' });
         const to = input.to as string | undefined ?? (config.allowedTo.length === 1 ? config.allowedTo[0] : undefined);
         if (!to || !config.allowedTo.includes(to)) return json(response, 403, { error: 'recipient_not_authorized' });
         const saved = store.list().find(call => call.requestId === input.requestId);
@@ -311,10 +509,25 @@ export function createBrokerServer(options: BrokerServerOptions) {
         if (!saved && !newPhoneCallControlSchema.safeParse({ assignmentId: input.requestId,
           purpose: input.purpose.trim() }).success) return json(response, 400, { error: 'invalid_call_request' });
         try {
-          const result = await requestOutbound({ requestId: input.requestId, purpose: input.purpose.trim(), to, origin: 'authenticated_broker_control' });
+          const selected = callContinuationPatch(input.continuation);
+          if (saved) assertCallContinuationReplay(saved.continuation, selected.continuation);
+          // Historical receipts require no new admission. New selected calls
+          // need the complete eligible-history and selected-answer composition.
+          if (selected.continuation && !saved && (!options.eligibleContext || !options.selectedQuestion))
+            return json(response, 503, { error: 'call_continuation_unavailable' });
+          const result = await requestOutbound({ requestId: input.requestId, purpose: input.purpose.trim(), to,
+            origin: 'authenticated_broker_control', ...selected, ...outboundRetryOfPatch(input.retryOf) });
           return json(response, result.replayed ? 200 : 201, { replayed: result.replayed, call: publicCall(result.call) });
         } catch (error) {
+          if (error instanceof OutboundRetryError) return json(response,
+            error.code === 'call_request_unavailable' ? 503 : 409, { error: error.code });
+          if (error instanceof CallContinuationError) {
+            if (error.code !== 'invalid_call_continuation' && (input.retryOf !== undefined || saved?.retryOf !== undefined))
+              return json(response, 409, { error: 'call_request_conflict' });
+            return json(response, error.code === 'invalid_call_continuation' ? 400 : 409, { error: error.code });
+          }
           if ((error as { code?: string }).code === 'call_already_open') return json(response, 409, { error: 'call_already_open' });
+          if (input.continuation) return json(response, 503, { error: 'call_request_unavailable' });
           throw error;
         }
       }
@@ -326,15 +539,22 @@ export function createBrokerServer(options: BrokerServerOptions) {
           const observed = await provider.calls(call.callSid).fetch();
           if ((call.direction === 'outbound' && (observed.to !== call.number || observed.from !== config.from))
             || (call.direction === 'inbound' && (observed.from !== call.number || observed.to !== config.from))) throw new Error('provider_call_identity_mismatch');
-          if (providerStates.has(observed.status as CallStatus)) observeProviderRecord(call, observed);
+          if (providerStates.has(observed.status as CallStatus)) observeProviderRecord(call, observed, 'authenticated_fetch');
           const reconciled = store.get(call.id)!;
           if ((terminalCallStatuses.has(reconciled.status) || reconciled.primaryClosePending) && active.has(call.id)) await active.get(call.id)!.stop('provider_terminal');
-          else if (terminalCallStatuses.has(reconciled.status) || reconciled.primaryClosePending) await closePrimary(reconciled);
+          else if (terminalCallStatuses.has(reconciled.status) || reconciled.primaryClosePending) {
+            if (reconciled.inbound) await inbound.stop(reconciled.id, 'provider_terminal');
+            else await closePrimary(reconciled);
+          }
+        } else if (call.inbound && !active.has(call.id)) {
+          inbound.stopLocal(call.id, 'operator_requested');
+          await endWaitingCall(call);
+          await inbound.stop(call.id, 'operator_requested');
         } else if (active.has(call.id)) await active.get(call.id)!.stop('operator_requested');
         else if (!providerFinished(call)) {
           store.update(call.id, { endedAt: call.endedAt ?? new Date().toISOString() });
           const ended = await provider.calls(call.callSid).update({ status: 'completed' });
-          if (ended.status === 'completed') observeProviderRecord(call, ended);
+          if (ended.status === 'completed') observeProviderRecord(call, ended, 'authenticated_update');
           else store.update(call.id, { status: 'unknown', endedAt: new Date().toISOString() });
           await closePrimary(call);
         }
@@ -347,8 +567,9 @@ export function createBrokerServer(options: BrokerServerOptions) {
     if (request.method !== 'POST') return json(response, 404, { error: 'not_found' });
     const incoming = route === '/broker/incoming-call';
     const match = route.match(/^\/broker\/(answer|status|callback)\/([0-9a-f-]{36})$/);
+    const continuation = route.match(/^\/broker\/inbound\/([0-9a-f-]{36})\/continue$/);
     const genericStatus = route === '/broker/status';
-    if (!incoming && !match && !genericStatus) return json(response, 404, { error: 'not_found' });
+    if (!incoming && !match && !genericStatus && !continuation) return json(response, 404, { error: 'not_found' });
     const raw = new URLSearchParams(await body(request));
     const params: Record<string, string> = {};
     for (const [key, value] of raw) { if (key in params) return json(response, 400, { error: 'duplicate_callback_field' }); params[key] = value; }
@@ -356,8 +577,39 @@ export function createBrokerServer(options: BrokerServerOptions) {
     if (!proof || !CALL_SID.test(params.CallSid || '')) return json(response, 403, { error: 'invalid_provider_callback' });
     if (!accepting) return xml(response, fallbackTwiml('Dexter is being updated. Please call again shortly.'));
     let call: BrokerCall;
+    if (continuation) {
+      const saved = store.get(continuation[1]);
+      if (!saved?.inbound || saved.callSid !== params.CallSid || params.Direction !== 'inbound'
+        || params.From !== saved.number || params.To !== config.from) return json(response, 403, { error: 'call_identity_mismatch' });
+      if (!options.inboundAttachment) {
+        await inbound.stop(saved.id, 'service_unavailable').catch(error => { store.update(saved.id, { failure: safeFailure(error) }); });
+        return xml(response, '<Response><Hangup/></Response>');
+      }
+      try { call = await inbound.resume(saved.id, proof); }
+      catch (error) { store.update(saved.id, { failure: safeFailure(error) }); call = store.get(saved.id)!; }
+      return inboundResponse(call, response);
+    }
     if (incoming) {
       if (params.To !== config.from || !isPhoneNumber(params.From)) return json(response, 403, { error: 'call_identity_mismatch' });
+      const retained = store.bySid(params.CallSid);
+      if ((!retained && options.inboundAttachment) || retained?.inbound) {
+        if (params.Direction !== 'inbound' || (retained && !retained.inbound)) return json(response, 409, { error: 'call_mode_conflict' });
+        if (retained?.inbound && !options.inboundAttachment) {
+          if (canonicalJson(retained.inbound.begin.providerProof) !== canonicalJson(proof)) return json(response, 409, { error: 'call_identity_mismatch' });
+          await inbound.stop(retained.id, 'service_unavailable').catch(error => { store.update(retained.id, { failure: safeFailure(error) }); });
+          return xml(response, '<Response><Hangup/></Response>');
+        }
+        try { call = await inbound.accept(proof); }
+        catch (error) {
+          const reserved = store.bySid(params.CallSid);
+          if (!reserved?.inbound) throw error;
+          // An identity mismatch cannot recover a different saved caller's wait.
+          if (canonicalJson(reserved.inbound.begin.providerProof) !== canonicalJson(proof)) return json(response, 409, { error: 'call_identity_mismatch' });
+          store.update(reserved.id, { failure: safeFailure(error) }); call = store.get(reserved.id)!;
+        }
+        sessionCalls.add(call.id);
+        return inboundResponse(call, response);
+      }
       const requestId = createHash('sha256').update(`incoming:${params.CallSid}`).digest('hex');
       call = store.reserve({ requestId, direction: 'inbound', purpose: 'The person called Dexter.', number: params.From, callSid: params.CallSid }).call;
       sessionCalls.add(call.id);
@@ -368,17 +620,28 @@ export function createBrokerServer(options: BrokerServerOptions) {
           || (saved.direction === 'inbound' && (params.To !== config.from || params.From !== saved.number))
           || (saved.direction === 'inbound' && match?.[1] === 'answer')
           || (saved.callSid && saved.callSid !== params.CallSid)) return json(response, 403, { error: 'call_identity_mismatch' });
-      if (!saved.callSid && saved.harkDispatch) {
+      if (saved.outboundObservation) {
+        const identity = outboundAcceptedIdentitySchema.parse({ accountSid: params.AccountSid, callSid: params.CallSid,
+          from: params.From, to: params.To });
+        const statusCallback = genericStatus || match?.[1] === 'status';
+        call = selectedProviderObservation(saved, identity, statusCallback ? { status: params.CallStatus,
+          source: 'signed_status_callback', evidenceDigest: sha256Hex(JSON.stringify([
+            'broker.provider-status-callback/v1', proof.url, Object.keys(proof.params).sort().map(key => [key, proof.params[key]])])) } : undefined);
+      } else if (!saved.callSid && saved.harkDispatch) {
         if (saved.harkDispatch.state !== 'dispatch_started') return json(response, 403, { error: 'call_not_dispatched' });
         call = store.acceptHarkDispatch(saved.id, params.CallSid, new Date().toISOString());
       } else call = saved.callSid ? saved : store.update(saved.id, { callSid: params.CallSid });
-      if (match?.[1] === 'callback') return xml(response, await callbacks.consent(call, proof));
+      if (match?.[1] === 'callback') {
+        if (call.inbound) return json(response, 409, { error: 'call_mode_conflict' });
+        return xml(response, await callbacks.consent(call, proof));
+      }
       if (genericStatus || match![1] === 'status') {
         if (providerStates.has(params.CallStatus as CallStatus)) {
           const state = params.CallStatus as CallStatus;
           call = observeProviderState(call.id, state as HarkProviderStatus);
           if (terminalCallStatuses.has(call.status)) {
             if (active.has(call.id)) await active.get(call.id)!.stop('provider_terminal');
+            else if (call.inbound) await inbound.stop(call.id, 'provider_terminal');
             else await closePrimary(call);
           }
         }
@@ -417,7 +680,8 @@ export function createBrokerServer(options: BrokerServerOptions) {
       socket.write('HTTP/1.1 403 Forbidden\r\n\r\n'); socket.destroy(); return;
     }
     const call = store.get(match[1]);
-    if (!call?.primary || !call.callSid || call.endedAt || terminalCallStatuses.has(call.status) || claimed.has(call.id)) {
+    if (!call?.primary || !call.callSid || call.endedAt || terminalCallStatuses.has(call.status) || claimed.has(call.id)
+      || (call.inbound && !inbound.mediaAllowed(call))) {
       socket.write('HTTP/1.1 409 Conflict\r\n\r\n'); socket.destroy(); return;
     }
     claimed.add(call.id);
@@ -431,18 +695,20 @@ export function createBrokerServer(options: BrokerServerOptions) {
     let backend: ReturnType<typeof createPrimaryBackend> | undefined;
     let stopping = false;
     let stopPromise: Promise<void> | undefined;
-    let inputBytes = 0;
+    let inputBytes = call.liveGenerations?.inputNextSample ?? 0;
     let lastSpeechAt = 0;
     const receipts = new PlaybackReceipts();
     const metrics = () => ({ receivedAudioBytes: inputBytes, sentAudioBytes: receipts.sentBytes, playedAudioBytes: receipts.playedBytes, clearedAudioBytes: receipts.clearedBytes });
     const startTimer = setTimeout(() => { void stop('media_start_timeout'); }, 8_000);
-    const durationTimer = setTimeout(() => { void stop('duration_limit'); }, config.maxCallSeconds * 1000);
+    const callDeadlineAt = call.liveGenerations?.clocks.callDeadlineAt ?? new Date(Date.now() + config.maxCallSeconds * 1000).toISOString();
+    const durationTimer = setTimeout(() => { void stop('duration_limit'); }, Math.max(0, Date.parse(callDeadlineAt) - Date.now()));
 
     function stop(reason: string): Promise<void> {
       if (stopPromise) return stopPromise;
       stopping = true;
       clearTimeout(startTimer); clearTimeout(durationTimer);
       const previous = store.get(call.id)!;
+      if (previous.inbound) inbound.stopLocal(call.id, reason);
       store.update(call.id, { endedAt: previous.endedAt ?? new Date().toISOString(), primaryClosePending: true });
       stopPromise = (async () => {
         const closing = live?.close(reason);
@@ -451,11 +717,11 @@ export function createBrokerServer(options: BrokerServerOptions) {
           if (reason !== 'provider_terminal' && saved && !providerFinished(saved)) {
             if (reason === 'voice_unavailable') {
               const spoken = await provider.calls(call.callSid!).update({ twiml: fallbackTwiml('My voice connection stopped working. Please try me again shortly.') });
-              if (providerStates.has(spoken.status as CallStatus)) observeProviderRecord(saved, spoken);
+              if (providerStates.has(spoken.status as CallStatus)) observeProviderRecord(saved, spoken, 'authenticated_update');
               else store.update(call.id, { status: 'unknown' });
             } else {
               const ended = await provider.calls(call.callSid!).update({ status: 'completed' });
-              if (ended.status === 'completed') observeProviderRecord(saved, ended);
+              if (ended.status === 'completed') observeProviderRecord(saved, ended, 'authenticated_update');
               else store.update(call.id, { status: 'unknown' });
             }
           }
@@ -487,19 +753,20 @@ export function createBrokerServer(options: BrokerServerOptions) {
         const frame = JSON.parse(raw.toString());
         if (frame.event === 'start') {
           if (streamSid) throw new Error('duplicate_media_start');
+          if (call.inbound && !inbound.mediaAllowed(store.get(call.id)!)) throw new Error('inbound_media_not_admitted');
           streamSid = mediaStart(frame.start, { accountSid: config.twilioAccountSid, callSid: call.callSid!, token: streamToken(config.controlToken, call.id, call.callSid!) });
           clearTimeout(startTimer);
           if (call.callAssignment?.origin === 'authenticated_hark_delivery') {
             store.update(call.id, { streamSid });
             store.observeHarkMediaStarted(call.id, new Date().toISOString());
-          } else store.update(call.id, { streamSid, status: 'in-progress', mediaStartedAt: new Date().toISOString() });
-          backend = createPrimaryBackend({ callId: call.id, callSid: call.callSid!, bindingId: call.primary!.bindingId, api: primary, store, watchUntilCallEnds: true, lastCallerSpeechAt: () => lastSpeechAt });
-          live = voiceFactory({ apiKey: config.apiKey, callId: call.id, voice: config.voice,
+          } else store.update(call.id, { streamSid, status: 'in-progress', mediaStartedAt: store.get(call.id)!.mediaStartedAt ?? new Date().toISOString() });
+          if (!options.eligibleContext) backend = createPrimaryBackend({ callId: call.id, callSid: call.callSid!, bindingId: call.primary!.bindingId, api: primary, store, watchUntilCallEnds: true, lastCallerSpeechAt: () => lastSpeechAt });
+          const voiceOptions: BrokerLiveSessionOptions = { apiKey: config.apiKey, callId: call.id, voice: config.voice,
             instructions: brokerInstructions({ direction: call.direction, purpose: call.purpose, registeredAssignment: !!call.callAssignment,
               ...(call.callAssignment?.origin === 'authenticated_hark_delivery' ? { watch: call.callAssignment.value.hark } : {}),
               name: call.primary!.name, context: call.primary!.context }),
             history: brokerHistory({ name: call.primary!.name, context: call.primary!.context }),
-            backend,
+            backend: backend ?? { async delegate() { throw new Error('generation_backend_required'); } },
             onAudio(payload) {
               if (stopping || ws.readyState !== WebSocket.OPEN || !streamSid) return;
               if (ws.bufferedAmount > 256_000 || receipts.pendingCount > 300 || receipts.backlogMs > 6_000) { void stop('audio_backpressure'); return; }
@@ -513,6 +780,10 @@ export function createBrokerServer(options: BrokerServerOptions) {
             },
             onReady({ sessionId }) {
               connectedSessionId = sessionId;
+              // The selected host publishes the exact eligible saved question.
+              // Its operator purpose must never become an automatic new task.
+              if (call.continuation) return;
+              if (options.eligibleContext && store.get(call.id)!.voiceOpening) return;
               store.update(call.id, { liveSessionId: sessionId, voiceOpening: { status: 'pending' } });
               // Live's documented speak-first command runs while phone audio
               // continues. Its receipt confirms context injection, not playback.
@@ -534,7 +805,22 @@ export function createBrokerServer(options: BrokerServerOptions) {
                   sessionId: connectedSessionId }, event.eventId, typeof event.code === 'string' ? event.code : 'provider_error');
               if (event.type === 'live.error') store.update(call.id, { failure: { code: String(event.code || 'live_error'), message: 'The voice connection could not continue' } });
             },
-          });
+          };
+          live = options.eligibleContext ? createGenerationVoice({ call: store.get(call.id)!, callDeadlineAt,
+            apiKey: config.apiKey, voice: config.voice, store, primary, context: options.eligibleContext, voiceFactory,
+            ...(options.selectedQuestion ? { selectedQuestion: options.selectedQuestion } : {}),
+            ...(call.continuation && options.callerIntent ? { callerIntent: createCallerIntentResolver({
+              callId: call.id, store, client: options.callerIntent.client, timeoutMs: options.callerIntent.timeoutMs,
+            }) } : {}),
+            onAudio: payload => voiceOptions.onAudio(payload, { deliveryId: 'generation_host_audio' }),
+            onReady: voiceOptions.onReady, onClosed: voiceOptions.onClosed,
+            onPlaybackClear: () => voiceOptions.onPlaybackClear?.('application_interrupt'),
+            onProblem(code) { queueMicrotask(() => { if (stopping) return;
+              store.update(call.id, { failure: safeFailure(Object.assign(new Error(code), { code })) });
+              void stop('voice_unavailable');
+            }); },
+          }) : voiceFactory(voiceOptions);
+          if (call.continuation && options.eligibleContext) selectedHosts.set(call.id, live as GenerationVoiceSession);
         } else if (frame.event === 'media') {
           if (!streamSid || frame.streamSid !== streamSid || frame.media?.track !== 'inbound'
               || typeof frame.media.payload !== 'string' || frame.media.payload.length > 32768) throw new Error('invalid_input_audio');
@@ -543,7 +829,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
           if (inputBytes > (config.maxCallSeconds + 10) * 8000) throw new Error('input_duration_exceeded');
           // Twilio timestamps are media positions, not an authorization or a turn boundary.
           if (inputSpeechEnergy(bytes) > 0.012) { lastSpeechAt = Date.now(); backend?.noteCallerSpeech(lastSpeechAt, inputBytes / 8); }
-          live?.appendAudio(frame.media.payload);
+          if (live?.appendAudio(frame.media.payload) === false) void stop('input_audio_refused');
         } else if (frame.event === 'mark' && frame.streamSid === streamSid && typeof frame.mark?.name === 'string') {
           receipts.acknowledge(frame.mark.name);
         } else if (frame.event === 'stop') {
@@ -555,13 +841,30 @@ export function createBrokerServer(options: BrokerServerOptions) {
   }
 
   let maintenance: Promise<void> | undefined;
-  const maintenanceTimer = setInterval(() => {
-    if (!accepting || maintenance) return;
+  function maintain(): Promise<void> {
+    if (!accepting) return Promise.resolve();
+    if (maintenance) return maintenance;
     maintenance = (async () => {
       await callbacks.dispatchPending();
       for (const call of store.list()) {
         if (active.has(call.id) || claimed.has(call.id)) continue;
-        if (call.primaryClosePending) await closePrimary(call);
+        if (call.inbound) {
+          try {
+            if (!options.inboundAttachment) inbound.stopLocal(call.id, 'service_unavailable');
+            if (call.mediaStartedAt) inbound.stopLocal(call.id, 'media_session_lost');
+            await inbound.tick(call.id);
+          } catch (error) { store.update(call.id, { failure: safeFailure(error) }); }
+          finally {
+            const current = store.get(call.id)!;
+            if (current.inbound?.localStop) await endWaitingCall(current);
+          }
+          continue;
+        }
+        // A terminal callback can be durable just before a process stops,
+        // without reaching the first closePrimary write. Recover that exact
+        // selected call after restart, while active media retains its own stop.
+        if (call.primaryClosePending || (call.continuation && call.primary && !call.primaryClosed
+          && providerFinished(call) && !active.has(call.id) && !claimed.has(call.id))) await closePrimary(call);
         if (!call.callSid || (providerFinished(call) && !needsHarkTiming(call)) || active.has(call.id) || claimed.has(call.id)
             || Date.now() - Date.parse(call.createdAt) < 60_000) continue;
         try {
@@ -573,7 +876,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
           // Media may have connected while the provider lookup was pending.
           if (active.has(call.id) || claimed.has(call.id)) {
             if (terminalCallStatuses.has(observed.status as CallStatus) && active.has(call.id)) {
-              observeProviderRecord(call, observed);
+              observeProviderRecord(call, observed, 'authenticated_fetch');
               await active.get(call.id)!.stop('provider_terminal');
             }
             continue;
@@ -581,13 +884,13 @@ export function createBrokerServer(options: BrokerServerOptions) {
           const current = store.get(call.id)!;
           store.update(call.id, { endedAt: current.endedAt ?? new Date().toISOString() });
           if (terminalCallStatuses.has(observed.status as CallStatus)) {
-            observeProviderRecord(call, observed);
+            observeProviderRecord(call, observed, 'authenticated_fetch');
           } else if (providerFinished(current)) {
             // A delayed provider read cannot reopen a terminal call or add time.
             continue;
           } else {
             const ended = await provider.calls(call.callSid).update({ status: 'completed' });
-            if (ended.status === 'completed') observeProviderRecord(call, ended);
+            if (ended.status === 'completed') observeProviderRecord(call, ended, 'authenticated_update');
             else store.update(call.id, { status: 'unknown', endedAt: new Date().toISOString() });
           }
           await closePrimary(store.get(call.id)!);
@@ -595,22 +898,33 @@ export function createBrokerServer(options: BrokerServerOptions) {
       }
       await flushHark();
     })().finally(() => { maintenance = undefined; });
+    return maintenance;
+  }
+  const maintenanceTimer = setInterval(() => {
+    void maintain().catch(error => { console.error('[dexter-broker] Maintenance could not finish', { code: safeFailure(error).code }); });
   }, 10_000);
   maintenanceTimer.unref();
 
   async function close() {
     accepting = false;
+    // Freeze every saved wait before awaiting any in-flight begin/consume operation.
+    for (const call of store.list()) if (call.inbound && !call.inbound.closure) inbound.stopLocal(call.id, 'service_shutdown');
     clearInterval(maintenanceTimer);
     server.close();
     await Promise.allSettled([...pendingRequests]);
     await maintenance;
     await Promise.allSettled([...active.values()].map(call => call.stop('service_shutdown')));
+    for (const call of store.list()) if (call.inbound) {
+      await endWaitingCall(store.get(call.id)!);
+      await inbound.stop(call.id, 'service_shutdown').catch(error => { store.update(call.id, { failure: safeFailure(error) }); });
+    }
+    await inbound.drain();
     for (const id of sessionCalls) {
       const call = store.get(id);
       if (!call?.callSid || providerFinished(call)) continue;
       try {
         const ended = await provider.calls(call.callSid).update({ status: 'completed' });
-        if (ended.status === 'completed') observeProviderRecord(call, ended);
+        if (ended.status === 'completed') observeProviderRecord(call, ended, 'authenticated_update');
         else store.update(id, { status: 'unknown', endedAt: new Date().toISOString() });
         await closePrimary(call);
       } catch (error) { store.update(id, { status: 'unknown', failure: safeFailure(error) }); }
@@ -620,5 +934,5 @@ export function createBrokerServer(options: BrokerServerOptions) {
     sockets.close();
     store.close();
   }
-  return { server, store, close };
+  return { server, store, close, maintain };
 }

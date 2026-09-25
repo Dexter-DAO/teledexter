@@ -14,7 +14,9 @@ import { HARK_PHONE_PURPOSE, harkSourceDigest, type ResolvedHarkAssignment } fro
 import type { PhoneCallAssignment } from '../src/broker/assignment.js';
 import type { BrokerConfig } from '../src/broker/config.js';
 import type { BrokerCall } from '../src/broker/store.js';
-import type { PrimaryApiClient } from '../src/broker/primaryApi.js';
+import type { BrokerDelegationRecord } from '../src/broker/backend.js';
+import type { PrimaryApiClient, PrimarySubmission, PrimaryTurn } from '../src/broker/primaryApi.js';
+import type { BrokerLiveSessionOptions, LiveBackendChannel, LiveBackendUpdate, LiveDelegationRequest, LiveTranscriptSnapshot } from '../src/live/types.js';
 import { streamToken } from '../src/broker/phone.js';
 import { makeResolvedHarkAssignment } from './fixtures/broker-hark.js';
 
@@ -52,7 +54,8 @@ function notificationFor(resolved: ResolvedHarkAssignment) {
       deliveryId: saved.deliveryId, originTaskId: saved.originTaskId } };
 }
 
-async function fixture(t: test.TestContext, overrides: { ambiguousDial?: boolean; failedRegistration?: boolean; returnedSid?: string } = {}) {
+async function fixture(t: test.TestContext, overrides: { ambiguousDial?: boolean; failedRegistration?: boolean; returnedSid?: string;
+  mismatchedAssignmentRef?: boolean } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-hark-server-'));
   let resolved = futureAssignment();
   let apiStatus = 200;
@@ -84,6 +87,26 @@ async function fixture(t: test.TestContext, overrides: { ambiguousDial?: boolean
   const registered: PhoneCallAssignment[] = [];
   const savedBeforeDial: BrokerCall[] = [];
   const openings: string[] = [];
+  const submissions: Array<{ bindingId: string; requestId: string; input: PrimarySubmission }> = [];
+  const resultReads: string[] = [];
+  const updates: LiveBackendUpdate[] = [];
+  const resultText = 'The watched stock is up 5.2 percent.';
+  let voiceOptions: BrokerLiveSessionOptions | undefined;
+  let snapshot: LiveTranscriptSnapshot = { revision: 0, callerRevision: 0, fragments: [] };
+  const transcriptListeners = new Set<(value: LiveTranscriptSnapshot) => void>();
+  const voiceAbort = new AbortController();
+  let audioResolve: () => void = () => {};
+  const audioReceived = new Promise<void>(resolve => { audioResolve = resolve; });
+  const channel: LiveBackendChannel = {
+    signal: voiceAbort.signal,
+    getContext: () => structuredClone(snapshot),
+    subscribeContext(listener) { transcriptListeners.add(listener); return () => { transcriptListeners.delete(listener); }; },
+    async publish(update) {
+      updates.push(structuredClone(update));
+      return { eventId: update.id, status: voiceAbort.signal.aborted ? 'closed' : 'accepted',
+        observedCallerRevision: snapshot.callerRevision, observedTranscriptSequence: snapshot.revision };
+    },
+  };
   let openingResolve: () => void = () => {};
   const opening = new Promise<void>(resolve => { openingResolve = resolve; });
   let broker: ReturnType<typeof createBrokerServer>;
@@ -99,8 +122,32 @@ async function fixture(t: test.TestContext, overrides: { ambiguousDial?: boolean
       if (overrides.failedRegistration) throw new Error('saved_snapshot_no_longer_matches');
       if (assignment) registered.push(structuredClone(assignment));
       return { bindingId, callSid: sid, state: 'open',
-        ...(assignment ? { callAssignmentRef: { assignmentId: assignment.assignmentId, revision: 1, digest: 'a'.repeat(64) } } : {}),
+        ...(assignment ? { callAssignmentRef: { assignmentId: overrides.mismatchedAssignmentRef ? randomUUID() : assignment.assignmentId,
+          revision: 1, digest: 'a'.repeat(64) } } : {}),
         context: { primaryDexterId: randomUUID(), threadId: randomUUID(), displayName: 'Branch', messages: [] } };
+    },
+    async submit(binding: string, requestId: string, input: PrimarySubmission) {
+      const disk = JSON.parse(fs.readFileSync(path.join(directory, 'calls.json'), 'utf8')) as { calls: Record<string, BrokerCall> };
+      const saved = disk.calls[voiceOptions!.callId];
+      const entry = saved.delegations[requestId] as BrokerDelegationRecord;
+      assert.equal(binding, bindingId);
+      assert.equal(entry.status, 'dispatching', 'exact source must be durable before Primary submission');
+      assert.deepEqual(entry.submission, input);
+      assert.deepEqual(input.callAssignmentRef, saved.primary!.callAssignmentRef);
+      assert.deepEqual(saved.callAssignment, { origin: 'authenticated_hark_delivery', value: resolved.callAssignment });
+      submissions.push({ bindingId: binding, requestId, input: structuredClone(input) });
+      return { bindingId, requestId, state: 'queued', replayed: false };
+    },
+    async result(binding: string, requestId: string) {
+      assert.equal(binding, bindingId); resultReads.push(requestId);
+      return { bindingId, requestId, state: 'completed', assistant: {
+        messageId: '88888888-8888-4888-8888-888888888888', eventId: '99999999-9999-4999-8999-999999999999',
+        sequence: '1', text: resultText,
+      } };
+    },
+    async captureTurn(binding: string, turn: PrimaryTurn) {
+      assert.equal(binding, bindingId);
+      return { bindingId, sourceEventId: turn.sourceEventId, revision: turn.revision, recordId: turn.sourceEventId, replayed: false };
     },
     async close() { return { bindingId, callSid: sid, state: 'closed' }; },
   } as unknown as PrimaryApiClient;
@@ -132,17 +179,19 @@ async function fixture(t: test.TestContext, overrides: { ambiguousDial?: boolean
       probe: async () => { counters.preflight++; await beforePreflight?.(); if (preflightFailure) throw new Error('Live unavailable'); return { model: 'gpt-live-1', audioBytes: 800, sessionId: 'fixture', finalized: true }; },
       voiceFactory: options => {
         counters.voice++;
+        voiceOptions = options;
         assert.ok(broker.store.get(options.callId)?.primary);
         queueMicrotask(() => options.onReady({ callId: options.callId, sessionId: 'fixture-hark-live' }));
         return {
-          appendAudio() { return true; },
+          appendAudio() { audioResolve(); return true; },
           async appendContext() { return { eventId: 'context', status: 'accepted' }; },
           async appendInstructions(text: string) {
             counters.opening++; openings.push(text); openingResolve(); return { eventId: 'opening', status: 'accepted' };
           },
           async interruptPlayback() { return { eventId: 'playback', status: 'accepted' }; },
-          resumePlayback() {}, getTranscript() { return { revision: 0, callerRevision: 0, fragments: [] }; },
+          resumePlayback() {}, getTranscript() { return structuredClone(snapshot); },
           async close(reason) {
+            voiceAbort.abort();
             const result = { callId: options.callId, sessionId: 'fixture-hark-live', finalized: true,
               transcriptPersisted: true, outputAudioDiscarded: false, reason: reason || 'closed' };
             options.onClosed(result); return result;
@@ -158,6 +207,20 @@ async function fixture(t: test.TestContext, overrides: { ambiguousDial?: boolean
   t.after(async () => { await broker.close(); api.closeAllConnections(); api.close(); fs.rmSync(directory, { recursive: true, force: true }); });
   return {
     config, sid, bindingId, directory, counters, apiRequests, savedBeforeDial, registered, openings, opening,
+    audioReceived, submissions, resultReads, updates, resultText,
+    async caller(text: string) {
+      assert.ok(voiceOptions, 'media session must exist before caller transcription');
+      snapshot = { revision: 1, callerRevision: 1, fragments: [
+        { eventId: 'hark-caller-source', role: 'user', text, startMs: 1, endMs: 20, sequence: 1 },
+      ] };
+      await voiceOptions.onTranscript(structuredClone(snapshot));
+      for (const listener of transcriptListeners) listener(structuredClone(snapshot));
+      return { callId: voiceOptions.callId, sessionId: 'fixture-hark-live', delegationId: 'hark-explicit-delegation',
+        requestId: 'live-hark-explicit-delegation', offsetMs: 20, transcript: structuredClone(snapshot) } satisfies LiveDelegationRequest;
+    },
+    async delegate(request: LiveDelegationRequest) {
+      assert.ok(voiceOptions); await voiceOptions.backend.delegate(structuredClone(request), channel);
+    },
     get broker() { return broker; }, get base() { return base; }, get resolved() { return resolved; },
     setReadiness(value: boolean) { readinessEligible = value; },
     setPreflightFailure(value: boolean) { preflightFailure = value; },
@@ -197,7 +260,7 @@ async function fixture(t: test.TestContext, overrides: { ambiguousDial?: boolean
   };
 }
 
-test('saved API assignment crosses durable reservation, provider create, signed answer and Primary registration', async t => {
+test('saved Hark assignment reaches raw caller delegation, Primary result and exact retry without another submit', async t => {
   const f = await fixture(t);
   const notification = f.notification();
   const result = await f.post(notification);
@@ -236,6 +299,33 @@ test('saved API assignment crosses durable reservation, provider create, signed 
   assert.equal(f.counters.voice, 1);
   assert.equal(f.counters.opening, 1);
   assert.ok(!f.openings[0].includes(notification.briefing));
+  ws.send(JSON.stringify({ event: 'media', streamSid: 'MZ' + '3'.repeat(32),
+    media: { track: 'inbound', payload: Buffer.alloc(160, 0).toString('base64') } }));
+  await f.audioReceived;
+  const rawCallerText = ' Please check the current price of that watched stock.\t';
+  const delegation = await f.caller(rawCallerText);
+  assert.equal(f.submissions.length, 0, 'caller transcription alone cannot submit a request');
+  await f.delegate(delegation);
+  assert.equal(f.submissions.length, 1);
+  const submitted = f.submissions[0];
+  const saved = f.broker.store.get(reply.intentId)!;
+  const entry = saved.delegations[submitted.requestId] as BrokerDelegationRecord;
+  assert.equal(submitted.input.text, rawCallerText);
+  assert.equal(submitted.input.source.callSid, f.sid);
+  assert.equal(submitted.input.source.revision, 1);
+  assert.deepEqual(submitted.input.callAssignmentRef, saved.primary!.callAssignmentRef);
+  assert.deepEqual(saved.callAssignment, { origin: 'authenticated_hark_delivery', value: f.resolved.callAssignment });
+  assert.equal(entry.status, 'completed');
+  assert.equal(entry.result, f.resultText);
+  assert.equal(entry.delivery, 'accepted');
+  assert.deepEqual(f.resultReads, [submitted.requestId]);
+  assert.ok(f.updates.some(update => update.kind === 'result' && update.text === f.resultText));
+  const frozenSubmission = structuredClone(entry.submission);
+  await f.delegate(delegation);
+  assert.equal(f.submissions.length, 1, 'exact delegation retry must not submit again');
+  const replay = f.broker.store.get(reply.intentId)!;
+  assert.equal(Object.keys(replay.delegations).length, 1);
+  assert.deepEqual((replay.delegations[submitted.requestId] as BrokerDelegationRecord).submission, frozenSubmission);
   ws.close();
   await new Promise<void>(resolve => ws.once('close', () => resolve()));
 });
@@ -359,6 +449,18 @@ test('registration refusal cannot start voice or replace the saved assignment', 
   assert.doesNotMatch(await answer.text(), /<Stream/);
   assert.equal(f.broker.store.get(call.id)?.status, 'failed');
   assert.equal(f.counters.voice, 0);
+  assert.deepEqual(f.broker.store.get(call.id)?.callAssignment, call.callAssignment);
+});
+
+test('mismatched Hark assignment reference cannot register voice or submit caller work', async t => {
+  const f = await fixture(t, { mismatchedAssignmentRef: true });
+  assert.equal((await f.post(f.notification())).status, 202);
+  const call = f.broker.store.list()[0];
+  const answer = await f.answer(call.id);
+  assert.doesNotMatch(await answer.text(), /<Stream/);
+  assert.equal(f.counters.voice, 0);
+  assert.equal(f.submissions.length, 0);
+  assert.equal(f.broker.store.get(call.id)?.primary, undefined);
   assert.deepEqual(f.broker.store.get(call.id)?.callAssignment, call.callAssignment);
 });
 
