@@ -259,7 +259,7 @@ export function createRestrictedSetupServer(options: RestrictedSetupServerOption
       if (reason === 'provider_terminal') await flow.recover(saved.verificationCallback.permit.request).catch(() => {});
       else await flow.stop(saved.verificationCallback.permit.request);
     } else if (saved.restrictedSetup) {
-      store.recordRestrictedSetup(call.id, stopRestrictedSetup(saved, new Date().toISOString()));
+      store.recordRestrictedSetup(call.id, stopRestrictedSetup(get(call.id), new Date().toISOString()));
       if (reason !== 'provider_terminal') await provider.calls(saved.callSid!).update({ status: 'completed' });
     }
     store.update(call.id, { endedAt: saved.endedAt ?? new Date().toISOString() });
