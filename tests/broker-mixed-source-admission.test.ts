@@ -14,7 +14,7 @@ import { beginBrokerPublication, beginSelectedQuestionPublication, settleBrokerP
 import { createRequestDeliveryJournal, retainRequestDeliveryAssociation, createRequestDeliveryQuestionRecord,
   PHONE_REQUEST_DELIVERY_VERSION } from '../src/broker/requestDelivery.js';
 import type { SelectedQuestionSeed } from '../src/broker/selectedQuestion.js';
-import { PrimaryApiError, type PrimaryQuestion, type PrimaryReplyInput, type PrimaryResult, type PrimarySubmission, type PrimaryTurn } from '../src/broker/primaryApi.js';
+import { PrimaryApiError, type PrimaryCall, type PrimaryQuestion, type PrimaryReplyInput, type PrimaryResult, type PrimarySubmission, type PrimaryTurn } from '../src/broker/primaryApi.js';
 import { rawSubmissionDigest, turnBodyDigest } from '../src/broker/reconciliation.js';
 import type { LiveBackendChannel, LiveDelegationRequest, LiveTranscriptSnapshot } from '../src/live/types.js';
 
@@ -35,9 +35,13 @@ async function fixture(t: TestContext, selectedResult = false) {
   let clock = Date.now(), sequence = 0;
   const assignmentRef = selectedResult ? { assignmentId: initial.requestId, revision: 1 as const, digest: 'c'.repeat(64) } : undefined;
   const snapshot: LiveTranscriptSnapshot = { revision: 0, callerRevision: 0, fragments: [] };
+  const binding: PrimaryCall = { bindingId, callSid, state: 'open',
+    context: { primaryDexterId: id(3), threadId: id(4), displayName: 'Dexter', messages: [] },
+    ...(assignmentRef ? { callAssignmentRef: assignmentRef } : {}) };
+  store.recordPrimaryBinding(initial.id, binding);
+  assert.deepEqual(store.get(initial.id)!.primary, { bindingId, name: 'Dexter', context: '',
+    primaryDexterId: id(3), threadId: id(4), ...(assignmentRef ? { callAssignmentRef: assignmentRef } : {}) });
   store.update(initial.id, { status: 'in-progress', liveSessionId: sessionId, mediaStartedAt: initial.createdAt,
-    primary: { bindingId, name: 'Dexter', context: '', primaryDexterId: id(3), threadId: id(4),
-      ...(assignmentRef ? { callAssignmentRef: assignmentRef } : {}) },
     liveGenerations: { version: 1, callId: initial.id, binding: { bindingId, callSid,
       ownerPrincipalId: id(2), primaryDexterId: id(3), threadId: id(4),
       ...(assignmentRef ? { callAssignmentRef: assignmentRef } : {}) },
