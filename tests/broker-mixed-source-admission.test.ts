@@ -137,14 +137,22 @@ async function fixture(t: TestContext, selectedResult = false) {
       }
       const current = store.get(initial.id)!;
       const rendering = { ...(update ?? { id: `result_${entry.requestId}_${entry.status}_${entry.currentQuestionId ?? 'none'}_${snapshot.callerRevision}_0`,
-        kind: 'result' as const, text: entry.result ?? 'Continue the comparison?' }), speak: true, expectedCallerRevision: snapshot.callerRevision };
+        kind: 'result' as const, text: entry.result ?? (entry.status === 'dispatch_unknown'
+          ? 'I am checking the saved request status.' : 'Continue the comparison?') }), speak: true, expectedCallerRevision: snapshot.callerRevision };
       const ordinaryDelivery: Parameters<typeof beginBrokerPublication>[5] = !update && entry.primaryResult?.state === 'completed'
         ? { chunkIndex: 0, response: { bindingId, callSid, requestId: entry.primaryResult.requestId, version,
           delivery: { state: 'ready', text: rendering.text, source: { kind: 'assistant', messageId: entry.primaryResult.assistant.messageId,
             eventSequence: entry.primaryResult.assistant.sequence, provenance: { messageCreatedAt: initial.createdAt,
               eventId: entry.primaryResult.assistant.eventId, eventOccurredAt: initial.createdAt, runId: id(7) } } } } } : undefined;
       const intent = beginBrokerPublication(store, { callId: current.id, callSid, bindingId, sessionId }, entry.requestId,
-        rendering, snapshot, ordinaryDelivery)!;
+        rendering, snapshot, ordinaryDelivery);
+      if (!intent) {
+        assert.equal(entry.status, 'dispatch_unknown', 'only the expected unknown submission may lack publication authority');
+        assert.equal(entry.primaryResult, undefined, 'unknown submission commentary must not claim a confirmed result');
+        commentary.push(rendering.text);
+        return { delivery: await channel.publish(rendering), sessionId, snapshot: structuredClone(snapshot),
+          inputThroughMs: snapshot.fragments.at(-1)?.endMs ?? 0, publicationReceipts: [] };
+      }
       const delivery = { eventId: `append_${intent.record.publicationSequence}`, status: 'accepted' as const,
         observedCallerRevision: snapshot.callerRevision,
         observedTranscriptSequence: Math.max(0, ...snapshot.fragments.map(fragment => fragment.sequence)) };
@@ -378,6 +386,8 @@ test('503 first submit and a later typed 409 GET retain unknown admission and ne
   h.hooks.submitError = associationError('associated_result_unavailable', 503);
   h.hooks.readError = associationError('delivery_association_mismatch');
   const task = h.route('Research the company in that result.', { kind: 'task', contextReference: offeredReference }, [], [offeredReference]);
+  const publications = structuredClone(h.store.get(h.callId)!.publications);
+  const candidates = callerIntentResultPublicationCandidates(h.store.get(h.callId)!, h.sessionId);
   await h.backend.delegateFrozenTask(task.request, task.ref, h.channel);
   h.advance(11_000);
   await h.backend.delegateFrozenTask(task.request, task.ref, h.channel);
@@ -385,13 +395,27 @@ test('503 first submit and a later typed 409 GET retain unknown admission and ne
   assert.equal(h.posts.length, 1); assert.ok(h.reads.length > 0);
   assert.equal(h.entries()[0].status, 'dispatch_unknown'); assert.equal(h.entries()[0].admissionRefusal, undefined);
   assert.equal(h.entries()[0].submitError?.status, 503); assert.equal(h.entries()[0].lastResultReadError?.status, 409);
+  assert.equal(h.entries()[0].primaryResult, undefined);
+  assert.equal(h.posts[0].text, task.frozen.turn.text); assert.equal(h.posts[0].source.sourceEventId, task.frozen.turn.sourceEventId);
+  assert.deepEqual(h.store.get(h.callId)!.publications, publications, 'unknown recovery must preserve the entire prior publication journal');
+  assert.deepEqual(callerIntentResultPublicationCandidates(h.store.get(h.callId)!, h.sessionId), candidates,
+    'local status commentary must not add result reference authority');
+  assert.ok(h.commentary.includes('I am checking the saved request status.'), 'unknown submission must emit the fixed local status');
 });
 
 test('the associated refusal rule cannot narrow an ordinary first-submit 409', async t => {
   const h = await fixture(t); h.hooks.submitError = associationError('delivery_association_mismatch');
   const task = h.route('Research AMD.', { kind: 'task' });
+  const publications = structuredClone(h.store.get(h.callId)!.publications);
+  const candidates = callerIntentResultPublicationCandidates(h.store.get(h.callId)!, h.sessionId);
   await h.backend.delegateFrozenTask(task.request, task.ref, h.channel);
   assert.equal(h.entries()[0].status, 'dispatch_unknown'); assert.equal(h.entries()[0].admissionRefusal, undefined);
+  assert.equal(h.posts.length, 1); assert.equal(h.entries()[0].primaryResult, undefined);
+  assert.equal(h.posts[0].text, task.frozen.turn.text); assert.equal(h.posts[0].source.sourceEventId, task.frozen.turn.sourceEventId);
+  assert.deepEqual(h.store.get(h.callId)!.publications, publications, 'ordinary unknown admission must not create a publication record');
+  assert.deepEqual(callerIntentResultPublicationCandidates(h.store.get(h.callId)!, h.sessionId), candidates,
+    'ordinary unknown admission must not acquire result reference authority');
+  assert.ok(h.commentary.includes('I am checking the saved request status.'), 'unknown submission must emit the fixed local status');
 });
 
 test('a refused associated task allows the already queued ordinary successor to dispatch once', async t => {
