@@ -194,6 +194,9 @@ test('HTTP identity mismatch refuses, malformed success stays pending, and exact
 test('store refuses removal, manual delivery mutation, changed terminal answer, or receipts without a saved outcome', async t => {
   const f = fixture(t); await f.recover();
   const original = f.store.get(f.call.id)!;
+  const file = path.join(f.directory, 'calls.json');
+  const persistedBytes = fs.readFileSync(file, 'utf8');
+  const persistedCall = JSON.parse(persistedBytes).calls[f.call.id];
   assert.throws(() => f.store.update(f.call.id, { harkReceiptOutbox: undefined }), /cannot be removed/);
   const box = structuredClone(original.harkReceiptOutbox!);
   Object.values(box.entries)[0]!.attempts++;
@@ -205,7 +208,9 @@ test('store refuses removal, manual delivery mutation, changed terminal answer, 
   assert.throws(() => f.store.update(f.call.id, { delegations: changed }), /terminal result cannot change/);
   assert.throws(() => f.store.update(f.call.id, { delegations: {} }), /saved completed request/);
   assert.deepEqual(f.store.get(f.call.id), original);
-  f.restart(); assert.deepEqual(f.store.get(f.call.id), original);
+  assert.equal(fs.readFileSync(file, 'utf8'), persistedBytes);
+  f.restart(); assert.deepEqual(f.store.get(f.call.id), persistedCall);
+  assert.equal(fs.readFileSync(file, 'utf8'), persistedBytes);
 });
 
 test('restart rejects a persisted receipt whose binding no longer matches the saved call', async t => {

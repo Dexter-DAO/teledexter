@@ -71,7 +71,7 @@ test('successor registration/context crosses actual HTTP with negotiated full me
   assert.throws(() => createPrimaryApiClient({ ...options, contextProtocol: { version: 'unknown', parse: value => value } } as never));
 });
 
-async function host(t: test.TestContext, slowClose = false, questionMode = false) {
+async function host(t: test.TestContext, slowClose = false, questionMode = false, boundedCleanup = false) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-generation-server-'));
   const config: BrokerConfig = { host: '127.0.0.1', port: 3213, publicOrigin: 'https://phone.example.test', stateDir: directory,
     controlToken: 'c'.repeat(40), apiKey: 'fixture-key', model: 'gpt-live-1', voice: 'marin',
@@ -171,7 +171,15 @@ async function host(t: test.TestContext, slowClose = false, questionMode = false
     customParameters: { token: streamToken(config.controlToken, reserved.id, sid) },
     mediaFormat: { encoding: 'audio/x-mulaw', sampleRate: 8000, channels: 1 } } }));
   await until(() => store.get(reserved.id)?.liveGenerations?.phase === 'active');
-  t.after(async () => { finishQuestion?.(); finishSlowClose?.(); ws.terminate(); await broker.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  t.after(async () => {
+    finishQuestion?.(); finishSlowClose?.(); ws.terminate();
+    const closing = broker.close();
+    if (boundedCleanup) {
+      const cleanup = observedWork(closing);
+      await boundary('broker cleanup', cleanup.settled, [cleanup]);
+    } else await closing;
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
   const audio = (silent = false) => ws.send(JSON.stringify({ event: 'media', streamSid, media: { track: 'inbound', payload: Buffer.alloc(160, silent ? 255 : 0).toString('base64') } }));
   const delegate = async (index = 0) => {
     audio(); await until(() => voices[index]!.inputs.length > 0);
@@ -285,57 +293,126 @@ test('generation host resumes the saved sample clock and preserves the original 
 });
 
 
-async function preparedFollowup(f: Awaited<ReturnType<typeof host>>) {
+function observedWork(work: Promise<void>) {
+  let settled = false, failed = false;
+  let failure: unknown;
+  void work.then(() => { settled = true; }, error => { settled = true; failed = true; failure = error; });
+  return { settled: () => settled, check() { if (failed) throw failure; } };
+}
+
+async function boundary(label: string, predicate: () => boolean, work: ReturnType<typeof observedWork>[], limit = 6000) {
+  const end = Date.now() + limit;
+  for (;;) {
+    for (const operation of work) operation.check();
+    if (predicate()) return;
+    assert.ok(Date.now() < end, `timed out waiting for ${label}`);
+    await wait(10);
+  }
+}
+
+async function preparedFollowup(f: Awaited<ReturnType<typeof host>>, work: ReturnType<typeof observedWork>[]) {
   const first = f.voices[0]!;
   for (let index = 0; index < 69; index++) f.audio(true);
-  f.audio(); await until(() => first.inputs.length === 71);
+  f.audio(); await boundary('follow-up audio', () => first.inputs.length === 71, work);
   first.captions.revision = 2; first.captions.callerRevision = 2;
   first.captions.fragments.push({ eventId: 'explicit_followup', role: 'user', text: ' Then compare Apple.', startMs: 1400, endMs: 1420, sequence: 2 });
   first.options.onTranscript(first.captions);
-  return () => first.options.backend.delegate({ callId: f.callId, sessionId: 'generation_1', delegationId: 'followup',
-    requestId: 'provider_followup', offsetMs: 1420, transcript: structuredClone(first.captions) }, first.channel);
+  const snapshot = structuredClone(first.captions);
+  const listeners = new Set<(snapshot: LiveTranscriptSnapshot) => void>();
+  let entered = false, released = false;
+  // Only this delegation sees delayed captions. The original worker keeps its
+  // normal channel, so its stable result observation can trigger replacement.
+  const channel: LiveBackendChannel = { ...first.channel,
+    getContext: () => released ? structuredClone(snapshot) : { revision: 0, callerRevision: 0, fragments: [] },
+    subscribeContext(listener) {
+      entered = true; listeners.add(listener);
+      return () => { listeners.delete(listener); };
+    },
+  };
+  return {
+    start: () => first.options.backend.delegate({ callId: f.callId, sessionId: 'generation_1', delegationId: 'followup',
+      requestId: 'provider_followup', offsetMs: 1420, transcript: structuredClone(snapshot) }, channel),
+    entered: () => entered,
+    pending: () => entered && !released && listeners.size > 0,
+    release() {
+      if (released) return;
+      released = true;
+      for (const listener of listeners) listener(structuredClone(snapshot));
+    },
+  };
 }
 
 test('actual host retains the old follow-up admission while a delayed fresh-context fetch buffers only unsent audio', async t => {
-  const f = await host(t); const work = f.delegate(); await until(() => f.posts.length === 1);
-  const original = structuredClone(f.posts[0]); const startFollowup = await preparedFollowup(f);
-  const fetch = f.eligible.fetch;
-  let releaseFetch!: () => void;
-  const fetching = new Promise<void>(resolve => { releaseFetch = resolve; });
-  f.eligible.fetch = async scope => { await fetching; return fetch(scope); };
-  let next: Promise<void> | undefined;
-  f.release(() => { next = startFollowup(); });
-  await until(() => f.store.get(f.callId)!.liveGenerations!.phase === 'replacing');
-  assert.equal(f.voices[0]!.closed.length, 0, 'source admission still owns the old transcript');
-  const before = f.store.get(f.callId)!.liveGenerations!.inputNextSample;
-  f.audio(true); await until(() => f.store.get(f.callId)!.liveGenerations!.inputNextSample === before + 160);
-  assert.equal(f.voices[0]!.inputs.length, 71, 'new frame remains buffered after the barrier');
-  releaseFetch();
-  await until(() => f.posts.length === 2 && f.voices.length === 2);
-  await Promise.all([work, next]);
-  assert.deepEqual(f.posts[0], original); assert.equal(f.posts[1]!.input.text, ' Then compare Apple.');
-  assert.notEqual(f.posts[1]!.input.source.sourceEventId, original.input.source.sourceEventId);
-  assert.equal(f.voices[1]!.inputs.length, 1); assert.equal(f.voices[1]!.inputs[0], Buffer.alloc(160, 255).toString('base64'));
-  assert.equal(f.providerEnds(), 0); assert.equal(f.opening.length, 1);
-  assert.equal(f.store.get(f.callId)!.liveGenerations!.inputNextSample, before + 160);
+  const f = await host(t, false, false, true);
+  const work = [observedWork(f.delegate())];
+  let followup: Awaited<ReturnType<typeof preparedFollowup>> | undefined;
+  let releaseFetch = () => {};
+  try {
+    await boundary('original submission', () => f.posts.length === 1, work);
+    const original = structuredClone(f.posts[0]!);
+    followup = await preparedFollowup(f, work);
+    const next = observedWork(followup.start()); work.push(next);
+    await boundary('pending follow-up caption observation', followup.entered, work);
+    assert.equal(followup.pending(), true); assert.equal(next.settled(), false); assert.equal(f.posts.length, 1);
+    const fetch = f.eligible.fetch;
+    const fetching = new Promise<void>(resolve => { releaseFetch = resolve; });
+    let fetchEntered = false;
+    f.eligible.fetch = async scope => { fetchEntered = true; await fetching; return fetch(scope); };
+    f.release();
+    await boundary('replacement fetch', () => fetchEntered && f.store.get(f.callId)!.liveGenerations!.phase === 'replacing', work);
+    assert.equal(followup.pending(), true, 'caption observation still holds source admission');
+    assert.equal(next.settled(), false); assert.equal(f.posts.length, 1);
+    assert.equal(f.voices[0]!.closed.length, 0, 'source admission still owns the old transcript');
+    const before = f.store.get(f.callId)!.liveGenerations!.inputNextSample;
+    f.audio(true);
+    await boundary('buffered audio', () => f.store.get(f.callId)!.liveGenerations!.inputNextSample === before + 160, work);
+    assert.equal(f.voices[0]!.inputs.length, 71, 'new frame remains buffered after the barrier');
+    followup.release();
+    await boundary('follow-up submission and old source retirement', () => f.posts.length === 2 && f.voices[0]!.closed.length === 1, work);
+    releaseFetch();
+    await boundary('replacement attachment', () => f.voices.length === 2 && f.voices[1]!.inputs.length === 1, work);
+    await boundary('both saved results', () => work.every(operation => operation.settled()), work);
+    assert.deepEqual(f.posts[0], original); assert.equal(f.posts[1]!.input.text, ' Then compare Apple.');
+    assert.notEqual(f.posts[1]!.input.source.sourceEventId, original.input.source.sourceEventId);
+    const saved = f.store.get(f.callId)!.delegations[f.posts[1]!.requestId] as BrokerDelegationRecord;
+    assert.equal(saved.sessionId, 'generation_1'); assert.deepEqual(saved.submission, f.posts[1]!.input);
+    assert.equal(saved.status, 'completed'); assert.ok(f.voices[1]!.spoken.join('').includes(f.eligibleText));
+    assert.equal(f.voices[1]!.inputs[0], Buffer.alloc(160, 255).toString('base64'));
+    assert.equal(f.providerEnds(), 0); assert.equal(f.opening.length, 1);
+    assert.equal(f.store.get(f.callId)!.liveGenerations!.inputNextSample, before + 160);
+  } finally { followup?.release(); releaseFetch(); }
 });
 
-test('actual call stop cancels an admission drain before the stability interval or result observation ends', async t => {
-  const f = await host(t); const work = f.delegate(); await until(() => f.posts.length === 1);
-  const startFollowup = await preparedFollowup(f); let next: Promise<void> | undefined;
-  const fetch = f.eligible.fetch;
-  let releaseFetch!: () => void;
-  const fetching = new Promise<void>(resolve => { releaseFetch = resolve; });
-  f.eligible.fetch = async scope => { await fetching; return fetch(scope); };
-  f.release(() => { next = startFollowup(); });
-  await until(() => f.store.get(f.callId)!.liveGenerations!.phase === 'replacing');
-  assert.equal(f.voices[0]!.closed.length, 0);
-  f.ws.close(); await until(() => f.providerEnds() === 1);
-  releaseFetch();
-  assert.ok(f.store.get(f.callId)!.endedAt);
-  await Promise.allSettled([work, next]);
-  assert.equal(f.posts.length, 1, 'ending the actual call prevents a new source submission');
-  assert.equal(f.voices.length, 1, 'stop does not wait to start another provider generation');
+test('actual call stop cancels an admission drain while follow-up captions and replacement fetch are held', async t => {
+  const f = await host(t, false, false, true);
+  const work = [observedWork(f.delegate())];
+  let followup: Awaited<ReturnType<typeof preparedFollowup>> | undefined;
+  let releaseFetch = () => {};
+  try {
+    await boundary('original submission', () => f.posts.length === 1, work);
+    followup = await preparedFollowup(f, work);
+    const next = observedWork(followup.start()); work.push(next);
+    await boundary('pending follow-up caption observation', followup.entered, work);
+    assert.equal(followup.pending(), true); assert.equal(next.settled(), false); assert.equal(f.posts.length, 1);
+    const fetch = f.eligible.fetch;
+    const fetching = new Promise<void>(resolve => { releaseFetch = resolve; });
+    let fetchEntered = false;
+    f.eligible.fetch = async scope => { fetchEntered = true; await fetching; return fetch(scope); };
+    f.release();
+    await boundary('replacement fetch', () => fetchEntered && f.store.get(f.callId)!.liveGenerations!.phase === 'replacing', work);
+    assert.equal(followup.pending(), true, 'source admission remains unresolved before stop');
+    assert.equal(next.settled(), false); assert.equal(f.posts.length, 1); assert.equal(f.voices[0]!.closed.length, 0);
+    f.ws.close();
+    // Stop may reject the interrupted work. Observe its settlement without
+    // treating an expected cancellation as a failed pre-stop boundary.
+    await boundary('provider hangup and source cancellation', () => f.providerEnds() === 1 && next.settled(), []);
+    assert.ok(f.store.get(f.callId)!.endedAt);
+    assert.equal(f.voices[0]!.closed.length, 1); assert.equal(followup.pending(), false);
+    followup.release(); releaseFetch();
+    await boundary('stopped result observation', () => work.every(operation => operation.settled()), []);
+    assert.equal(f.posts.length, 1, 'ending the actual call prevents a new source submission');
+    assert.equal(f.voices.length, 1, 'stop does not wait to start another provider generation');
+  } finally { followup?.release(); releaseFetch(); }
 });
 
 test('late question-chunk rejection crosses actual host callbacks and forces a different publication attempt', async t => {

@@ -24,6 +24,30 @@ const sid = `CA${'a'.repeat(32)}`;
 const owner = uuid(2), primary = uuid(3), thread = uuid(4), binding = uuid(5), request = uuid(6), questionId = uuid(7);
 const session = 'selected_initial', nextSession = 'selected_successor';
 const continuation = { originalRequestId: request, questionId, questionRevision: 1 as const };
+const WAIT_MS = 3_000;
+function deferred<T>() {
+  let resolve!: (value: T) => void, reject!: (error: Error) => void;
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+  void promise.catch(() => {});
+  return { promise, resolve, reject };
+}
+function observe<T>(work: Promise<T>) {
+  return work.then(value => ({ state: 'fulfilled' as const, value }), error => ({ state: 'rejected' as const, error }));
+}
+async function bounded<T>(work: Promise<T>, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([work, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`Fixture wait timed out: ${label}`)), WAIT_MS);
+    })]);
+  } finally { clearTimeout(timer); }
+}
+function milestone<T>(entered: Promise<T>, work: ReturnType<typeof observe>, label: string): Promise<T> {
+  return bounded(Promise.race([entered, work.then(outcome => {
+    if (outcome.state === 'rejected') throw outcome.error;
+    throw new Error(`Operation completed before fixture milestone: ${label}`);
+  })]), label);
+}
 
 function fixture(t: TestContext, options: { admitted?: boolean; generation?: boolean; owner?: boolean; expired?: boolean } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-selected-question-store-'));
@@ -284,22 +308,30 @@ test('new answers require the current source session while original question ide
   assert.deepEqual(f.restart().get(f.call.id)!.selectedQuestion, saved);
 });
 
-test('call stop permits the already-admitted raw capture acknowledgement but no reply dispatch', async t => {
-  const f = fixture(t), options = hostOptions(f); let release!: (value: PrimaryTurnReceipt) => void;
-  let entered!: (value: PrimaryTurn) => void; const captured = new Promise<PrimaryTurn>(resolve => { entered = resolve; });
+test('call stop permits the already-admitted raw capture acknowledgement but no reply dispatch', { timeout: 9_000 }, async t => {
+  const f = fixture(t), options = hostOptions(f);
+  const captured = deferred<PrimaryTurn>(), release = deferred<PrimaryTurnReceipt>();
   let posts = 0;
-  options.capture = async (_id, turn) => { entered(turn); return new Promise<PrimaryTurnReceipt>(resolve => { release = resolve; }).then(receipt => saveCapture(f, turn, receipt)); };
+  options.capture = async (_id, turn) => { captured.resolve(turn); return release.promise.then(receipt => saveCapture(f, turn, receipt)); };
   options.requests.reply = async journal => { posts++; return response(journal, 'answered'); };
-  const host = createSelectedQuestionHost(options); await host.start();
-  const input = qualifiedAnswer(f), work = host.answer(input), turn = await captured;
-  f.store().update(f.call.id, { status: 'completed', endedAt: new Date().toISOString() }); host.stop();
-  release(captureReceipt(turn)); await work;
-  const saved = f.store().get(f.call.id)!.selectedQuestion!;
-  assert.equal(posts, 0); assert.deepEqual(saved.questions[0]!.admissions[0]!.answer, input);
-  assert.equal(saved.questions[0]!.admissions[0]!.captured!.reply!.input.text, input.input.text);
-  assert.equal(saved.questions[0]!.admissions[0]!.localRefusal!.code, 'call_ended');
-  assert.equal(saved.questions[0]!.record!.attempts.length, 0);
-  assert.deepEqual(f.restart().get(f.call.id)!.selectedQuestion, saved);
+  const host = createSelectedQuestionHost(options); await bounded(host.start(), 'host start before capture');
+  const input = qualifiedAnswer(f), work = host.answer(input), outcome = observe(work);
+  try {
+    const turn = await milestone(captured.promise, outcome, 'capture entered');
+    f.store().update(f.call.id, { status: 'completed', endedAt: new Date().toISOString() }); host.stop();
+    release.resolve(captureReceipt(turn)); await bounded(work, 'stopped capture settlement');
+    const saved = f.store().get(f.call.id)!.selectedQuestion!;
+    assert.equal(posts, 0); assert.deepEqual(saved.questions[0]!.admissions[0]!.answer, input);
+    assert.equal(saved.questions[0]!.admissions[0]!.captured!.reply!.input.text, input.input.text);
+    assert.equal(saved.questions[0]!.admissions[0]!.localRefusal!.code, 'call_ended');
+    assert.equal(saved.questions[0]!.record!.attempts.length, 0);
+    assert.deepEqual(f.restart().get(f.call.id)!.selectedQuestion, saved);
+  } finally {
+    try { host.stop(); } finally {
+      release.reject(new Error('fixture cleanup'));
+      await bounded(outcome, 'capture cleanup settlement');
+    }
+  }
 });
 
 test('an uncertain dispatched reply may reconcile after call stop and restart without another POST', async t => {
@@ -485,24 +517,32 @@ test('ordinary call journals retain absent selected evidence and exact bytes on 
 });
 
 
-test('store blocks a prepared first dispatch if a question chunk is rejected during its fresh read', async t => {
-  const f = fixture(t), options = hostOptions(f); let release!: (value: RequestDeliveryQuestionResult) => void;
-  let read!: () => void; const entered = new Promise<void>(resolve => { read = resolve; });
-  options.requests.question = async () => { read(); return new Promise(resolve => { release = resolve; }); };
+test('store blocks a prepared first dispatch if a question chunk is rejected during its fresh read', { timeout: 9_000 }, async t => {
+  const f = fixture(t), options = hostOptions(f);
+  const release = deferred<RequestDeliveryQuestionResult>(), entered = deferred<void>();
+  options.requests.question = async () => { entered.resolve(); return release.promise; };
   // The durable store is the final guard even if a host callback is permissive.
   options.admittedReplyIsValid = () => true;
   let posts = 0; options.requests.reply = async journal => { posts++; return response(journal, 'answered'); };
-  const host = createSelectedQuestionHost(options); await host.start();
-  const input = qualifiedAnswer(f), work = host.answer(input); await entered;
-  const call = f.store().get(f.call.id)!, slot = call.selectedQuestion!.questions[0]!;
-  const presentation = call.selectedQuestionVoice!.presentations.at(-1)!;
-  assert.ok(slot.admissions[0]!.captured); assert.ok(call.selectedQuestionVoice!.sources[0]!.capture);
-  rejectBrokerPublication(f.store(), { callId: call.id, callSid: sid, bindingId: binding, sessionId: session },
-    presentation.publicationReceipts[0]!.eventId, 'append_refused');
-  release(response(slot.admissions[0]!.captured!));
-  await assert.rejects(work, /dispatch requires captured source and accepted publications/);
-  assert.equal(posts, 0);
-  assert.equal(f.store().get(f.call.id)!.selectedQuestion!.questions[0]!.record!.attempts[0]!.dispatches, 0);
+  const host = createSelectedQuestionHost(options); await bounded(host.start(), 'host start before question read');
+  const input = qualifiedAnswer(f), work = host.answer(input), outcome = observe(work);
+  try {
+    await milestone(entered.promise, outcome, 'question read entered');
+    const call = f.store().get(f.call.id)!, slot = call.selectedQuestion!.questions[0]!;
+    const presentation = call.selectedQuestionVoice!.presentations.at(-1)!;
+    assert.ok(slot.admissions[0]!.captured); assert.ok(call.selectedQuestionVoice!.sources[0]!.capture);
+    rejectBrokerPublication(f.store(), { callId: call.id, callSid: sid, bindingId: binding, sessionId: session },
+      presentation.publicationReceipts[0]!.eventId, 'append_refused');
+    release.resolve(response(slot.admissions[0]!.captured!));
+    await assert.rejects(bounded(work, 'rejected question settlement'), /dispatch requires captured source and accepted publications/);
+    assert.equal(posts, 0);
+    assert.equal(f.store().get(f.call.id)!.selectedQuestion!.questions[0]!.record!.attempts[0]!.dispatches, 0);
+  } finally {
+    try { host.stop(); } finally {
+      release.reject(new Error('fixture cleanup'));
+      await bounded(outcome, 'question read cleanup settlement');
+    }
+  }
 });
 
 test('selected completed-result publication keeps original execution and current delivery without a new run', async t => {

@@ -20,6 +20,15 @@ const receipt = (turn: PrimaryTurn): PrimaryTurnReceipt => ({ bindingId, sourceE
 async function fixture(t: TestContext) {
   const directory = await mkdtemp(path.join(tmpdir(), 'broker-selected-freezer-'));
   let store = new BrokerStore(directory);
+  const controller = new AbortController(), abort = () => controller.abort();
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; abort(); }, 3_000);
+  t.signal.addEventListener('abort', abort, { once: true });
+  t.after(async () => {
+    clearTimeout(timer); t.signal.removeEventListener('abort', abort); controller.abort();
+    try { store.close(); } finally { await rm(directory, { recursive: true, force: true }); }
+    assert.equal(timedOut, false, 'Fixture exceeded its 3s lifetime');
+  });
   const call = store.reserve({ requestId: 'selected-freezer-fixture', direction: 'inbound', number: '+15550000001', purpose: '', callSid }).call;
   store.recordPrimaryBinding(call.id, { bindingId, callSid, state: 'open', context: { primaryDexterId, threadId, displayName: 'Dexter', messages: [] } });
   store.update(call.id, { status: 'in-progress', mediaStartedAt: call.createdAt, liveSessionId: sessionId,
@@ -29,7 +38,6 @@ async function fixture(t: TestContext) {
       segments: [{ generationId: uuid(6), ordinal: 1, sessionId, createdAt: call.createdAt, readyAt: call.createdAt,
         state: 'active', version, pageDigest: 'b'.repeat(64), inputFirstSample: 0, inputLastSampleExclusive: 0,
         transcript: { revision: 0, callerRevision: 0, fragments: [] }, outputDiscarded: false }] } });
-  const controller = new AbortController();
   const snapshot: LiveTranscriptSnapshot = { revision: 0, callerRevision: 0, fragments: [] };
   const listeners = new Set<(value: LiveTranscriptSnapshot) => void>();
   let sources: SelectedQuestionSourceAnchor[] = [];
@@ -67,7 +75,6 @@ async function fixture(t: TestContext) {
   };
   const request = (offsetMs = 100): LiveDelegationRequest => ({ callId: call.id, sessionId: store.get(call.id)!.liveSessionId!,
     delegationId: 'explicit_answer', requestId: 'explicit_answer_request', offsetMs, transcript: structuredClone(snapshot) });
-  t.after(async () => { controller.abort(); store.close(); await rm(directory, { recursive: true, force: true }); });
   return { call, add, speech, request, channel, controller, posts, captures,
     backend: () => backend, create, store: () => store, setSources(value: SelectedQuestionSourceAnchor[]) { sources = structuredClone(value); },
     sources: () => structuredClone(sources), snapshot: () => structuredClone(snapshot),
@@ -76,7 +83,7 @@ async function fixture(t: TestContext) {
   };
 }
 
-test('actual backend freezer preserves raw text and source clock without HTTP or a journalled ordinary request', async t => {
+test('actual backend freezer preserves raw text and source clock without HTTP or a journalled ordinary request', { timeout: 6_000 }, async t => {
   const h = await fixture(t); h.add('  Yes, compare both.\t'); h.speech();
   const before = await h.disk();
   const frozen = await h.backend().freezeCallerTurn(h.request(), h.channel, []);
@@ -87,13 +94,13 @@ test('actual backend freezer preserves raw text and source clock without HTTP or
   assert.deepEqual(await h.disk(), before); assert.deepEqual(h.posts, []); assert.deepEqual(h.captures, []);
 });
 
-test('selected port refuses the ordinary delegate path before any new Primary run', async t => {
+test('selected port refuses the ordinary delegate path before any new Primary run', { timeout: 6_000 }, async t => {
   const h = await fixture(t); h.add('Hello'); h.speech();
   await assert.rejects(h.backend().delegate(h.request(), h.channel), /selected_question_requires_answer_port/);
   assert.deepEqual(h.posts, []); assert.deepEqual((await h.disk()).delegations, {});
 });
 
-test('ordinary admission uses the same extracted candidate and preserves its raw submission', async t => {
+test('ordinary admission uses the same extracted candidate and preserves its raw submission', { timeout: 6_000 }, async t => {
   const h = await fixture(t); h.add('  Please compare NVIDIA and Apple.\n'); h.speech();
   const frozen = await h.backend().freezeCallerTurn(h.request(), h.channel, []); assert.ok(frozen);
   h.backend().persistAcousticEvidence();
@@ -104,7 +111,7 @@ test('ordinary admission uses the same extracted candidate and preserves its raw
   assert.equal(input.source.revision, 1); assert.equal(input.callAssignmentRef, undefined);
 });
 
-test('two completed caller groups choose the explicitly delegated group and preserve earlier accepted source', async t => {
+test('two completed caller groups choose the explicitly delegated group and preserve earlier accepted source', { timeout: 6_000 }, async t => {
   const h = await fixture(t); h.add('Yes.', 25, 200); h.speech();
   const first = await h.backend().freezeCallerTurn(h.request(), h.channel, []); assert.ok(first);
   h.setSources([{ frozen: first, capture: receipt(first.turn), replyPending: false }]);
@@ -115,7 +122,7 @@ test('two completed caller groups choose the explicitly delegated group and pres
   assert.deepEqual(h.sources()[0]!.frozen, first);
 });
 
-test('later caption extension retains its accepted source and cannot create another answer', async t => {
+test('later caption extension retains its accepted source and cannot create another answer', { timeout: 6_000 }, async t => {
   const h = await fixture(t); h.add('Yes.', 25, 200); h.speech();
   const frozen = await h.backend().freezeCallerTurn(h.request(), h.channel, []); assert.ok(frozen);
   h.setSources([{ frozen, capture: receipt(frozen.turn), replyPending: false }]);
@@ -124,7 +131,7 @@ test('later caption extension retains its accepted source and cannot create anot
   assert.equal(h.sources()[0]!.frozen.turn.text, 'Yes.');
 });
 
-test('accepted original capture prevents duplicate revision1 and later final text becomes revision2', async t => {
+test('accepted original capture prevents duplicate revision1 and later final text becomes revision2', { timeout: 6_000 }, async t => {
   const h = await fixture(t); h.add('Yes.', 25, 200); h.speech();
   const frozen = await h.backend().freezeCallerTurn(h.request(), h.channel, []); assert.ok(frozen);
   h.setSources([{ frozen, capture: receipt(frozen.turn), replyPending: false }]);
@@ -137,7 +144,7 @@ test('accepted original capture prevents duplicate revision1 and later final tex
   assert.deepEqual(h.sources()[0]!.frozen, frozen); assert.deepEqual(h.posts, []);
 });
 
-test('unresolved selected reply or missing raw capture ACK blocks final source revision and closeout', async t => {
+test('unresolved selected reply or missing raw capture ACK blocks final source revision and closeout', { timeout: 6_000 }, async t => {
   const h = await fixture(t); h.add('Yes.', 25, 200); h.speech();
   const frozen = await h.backend().freezeCallerTurn(h.request(), h.channel, []); assert.ok(frozen);
   h.setSources([{ frozen, capture: receipt(frozen.turn), replyPending: true }]);
@@ -150,7 +157,7 @@ test('unresolved selected reply or missing raw capture ACK blocks final source r
   assert.equal(h.captures.length, 0);
 });
 
-test('restart uses persisted acoustic source evidence and skips an already acknowledged selected answer', async t => {
+test('restart uses persisted acoustic source evidence and skips an already acknowledged selected answer', { timeout: 6_000 }, async t => {
   const h = await fixture(t); h.add('Yes.'); h.speech();
   const frozen = await h.backend().freezeCallerTurn(h.request(), h.channel, []); assert.ok(frozen);
   h.setSources([{ frozen, capture: receipt(frozen.turn), replyPending: false }]); h.restart();
@@ -159,7 +166,7 @@ test('restart uses persisted acoustic source evidence and skips an already ackno
   assert.equal(h.captures.length, 0); assert.equal(h.backend().closeoutPending(), 0);
 });
 
-test('caller audio is required but noise bursts are not counted as transcript identities', async t => {
+test('caller audio is required but noise bursts are not counted as transcript identities', { timeout: 6_000 }, async t => {
   const h = await fixture(t); h.add('Yes.');
   assert.equal(await h.backend().freezeCallerTurn(h.request(), h.channel, []), undefined);
   h.speech(100); h.speech(200); h.speech(300);
@@ -167,7 +174,7 @@ test('caller audio is required but noise bursts are not counted as transcript id
   assert.ok(frozen); assert.equal(frozen.turn.text, 'Yes.'); assert.equal(frozen.firstEventId, 'caption_1');
 });
 
-test('abort and call stop refuse a source freeze without a new request or capture', async t => {
+test('abort and call stop refuse a source freeze without a new request or capture', { timeout: 6_000 }, async t => {
   const h = await fixture(t); h.add('Yes.'); h.speech(); h.controller.abort();
   assert.equal(await h.backend().freezeCallerTurn(h.request(), h.channel, []), undefined);
   assert.deepEqual(h.posts, []); assert.deepEqual(h.captures, []);
@@ -177,7 +184,7 @@ test('abort and call stop refuse a source freeze without a new request or captur
   assert.deepEqual(next.posts, []); assert.deepEqual(next.captures, []);
 });
 
-test('foreign call/session and changed selected capture identity refuse before execution', async t => {
+test('foreign call/session and changed selected capture identity refuse before execution', { timeout: 6_000 }, async t => {
   const h = await fixture(t); h.add('Yes.'); h.speech();
   await assert.rejects(h.backend().freezeCallerTurn({ ...h.request(), callId: uuid(99) }, h.channel, []), /identity_mismatch/);
   await assert.rejects(h.backend().freezeCallerTurn({ ...h.request(), sessionId: 'foreign' }, h.channel, []), /identity_mismatch/);

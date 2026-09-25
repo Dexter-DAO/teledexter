@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test, { type TestContext } from 'node:test';
+import { writeSync } from 'node:fs';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
@@ -40,6 +41,31 @@ async function until(predicate: () => boolean) {
   }
   assert.ok(predicate(), 'expected bounded backend transition was not reached');
 }
+async function boundedStep<T>(label: string, work: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([work, new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(`Generation fixture step timed out: ${label}`)), 2000);
+    })]);
+  } finally { clearTimeout(timer); }
+}
+type Diagnostic = (stage: string, event: 'before' | 'after' | 'rejected') => void;
+function diagnosticSync<T>(diagnostic: Diagnostic | undefined, stage: string, start: () => T): T {
+  diagnostic?.(stage, 'before');
+  try {
+    const value = start(); diagnostic?.(stage, 'after'); return value;
+  } catch (error) { diagnostic?.(stage, 'rejected'); throw error; }
+}
+function diagnosticAwait<T>(diagnostic: Diagnostic | undefined, stage: string, start: () => Promise<T>): Promise<T> {
+  if (!diagnostic) return start();
+  diagnostic(stage, 'before');
+  let work: Promise<T>;
+  try { work = start(); }
+  catch (error) { diagnostic(stage, 'rejected'); throw error; }
+  return work.then(value => { diagnostic(stage, 'after'); return value; }, error => {
+    diagnostic(stage, 'rejected'); throw error;
+  });
+}
 function voiceContext(sessionId: string) {
   const controller = new AbortController();
   const listeners = new Set<(snapshot: LiveTranscriptSnapshot) => void>();
@@ -65,16 +91,18 @@ function voiceContext(sessionId: string) {
     inputThroughMs: () => inputThroughMs };
 }
 
-async function fixture(t: TestContext) {
-  const directory = await mkdtemp(path.join(tmpdir(), 'broker-generation-backend-'));
+async function fixture(t: TestContext, diagnostic?: Diagnostic) {
+  const directory = await diagnosticAwait(diagnostic, 'setup.mkdtemp', () => mkdtemp(path.join(tmpdir(), 'broker-generation-backend-')));
   const stores: BrokerStore[] = [];
-  let store = new BrokerStore(directory); stores.push(store);
+  let store = diagnosticSync(diagnostic, 'setup.store', () => new BrokerStore(directory)); stores.push(store);
   const callLifetime = new AbortController();
   const cleanups: Array<() => void> = [];
   const tasks: Promise<void>[] = [];
   const contexts = new Map([[oldSession, voiceContext(oldSession)], [newSession, voiceContext(newSession)]]);
-  const call = store.reserve({ requestId: 'synthetic-generation-call', number: '+15550000001',
-    direction: 'inbound', purpose: '', callSid }).call;
+  const call = diagnosticSync(diagnostic, 'setup.reserve', () => store.reserve({ requestId: 'synthetic-generation-call', number: '+15550000001',
+    direction: 'inbound', purpose: '', callSid }).call);
+  diagnosticSync(diagnostic, 'setup.binding', () => store.recordPrimaryBinding(call.id, { bindingId, callSid, state: 'open',
+    context: { primaryDexterId, threadId, displayName: 'Dexter', messages: [] } }));
   const version = { ownerPrincipalId, primaryDexterId, threadId, contextEpoch: '1', threadEventSequence: '1', digest: 'a'.repeat(64) };
   const generations: LiveGenerationJournal = { version: 1, callId: call.id,
     binding: { bindingId, callSid, ownerPrincipalId, primaryDexterId, threadId },
@@ -83,8 +111,8 @@ async function fixture(t: TestContext) {
     segments: [{ generationId: oldGenerationId, ordinal: 1, createdAt: call.createdAt, readyAt: call.createdAt,
       state: 'active', sessionId: oldSession, version, pageDigest: 'b'.repeat(64), inputFirstSample: 0,
       transcript: contexts.get(oldSession)!.channel.getContext(), outputDiscarded: false }] };
-  store.update(call.id, { status: 'in-progress', liveSessionId: oldSession, mediaStartedAt: call.createdAt,
-    primary: { bindingId, name: null, context: '', primaryDexterId, threadId }, liveGenerations: generations });
+  diagnosticSync(diagnostic, 'setup.update', () => store.update(call.id, { status: 'in-progress', liveSessionId: oldSession, mediaStartedAt: call.createdAt,
+    liveGenerations: generations }));
   const posts: Array<{ binding: string; id: string; input: PrimarySubmission }> = [];
   const reads: string[] = [];
   const captures: PrimaryTurn[] = [];
@@ -126,26 +154,31 @@ async function fixture(t: TestContext) {
   const observation: NonNullable<PrimaryBackendOptions['observation']> = {
     signal: callLifetime.signal,
     async publish(entry, update) {
-      const deliverySessionId = store.get(call.id)!.liveSessionId!;
-      const snapshot = contexts.get(deliverySessionId)!.channel.getContext();
-      publications.push({ sourceSessionId: entry.sessionId, deliverySessionId, entry: structuredClone(entry), ...(update ? { update } : {}) });
-      const identity = { callId: call.id, callSid, bindingId, sessionId: deliverySessionId,
-        ...(entry.sessionId !== deliverySessionId ? { sourceSessionId: entry.sessionId } : {}) };
-      const receipts: BrokerPublicationReceipt[] = [];
-      let delivery = { eventId: '', status: behavior.publicationStatus,
-        observedCallerRevision: snapshot.callerRevision, observedTranscriptSequence: snapshot.revision };
-      for (let chunk = 0; chunk < (update ? 1 : 2); chunk++) {
-        const input = update ?? { id: `publication_${publications.length}_${chunk}`, kind: 'result' as const,
-          speak: true, text: `Owned question chunk ${chunk}`, expectedCallerRevision: snapshot.callerRevision };
-        const intent = beginBrokerPublication(store, identity, entry.requestId, input, snapshot);
-        assert.ok(intent);
-        delivery = { ...delivery, eventId: `synthetic_publication_${publications.length}_${chunk}` };
-        if (behavior.rejectBeforeReceipt) rejectBrokerPublication(store, identity, delivery.eventId, 'provider_error');
-        if (intent.created) settleBrokerPublication(store, intent.record, delivery, snapshot, false);
-        receipts.push({ publicationSequence: intent.record.publicationSequence, sessionId: deliverySessionId, eventId: delivery.eventId });
-      }
-      return { sessionId: deliverySessionId, snapshot, inputThroughMs: contexts.get(deliverySessionId)!.inputThroughMs(),
-        delivery, publicationReceipts: receipts };
+      diagnostic?.('observer.publish', 'before');
+      try {
+        const deliverySessionId = store.get(call.id)!.liveSessionId!;
+        const snapshot = contexts.get(deliverySessionId)!.channel.getContext();
+        publications.push({ sourceSessionId: entry.sessionId, deliverySessionId, entry: structuredClone(entry), ...(update ? { update } : {}) });
+        const identity = { callId: call.id, callSid, bindingId, sessionId: deliverySessionId,
+          ...(entry.sessionId !== deliverySessionId ? { sourceSessionId: entry.sessionId } : {}) };
+        const receipts: BrokerPublicationReceipt[] = [];
+        let delivery = { eventId: '', status: behavior.publicationStatus,
+          observedCallerRevision: snapshot.callerRevision, observedTranscriptSequence: snapshot.revision };
+        for (let chunk = 0; chunk < (update ? 1 : 2); chunk++) {
+          const input = update ? { ...update, expectedCallerRevision: snapshot.callerRevision } : { id: `publication_${publications.length}_${chunk}`, kind: 'result' as const,
+            speak: true, text: `Owned question chunk ${chunk}`, expectedCallerRevision: snapshot.callerRevision };
+          const intent = beginBrokerPublication(store, identity, entry.requestId, input, snapshot);
+          assert.ok(intent, 'Fixture publication requires an admitted request and the current caller revision');
+          delivery = { ...delivery, eventId: `synthetic_publication_${publications.length}_${chunk}` };
+          if (behavior.rejectBeforeReceipt) rejectBrokerPublication(store, identity, delivery.eventId, 'provider_error');
+          if (intent.created) settleBrokerPublication(store, intent.record, delivery, snapshot, false);
+          receipts.push({ publicationSequence: intent.record.publicationSequence, sessionId: deliverySessionId, eventId: delivery.eventId });
+        }
+        const receipt = { sessionId: deliverySessionId, snapshot, inputThroughMs: contexts.get(deliverySessionId)!.inputThroughMs(),
+          delivery, publicationReceipts: receipts };
+        diagnostic?.('observer.publish', 'after');
+        return receipt;
+      } catch (error) { diagnostic?.('observer.publish', 'rejected'); throw error; }
     },
   };
   const backend = (sourceSessionId: string): PrimaryBackend => createPrimaryBackend({
@@ -160,7 +193,7 @@ async function fixture(t: TestContext) {
     transcript: contexts.get(sessionId)!.channel.getContext(),
   });
   const delegate = (instance: PrimaryBackend, sessionId: string, delegationId: string) => {
-    const work = instance.delegate(request(sessionId, delegationId), contexts.get(sessionId)!.channel);
+    const work = diagnosticAwait(diagnostic, 'worker.delegate', () => instance.delegate(request(sessionId, delegationId), contexts.get(sessionId)!.channel));
     tasks.push(work); return work;
   };
   const speak = (instance: PrimaryBackend, sessionId: string, text: string, startMs = 800, endMs = 1000) => {
@@ -189,16 +222,30 @@ async function fixture(t: TestContext) {
     contexts.get(oldSession)!.controller.abort();
   };
   const saved = () => Object.values(store.get(call.id)!.delegations) as BrokerDelegationRecord[];
-  const reopen = () => { store.close(); store = new BrokerStore(directory); stores.push(store); return store; };
-  t.after(async () => {
-    callLifetime.abort();
-    if (!store.get(call.id)!.endedAt) store.update(call.id, { endedAt: new Date().toISOString(), status: 'completed' });
-    for (const cleanup of cleanups) cleanup();
-    for (const context of contexts.values()) context.controller.abort();
-    await Promise.allSettled(tasks);
-    for (const saved of stores) saved.close();
-    await rm(directory, { recursive: true, force: true });
-  });
+  const reopen = () => {
+    diagnosticSync(diagnostic, 'reopen.store_close', () => store.close());
+    store = diagnosticSync(diagnostic, 'reopen.store', () => new BrokerStore(directory)); stores.push(store); return store;
+  };
+  t.after(() => diagnosticAwait(diagnostic, 'teardown', async () => {
+    diagnosticSync(diagnostic, 'teardown.call_abort', () => callLifetime.abort());
+    diagnosticSync(diagnostic, 'teardown.update', () => {
+      if (!store.get(call.id)!.endedAt) store.update(call.id, { endedAt: new Date().toISOString(), status: 'completed' });
+    });
+    diagnosticSync(diagnostic, 'teardown.cleanups', () => { for (const cleanup of cleanups) cleanup(); });
+    diagnosticSync(diagnostic, 'teardown.voice_abort', () => { for (const context of contexts.values()) context.controller.abort(); });
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await diagnosticAwait(diagnostic, 'teardown.task_drain', () => Promise.race([Promise.allSettled(tasks), new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error('backend fixture tasks did not settle after call abort')), 2_000);
+      })]));
+    } finally {
+      diagnostic?.('teardown.finally', 'before');
+      if (timeout) clearTimeout(timeout);
+      for (const saved of stores) diagnosticSync(diagnostic, 'teardown.store_close', () => saved.close());
+      await diagnosticAwait(diagnostic, 'teardown.remove', () => boundedStep('remove owned fixture directory', rm(directory, { recursive: true, force: true })));
+      diagnostic?.('teardown.finally', 'after');
+    }
+  }));
   return { directory, call, contexts, posts, reads, captures, replies, questionReads, publications, admissions, behavior, completed,
     callLifetime, backend, request, delegate, speak, rotate, saved, reopen, store: () => store,
     onCleanup: (fn: () => void) => { cleanups.push(fn); } };
@@ -236,11 +283,11 @@ test('accepted task observation survives old voice abort and delivers through th
   const f = await fixture(t); const old = f.backend(oldSession);
   const held = deferred<PrimaryResult>();
   f.behavior.result = async () => held.promise;
+  f.onCleanup(() => { const id = f.reads[0]; if (id) held.resolve(f.completed(id)); });
   f.speak(old, oldSession, ' Read my portfolio.\t');
   const work = f.delegate(old, oldSession, 'portfolio');
   await until(() => f.reads.length === 1);
   const original = structuredClone(f.saved()[0]);
-  f.onCleanup(() => held.resolve(f.completed(original.requestId)));
   f.rotate();
   assert.equal(f.contexts.get(oldSession)!.channel.signal.aborted, true);
   assert.equal(f.callLifetime.signal.aborted, false);
@@ -261,10 +308,11 @@ test('accepted task observation survives old voice abort and delivers through th
 test('call-owned abort stops observation even when the new voice session remains open', async t => {
   const f = await fixture(t); const old = f.backend(oldSession);
   const held = deferred<PrimaryResult>(); f.behavior.result = async () => held.promise;
+  f.onCleanup(() => { const id = f.reads[0]; if (id) held.resolve(f.completed(id)); });
   f.speak(old, oldSession, 'Read my portfolio.');
   const work = f.delegate(old, oldSession, 'portfolio');
   await until(() => f.reads.length === 1);
-  const id = f.posts[0].id; f.onCleanup(() => held.resolve(f.completed(id)));
+  const id = f.posts[0].id;
   f.rotate(); f.callLifetime.abort(); held.resolve(f.completed(id)); await work;
   assert.equal(f.contexts.get(newSession)!.channel.signal.aborted, false);
   assert.deepEqual(f.publications, []);
@@ -275,10 +323,11 @@ test('new-generation delegated instruction queues behind accepted work and keeps
   const f = await fixture(t); const old = f.backend(oldSession);
   const held = deferred<PrimaryResult>(); let firstId: string | undefined;
   f.behavior.result = async id => { firstId ??= id; return id === firstId ? held.promise : f.completed(id); };
+  f.onCleanup(() => { if (firstId) held.resolve(f.completed(firstId)); });
   f.speak(old, oldSession, 'Read my portfolio.');
   const firstWork = f.delegate(old, oldSession, 'portfolio');
   await until(() => f.reads.length === 1);
-  const original = structuredClone(f.saved()[0]); f.onCleanup(() => held.resolve(f.completed(original.requestId)));
+  const original = structuredClone(f.saved()[0]);
   f.rotate(); const current = f.backend(newSession);
   const raw = ' Also compare NVIDIA with Apple.\t'; f.speak(current, newSession, raw);
   const secondWork = f.delegate(current, newSession, 'comparison');
@@ -358,61 +407,78 @@ test('rejected current-generation question publication never qualifies a spoken 
   assert.equal(f.saved()[0].deferredTurns!.every(turn => turn.status === 'recorded_not_submitted'), true);
 });
 
-test('restart recovers an uncertain new-generation answer by the original question without replaying its POST', async t => {
-  const f = await fixture(t); const question = pendingQuestion();
-  let remoteAnswer: PrimaryQuestion | undefined;
-  let readsAvailable = true;
-  f.behavior.result = async id => remoteAnswer && readsAvailable ? f.completed(id) : questionResult(id, question);
-  f.behavior.question = async id => {
-    if (!readsAvailable) throw new PrimaryApiError('request_timeout');
-    return questionResult(id, remoteAnswer ?? question);
+test('restart recovers an uncertain new-generation answer by the original question without replaying its POST', { timeout: 15_000 }, async t => {
+  // Fixed stage identifiers only: no caller text, error body, IDs or journal bytes.
+  let markerCount = 0;
+  const diagnostic: Diagnostic = (stage, event) => {
+    if (markerCount < 256) {
+      markerCount++; writeSync(2, `generation_backend_sixth ${stage} ${event}\n`);
+    } else if (markerCount === 256) {
+      markerCount++; writeSync(2, 'generation_backend_sixth marker_limit_reached\n');
+    }
   };
-  f.behavior.reply = async (_id, _questionId, input) => {
-    remoteAnswer = answeredQuestion(question, input); readsAvailable = false;
-    throw new PrimaryApiError('request_timeout');
-  };
-  const old = f.backend(oldSession); f.speak(old, oldSession, 'Compare these stocks.');
-  await f.delegate(old, oldSession, 'comparison');
-  f.rotate(); const current = f.backend(newSession);
-  f.speak(current, newSession, 'Please repeat the question.');
-  await f.delegate(current, newSession, 'repeat');
-  const initialPresentation = structuredClone(f.saved()[0].questions![questionId].presentation);
-  const priorPublications = f.publications.length;
-  f.speak(current, newSession, 'No.', 3000, 3200);
-  await f.delegate(current, newSession, 'answer');
-  const original = structuredClone(f.saved()[0]);
-  const uncertain = original.questions![questionId].reply!;
-  assert.equal(uncertain.status, 'unknown'); assert.equal(uncertain.sourceSessionId, newSession);
-  assert.equal(f.replies.length, 1); assert.equal(f.posts.length, 1);
-  assert.equal(f.publications.slice(priorPublications).filter(value => !value.update).length, 0,
-    'unknown reply cannot present the question as newly unanswered');
-  assert.ok(f.publications.slice(priorPublications).some(value => value.update?.id.endsWith('_reply_unknown')));
-  assert.deepEqual(original.questions![questionId].presentation, initialPresentation);
-  const before = await readFile(path.join(f.directory, 'calls.json'), 'utf8');
-  f.reopen();
-  assert.equal(await readFile(path.join(f.directory, 'calls.json'), 'utf8'), before);
-  readsAvailable = true;
-  const recovered = f.backend(newSession);
-  await f.delegate(recovered, newSession, 'answer');
-  const saved = f.saved()[0];
-  assert.equal(saved.status, 'completed');
-  assert.equal(saved.questions![questionId].reply!.status, 'accepted');
-  assert.deepEqual(saved.questions![questionId].reply!.input, uncertain.input);
-  assert.equal(saved.questions![questionId].question.runId, runId);
-  assert.deepEqual(saved.submission, original.submission); assert.equal(saved.sessionId, oldSession);
-  assert.equal(f.replies.length, 1); assert.equal(f.posts.length, 1);
-  assert.equal(f.questionReads.at(-1)!.requestId, original.requestId);
-  await f.delegate(recovered, newSession, 'answer');
-  assert.equal(f.replies.length, 1); assert.equal(f.posts.length, 1);
+  return diagnosticAwait(diagnostic, 'callback', async () => {
+    const f = await diagnosticAwait(diagnostic, 'setup', () => fixture(t, diagnostic)); const question = pendingQuestion();
+    let remoteAnswer: PrimaryQuestion | undefined;
+    let readsAvailable = true;
+    f.behavior.result = async id => remoteAnswer && readsAvailable ? f.completed(id) : questionResult(id, question);
+    f.behavior.question = async id => {
+      if (!readsAvailable) throw new PrimaryApiError('request_timeout');
+      return questionResult(id, remoteAnswer ?? question);
+    };
+    f.behavior.reply = async (_id, _questionId, input) => {
+      remoteAnswer = answeredQuestion(question, input); readsAvailable = false;
+      throw new PrimaryApiError('request_timeout');
+    };
+    const old = diagnosticSync(diagnostic, 'backend.old', () => f.backend(oldSession));
+    diagnosticSync(diagnostic, 'speak.initial', () => f.speak(old, oldSession, 'Compare these stocks.'));
+    await diagnosticAwait(diagnostic, 'delegate.initial', () => boundedStep('initial comparison and pending question', f.delegate(old, oldSession, 'comparison')));
+    diagnosticSync(diagnostic, 'rotate', () => f.rotate());
+    const current = diagnosticSync(diagnostic, 'backend.current', () => f.backend(newSession));
+    diagnosticSync(diagnostic, 'speak.repeat', () => f.speak(current, newSession, 'Please repeat the question.'));
+    await diagnosticAwait(diagnostic, 'delegate.repeat', () => boundedStep('current-generation question presentation', f.delegate(current, newSession, 'repeat')));
+    const initialPresentation = structuredClone(f.saved()[0].questions![questionId].presentation);
+    const priorPublications = f.publications.length;
+    diagnosticSync(diagnostic, 'speak.answer', () => f.speak(current, newSession, 'No.', 3000, 3200));
+    await diagnosticAwait(diagnostic, 'delegate.answer', () => boundedStep('first answer reaches durable unknown outcome', f.delegate(current, newSession, 'answer')));
+    const original = structuredClone(f.saved()[0]);
+    const uncertain = original.questions![questionId].reply!;
+    assert.equal(uncertain.status, 'unknown'); assert.equal(uncertain.sourceSessionId, newSession);
+    assert.equal(f.replies.length, 1); assert.equal(f.posts.length, 1);
+    assert.equal(f.publications.slice(priorPublications).filter(value => !value.update).length, 0,
+      'unknown reply cannot present the question as newly unanswered');
+    assert.ok(f.publications.slice(priorPublications).some(value => value.update?.id.endsWith('_reply_unknown')));
+    assert.deepEqual(original.questions![questionId].presentation, initialPresentation);
+    const before = await diagnosticAwait(diagnostic, 'read.before_restart', () => boundedStep('read durable unknown reply before restart', readFile(path.join(f.directory, 'calls.json'), 'utf8')));
+    const durableReply = JSON.parse(before).calls[f.call.id].delegations[original.requestId].questions[questionId].reply;
+    assert.equal(durableReply.status, 'unknown');
+    assert.deepEqual(durableReply.input, uncertain.input, 'exact unknown reply is present in the durable journal');
+    diagnosticSync(diagnostic, 'reopen', () => f.reopen());
+    assert.equal(await diagnosticAwait(diagnostic, 'read.after_restart', () => boundedStep('verify unchanged journal after restart', readFile(path.join(f.directory, 'calls.json'), 'utf8'))), before);
+    readsAvailable = true;
+    const recovered = diagnosticSync(diagnostic, 'backend.recovered', () => f.backend(newSession));
+    await diagnosticAwait(diagnostic, 'delegate.recovery', () => boundedStep('read-only original-question recovery', f.delegate(recovered, newSession, 'answer')));
+    const saved = f.saved()[0];
+    assert.equal(saved.status, 'completed');
+    assert.equal(saved.questions![questionId].reply!.status, 'accepted');
+    assert.deepEqual(saved.questions![questionId].reply!.input, uncertain.input);
+    assert.equal(saved.questions![questionId].question.runId, runId);
+    assert.deepEqual(saved.submission, original.submission); assert.equal(saved.sessionId, oldSession);
+    assert.equal(f.replies.length, 1); assert.equal(f.posts.length, 1);
+    assert.equal(f.questionReads.at(-1)!.requestId, original.requestId);
+    await diagnosticAwait(diagnostic, 'delegate.replay', () => boundedStep('exact admitted answer replay', f.delegate(recovered, newSession, 'answer')));
+    assert.equal(f.replies.length, 1); assert.equal(f.posts.length, 1);
+  });
 });
 
 test('terminal call prevents queued next-generation instruction promotion after a late result', async t => {
   const f = await fixture(t); const old = f.backend(oldSession);
   const held = deferred<PrimaryResult>(); f.behavior.result = async () => held.promise;
+  f.onCleanup(() => { const id = f.reads[0]; if (id) held.resolve(f.completed(id)); });
   f.speak(old, oldSession, 'Read my portfolio.');
   const firstWork = f.delegate(old, oldSession, 'portfolio');
   await until(() => f.reads.length === 1);
-  const original = structuredClone(f.saved()[0]); f.onCleanup(() => held.resolve(f.completed(original.requestId)));
+  const original = structuredClone(f.saved()[0]);
   f.rotate(); const current = f.backend(newSession);
   f.speak(current, newSession, 'Then compare these stocks.');
   const nextWork = f.delegate(current, newSession, 'comparison');
@@ -561,11 +627,11 @@ test('proved refused answer remains immutable while a freshly presented question
 test('admission drain sees exact durable source before held submission HTTP and does not await result observation', async t => {
   const f = await fixture(t); const old = f.backend(oldSession);
   const held = deferred<PrimaryResult>(); f.behavior.submit = async () => held.promise;
+  f.onCleanup(() => { const id = f.posts[0]?.id; if (id) held.resolve({ bindingId, requestId: id, state: 'queued' }); });
   const raw = ' Read my portfolio.\t'; f.speak(old, oldSession, raw);
   const work = f.delegate(old, oldSession, 'portfolio');
   await until(() => f.admissions.length === 1 && f.posts.length === 1);
   const admission = f.admissions[0]; const prepared = admission.entries[0];
-  f.onCleanup(() => held.resolve({ bindingId, requestId: prepared.requestId, state: 'queued' }));
   assert.equal(prepared.status, 'prepared');
   assert.equal(prepared.sessionId, oldSession); assert.equal(prepared.submission.text, raw);
   assert.equal(admission.request.delegationId, 'portfolio');
@@ -707,15 +773,34 @@ test('ended-call closeout settles a definitely-undispatched answer locally and p
         revisionRecordId: eventId, bodyDigest: turnBodyDigest(turn), replayed: false }; } },
   });
   const originalCloseout = closeoutFor(oldSession);
-  await originalCloseout.flushPendingCaptures();
+  await boundedStep('original-session ended-call capture flush', originalCloseout.flushPendingCaptures());
   const closeout = closeoutFor(newSession);
   const refused = f.saved()[0].questions![questionId].reply!;
   assert.equal(refused.status, 'refused'); assert.equal(refused.refusal!.code, 'call_ended_before_reply_dispatch');
   assert.deepEqual(refused.input, prepared.input); assert.equal(f.questionReads.length, readsBefore);
-  const capture = await closeout.captureCompletedTurns(f.contexts.get(newSession)!.channel.getContext(), {
-    sessionFinalized: true, assistantPlaybackComplete: false });
+  const originalTurn: PrimaryTurn = { sourceEventId: prepared.input.source.sourceEventId, revision: 1,
+    itemId: prepared.input.source.itemId, role: 'user', text: prepared.input.text,
+    occurredAt: prepared.input.source.receivedAt };
+  assert.equal(originalTurn.text, ' Yes. ');
+  assert.deepEqual(f.store().get(f.call.id)!.canonicalTurns?.[originalTurn.sourceEventId], {
+    ...originalTurn, state: 'dispatching', sourceSessionId: newSession },
+  'old-session closeout must leave the new-session raw source unacknowledged');
+  // Production closeout flushes each source session before completed transcript capture.
+  const flushed = await boundedStep('new-session ended-call capture flush', closeout.flushPendingCaptures());
+  assert.deepEqual(flushed, { pending: 0, unsupported: [] });
+  assert.deepEqual(f.captures.filter(turn => turn.sourceEventId === originalTurn.sourceEventId), [originalTurn],
+    'the new session must acknowledge the original raw revision exactly once');
+  assert.deepEqual(f.store().get(f.call.id)!.canonicalTurns?.[originalTurn.sourceEventId], {
+    ...originalTurn, state: 'captured', sourceSessionId: newSession, recordId: originalTurn.sourceEventId });
+  const capture = await boundedStep('ended-call completed transcript capture',
+    closeout.captureCompletedTurns(f.contexts.get(newSession)!.channel.getContext(), {
+      sessionFinalized: true, assistantPlaybackComplete: false }));
   assert.equal(capture.unsupported.includes('reply_outcome_unknown'), false);
-  assert.ok(f.captures.some(turn => turn.sourceEventId === prepared.input.source.sourceEventId && turn.text === prepared.input.text));
+  assert.equal(capture.unsupported.includes('capture_outcome_unknown'), false);
+  assert.deepEqual(f.captures.filter(turn => turn.sourceEventId === originalTurn.sourceEventId), [originalTurn],
+    'completed transcript capture must not duplicate or replace the acknowledged raw revision');
   assert.equal(originalCloseout.closeoutPending(), 0); assert.equal(closeout.closeoutPending(), 0);
+  assert.deepEqual(f.saved()[0].questions![questionId].reply!.input, prepared.input);
+  assert.equal(f.questionReads.length, readsBefore);
   assert.equal(f.replies.length, 0); assert.equal(f.posts.length, 1);
 });
