@@ -377,7 +377,7 @@ for (const route of ['task', 'ordinary_answer', 'selected_answer'] as const) {
           const saved = f.currentCall().callerRouting!.records.at(-1)!;
           const frozen = structuredClone(saved.frozen), input = structuredClone(saved.intent!.input);
           const publicationSequence = f.currentCall().publications!.records.at(-1)!.publicationSequence;
-          const inputNextSample = f.currentCall().liveGenerations!.inputNextSample;
+          const inputSamples = voice.input.reduce((total, payload) => total + Buffer.from(payload, 'base64').length, 0);
           const frames = voice.input.length;
           assert.equal(completed, false);
           assert.equal(saved.intent!.response, undefined);
@@ -395,8 +395,11 @@ for (const route of ['task', 'ordinary_answer', 'selected_answer'] as const) {
           }
           if (duringIntent !== 'unchanged') await f.mediaOnly(duringIntent === 'silence');
           assert.equal(voice.input.length, frames + (duringIntent === 'unchanged' ? 0 : 1));
-          assert.equal(f.currentCall().liveGenerations!.inputNextSample,
-            inputNextSample + (duringIntent === 'unchanged' ? 0 : 160));
+          // Streaming input advances before the next generation journal save.
+          assert.equal(voice.input.reduce((total, payload) => total + Buffer.from(payload, 'base64').length, 0),
+            inputSamples + (duringIntent === 'unchanged' ? 0 : 160));
+          if (duringIntent !== 'unchanged') assert.deepEqual(Buffer.from(voice.input.at(-1)!, 'base64'),
+            Buffer.alloc(160, duringIntent === 'silence' ? 255 : 0));
           assert.deepEqual(voice.caption, caption, 'the provider has not emitted a revised caption');
           const segment = f.currentCall().liveGenerations!.segments.find(value => value.sessionId === speech.request.sessionId)!;
           assert.deepEqual(segment.transcript, caption);
