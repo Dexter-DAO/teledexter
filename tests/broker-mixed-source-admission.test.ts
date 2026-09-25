@@ -193,10 +193,13 @@ async function fixture(t: TestContext, selectedResult = false) {
     generations.inputNextSample = Math.ceil(endMs * 8); generations.segments[0].inputLastSampleExclusive = generations.inputNextSample;
     generations.segments[0].transcript = structuredClone(snapshot); store.update(initial.id, { liveGenerations: generations });
     const sourceEventId = brokerIdentity('source', initial.id, sessionId, firstEventId);
+    const observedSpeechAtMs = ++clock;
+    backend.noteCallerSpeech(observedSpeechAtMs, endMs);
     const frozen: FrozenCallerTurn = { sessionId, firstEventId, callerRevision: sequence, firstSequence: sequence,
-      lastSequence: sequence, startMs, endMs, audioThroughMs: endMs, observedSpeechAtMs: ++clock,
+      lastSequence: sequence, startMs, endMs, audioThroughMs: endMs, observedSpeechAtMs,
       turn: { sourceEventId, revision: 1, itemId: `live-turn-${sourceEventId}`, role: 'user', text,
         occurredAt: new Date(Date.parse(initial.createdAt) + startMs).toISOString() } };
+    assert.doesNotThrow(() => backend.assertFrozenCallerSpeechCurrent(frozen), 'fixture speech frontier must match its frozen source');
     const request: LiveDelegationRequest = { callId: initial.id, sessionId, delegationId: `delegate_${sequence}`,
       requestId: `provider_request_${sequence}`, offsetMs: endMs, transcript: structuredClone(snapshot) };
     const inventory = callerIntentResultPublicationInventory(current, sessionId);
