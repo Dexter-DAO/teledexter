@@ -7,6 +7,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { BrokerStore } from '../src/broker/store.js';
+import { OutboundRetryError } from '../src/broker/outboundSettlement.js';
 import { createBrokerServer } from '../src/broker/server.js';
 import type { BrokerConfig } from '../src/broker/config.js';
 import { CallRequestReceiptError, PHONE_OWNER_CALL_PURPOSE, readCallRequestReceipt } from '../src/broker/callRequestReceipt.js';
@@ -79,13 +80,21 @@ for (const failure of ['missing-file', 'malformed-file', 'cache-mismatch', 'fore
 
 test('restarted duplicate request keys remain unavailable rather than choosing either call', t => {
   const f = fixture(t); const request = input(); const first = f.store.reserve(request, 'authenticated_broker_control').call;
-  f.store.close();
   const second = structuredClone(first); second.id = randomUUID();
   second.callAssignment!.value.brokerCallId = second.id;
   fs.writeFileSync(f.file, JSON.stringify({ version: 1, calls: { [first.id]: first, [second.id]: second } }), { mode: 0o600 });
-  const restarted = new BrokerStore(f.directory); t.after(() => restarted.close());
-  assert.throws(() => readCallRequestReceipt(restarted, request.requestId), unavailable);
-  assert.throws(() => readCallRequestReceipt(restarted, randomUUID()), unavailable);
+  const duplicateBytes = fs.readFileSync(f.file, 'utf8');
+  assert.throws(() => readCallRequestReceipt(f.store, request.requestId), unavailable);
+  assert.throws(() => readCallRequestReceipt(f.store, randomUUID()), unavailable);
+  assert.equal(fs.readFileSync(f.file, 'utf8'), duplicateBytes);
+  f.store.close();
+  const restarted: BrokerStore[] = [];
+  try {
+    assert.throws(() => { restarted.push(new BrokerStore(f.directory)); }, error =>
+      error instanceof OutboundRetryError && error.code === 'call_request_unavailable');
+  } finally { for (const store of restarted) store.close(); }
+  assert.equal(fs.readFileSync(f.file, 'utf8'), duplicateBytes);
+  assert.equal(fs.existsSync(f.lock), false, 'failed startup releases only its acquired writer lock');
 });
 
 test('actual HTTP receipt recovers historical calls outside recipient policy without calling any external port', async t => {

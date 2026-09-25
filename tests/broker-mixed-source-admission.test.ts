@@ -14,7 +14,7 @@ import { beginBrokerPublication, beginSelectedQuestionPublication, settleBrokerP
 import { createRequestDeliveryJournal, retainRequestDeliveryAssociation, createRequestDeliveryQuestionRecord,
   PHONE_REQUEST_DELIVERY_VERSION } from '../src/broker/requestDelivery.js';
 import type { SelectedQuestionSeed } from '../src/broker/selectedQuestion.js';
-import { PrimaryApiError, type PrimaryQuestion, type PrimaryReplyInput, type PrimaryResult, type PrimarySubmission, type PrimaryTurn } from '../src/broker/primaryApi.js';
+import { PrimaryApiError, type PrimaryCall, type PrimaryQuestion, type PrimaryReplyInput, type PrimaryResult, type PrimarySubmission, type PrimaryTurn } from '../src/broker/primaryApi.js';
 import { rawSubmissionDigest, turnBodyDigest } from '../src/broker/reconciliation.js';
 import type { LiveBackendChannel, LiveDelegationRequest, LiveTranscriptSnapshot } from '../src/live/types.js';
 
@@ -35,9 +35,13 @@ async function fixture(t: TestContext, selectedResult = false) {
   let clock = Date.now(), sequence = 0;
   const assignmentRef = selectedResult ? { assignmentId: initial.requestId, revision: 1 as const, digest: 'c'.repeat(64) } : undefined;
   const snapshot: LiveTranscriptSnapshot = { revision: 0, callerRevision: 0, fragments: [] };
+  const binding: PrimaryCall = { bindingId, callSid, state: 'open',
+    context: { primaryDexterId: id(3), threadId: id(4), displayName: 'Dexter', messages: [] },
+    ...(assignmentRef ? { callAssignmentRef: assignmentRef } : {}) };
+  store.recordPrimaryBinding(initial.id, binding);
+  assert.deepEqual(store.get(initial.id)!.primary, { bindingId, name: 'Dexter', context: '',
+    primaryDexterId: id(3), threadId: id(4), ...(assignmentRef ? { callAssignmentRef: assignmentRef } : {}) });
   store.update(initial.id, { status: 'in-progress', liveSessionId: sessionId, mediaStartedAt: initial.createdAt,
-    primary: { bindingId, name: 'Dexter', context: '', primaryDexterId: id(3), threadId: id(4),
-      ...(assignmentRef ? { callAssignmentRef: assignmentRef } : {}) },
     liveGenerations: { version: 1, callId: initial.id, binding: { bindingId, callSid,
       ownerPrincipalId: id(2), primaryDexterId: id(3), threadId: id(4),
       ...(assignmentRef ? { callAssignmentRef: assignmentRef } : {}) },
@@ -133,16 +137,30 @@ async function fixture(t: TestContext, selectedResult = false) {
       }
       const current = store.get(initial.id)!;
       const rendering = { ...(update ?? { id: `result_${entry.requestId}_${entry.status}_${entry.currentQuestionId ?? 'none'}_${snapshot.callerRevision}_0`,
-        kind: 'result' as const, text: entry.result ?? 'Continue the comparison?' }), speak: true, expectedCallerRevision: snapshot.callerRevision };
+        kind: 'result' as const, text: entry.result ?? (entry.status === 'dispatch_unknown'
+          ? 'I am checking the saved request status.' : 'Continue the comparison?') }), speak: true, expectedCallerRevision: snapshot.callerRevision };
       const ordinaryDelivery: Parameters<typeof beginBrokerPublication>[5] = !update && entry.primaryResult?.state === 'completed'
         ? { chunkIndex: 0, response: { bindingId, callSid, requestId: entry.primaryResult.requestId, version,
           delivery: { state: 'ready', text: rendering.text, source: { kind: 'assistant', messageId: entry.primaryResult.assistant.messageId,
             eventSequence: entry.primaryResult.assistant.sequence, provenance: { messageCreatedAt: initial.createdAt,
               eventId: entry.primaryResult.assistant.eventId, eventOccurredAt: initial.createdAt, runId: id(7) } } } } } : undefined;
       const intent = beginBrokerPublication(store, { callId: current.id, callSid, bindingId, sessionId }, entry.requestId,
-        rendering, snapshot, ordinaryDelivery)!;
-      const delivery = { eventId: `append_${intent.record.publicationSequence}`, status: 'accepted' as const };
+        rendering, snapshot, ordinaryDelivery);
+      if (!intent) {
+        assert.equal(entry.status, 'dispatch_unknown', 'only the expected unknown submission may lack publication authority');
+        assert.equal(entry.primaryResult, undefined, 'unknown submission commentary must not claim a confirmed result');
+        commentary.push(rendering.text);
+        return { delivery: await channel.publish(rendering), sessionId, snapshot: structuredClone(snapshot),
+          inputThroughMs: snapshot.fragments.at(-1)?.endMs ?? 0, publicationReceipts: [] };
+      }
+      const delivery = { eventId: `append_${intent.record.publicationSequence}`, status: 'accepted' as const,
+        observedCallerRevision: snapshot.callerRevision,
+        observedTranscriptSequence: Math.max(0, ...snapshot.fragments.map(fragment => fragment.sequence)) };
       settleBrokerPublication(store, intent.record, delivery, snapshot, false);
+      assert.deepEqual(store.get(initial.id)!.publications!.records.find(record =>
+        record.publicationSequence === intent.record.publicationSequence)!.outcome,
+        { eventId: delivery.eventId, status: 'accepted', callerRevision: delivery.observedCallerRevision,
+          transcriptSequence: delivery.observedTranscriptSequence }, 'fixture publication must retain its exact accepted frontier');
       return { delivery, sessionId, snapshot: structuredClone(snapshot), inputThroughMs: snapshot.fragments.at(-1)?.endMs ?? 0,
         publicationReceipts: [{ publicationSequence: intent.record.publicationSequence, sessionId, eventId: delivery.eventId }] };
     } },
@@ -189,10 +207,13 @@ async function fixture(t: TestContext, selectedResult = false) {
     generations.inputNextSample = Math.ceil(endMs * 8); generations.segments[0].inputLastSampleExclusive = generations.inputNextSample;
     generations.segments[0].transcript = structuredClone(snapshot); store.update(initial.id, { liveGenerations: generations });
     const sourceEventId = brokerIdentity('source', initial.id, sessionId, firstEventId);
+    const observedSpeechAtMs = ++clock;
+    backend.noteCallerSpeech(observedSpeechAtMs, endMs);
     const frozen: FrozenCallerTurn = { sessionId, firstEventId, callerRevision: sequence, firstSequence: sequence,
-      lastSequence: sequence, startMs, endMs, audioThroughMs: endMs, observedSpeechAtMs: ++clock,
+      lastSequence: sequence, startMs, endMs, audioThroughMs: endMs, observedSpeechAtMs,
       turn: { sourceEventId, revision: 1, itemId: `live-turn-${sourceEventId}`, role: 'user', text,
         occurredAt: new Date(Date.parse(initial.createdAt) + startMs).toISOString() } };
+    assert.doesNotThrow(() => backend.assertFrozenCallerSpeechCurrent(frozen), 'fixture speech frontier must match its frozen source');
     const request: LiveDelegationRequest = { callId: initial.id, sessionId, delegationId: `delegate_${sequence}`,
       requestId: `provider_request_${sequence}`, offsetMs: endMs, transcript: structuredClone(snapshot) };
     const inventory = callerIntentResultPublicationInventory(current, sessionId);
@@ -262,7 +283,9 @@ test('a late question publication rejection removes the candidate and prevents f
   const h = await fixture(t); h.pendingQuestion();
   const first = h.route('Compare these companies.', { kind: 'task' });
   await h.backend.delegateFrozenTask(first.request, first.ref, h.channel);
-  const targets = h.backend.questionTargets(h.sessionId), answer = h.route('Yes.', { kind: 'answer', target: targets[0] }, targets);
+  const targets = h.backend.questionTargets(h.sessionId);
+  assert.equal(targets.length, 1, 'the accepted question must be offered before its late rejection');
+  const answer = h.route('Yes.', { kind: 'answer', target: targets[0] }, targets);
   const publication = h.store.get(h.callId)!.publications!.records.at(-1)!;
   rejectBrokerPublication(h.store, { callId: h.callId, callSid: publication.callSid, bindingId: h.bindingId,
     sessionId: h.sessionId }, publication.outcome!.eventId, 'provider_error');
@@ -288,7 +311,8 @@ test('an offered associated context reference is required, frozen in the submiss
 test('an explicitly selected ordinary result reference is frozen from its complete publication without an associated reference', async t => {
   const h = await fixture(t), first = h.route('Research AMD.', { kind: 'task' });
   await h.backend.delegateFrozenTask(first.request, first.ref, h.channel);
-  const candidate = callerIntentResultPublicationCandidates(h.store.get(h.callId)!, h.sessionId)[0]; assert.ok(candidate);
+  const candidate = callerIntentResultPublicationCandidates(h.store.get(h.callId)!, h.sessionId)[0];
+  assert.ok(candidate, 'the accepted ordinary result must be offered before its explicit reference');
   assert.equal(candidate.reference.kind, 'ordinary');
   const reference = { id: candidate.id, digest: candidate.digest };
   const next = h.route('Explain the risks in that result.', { kind: 'task', contextReference: reference }, [], [reference]);
@@ -362,6 +386,8 @@ test('503 first submit and a later typed 409 GET retain unknown admission and ne
   h.hooks.submitError = associationError('associated_result_unavailable', 503);
   h.hooks.readError = associationError('delivery_association_mismatch');
   const task = h.route('Research the company in that result.', { kind: 'task', contextReference: offeredReference }, [], [offeredReference]);
+  const publications = structuredClone(h.store.get(h.callId)!.publications);
+  const candidates = callerIntentResultPublicationCandidates(h.store.get(h.callId)!, h.sessionId);
   await h.backend.delegateFrozenTask(task.request, task.ref, h.channel);
   h.advance(11_000);
   await h.backend.delegateFrozenTask(task.request, task.ref, h.channel);
@@ -369,13 +395,27 @@ test('503 first submit and a later typed 409 GET retain unknown admission and ne
   assert.equal(h.posts.length, 1); assert.ok(h.reads.length > 0);
   assert.equal(h.entries()[0].status, 'dispatch_unknown'); assert.equal(h.entries()[0].admissionRefusal, undefined);
   assert.equal(h.entries()[0].submitError?.status, 503); assert.equal(h.entries()[0].lastResultReadError?.status, 409);
+  assert.equal(h.entries()[0].primaryResult, undefined);
+  assert.equal(h.posts[0].text, task.frozen.turn.text); assert.equal(h.posts[0].source.sourceEventId, task.frozen.turn.sourceEventId);
+  assert.deepEqual(h.store.get(h.callId)!.publications, publications, 'unknown recovery must preserve the entire prior publication journal');
+  assert.deepEqual(callerIntentResultPublicationCandidates(h.store.get(h.callId)!, h.sessionId), candidates,
+    'local status commentary must not add result reference authority');
+  assert.ok(h.commentary.includes('I am checking the saved request status.'), 'unknown submission must emit the fixed local status');
 });
 
 test('the associated refusal rule cannot narrow an ordinary first-submit 409', async t => {
   const h = await fixture(t); h.hooks.submitError = associationError('delivery_association_mismatch');
   const task = h.route('Research AMD.', { kind: 'task' });
+  const publications = structuredClone(h.store.get(h.callId)!.publications);
+  const candidates = callerIntentResultPublicationCandidates(h.store.get(h.callId)!, h.sessionId);
   await h.backend.delegateFrozenTask(task.request, task.ref, h.channel);
   assert.equal(h.entries()[0].status, 'dispatch_unknown'); assert.equal(h.entries()[0].admissionRefusal, undefined);
+  assert.equal(h.posts.length, 1); assert.equal(h.entries()[0].primaryResult, undefined);
+  assert.equal(h.posts[0].text, task.frozen.turn.text); assert.equal(h.posts[0].source.sourceEventId, task.frozen.turn.sourceEventId);
+  assert.deepEqual(h.store.get(h.callId)!.publications, publications, 'ordinary unknown admission must not create a publication record');
+  assert.deepEqual(callerIntentResultPublicationCandidates(h.store.get(h.callId)!, h.sessionId), candidates,
+    'ordinary unknown admission must not acquire result reference authority');
+  assert.ok(h.commentary.includes('I am checking the saved request status.'), 'unknown submission must emit the fixed local status');
 });
 
 test('a refused associated task allows the already queued ordinary successor to dispatch once', async t => {
@@ -395,7 +435,7 @@ test('a refused associated task allows the already queued ordinary successor to 
   const parent = h.entries()[0];
   h.completedSubmits();
   h.results.set(parent.requestId, { requestId: parent.requestId, bindingId: h.bindingId, state: 'completed',
-    assistant: { messageId: id(70), eventId: id(71), sequence: '2', text: 'Comparison saved.' } });
+    assistant: { messageId: id(70), eventId: id(71), sequence: '1', text: 'Comparison saved.' } });
   await h.backend.delegateFrozenTask(first.request, first.ref, h.channel);
   assert.equal(h.posts.length, 3); assert.deepEqual(h.posts.map(value => value.text), [first.frozen.turn.text, refused.frozen.turn.text, next.frozen.turn.text]);
   assert.equal(h.entries().find(entry => entry.submission.source.sourceEventId === refused.ref.sourceEventId)!.status, 'admission_refused');
@@ -456,7 +496,7 @@ test('an expired queued source releases a later fresh source without changing ei
   await h.backend.delegateFrozenTask(next.request, next.ref, h.channel);
   const parent = h.entries()[0]; h.completedSubmits();
   h.results.set(parent.requestId, { requestId: parent.requestId, bindingId: h.bindingId, state: 'completed',
-    assistant: { messageId: id(72), eventId: id(73), sequence: '2', text: 'Comparison saved.' } });
+    assistant: { messageId: id(72), eventId: id(73), sequence: '1', text: 'Comparison saved.' } });
   await h.backend.delegateFrozenTask(first.request, first.ref, h.channel);
   assert.deepEqual(h.posts.map(input => input.text), [first.frozen.turn.text, next.frozen.turn.text]);
   const local = h.entries().find(entry => entry.submission.source.sourceEventId === expired.ref.sourceEventId)!;

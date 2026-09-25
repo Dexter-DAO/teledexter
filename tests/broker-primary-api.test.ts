@@ -86,13 +86,13 @@ test('associated-result rejects mixed references, unknown fields, noncanonical I
 
 test('associated-result typed refusals retain original remote classification without client retry', async () => {
   for (const remoteCode of ['delivery_association_mismatch', 'associated_result_unavailable']) {
-    const h = harness([json({ error: remoteCode, retryable: false }, 409)], {
+    const h = harness([json({ error: { code: remoteCode, retryable: false } }, 409)], {
       contextProtocol: { version: 'memory-eligible-v1', parse() { throw new Error('No context'); } },
     });
     await assert.rejects(h.client.submit(bindingId, requestId, { ...submission, associatedResultReference: {
       v: 'phone.associated-result-reference.v1', deliveryAssociationId: eventId,
       originalRequestId: messageId, assistantMessageId: primaryDexterId } }),
-    (error: unknown) => error instanceof PrimaryApiError && error.status === 409 && error.remoteCode === remoteCode);
+    (error: unknown) => error instanceof PrimaryApiError && error.status === 409 && error.remoteCode === remoteCode && error.retryable === false);
     assert.equal(h.requests.length, 1);
   }
 });

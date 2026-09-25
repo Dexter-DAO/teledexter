@@ -662,8 +662,21 @@ test('candidate source identity, execution, current binding and selected associa
     [value.results[0], { ...value.results[1], execution: { ...value.results[1]!.execution, requestId: value.results[0]!.execution.requestId } }],
     [value.results[0], { ...value.results[1], execution: { ...value.results[1]!.execution, runId: value.results[0]!.execution.runId } }],
   ]) assert.equal(callerIntentV2InputSchema.safeParse({ ...value, results, resultCoverage: { state: 'complete', count: 2 } }).success, false);
-  value.results[0]!.execution.bindingId = id(90);
-  assert.throws(() => callerIntentInputDigest(operationId, bindingId, value), /caller_intent_candidate_binding_mismatch/);
+  const inconsistent = structuredClone(value);
+  inconsistent.results[0]!.execution.bindingId = id(90);
+  const refused = callerIntentV2InputSchema.safeParse(inconsistent);
+  if (refused.success) assert.fail('Conflicting bindings for the same candidate execution must be refused');
+  assert.deepEqual(refused.error.issues, [
+    { code: 'custom', message: 'Candidate execution identities disagree', path: [] },
+  ]);
+  assert.throws(() => callerIntentInputDigest(operationId, bindingId, inconsistent), /Candidate execution identities disagree/);
+
+  const otherCall = structuredClone(value);
+  for (const candidate of [...otherCall.questions, ...otherCall.results])
+    if (candidate.kind === 'ordinary') candidate.execution.bindingId = id(90);
+  assert.deepEqual(callerIntentV2InputSchema.parse(otherCall), otherCall);
+  assert.throws(() => callerIntentInputDigest(operationId, bindingId, otherCall),
+    { name: 'Error', message: 'caller_intent_candidate_binding_mismatch' });
 });
 
 test('context coverage accepts only the frozen inventory-compatible modes', () => {
@@ -712,11 +725,27 @@ test('every supplied result stays referenceable only with complete API context',
 
 test('response echoes bind version, exact coverage, raw input and all operation identities', () => {
   const value = input('overflow_eight'), saved = pending(value, unavailable('inventory_overflow'));
+  const inconsistent = { ...saved, bindingId: id(90) };
+  const refused = callerIntentV2ResponseSchema.safeParse(inconsistent);
+  if (refused.success) assert.fail('A response binding must agree with its ordinary candidates');
+  assert.deepEqual(refused.error.issues, [
+    { code: 'custom', path: ['bindingId'], message: 'Ordinary candidate belongs to another call' },
+  ]);
+  assert.throws(() => validate(value, inconsistent), /Ordinary candidate belongs to another call/);
+
+  const otherCall = structuredClone(inconsistent);
+  for (const candidate of [...otherCall.questions, ...otherCall.results])
+    if (candidate.kind === 'ordinary') candidate.execution.bindingId = id(90);
+  assert.deepEqual(callerIntentV2ResponseSchema.parse(otherCall), otherCall);
+  assert.throws(() => validate(value, otherCall), { name: 'Error', message: 'caller_intent_response_identity_changed' });
+
   for (const changed of [{ ...saved, resultCoverage: { state: 'overflow', count: 9 } }, { ...saved, inputDigest: 'f'.repeat(64) },
-    { ...saved, generationId: id(90) }, { ...saved, operationId: id(90) }, { ...saved, bindingId: id(90) },
+    { ...saved, generationId: id(90) }, { ...saved, operationId: id(90) },
     { ...saved, brokerInputDigest: 'f'.repeat(64) }, { ...saved, sourceSessionId: 'another' },
-    { ...saved, presentationDigest: 'f'.repeat(64) }, { ...saved, version: { ...value.version, contextEpoch: '5' } }])
-    assert.throws(() => validate(value, changed), /caller_intent_response_identity_changed/);
+    { ...saved, presentationDigest: 'f'.repeat(64) }, { ...saved, version: { ...value.version, contextEpoch: '5' } }]) {
+    assert.deepEqual(callerIntentV2ResponseSchema.parse(changed), changed);
+    assert.throws(() => validate(value, changed), { name: 'Error', message: 'caller_intent_response_identity_changed' });
+  }
   const { resultCoverage: ignored, resultContextCoverage: ignoredContext, ...legacy } = saved;
   assert.throws(() => validate(value, { ...legacy, v: 'phone.caller-intent.v1' }));
   assert.equal(callerIntentV1ResponseSchema.safeParse(saved).success, false);

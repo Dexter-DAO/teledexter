@@ -56,9 +56,29 @@ const receipt = (turn: PrimaryTurn): PrimaryTurnReceipt => ({ bindingId: seed.de
   sourceEventId: turn.sourceEventId, revision: turn.revision, recordId: turn.sourceEventId,
   revisionRecordId: uuid(40), bodyDigest: turnBodyDigest(turn), replayed: false });
 const empty = (): LiveTranscriptSnapshot => ({ revision: 0, callerRevision: 0, fragments: [] });
+const WAIT_MS = 3_000;
 function deferred<T>() {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>(yes => { resolve = yes; }); return { promise, resolve };
+  let resolve!: (value: T) => void, reject!: (error: Error) => void;
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+  void promise.catch(() => {});
+  return { promise, resolve, reject };
+}
+function observe<T>(work: Promise<T>) {
+  return work.then(value => ({ state: 'fulfilled' as const, value }), error => ({ state: 'rejected' as const, error }));
+}
+async function bounded<T>(work: Promise<T>, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([work, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`Fixture wait timed out: ${label}`)), WAIT_MS);
+    })]);
+  } finally { clearTimeout(timer); }
+}
+function milestone<T>(entered: Promise<T>, work: ReturnType<typeof observe>, label: string): Promise<T> {
+  return bounded(Promise.race([entered, work.then(outcome => {
+    if (outcome.state === 'rejected') throw outcome.error;
+    throw new Error(`Operation completed before fixture milestone: ${label}`);
+  })]), label);
 }
 
 function fixture() {
@@ -198,7 +218,7 @@ function fixture() {
     acoustic = { sessionId, audioThroughMs: undefined, observedSpeechAtMs: undefined };
   };
   return { options, call, hooks, events, captures, posts, associations, deliveries, admissions, channel, caller, rotate,
-    create: () => createSelectedQuestionVoiceAdapter(options), saved: () => structuredClone(saved!), voice: () => structuredClone(voice!),
+    abort: () => abort.abort(), create: () => createSelectedQuestionVoiceAdapter(options), saved: () => structuredClone(saved!), voice: () => structuredClone(voice!),
     setText(value: string) { questionText = value; }, setTime(value: number) { clock = value; },
     addSpeechWithoutCaption() { acoustic = { ...acoustic, audioThroughMs: (acoustic.audioThroughMs ?? 0) + 20 }; },
     frozen: () => structuredClone(frozen!), changeFrozen(value: Partial<FrozenSelectedCallerTurn>) { frozen = { ...frozen!, ...value }; } };
@@ -491,14 +511,24 @@ test('unknown reply POST is reconciled by a question read after restart without 
   assert.equal(h.saved().questions[0]!.record!.attempts[0]!.state, 'accepted');
 });
 
-test('durable answer admission releases the rotation drain before capture or reply HTTP', async () => {
-  const h = fixture(), adapter = h.create(); await adapter.host.start();
+test('durable answer admission releases the rotation drain before capture or reply HTTP', { timeout: 9_000 }, async t => {
+  const h = fixture(), adapter = h.create();
+  t.after(() => { try { adapter.stop(); } finally { h.abort(); } });
+  await bounded(adapter.host.start(), 'host start before admission');
   const captured = deferred<PrimaryTurnReceipt>(), admitted = deferred<void>();
   h.hooks.capture = () => captured.promise; h.hooks.admit = () => admitted.resolve();
-  const pending = adapter.delegate(h.caller(), h.channel); await admitted.promise;
-  assert.equal(h.saved().questions[0]!.admissions.length, 1); assert.equal(h.posts.length, 0);
-  adapter.stop(); captured.resolve(receipt(h.frozen().turn)); await pending;
-  assert.equal(h.posts.length, 0); assert.equal(h.saved().questions[0]!.admissions[0]!.localRefusal!.code, 'call_ended');
+  const pending = adapter.delegate(h.caller(), h.channel), outcome = observe(pending);
+  try {
+    await milestone(admitted.promise, outcome, 'durable answer admitted');
+    assert.equal(h.saved().questions[0]!.admissions.length, 1); assert.equal(h.posts.length, 0);
+    adapter.stop(); captured.resolve(receipt(h.frozen().turn)); await bounded(pending, 'stopped answer settlement');
+    assert.equal(h.posts.length, 0); assert.equal(h.saved().questions[0]!.admissions[0]!.localRefusal!.code, 'call_ended');
+  } finally {
+    try { adapter.stop(); } finally {
+      h.abort(); captured.reject(new Error('fixture cleanup'));
+      await bounded(outcome, 'answer cleanup settlement');
+    }
+  }
 });
 
 test('stop after source evidence save retains capture even if the host never admits its reply', async () => {
@@ -572,25 +602,47 @@ test('call journal validation retains rejected historical proof and refuses miss
   assert.throws(() => validateSelectedQuestionVoiceCall(moved, saved), /audio_origin_changed/);
 });
 
-test('stop during source freezing releases the drain but keeps binding close pending until the source is retained', async () => {
-  const h = fixture(), adapter = h.create(); await adapter.host.start(); const request = h.caller();
-  const freeze = deferred<FrozenSelectedCallerTurn | undefined>(), entered = deferred<void>();
+test('stop during source freezing releases the drain but keeps binding close pending until the source is retained', { timeout: 9_000 }, async t => {
+  const h = fixture(), adapter = h.create();
+  t.after(() => { try { adapter.stop(); } finally { h.abort(); } });
+  await bounded(adapter.host.start(), 'host start before stopped freeze');
+  const request = h.caller(), freeze = deferred<FrozenSelectedCallerTurn | undefined>(), entered = deferred<void>();
   h.hooks.freezer = () => { entered.resolve(); return freeze.promise; };
-  const pending = adapter.delegate(request, h.channel); await entered.promise;
-  adapter.stop(); assert.equal(h.admissions.length, 1);
-  assert.deepEqual(await adapter.prepareCloseout(), { pendingAdmissions: 1, pendingCaptures: 0, pendingReplies: 0, ready: false });
-  freeze.resolve(h.frozen()); await assert.rejects(pending, /call_inactive/);
-  assert.equal(h.voice().sources.length, 1);
-  assert.deepEqual(await adapter.prepareCloseout(), { pendingAdmissions: 0, pendingCaptures: 0, pendingReplies: 0, ready: true });
-  assert.equal(h.captures.length, 1); assert.equal(h.posts.length, 0);
+  const pending = adapter.delegate(request, h.channel), outcome = observe(pending);
+  try {
+    await milestone(entered.promise, outcome, 'source freezer entered before stop');
+    adapter.stop(); assert.equal(h.admissions.length, 1);
+    assert.deepEqual(await bounded(adapter.prepareCloseout(), 'closeout while source held'),
+      { pendingAdmissions: 1, pendingCaptures: 0, pendingReplies: 0, ready: false });
+    freeze.resolve(h.frozen()); await assert.rejects(bounded(pending, 'stopped source settlement'), /call_inactive/);
+    assert.equal(h.voice().sources.length, 1);
+    assert.deepEqual(await bounded(adapter.prepareCloseout(), 'closeout after source retained'),
+      { pendingAdmissions: 0, pendingCaptures: 0, pendingReplies: 0, ready: true });
+    assert.equal(h.captures.length, 1); assert.equal(h.posts.length, 0);
+  } finally {
+    try { adapter.stop(); } finally {
+      h.abort(); freeze.reject(new Error('fixture cleanup'));
+      await bounded(outcome, 'stopped freeze cleanup settlement');
+    }
+  }
 });
 
-test('rotation during source freezing retains original source without relabelling or replying from old presentation', async () => {
-  const h = fixture(), adapter = h.create(); await adapter.host.start(); const request = h.caller();
-  const original = h.frozen(), freeze = deferred<FrozenSelectedCallerTurn | undefined>(), entered = deferred<void>();
+test('rotation during source freezing retains original source without relabelling or replying from old presentation', { timeout: 9_000 }, async t => {
+  const h = fixture(), adapter = h.create();
+  t.after(() => { try { adapter.stop(); } finally { h.abort(); } });
+  await bounded(adapter.host.start(), 'host start before rotated freeze');
+  const request = h.caller(), original = h.frozen(), freeze = deferred<FrozenSelectedCallerTurn | undefined>(), entered = deferred<void>();
   h.hooks.freezer = () => { entered.resolve(); return freeze.promise; };
-  const pending = adapter.delegate(request, h.channel); await entered.promise;
-  h.rotate(); freeze.resolve(original); await assert.rejects(pending, /reply_unqualified/);
-  assert.deepEqual(h.voice().sources[0]!.frozen, original); assert.equal(h.posts.length, 0);
-  await adapter.prepareCloseout(); assert.deepEqual(h.captures, [original.turn]);
+  const pending = adapter.delegate(request, h.channel), outcome = observe(pending);
+  try {
+    await milestone(entered.promise, outcome, 'source freezer entered before rotation');
+    h.rotate(); freeze.resolve(original); await assert.rejects(bounded(pending, 'rotated source settlement'), /reply_unqualified/);
+    assert.deepEqual(h.voice().sources[0]!.frozen, original); assert.equal(h.posts.length, 0);
+    await bounded(adapter.prepareCloseout(), 'rotated source closeout'); assert.deepEqual(h.captures, [original.turn]);
+  } finally {
+    try { adapter.stop(); } finally {
+      h.abort(); freeze.reject(new Error('fixture cleanup'));
+      await bounded(outcome, 'rotated freeze cleanup settlement');
+    }
+  }
 });

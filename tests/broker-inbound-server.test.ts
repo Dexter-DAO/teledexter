@@ -10,7 +10,8 @@ import { createBrokerServer } from '../src/broker/server.js';
 import { inboundBeginRef, type InboundBeginIdentity, type InboundOutcome } from '../src/broker/inboundContract.js';
 import { BrokerStore, type BrokerCall } from '../src/broker/store.js';
 import type { BrokerConfig } from '../src/broker/config.js';
-import type { PrimaryApiClient } from '../src/broker/primaryApi.js';
+import { PrimaryApiError, type PrimaryApiClient } from '../src/broker/primaryApi.js';
+import { createInboundHoldAdapter } from '../src/broker/inboundHold.js';
 import { streamToken } from '../src/broker/phone.js';
 
 async function fixture(t: test.TestContext, options: { selected?: boolean; retained?: BrokerCall; initialRemote?: InboundOutcome } = {}) {
@@ -22,27 +23,32 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
     twilioAccountSid: 'AC' + '1'.repeat(32), twilioAuthToken: 'fixture-twilio-secret', from: '+12025550100',
     allowedTo: ['+12025550123'], apiBaseUrl: 'https://api.example.test', phoneServiceSecret: 's'.repeat(40), maxCallSeconds: 60 };
   const params = { AccountSid: config.twilioAccountSid, CallSid: 'CA' + '2'.repeat(32), From: config.allowedTo[0], To: config.from,
-    Direction: 'inbound', CallStatus: 'ringing' };
+    Direction: 'inbound', CallStatus: 'ringing', StirVerstat: 'TN-Validation-Passed-A' };
   const attachmentId = options.initialRemote?.attachmentId ?? randomUUID();
   const approvalRef = options.initialRemote && 'approvalRef' in options.initialRemote ? options.initialRemote.approvalRef
     : { attachmentId, approvalId: randomUUID(), digest: 'd'.repeat(64) };
   const bindingId = options.initialRemote?.state === 'bound' ? options.initialRemote.bindingId : randomUUID();
+  const primaryDexterId = randomUUID(), threadId = randomUUID();
   let remote = options.initialRemote;
   let loseConsume = false, lostBegin = false, authority = true, cancellationUnavailable = false;
   const lifecycle: string[] = [];
   let providerGate: Promise<void> | undefined; let releaseProvider: (() => void) | undefined;
   let providerEntered: (() => void) | undefined; let providerState = 'in-progress';
+  let beginError: Error | undefined;
   let statusGate: Promise<void> | undefined; let releaseStatus: (() => void) | undefined;
   const seen = { dial: 0, end: 0, voice: 0, begin: 0, consume: 0, context: 0, cancel: 0, close: 0, legacyClose: 0 };
   const context = () => {
     seen.context++;
     if (!authority) throw new Error('authority_unavailable');
     return { bindingId, callSid: params.CallSid, state: 'open' as const,
-      context: { primaryDexterId: randomUUID(), threadId: randomUUID(), displayName: 'Branch', messages: [] } };
+      context: { primaryDexterId, threadId, displayName: 'Branch', messages: [] } };
   };
   const primary = {
     async beginInbound(begin: InboundBeginIdentity) {
       seen.begin++;
+      assert.ok(store.list()[0].inbound!.continuation);
+      assert.deepEqual(begin.providerProof, store.list()[0].inbound!.begin.providerProof);
+      if (beginError) throw beginError;
       assert.equal(store.list()[0].inbound!.beginAttemptedAt !== undefined, true);
       remote ??= { attachmentId, beginRef: inboundBeginRef(begin), state: 'pending', expiresAt: new Date(Date.now() + 300_000).toISOString() };
       if (lostBegin) { lostBegin = false; throw new Error('lost_begin'); }
@@ -82,9 +88,7 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
     async update() { seen.end++; return { sid, status: 'completed' }; },
   }), { async create() { seen.dial++; throw new Error('inbound_must_not_dial'); } });
   const broker = createBrokerServer({ config, store, primary, provider: { calls: provider } as unknown as ReturnType<typeof Twilio>,
-    ...(options.selected === false ? {} : { inboundAttachment: { waitingResponse: ({ continuationUrl }: { continuationUrl: string }) => {
-      const response = new Twilio.twiml.VoiceResponse(); response.pause({ length: 1 }); response.redirect({ method: 'POST' }, continuationUrl); return response.toString();
-    } } }),
+    ...(options.selected === false ? {} : { inboundAttachment: createInboundHoldAdapter({ publicOrigin: config.publicOrigin, store }) }),
     voiceFactory: settings => {
       seen.voice++;
       queueMicrotask(() => settings.onReady({ callId: settings.callId, sessionId: 'inbound-fixture' }));
@@ -106,6 +110,8 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
   const close = async () => { if (!closed) { closed = true; await broker.close(); } };
   t.after(async () => { await close(); fs.rmSync(dir, { recursive: true, force: true }); });
   return { broker, store, base, config, params, seen, lifecycle, webhook, close, remote: () => remote,
+    async waitForAdmission() { const call = store.list()[0]; await (await webhook(`/broker/inbound/${call.id}/continue`)).text(); },
+    beginError(error?: Error) { beginError = error; },
     approve() { assert.ok(remote?.state === 'pending'); remote = { ...remote, state: 'approved', approvalRef }; },
     loseBegin() { lostBegin = true; }, loseConsume() { loseConsume = true; }, refuseContext() { authority = false; },
     refuseCancellation() { cancellationUnavailable = true; },
@@ -124,7 +130,7 @@ test('actual HTTP incoming waits on same leg and approved continuation enters ex
   const wait = await incoming.text();
   assert.equal(incoming.status, 200); assert.match(wait, /<Redirect/); assert.doesNotMatch(wait, /<Gather|<Stream/);
   assert.equal(f.seen.dial, 0); assert.equal(f.seen.context, 0); assert.equal(f.seen.voice, 0);
-  const call = f.store.list()[0]; f.approve();
+  const call = f.store.list()[0]; await f.waitForAdmission(); f.approve();
   const response = await f.webhook(`/broker/inbound/${call.id}/continue`);
   assert.equal(response.status, 200); assert.match(await response.text(), /<Stream/);
   assert.equal(f.seen.consume, 1); assert.equal(f.seen.dial, 0);
@@ -146,7 +152,7 @@ test('actual HTTP incoming waits on same leg and approved continuation enters ex
 
 test('lost registration followed by terminal callback closes exact inbound binding after authority loss', async t => {
   const f = await fixture(t); await (await f.webhook('/broker/incoming-call')).text();
-  const call = f.store.list()[0]; f.approve(); f.loseConsume();
+  const call = f.store.list()[0]; await f.waitForAdmission(); f.approve(); f.loseConsume();
   const lost = await f.webhook(`/broker/inbound/${call.id}/continue`);
   assert.match(await lost.text(), /<Redirect/);
   assert.equal(f.store.get(call.id)!.primary, undefined); f.refuseContext();
@@ -161,7 +167,8 @@ test('lost registration followed by terminal callback closes exact inbound bindi
 test('lost begin stays a recoverable wait and terminal callback cancels it', async t => {
   const f = await fixture(t); f.loseBegin();
   const first = await f.webhook('/broker/incoming-call'); assert.match(await first.text(), /<Redirect/);
-  const call = f.store.list()[0]; assert.equal(call.inbound!.remote, undefined);
+  const call = f.store.list()[0]; assert.equal(f.seen.begin, 0); await f.waitForAdmission();
+  assert.equal(f.seen.begin, 1); assert.equal(f.store.get(call.id)!.inbound!.remote, undefined);
   const terminal = await f.webhook('/broker/status', { CallStatus: 'completed' }); await terminal.text();
   assert.equal(f.store.get(call.id)!.inbound!.remote?.state, 'cancelled');
   assert.equal(f.seen.context, 0); assert.equal(f.seen.consume, 0);
@@ -183,7 +190,7 @@ test('unselected adapter preserves existing callback behavior for new incoming c
 });
 
 test('shutdown fences all saved waiting calls, including restored calls absent from this process sessions', async t => {
-  const first = await fixture(t); await (await first.webhook('/broker/incoming-call')).text(); first.approve();
+  const first = await fixture(t); await (await first.webhook('/broker/incoming-call')).text(); await first.waitForAdmission(); first.approve();
   const saved = first.store.list()[0]; const remote = first.remote()!;
   const restarted = await fixture(t, { selected: false, retained: saved, initialRemote: remote });
   await restarted.close();
@@ -193,7 +200,7 @@ test('shutdown fences all saved waiting calls, including restored calls absent f
 });
 
 test('disabled adapter cannot consume a retained approved call through a continuation', async t => {
-  const first = await fixture(t); await (await first.webhook('/broker/incoming-call')).text(); first.approve();
+  const first = await fixture(t); await (await first.webhook('/broker/incoming-call')).text(); await first.waitForAdmission(); first.approve();
   const saved = first.store.list()[0];
   const restarted = await fixture(t, { selected: false, retained: saved, initialRemote: first.remote()! });
   const result = await restarted.webhook(`/broker/inbound/${saved.id}/continue`);
@@ -204,7 +211,7 @@ test('disabled adapter cannot consume a retained approved call through a continu
 
 
 test('shutdown stop is saved before an in-flight approved status can consume', async t => {
-  const f = await fixture(t); await (await f.webhook('/broker/incoming-call')).text(); f.approve();
+  const f = await fixture(t); await (await f.webhook('/broker/incoming-call')).text(); await f.waitForAdmission(); f.approve();
   const call = f.store.list()[0]; const release = f.gateStatus();
   const continuing = f.webhook(`/broker/inbound/${call.id}/continue`);
   await new Promise(resolve => setTimeout(resolve, 20));
@@ -217,7 +224,7 @@ test('shutdown stop is saved before an in-flight approved status can consume', a
 
 test('stopped wait terminates provider leg even while API cancellation fails', async t => {
   const f = await fixture(t); await (await f.webhook('/broker/incoming-call')).text();
-  const call = f.store.list()[0]; f.refuseCancellation();
+  const call = f.store.list()[0]; await f.waitForAdmission(); f.refuseCancellation();
   f.store.transitionInbound(call.id, { type: 'stop', observedAt: new Date().toISOString(), reason: 'broker_cancelled' });
   await f.broker.maintain();
   assert.equal(f.seen.end, 1);
@@ -237,7 +244,7 @@ test('enabling direct attachment leaves historical callback webhook retries in t
 
 
 test('terminal provider result arriving after media starts finalizes voice before binding closure', async t => {
-  const f = await fixture(t); await (await f.webhook('/broker/incoming-call')).text(); f.approve();
+  const f = await fixture(t); await (await f.webhook('/broker/incoming-call')).text(); await f.waitForAdmission(); f.approve();
   const call = f.store.list()[0]; await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text();
   const gate = f.gateProvider(); const maintaining = f.broker.maintain(); await gate.entered;
   const route = `/broker/media/${call.id}`;
@@ -254,4 +261,65 @@ test('terminal provider result arriving after media starts finalizes voice befor
   assert.equal(f.store.get(call.id)!.inbound!.closure?.state, 'closed');
   assert.ok(f.store.get(call.id)!.transcriptCapture);
   if (ws.readyState !== WebSocket.CLOSED) await new Promise<void>(resolve => ws.once('close', () => resolve()));
+});
+
+test('actual HTTP hold answers before redirect; restart and maintenance cannot create fresh admission', async t => {
+  const f = await fixture(t);
+  const first = await f.webhook('/broker/incoming-call'); const xml = await first.text();
+  assert.match(xml, /<Say>One moment\.<\/Say><Pause length="1"\/><Redirect method="POST">/);
+  assert.equal(f.seen.begin, 0); assert.equal(f.seen.context, 0);
+  const saved = f.store.list()[0]; const waitUntil = saved.inbound!.waitUntil;
+  await f.broker.maintain(); assert.equal(f.seen.begin, 0);
+  const restored = await fixture(t, { retained: saved });
+  await restored.broker.maintain(); assert.equal(restored.seen.begin, 0);
+  const bad = await restored.webhook(`/broker/inbound/${saved.id}/continue`, {}, false);
+  assert.equal(bad.status, 403); await bad.text();
+  assert.equal(restored.store.get(saved.id)!.inbound!.continuation, undefined);
+  const continued = await restored.webhook(`/broker/inbound/${saved.id}/continue`, { CallStatus: 'in-progress' });
+  const silent = await continued.text(); assert.match(silent, /<Pause/); assert.doesNotMatch(silent, /<Say|<Stream|<Gather/);
+  assert.equal(restored.seen.begin, 1); assert.equal(restored.seen.context, 0);
+  assert.equal(restored.store.get(saved.id)!.inbound!.waitUntil, waitUntil);
+  assert.deepEqual(restored.store.get(saved.id)!.inbound!.begin.providerProof, saved.inbound!.begin.providerProof);
+  assert.equal(restored.seen.dial, 0);
+});
+
+for (const code of ['inbound_carrier_attestation_required', 'inbound_enrollment_required'] as const) {
+  test(`actual HTTP ${code} hangs up while unavailable cancellation remains pending`, async t => {
+    const f = await fixture(t); await (await f.webhook('/broker/incoming-call')).text();
+    const call = f.store.list()[0];
+    f.beginError(new PrimaryApiError('http_error', 403, { code, retryable: false }));
+    f.refuseCancellation();
+    const response = await f.webhook(`/broker/inbound/${call.id}/continue`); const xml = await response.text();
+    assert.match(xml, /<Hangup/); assert.doesNotMatch(xml, /<Stream|<Gather|enrollment|attestation/);
+    const saved = f.store.get(call.id)!;
+    assert.equal(saved.inbound!.admissionRefusal?.code, code);
+    assert.equal(saved.inbound!.localStop?.reason, code);
+    assert.ok(saved.inbound!.cancelRequestedAt); assert.equal(saved.inbound!.remote, undefined);
+    assert.equal(saved.inbound!.closure, undefined); assert.equal(f.seen.context, 0); assert.equal(f.seen.consume, 0);
+    f.beginError(); await f.broker.maintain();
+    assert.equal(f.seen.begin, 1); assert.equal(f.seen.end, 1);
+    assert.equal(f.store.get(call.id)!.inbound!.remote, undefined);
+  });
+}
+
+test('actual HTTP retryable carrier503 continues silently and preserves one original begin', async t => {
+  const f = await fixture(t); await (await f.webhook('/broker/incoming-call')).text();
+  const call = f.store.list()[0];
+  f.beginError(new PrimaryApiError('http_error', 503, { code: 'inbound_carrier_admission_unavailable', retryable: true }));
+  const wait = await f.webhook(`/broker/inbound/${call.id}/continue`);
+  assert.match(await wait.text(), /<Redirect/);
+  const attempted = f.store.get(call.id)!;
+  assert.equal(attempted.inbound!.localStop, undefined); assert.equal(attempted.inbound!.admissionRefusal, undefined);
+  f.beginError(); await f.broker.maintain();
+  assert.equal(f.seen.begin, 2); assert.equal(f.store.list().length, 1);
+  assert.deepEqual(f.store.get(call.id)!.inbound!.begin, attempted.inbound!.begin);
+  assert.equal(f.store.get(call.id)!.inbound!.waitUntil, call.inbound!.waitUntil);
+  assert.equal(f.seen.context, 0); assert.equal(f.seen.dial, 0);
+});
+
+test('hold adapter refuses a different continuation destination', async t => {
+  const f = await fixture(t); await (await f.webhook('/broker/incoming-call')).text();
+  const call = f.store.list()[0]; const adapter = createInboundHoldAdapter({ publicOrigin: f.config.publicOrigin, store: f.store });
+  assert.throws(() => adapter.waitingResponse({ callId: call.id, continuationUrl: 'https://other.example/broker/inbound/' + call.id + '/continue' }), /mismatch/);
+  assert.equal(f.seen.begin, 0);
 });

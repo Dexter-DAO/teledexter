@@ -70,10 +70,12 @@ test('runtime patches cannot remove or rewrite a saved selection', t => {
 
 test('unassigned or inbound reservations refuse a continuation before persisting', t => {
   const f = fixture(t);
+  const emptyJournal = fs.readFileSync(f.file, 'utf8');
+  assert.deepEqual(JSON.parse(emptyJournal), { version: 1, calls: {} });
   assert.throws(() => f.store.reserve({ ...input(), continuation: selected() }), /call_continuation_not_allowed/);
   assert.throws(() => f.store.reserve({ ...input(), direction: 'inbound', continuation: selected() }, 'authenticated_broker_control'));
   assert.deepEqual(f.store.list(), []);
-  assert.equal(fs.existsSync(f.file), false);
+  assert.equal(fs.readFileSync(f.file, 'utf8'), emptyJournal);
 });
 
 test('restart refuses a tampered saved selector without upgrading or rewriting it', t => {

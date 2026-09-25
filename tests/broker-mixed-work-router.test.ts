@@ -8,7 +8,9 @@ import { brokerIdentity } from '../src/broker/backend.js';
 import { createMixedWorkRouter, recoverCallerRouteCaptures, type CallerIntentPort } from '../src/broker/mixedWork.js';
 import { turnBodyDigest } from '../src/broker/reconciliation.js';
 import type { FrozenCallerTurn } from '../src/broker/callerTurn.js';
-import type { CallerRouteDecision } from '../src/broker/callerRouting.js';
+import { callerRouteRef, type CallerRouteDecision } from '../src/broker/callerRouting.js';
+import { buildCallerIntentInput } from '../src/broker/callerIntentResolver.js';
+import { callerIntentInputDigest, type CallerIntentDecision, type CallerIntentV2Response } from '../src/broker/callerIntentContract.js';
 import type { LiveBackendChannel, LiveDelegationRequest } from '../src/live/types.js';
 
 const uuid = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
@@ -54,13 +56,42 @@ function fixture(t: TestContext, resolve: CallerIntentPort['resolve'], timeoutMs
   } };
   const read = () => store.get(reserved.id)!;
   const router = createMixedWorkRouter({ callId: reserved.id, store, intent: { timeoutMs,
-    resolve(input, signal) { resolutions++; assert.equal(read().callerRouting!.records[0]!.inputDigest, input.record.inputDigest);
-      assert.equal(input.record.frozen.turn.text, frozen.turn.text); return resolve(input, signal); } },
+    async resolve(input, signal) {
+      const ref = callerRouteRef(input.record), exactInput = buildCallerIntentInput(read(), input.record);
+      store.prepareCallerIntent(reserved.id, ref, { operationId: input.operationId, input: exactInput });
+      resolutions++; assert.equal(read().callerRouting!.records[0]!.inputDigest, input.record.inputDigest);
+      assert.equal(input.record.frozen.turn.text, frozen.turn.text);
+      const result = await resolve(input, signal);
+      if (signal.aborted) throw signal.reason;
+      let decision: CallerIntentDecision;
+      if (result.decision.kind === 'task') {
+        assert.equal(result.decision.contextReference, undefined); decision = { kind: 'task' };
+      } else if (result.decision.kind === 'clarify') {
+        assert.equal(result.decision.reason, 'mixed_intent'); decision = { kind: 'clarify', reason: 'mixed_intent' };
+      } else {
+        assert.equal(result.decision.kind, 'conversation'); decision = { kind: 'conversation' };
+      }
+      const reservedAt = new Date().toISOString();
+      const response: CallerIntentV2Response = { v: exactInput.v, operationId: input.operationId, bindingId,
+        inputDigest: callerIntentInputDigest(input.operationId, bindingId, exactInput),
+        brokerInputDigest: exactInput.brokerInputDigest, presentationDigest: exactInput.presentationDigest,
+        generationId: exactInput.generationId, sourceSessionId: exactInput.sourceSessionId,
+        callDeadlineAt: exactInput.callDeadlineAt, questions: exactInput.questions, results: exactInput.results,
+        version: exactInput.version, resultCoverage: exactInput.resultCoverage, resultContextCoverage: { state: 'complete' },
+        reservedAt, validUntil: new Date(Math.min(Date.parse(exactInput.callDeadlineAt), Date.parse(reservedAt) + 10_000)).toISOString(),
+        state: 'resolved', decision };
+      store.recordCallerIntentResponse(reserved.id, ref, response);
+      return result;
+    } },
     freezer: { async freeze() { freezes++; return frozen; } },
     active: () => !abort.signal.aborted && !read().endedAt,
-    resolutionInput: () => ({ version, publicationSequence: 0, questions: [], references: [] }),
+    resolutionInput: () => ({ version, publicationSequence: 0, questions: [], references: [],
+      resultCoverage: { state: 'complete', count: 0 } }),
     async admit(request, ref, decision) {
-      assert.deepEqual(read().callerRouting!.records.find(r => r.inputDigest === ref.inputDigest)?.decision, decision);
+      const saved = read().callerRouting!.records.find(r => r.inputDigest === ref.inputDigest)!;
+      assert.deepEqual(saved.decision, decision);
+      assert.equal(saved.intent?.response?.state, 'resolved');
+      assert.equal(saved.intent?.response?.inputDigest, callerIntentInputDigest(saved.intent!.operationId, bindingId, saved.intent!.input));
       decisions.push(decision);
       await onAdmit?.(request);
     },
@@ -79,6 +110,13 @@ test('duplicate in-flight delegation freezes and resolves once before its exact 
   const first = f.router.delegate(f.request, f.channel), second = f.router.delegate(f.request, f.channel);
   assert.equal(first, second); await until(() => f.counts().resolutions === 1);
   assert.equal(f.decisions.length, 0); assert.equal(f.read().callerRouting!.records[0]!.decision, undefined);
+  const prepared = f.read().callerRouting!.records[0]!, beforeReceipt = JSON.stringify(f.read().callerRouting);
+  assert.ok(prepared.intent, 'exact input must be durable before the held resolver callback');
+  assert.equal(prepared.intent.response, undefined);
+  assert.throws(() => f.store().decideCallerRoute(f.request.callId, callerRouteRef(prepared), {
+    inputDigest: prepared.inputDigest, decision: { kind: 'task' },
+  }), { message: 'caller_route_intent_unresolved' });
+  assert.equal(JSON.stringify(f.read().callerRouting), beforeReceipt);
   wait.resolve(); await first;
   assert.deepEqual(f.decisions, [{ kind: 'task' }]); assert.equal(f.counts().freezes, 1);
 });
@@ -94,6 +132,12 @@ test('wrong digest, unavailable inference and mixed speech never dispatch and pr
     assert.equal(f.decisions.length, 0); assert.equal(f.counts().resolutions, 1); assert.equal(f.counts().freezes, 1);
     assert.equal(f.counts().captures, 1); assert.ok(f.read().callerRouting!.records[0]!.capture);
     assert.equal(f.read().callerRouting!.records[0]!.frozen.turn.text, f.frozen.turn.text);
+    const saved = f.read().callerRouting!.records[0]!;
+    assert.ok(saved.intent, 'refused resolution retains the prepared exact input');
+    assert.deepEqual(saved.decision, { kind: 'clarify', reason: kind === 'mixed' ? 'mixed_intent' : 'unavailable' });
+    assert.deepEqual(f.notices, [kind === 'mixed' ? 'mixed_intent' : 'unavailable']);
+    assert.equal(saved.intent.response?.state, kind === 'unavailable' ? undefined : 'resolved');
+    if (kind === 'wrong_digest') assert.deepEqual(saved.intent.response?.state === 'resolved' && saved.intent.response.decision, { kind: 'task' });
   }
 });
 

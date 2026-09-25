@@ -110,6 +110,9 @@ async function preCallAssignmentCases(t: test.TestContext, parser: { safeParse(v
   ];
   for (const item of cases) await t.test(item.name, async child => {
     const f = await fixture(child, { assignmentParser: parser });
+    const journalFile = path.join(f.config.stateDir, 'calls.json');
+    const emptyJournal = fs.readFileSync(journalFile, 'utf8');
+    assert.deepEqual(JSON.parse(emptyJournal), { version: 1, calls: {} });
     const input = { requestId: item.requestId, purpose: item.purpose };
     assert.equal(parser.safeParse({ assignmentId: input.requestId, brokerCallId: canonicalId,
       revision: 1, purpose: input.purpose.trim() }).success, item.allowed);
@@ -118,7 +121,7 @@ async function preCallAssignmentCases(t: test.TestContext, parser: { safeParse(v
     await response.text();
     if (!item.allowed) {
       assert.deepEqual(f.broker.store.list(), []);
-      assert.equal(fs.existsSync(path.join(f.config.stateDir, 'calls.json')), false);
+      assert.equal(fs.readFileSync(journalFile, 'utf8'), emptyJournal);
       assert.deepEqual(f.calls, { create: 0, update: 0, preflight: 0, readiness: 0, bind: 0, close: 0, audio: 0, fetch: 0 });
       return;
     }

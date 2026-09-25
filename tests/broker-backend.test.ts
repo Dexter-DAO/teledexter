@@ -724,10 +724,13 @@ test('a later independent caller span excludes the already submitted turn', asyn
 
 test('identity mismatch prevents dispatch and a mismatched response cannot be spoken as success', async t => {
   const f = await fixture(t); f.add('Read my balance.'); f.speech();
-  f.store.update(f.call.id, { primary: { bindingId: otherBinding, name: null, context: '' } });
-  await assert.rejects(f.backend.delegate(f.request(), f.channel), /identity_mismatch/);
+  const before = await readFile(path.join(f.directory, 'calls.json'), 'utf8');
+  assert.throws(() => f.store.update(f.call.id, { primary: { bindingId: otherBinding, name: null, context: '' } }), /Primary binding cannot change/);
+  assert.equal(await readFile(path.join(f.directory, 'calls.json'), 'utf8'), before);
+  const mismatchedBackend = createPrimaryBackend({ ...f.options, bindingId: otherBinding });
+  await assert.rejects(mismatchedBackend.delegate(f.request(), f.channel), /identity_mismatch/);
   assert.equal(f.posts.length, 0);
-  f.store.update(f.call.id, { primary: { bindingId, name: null, context: '' } });
+  assert.equal(f.store.get(f.call.id)!.primary!.bindingId, bindingId);
   f.behavior.result = async id => ({ ...f.completed(id), bindingId: otherBinding });
   await f.backend.delegate(f.request(), f.channel);
   assert.equal(f.saved()[0].status, 'queued');

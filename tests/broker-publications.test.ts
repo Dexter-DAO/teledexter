@@ -174,9 +174,9 @@ async function generationFixture(t: TestContext) {
         pageDigest: 'b'.repeat(64), transcript: before, outputDiscarded: false },
     ],
   };
-  const current = f.store.get(f.call.id)!;
-  f.store.update(f.call.id, { primary: { ...current.primary!, primaryDexterId, threadId },
-    liveSessionId: 'sess_2', liveGenerations });
+  f.store.recordPrimaryBinding(f.call.id, { bindingId, callSid: f.identity.callSid, state: 'open',
+    context: { primaryDexterId, threadId, displayName: 'Dexter', messages: [] } });
+  f.store.update(f.call.id, { liveSessionId: 'sess_2', liveGenerations });
   const deliveryIdentity = { ...f.identity, sessionId: 'sess_2' };
   const publicationIdentity = { ...deliveryIdentity, sourceSessionId: 'sess_1' };
   const update = { id: 'generation_result', kind: 'result' as const, speak: true,

@@ -97,6 +97,8 @@ export interface BrokerLiveSessionOptions {
   /** Complete, source-validated successor history. Provider startup accepts or refuses its token budget. */
   eligibleHistory?: import('../broker/eligibleHistory.js').PreparedEligibleHistory;
   backend: BrokerLiveBackend;
+  /** Restricted setup only; absent preserves the original client delegation protocol. */
+  restrictedSetupTools?: import('./restrictedSetupTools.js').RestrictedSetupTools;
   /** Ordered audio deliveries use connection-local IDs, never provider event IDs. */
   onAudio(base64: string, metadata: { deliveryId: string }): void;
   onTranscript(snapshot: LiveTranscriptSnapshot): void | Promise<void>;
