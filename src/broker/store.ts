@@ -1,3 +1,6 @@
+import { validateRestrictedSetupCall, restrictedSetupJournalSchema, type RestrictedSetupJournal } from './restrictedSetupJournal.js';
+import { reserveVerificationCallback, parseVerificationCallbackJournal, validateVerificationCallbackCall, verificationCallbackPurpose, type VerificationCallbackJournal } from './verificationCallbackJournal.js';
+import { phoneVerificationCallbackPermitSchema, type PhoneVerificationCallbackPermit } from './verificationCallbackContract.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -68,6 +71,8 @@ export interface BrokerCall {
   harkReceiptOutbox?: PrimaryHarkReceiptOutbox;
   harkDispatch?: HarkDispatch;
   inbound?: InboundJournal;
+  verificationCallback?: VerificationCallbackJournal;
+  restrictedSetup?: RestrictedSetupJournal;
   voiceOpening?: { status: string; eventId?: string; reason?: string };
   finalized?: boolean; failure?: { code: string; message: string };
   canonicalTurns?: Record<string, unknown>;
@@ -365,6 +370,8 @@ function validateBrokerState(state: State): void {
     validateHarkJournal(call);
     validateHarkDispatch(call);
     validateInboundJournal(call);
+    validateVerificationCallbackCall(call);
+    validateRestrictedSetupCall(call);
     validateHarkReceiptCall(call);
     validateSelectedOutboundObservation(call);
   }
@@ -418,6 +425,9 @@ export class BrokerStore {
       validateCallerRouting(call, this.state?.calls[id]);
       validateBrokerAdmissionRefusals(call, this.state?.calls[id]);
       validateSelectedOutboundObservation(call, this.state?.calls[id]);
+      validateInboundJournal(call, this.state?.calls[id]);
+      validateVerificationCallbackCall(call, this.state?.calls[id]);
+      validateRestrictedSetupCall(call, this.state?.calls[id]);
     }
     validateOutboundRetries(next.calls, this.state?.calls);
     try { durablyReplaceJsonFile(this.file, JSON.stringify(next), fs, this.parent); }
@@ -455,7 +465,8 @@ export class BrokerStore {
   list(): BrokerCall[] { return structuredClone(Object.values(this.state.calls)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
 
   reserveInbound(input: { requestId: string; purpose: string; providerProof: InboundBeginIdentity['providerProof'] },
-    policy: InboundWaitPolicy, now = new Date().toISOString()): { call: BrokerCall; existing: boolean } {
+    policy: InboundWaitPolicy, now = new Date().toISOString(), enrollmentMode = false): { call: BrokerCall; existing: boolean } {
+    if (typeof enrollmentMode !== 'boolean') throw new Error('Invalid inbound mode construction');
     const proof = structuredClone(input.providerProof);
     const callSid = proof.params.CallSid;
     if (input.requestId !== inboundRequestId(callSid) || typeof input.purpose !== 'string'
@@ -472,7 +483,7 @@ export class BrokerStore {
     const id = randomUUID();
     const call: BrokerCall = { id, requestId: input.requestId, direction: 'inbound', purpose: input.purpose,
       number: proof.params.From, callSid, status: 'prepared', createdAt: now, updatedAt: now, delegations: {},
-      inbound: createInboundJournal({ brokerCallId: id, providerProof: proof }, policy, now) };
+      inbound: createInboundJournal({ brokerCallId: id, providerProof: proof }, policy, now, enrollmentMode) };
     validateInboundJournal(call);
     validateSelectedVoice(call);
     this.persist({ version: 1, calls: { ...this.state.calls, [id]: call } });
@@ -639,6 +650,52 @@ export class BrokerStore {
       harkDispatch: { ...previous.harkDispatch, state: 'provider_accepted', providerAcceptedAt: observedAt } });
   }
 
+  recordRestrictedSetup(id: string, value: RestrictedSetupJournal): BrokerCall {
+    const previous = this.state.calls[id];
+    if (!previous) throw new Error('Unknown restricted setup call');
+    const call = { ...previous, restrictedSetup: restrictedSetupJournalSchema.parse(value), updatedAt: new Date().toISOString() };
+    validateRestrictedSetupCall(call, previous);
+    this.persist({ version: 1, calls: { ...this.state.calls, [id]: call } });
+    return structuredClone(call);
+  }
+
+  /** API permit supplies the destination, request identity and financial reservation. */
+  reserveVerificationCallback(permit: PhoneVerificationCallbackPermit, observedAt: string): { call: BrokerCall; existing: boolean } {
+    const exactPermit = phoneVerificationCallbackPermitSchema.parse(permit);
+    const id = exactPermit.request.requestId;
+    const matches = Object.values(this.state.calls).filter(call => call.id === id || call.requestId === id);
+    if (matches.length) {
+      const prior = matches[0];
+      if (matches.length !== 1 || !prior?.verificationCallback
+        || canonicalJson(prior.verificationCallback.permit) !== canonicalJson(exactPermit))
+        throw new Error('Verification callback reservation conflicts');
+      validateVerificationCallbackCall(prior);
+      return { call: structuredClone(prior), existing: true };
+    }
+    const candidate = reserveVerificationCallback(exactPermit, observedAt);
+    const call: BrokerCall = { id, requestId: id, direction: 'outbound', number: candidate.permit.to,
+      purpose: verificationCallbackPurpose, createdAt: observedAt, updatedAt: observedAt,
+      status: 'prepared', delegations: {}, verificationCallback: candidate };
+    this.persist({ version: 1, calls: { ...this.state.calls, [id]: call } });
+    return { call: structuredClone(call), existing: false };
+  }
+
+  recordVerificationCallback(id: string, value: VerificationCallbackJournal): BrokerCall {
+    const previous = this.state.calls[id];
+    if (!previous?.verificationCallback) throw new Error('Unknown verification callback');
+    const journal = parseVerificationCallbackJournal(value);
+    const sid = journal.provider?.callSid ?? journal.answer?.proof.params.CallSid;
+    if (sid && Object.values(this.state.calls).some(call => call.id !== id && call.callSid === sid))
+      throw new Error('Call SID is already bound');
+    const call: BrokerCall = { ...previous, verificationCallback: journal,
+      ...(journal.provider ? { status: journal.provider.status } : {}),
+      ...(journal.providerTerminal ? { endedAt: previous.endedAt ?? journal.providerTerminal.observedAt } : {}),
+      ...(sid ? { callSid: sid } : {}), updatedAt: new Date().toISOString() };
+    validateVerificationCallbackCall(call, previous);
+    this.persist({ version: 1, calls: { ...this.state.calls, [id]: call } });
+    return structuredClone(call);
+  }
+
   /** The IDs come from the authenticated API binding response, never caller input. */
   recordPrimaryBinding(id: string, response: PrimaryCall): BrokerCall {
     const previous = this.state.calls[id];
@@ -738,12 +795,22 @@ export class BrokerStore {
     return structuredClone(journal.records.find(record => record.frozen.turn.sourceEventId === ref.sourceEventId)!);
   }
 
-  update(id: string, patch: Partial<Omit<BrokerCall, 'id' | 'requestId' | 'number' | 'direction' | 'purpose' | 'createdAt' | 'callAssignment' | 'continuation' | 'selectedQuestion' | 'selectedQuestionVoice' | 'callerRouting' | 'harkJournal' | 'harkDispatch' | 'inbound' | 'outboundObservation' | 'retryOf' | 'retrySuccessor'>>): BrokerCall {
+  update(id: string, patch: Partial<Omit<BrokerCall, 'id' | 'requestId' | 'number' | 'direction' | 'purpose' | 'createdAt' | 'callAssignment' | 'continuation' | 'selectedQuestion' | 'selectedQuestionVoice' | 'callerRouting' | 'harkJournal' | 'harkDispatch' | 'inbound' | 'outboundObservation' | 'retryOf' | 'retrySuccessor' | 'verificationCallback' | 'restrictedSetup'>>): BrokerCall {
     const previous = this.state.calls[id];
     if (!previous) throw new Error('Unknown broker call');
     // Runtime callers can bypass Omit. Check the same property snapshot that
     // will be persisted, so accessors cannot change a value after validation.
     const nextPatch = { ...patch };
+    if (Object.hasOwn(nextPatch, 'restrictedSetup')) {
+      if (canonicalJson((nextPatch as Partial<BrokerCall>).restrictedSetup) !== canonicalJson(previous.restrictedSetup))
+        throw new Error('Restricted setup requires an explicit transition');
+      delete (nextPatch as Partial<BrokerCall>).restrictedSetup;
+    }
+    if (Object.hasOwn(nextPatch, 'verificationCallback')) {
+      if (canonicalJson((nextPatch as Partial<BrokerCall>).verificationCallback) !== canonicalJson(previous.verificationCallback))
+        throw new Error('Verification callback requires an explicit transition');
+      delete (nextPatch as Partial<BrokerCall>).verificationCallback;
+    }
     for (const key of ['outboundObservation', 'retryOf', 'retrySuccessor'] as const) {
       if (!Object.hasOwn(nextPatch, key)) continue;
       if (canonicalJson((nextPatch as Partial<BrokerCall>)[key]) !== canonicalJson(previous[key]))
@@ -838,6 +905,8 @@ export class BrokerStore {
     validateHarkJournal(call);
     validateHarkDispatch(call);
     validateInboundJournal(call);
+    validateVerificationCallbackCall(call);
+    validateRestrictedSetupCall(call);
     validateHarkReceiptCall(call);
     assertHarkReceiptUpdate(previous, call);
     this.persist({ version: 1, calls: { ...this.state.calls, [id]: call } });
@@ -856,6 +925,8 @@ export class BrokerStore {
     validateHarkJournal(call);
     validateHarkDispatch(call);
     validateInboundJournal(call);
+    validateVerificationCallbackCall(call);
+    validateRestrictedSetupCall(call);
     validateHarkReceiptCall(call);
     this.persist({ version: 1, calls: { ...this.state.calls, [call.id]: call } });
     return structuredClone(call);

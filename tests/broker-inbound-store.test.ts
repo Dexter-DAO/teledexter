@@ -39,7 +39,8 @@ function fixture(t: test.TestContext) {
     get store() { return store; },
     send(event: InboundJournalEvent) { return store.transitionInbound(call.id, event); },
     restart() { store.close(); store = new BrokerStore(directory); return store.get(call.id)!; },
-    approve() { store.transitionInbound(call.id, { type: 'begin_attempted', observedAt: start });
+    continue() { return this.send({ type: 'continuation', providerProof: { ...proof, url: `https://phone.dexter.cash/broker/inbound/${call.id}/continue` }, observedAt: start }); },
+    approve() { this.continue(); store.transitionInbound(call.id, { type: 'begin_attempted', observedAt: start });
       store.transitionInbound(call.id, { type: 'outcome', outcome: approved, observedAt: after(1000) }); },
     bind() { this.approve(); this.send({ type: 'consume_attempted', observedAt: after(2000) });
       return this.send({ type: 'outcome', outcome: bound, observedAt: after(11_000) }); } };
@@ -149,7 +150,7 @@ test('an existing callback or operator record cannot become a new inbound attach
 });
 
 test('begin intent survives a lost response and exact remote outcome cannot renew expiry', t => {
-  const f = fixture(t); f.send({ type: 'begin_attempted', observedAt: start }); f.restart();
+  const f = fixture(t); f.continue(); f.send({ type: 'begin_attempted', observedAt: start }); f.restart();
   f.send({ type: 'outcome', outcome: { state: 'absent', beginRef: f.beginRef }, observedAt: after(1000) });
   f.send({ type: 'outcome', outcome: f.pending, observedAt: after(2000) });
   const saved = f.restart(); const bytes = fs.readFileSync(f.file, 'utf8');
@@ -342,4 +343,47 @@ test('legacy inbound and outbound calls load without attachment fields or mutati
   const bytes = fs.readFileSync(f.file, 'utf8'); f.restart();
   assert.deepEqual(f.store.get(legacy.id), legacy); assert.deepEqual(f.store.get(outbound.id), outbound);
   assert.equal(f.store.get(legacy.id)!.inbound, undefined); assert.equal(fs.readFileSync(f.file, 'utf8'), bytes);
+});
+
+test('fresh begin requires same-leg continuation and its first observation survives repeated polls', t => {
+  const f = fixture(t);
+  assert.throws(() => f.send({ type: 'begin_attempted', observedAt: start }), /continuation required/);
+  f.continue(); const first = f.store.get(f.call.id)!;
+  const laterProof = { ...first.inbound!.continuation!.providerProof, signature: 'later-valid-transport-signature',
+    params: { ...proof.params, CallStatus: 'in-progress' } };
+  f.send({ type: 'continuation', providerProof: laterProof, observedAt: after(1000) });
+  assert.deepEqual(f.restart().inbound!.continuation, first.inbound!.continuation);
+  assert.equal(f.store.get(f.call.id)!.inbound!.waitUntil, after(120_000));
+  f.send({ type: 'begin_attempted', observedAt: after(1000) });
+  assert.equal(f.restart().inbound!.beginAttemptedAt, after(1000));
+});
+
+for (const changed of ['CallSid', 'AccountSid', 'From', 'To', 'Direction', 'url'] as const) {
+  test(`continuation rejects different ${changed} without writing`, t => {
+    const f = fixture(t); const saved = f.continue(); const next = structuredClone(saved.inbound!.continuation!.providerProof);
+    if (changed === 'url') next.url += '/other'; else next.params[changed] += 'x';
+    const bytes = fs.readFileSync(f.file, 'utf8');
+    assert.throws(() => f.send({ type: 'continuation', providerProof: next, observedAt: after(1000) }));
+    assert.equal(fs.readFileSync(f.file, 'utf8'), bytes);
+  });
+}
+
+test('carrier refusal retains original stop and cannot be replaced by a different refusal', t => {
+  const f = fixture(t); f.continue(); f.send({ type: 'begin_attempted', observedAt: start });
+  f.send({ type: 'stop', reason: 'caller_hangup', observedAt: after(1000) });
+  const refused = f.send({ type: 'admission_refused', code: 'inbound_enrollment_required', observedAt: after(2000) });
+  assert.equal(refused.inbound!.localStop!.reason, 'caller_hangup');
+  assert.equal(refused.inbound!.cancelRequestedAt, after(1000));
+  assert.deepEqual(f.restart().inbound!.admissionRefusal, refused.inbound!.admissionRefusal);
+  assert.throws(() => f.send({ type: 'admission_refused', code: 'inbound_carrier_attestation_required', observedAt: after(3000) }), /refusal changed/);
+});
+
+test('historical attempted and approved journal needs no invented continuation on read', t => {
+  const f = fixture(t); f.approve(); f.store.close();
+  const data = JSON.parse(fs.readFileSync(f.file, 'utf8')) as { calls: Record<string, BrokerCall> };
+  delete data.calls[f.call.id].inbound!.continuation;
+  const bytes = JSON.stringify(data); fs.writeFileSync(f.file, bytes);
+  const recovered = f.restart();
+  assert.equal(recovered.inbound!.continuation, undefined); assert.equal(recovered.inbound!.remote?.state, 'approved');
+  assert.equal(fs.readFileSync(f.file, 'utf8'), bytes);
 });

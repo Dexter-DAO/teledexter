@@ -115,3 +115,27 @@ test('configuration errors do not contain callback or ingress secrets', () => {
     });
   }
 });
+
+
+test('verification setup absent preserves ordinary configuration and exports no receipt secret', () => {
+  for (const model of [undefined, '', '  ']) {
+    const config = brokerConfig({ ...baseEnv(), BROKER_VERIFICATION_SETUP_MODEL: model, HARK_PHONE_CALLBACK_SIGNING_SECRET: callbackSecret });
+    assert.equal(Object.hasOwn(config, 'verificationSetup'), false);
+  }
+});
+test('explicit verification model reuses exact local API and independent callback key', () => {
+  const config = brokerConfig({ ...baseEnv(), DEXTER_API_URL: 'http://127.0.0.1:3032',
+    BROKER_VERIFICATION_SETUP_MODEL: ' gpt-5-mini ', HARK_PHONE_CALLBACK_SIGNING_SECRET: callbackSecret });
+  assert.deepEqual(config.verificationSetup, { model: 'gpt-5-mini', apiBaseUrl: 'http://127.0.0.1:3032', signingSecret: callbackSecret });
+  assert.equal(Object.hasOwn(config, 'harkInternalToken'), false);
+  assert.equal(brokerConfig({ ...harkEnv(), BROKER_VERIFICATION_SETUP_MODEL: 'gpt-5-mini' }).verificationSetup?.apiBaseUrl, 'http://127.0.0.1:3030');
+});
+test('verification configuration refuses remote receipt origin, absent/shared secret and malformed model', () => {
+  for (const overrides of [{ DEXTER_API_URL: 'https://api.dexter.example' },
+    { HARK_PHONE_CALLBACK_SIGNING_SECRET: undefined }, { HARK_PHONE_CALLBACK_SIGNING_SECRET: 'short' },
+    { OUTBOUND_ALERT_SIGNING_SECRET: callbackSecret }, { BROKER_VERIFICATION_SETUP_MODEL: 'bad model' }]) {
+    assert.throws(() => brokerConfig({ ...baseEnv(), DEXTER_API_URL: 'http://127.0.0.1:3032',
+      BROKER_VERIFICATION_SETUP_MODEL: 'gpt-5-mini', HARK_PHONE_CALLBACK_SIGNING_SECRET: callbackSecret, ...overrides }),
+    error => error instanceof Error && !error.message.includes(callbackSecret));
+  }
+});

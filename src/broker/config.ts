@@ -9,6 +9,7 @@ export interface BrokerConfig {
   harkCallbackSigningSecret?: string;
   harkInternalToken?: string;
   maxCallSeconds: number;
+  verificationSetup?: { model: string; apiBaseUrl: string; signingSecret: string };
 }
 
 export const isPhoneNumber = (value: unknown): value is string =>
@@ -47,6 +48,19 @@ export function brokerConfig(env: NodeJS.ProcessEnv): BrokerConfig {
     if (!harkInternalToken || Buffer.byteLength(harkInternalToken, 'utf8') > 4096)
       throw new Error('Hark requires the existing bounded internal token');
   }
+  const setupModel = env.BROKER_VERIFICATION_SETUP_MODEL?.trim();
+  let verificationSetup: BrokerConfig['verificationSetup'];
+  if (setupModel) {
+    if (!/^[A-Za-z0-9_.:-]{1,200}$/.test(setupModel)) throw new Error('Invalid BROKER_VERIFICATION_SETUP_MODEL');
+    const receiptOrigin = new URL(harkApiBaseUrl ?? apiBaseUrl);
+    if (receiptOrigin.protocol !== 'http:' || !['127.0.0.1', 'localhost', '[::1]'].includes(receiptOrigin.hostname)
+      || receiptOrigin.pathname !== '/' || receiptOrigin.username || receiptOrigin.password || receiptOrigin.search || receiptOrigin.hash)
+      throw new Error('Phone verification requires an existing local API origin');
+    if (!harkCallbackSigningSecret || harkCallbackSigningSecret.length < 32
+      || harkCallbackSigningSecret === env.OUTBOUND_ALERT_SIGNING_SECRET?.trim())
+      throw new Error('Phone verification requires the existing independent callback signing secret');
+    verificationSetup = { model: setupModel, apiBaseUrl: receiptOrigin.origin, signingSecret: harkCallbackSigningSecret };
+  }
   const allowedTo = (env.BROKER_ALLOWED_TO || '').split(',').map(v => v.trim()).filter(Boolean);
   if (!isPhoneNumber(from) || !allowedTo.every(isPhoneNumber) || allowedTo.includes(from)) throw new Error('Invalid broker phone configuration');
   const port = Number(env.BROKER_PORT || 3213);
@@ -62,6 +76,6 @@ export function brokerConfig(env: NodeJS.ProcessEnv): BrokerConfig {
     apiKey: required('OPENAI_API_KEY'), model: env.BROKER_LIVE_MODEL || 'gpt-live-1',
     voice: env.BROKER_LIVE_VOICE || 'marin', twilioAccountSid: required('TWILIO_ACCOUNT_SID'),
     twilioAuthToken: required('TWILIO_AUTH_TOKEN'), from, allowedTo, apiBaseUrl,
-    phoneServiceSecret, maxCallSeconds, ...(harkApiBaseUrl ? { harkApiBaseUrl, harkCallbackSigningSecret, harkInternalToken } : {}),
+    phoneServiceSecret, maxCallSeconds, ...(verificationSetup ? { verificationSetup } : {}), ...(harkApiBaseUrl ? { harkApiBaseUrl, harkCallbackSigningSecret, harkInternalToken } : {}),
   };
 }

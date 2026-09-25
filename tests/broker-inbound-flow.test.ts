@@ -8,7 +8,7 @@ import Twilio from 'twilio';
 import { createInboundFlow } from '../src/broker/inbound.js';
 import { inboundBeginRef, type InboundBeginIdentity, type InboundOutcome } from '../src/broker/inboundContract.js';
 import { BrokerStore } from '../src/broker/store.js';
-import type { PrimaryApiClient } from '../src/broker/primaryApi.js';
+import { PrimaryApiError, type PrimaryApiClient } from '../src/broker/primaryApi.js';
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -24,11 +24,12 @@ async function fixture(t: test.TestContext) {
   const config = { twilioAccountSid: 'AC' + '1'.repeat(32), twilioAuthToken: 'inbound-test-secret',
     publicOrigin: 'https://phone.example.test', from: '+12025550100' };
   const params = { AccountSid: config.twilioAccountSid, CallSid: 'CA' + '2'.repeat(32), From: '+12025550123',
-    To: config.from, Direction: 'inbound', CallStatus: 'ringing' };
+    To: config.from, Direction: 'inbound', CallStatus: 'ringing', StirVerstat: 'TN-Validation-Passed-A' };
   const proof = (route: string) => ({ url: config.publicOrigin + route, params: { ...params },
     signature: Twilio.getExpectedTwilioSignature(config.twilioAuthToken, config.publicOrigin + route, params) });
   const original = proof('/broker/incoming-call');
   const bindingId = randomUUID(), attachmentId = randomUUID();
+  const primaryDexterId = randomUUID(), threadId = randomUUID();
   const approvalRef = { attachmentId, approvalId: randomUUID(), digest: 'b'.repeat(64) };
   let remote: InboundOutcome | undefined;
   let beginIdentity: InboundBeginIdentity | undefined;
@@ -39,6 +40,8 @@ async function fixture(t: test.TestContext) {
   let contextGate: ReturnType<typeof deferred<void>> | undefined;
   let consumedAt: string | undefined, closedAt: string | undefined;
   let pendingAfterClose = false;
+  let beginError: Error | undefined;
+  let consumeError: Error | undefined, contextError: Error | undefined; let refuseBeforeConsume = false;
   const counts = { begin: 0, recover: 0, status: 0, consume: 0, context: 0, cancel: 0, close: 0, provider: 0, closeout: 0 };
   const remember = (begin: InboundBeginIdentity) => {
     if (beginIdentity) assert.deepEqual(begin, beginIdentity); else beginIdentity = structuredClone(begin);
@@ -47,6 +50,7 @@ async function fixture(t: test.TestContext) {
     async beginInbound(begin: InboundBeginIdentity) {
       counts.begin++; remember(begin);
       if (beginGate) await beginGate.promise;
+      if (beginError) throw beginError;
       remote ??= { attachmentId, beginRef: inboundBeginRef(begin), state: 'pending', expiresAt: new Date(clock + 300_000).toISOString() };
       if (loseBegin) { loseBegin = false; throw new Error('lost_begin_response'); }
       return structuredClone(remote);
@@ -65,19 +69,23 @@ async function fixture(t: test.TestContext) {
       return structuredClone(remote!);
     },
     async openInboundCall(savedProof: typeof original, ref: typeof approvalRef) {
-      counts.consume++; assert.deepEqual(savedProof, original); assert.deepEqual(ref, approvalRef);
+      counts.consume++; assert.deepEqual(savedProof, original);
+      if (refuseBeforeConsume && consumeError) throw consumeError;
+      assert.deepEqual(ref, approvalRef);
       assert.ok(remote);
       consumedAt ??= at();
       remote = { attachmentId, beginRef: remote.beginRef, approvalRef, bindingId, state: 'bound', consumedAt, callState: 'open' };
+      if (consumeError) throw consumeError;
       if (loseConsume) { loseConsume = false; throw new Error('lost_consume_response'); }
       return primary.getContext(bindingId);
     },
     async getContext(id: string) {
       counts.context++; assert.equal(id, bindingId);
       if (contextGate) await contextGate.promise;
+      if (contextError) throw contextError;
       if (!contextAllowed) throw new Error('authority_unavailable');
       return { bindingId, callSid: params.CallSid, state: 'open' as const,
-        context: { primaryDexterId: randomUUID(), threadId: randomUUID(), displayName: 'Branch', messages: [] } };
+        context: { primaryDexterId, threadId, displayName: 'Branch', messages: [] } };
     },
     async closeInbound(id: string, input: { begin: InboundBeginIdentity; approvalRef: typeof approvalRef; bindingId: string }) {
       counts.close++; assert.equal(id, attachmentId); assert.deepEqual(input.begin, beginIdentity);
@@ -111,6 +119,14 @@ async function fixture(t: test.TestContext) {
     clock: () => clock, advance: (ms: number) => { clock += ms; },
     approve() { assert.ok(remote && remote.state === 'pending'); remote = { ...remote, state: 'approved', approvalRef }; },
     remote: () => remote,
+    async begin() { const first = await flow.accept(original); return flow.resume(first.id, proof(`/broker/inbound/${first.id}/continue`)); },
+    beginError(error?: Error) { beginError = error; },
+    consumeError(error: Error, beforeCommit: boolean) { consumeError = error; refuseBeforeConsume = beforeCommit; },
+    contextError(error: Error) { contextError = error; },
+    restoreHistorical(call: ReturnType<BrokerStore['list']>[number]) {
+      store.close(); fs.writeFileSync(path.join(directory, 'calls.json'), JSON.stringify({ version: 1, calls: { [call.id]: call } }));
+      store = new BrokerStore(directory); flow = build();
+    },
     loseBegin() { loseBegin = true; }, loseConsume() { loseConsume = true; }, loseClose() { loseClose = true; },
     refuseContext() { contextAllowed = false; }, pendingAfterClose() { pendingAfterClose = true; },
     gateBegin() { beginGate = deferred<void>(); return beginGate; },
@@ -122,7 +138,7 @@ async function fixture(t: test.TestContext) {
 
 test('pending inbound keeps original leg and proof; approval consumes that same call', async t => {
   const f = await fixture(t);
-  const first = await f.flow.accept(f.original);
+  const first = await f.begin();
   assert.equal(first.inbound!.remote?.state, 'pending');
   assert.equal(first.primary, undefined);
   assert.equal(f.counts.context, 0);
@@ -137,20 +153,20 @@ test('pending inbound keeps original leg and proof; approval consumes that same 
   assert.deepEqual(next.inbound!.begin.providerProof, f.original);
 });
 
-test('lost begin response recovers the original attachment without another begin', async t => {
+test('lost begin response recovers a sealed approval without another begin', async t => {
   const f = await fixture(t); f.loseBegin();
-  await assert.rejects(f.flow.accept(f.original), /lost_begin/);
+  await assert.rejects(f.begin(), /lost_begin/);
   const saved = f.store.list()[0];
-  f.advance(15_000);
+  f.approve(); f.advance(15_000);
   const next = await f.flow.tick(saved.id);
-  assert.equal(next.inbound!.remote?.state, 'pending');
+  assert.equal(next.inbound!.remote?.state, 'bound');
   assert.equal(next.inbound!.waitUntil, saved.inbound!.waitUntil);
-  assert.equal(f.counts.begin, 1); assert.equal(f.counts.recover, 1);
+  assert.equal(f.counts.begin, 1); assert.equal(f.counts.recover, 2);
 });
 
 test('local stop persists while begin is delayed and fences its eventual reply', async t => {
   const f = await fixture(t); const gate = f.gateBegin();
-  const beginning = f.flow.accept(f.original);
+  const beginning = f.begin();
   await new Promise(resolve => setImmediate(resolve));
   const id = f.store.list()[0].id;
   const stopping = f.flow.stop(id, 'caller_hangup');
@@ -162,7 +178,7 @@ test('local stop persists while begin is delayed and fences its eventual reply',
 });
 
 test('lost consume reply and authority loss recover and close without private context', async t => {
-  const f = await fixture(t); const first = await f.flow.accept(f.original); f.approve(); f.loseConsume();
+  const f = await fixture(t); const first = await f.begin(); f.approve(); f.loseConsume();
   await assert.rejects(f.flow.tick(first.id), /lost_consume/);
   f.refuseContext();
   const closed = await f.flow.stop(first.id, 'caller_hangup');
@@ -177,7 +193,7 @@ test('lost consume reply and authority loss recover and close without private co
 });
 
 test('lost closure response stays unresolved until its original receipt returns', async t => {
-  const f = await fixture(t); const first = await f.flow.accept(f.original); f.approve(); f.loseConsume();
+  const f = await fixture(t); const first = await f.begin(); f.approve(); f.loseConsume();
   await assert.rejects(f.flow.tick(first.id)); f.loseClose();
   await assert.rejects(f.flow.stop(first.id, 'caller_hangup'), /lost_close/);
   assert.equal(f.store.get(first.id)!.primaryClosed, undefined);
@@ -188,7 +204,7 @@ test('lost closure response stays unresolved until its original receipt returns'
 });
 
 test('delayed context cannot renew server anchored media grace', async t => {
-  const f = await fixture(t); const first = await f.flow.accept(f.original); f.approve(); const gate = f.gateContext();
+  const f = await fixture(t); const first = await f.begin(); f.approve(); const gate = f.gateContext();
   const consuming = f.flow.tick(first.id); await new Promise(resolve => setImmediate(resolve));
   const consumed = f.clock(); f.advance(31_000); gate.resolve();
   const next = await consuming;
@@ -199,7 +215,7 @@ test('delayed context cannot renew server anchored media grace', async t => {
 });
 
 test('restart after local waiting budget cancels rather than issuing a new wait', async t => {
-  const f = await fixture(t); const first = await f.flow.accept(f.original); const deadline = first.inbound!.waitUntil;
+  const f = await fixture(t); const first = await f.begin(); const deadline = first.inbound!.waitUntil;
   f.advance(120_000); f.restart();
   const stopped = await f.flow.tick(first.id);
   assert.equal(stopped.inbound!.waitUntil, deadline);
@@ -209,7 +225,7 @@ test('restart after local waiting budget cancels rather than issuing a new wait'
 });
 
 test('signed continuation cannot move caller or replace original proof', async t => {
-  const f = await fixture(t); const first = await f.flow.accept(f.original);
+  const f = await fixture(t); const first = await f.begin();
   const proof = f.proof(`/broker/inbound/${first.id}/continue`);
   proof.params.From = '+12025550999';
   proof.signature = Twilio.getExpectedTwilioSignature(f.config.twilioAuthToken, proof.url, proof.params);
@@ -219,7 +235,7 @@ test('signed continuation cannot move caller or replace original proof', async t
 });
 
 test('provider terminal before consumption closes waiting without account access', async t => {
-  const f = await fixture(t); const first = await f.flow.accept(f.original); f.approve(); f.providerStatus('completed');
+  const f = await fixture(t); const first = await f.begin(); f.approve(); f.providerStatus('completed');
   const ended = await f.flow.tick(first.id);
   assert.equal(ended.status, 'completed');
   assert.equal(ended.inbound!.remote?.state, 'cancelled');
@@ -227,7 +243,7 @@ test('provider terminal before consumption closes waiting without account access
 });
 
 test('a local stop during context retrieval wins over the late private reply', async t => {
-  const f = await fixture(t); const first = await f.flow.accept(f.original); f.approve(); const gate = f.gateContext();
+  const f = await fixture(t); const first = await f.begin(); f.approve(); const gate = f.gateContext();
   const consuming = f.flow.tick(first.id); await new Promise(resolve => setImmediate(resolve));
   const stopping = f.flow.stop(first.id, 'operator_requested'); gate.resolve();
   await consuming; await stopping;
@@ -237,7 +253,7 @@ test('a local stop during context retrieval wins over the late private reply', a
 });
 
 test('a started media session cannot be started again after crash recovery', async t => {
-  const f = await fixture(t); const first = await f.flow.accept(f.original); f.approve(); const bound = await f.flow.tick(first.id);
+  const f = await fixture(t); const first = await f.begin(); f.approve(); const bound = await f.flow.tick(first.id);
   f.store.update(first.id, { mediaStartedAt: new Date(f.clock()).toISOString() });
   f.restart();
   assert.equal(f.flow.mediaAllowed(f.store.get(first.id)!), false);
@@ -246,7 +262,7 @@ test('a started media session cannot be started again after crash recovery', asy
 
 
 test('persisted closure still resumes pending reconciliation without another close', async t => {
-  const f = await fixture(t); const call = await f.flow.accept(f.original); f.approve();
+  const f = await fixture(t); const call = await f.begin(); f.approve();
   await f.flow.tick(call.id); f.pendingAfterClose(); await f.flow.stop(call.id, 'caller_hangup');
   assert.equal(f.store.get(call.id)!.primaryClosePending, true);
   const original = f.store.get(call.id)!.inbound!.closure;
@@ -254,4 +270,160 @@ test('persisted closure still resumes pending reconciliation without another clo
   assert.equal(f.store.get(call.id)!.primaryClosePending, false);
   assert.deepEqual(f.store.get(call.id)!.inbound!.closure, original);
   assert.equal(f.counts.close, 1); assert.equal(f.counts.closeout, 2);
+});
+
+test('reservation and repeated maintenance stay unadmitted until an authenticated same-leg continuation', async t => {
+  const f = await fixture(t);
+  const first = await f.flow.accept(f.original);
+  assert.equal(first.inbound!.remote, undefined);
+  assert.equal(first.inbound!.continuation, undefined);
+  await Promise.all([f.flow.tick(first.id), f.flow.accept(f.original)]);
+  assert.equal(f.counts.begin, 0); assert.equal(f.counts.recover, 0); assert.equal(f.counts.provider, 0);
+  f.restart(); await f.flow.tick(first.id);
+  assert.equal(f.counts.begin, 0); assert.equal(f.counts.context, 0);
+  const continued = await f.flow.resume(first.id, f.proof(`/broker/inbound/${first.id}/continue`));
+  assert.equal(f.counts.begin, 1); assert.equal(continued.inbound!.remote?.state, 'pending');
+  assert.deepEqual(continued.inbound!.begin, first.inbound!.begin);
+  assert.equal(continued.inbound!.continuation?.beginBodyDigest, first.inbound!.beginBodyDigest);
+  assert.equal(continued.inbound!.waitUntil, first.inbound!.waitUntil);
+  assert.equal(continued.inbound!.begin.providerProof.params.StirVerstat, 'TN-Validation-Passed-A');
+});
+
+test('pending GET can observe but original proof and retained continuation are required for fresh pending POST', async t => {
+  const f = await fixture(t); const first = await f.begin();
+  const historical = structuredClone(first); delete historical.inbound!.continuation;
+  f.restoreHistorical(historical);
+  const bytes = fs.readFileSync(path.join(f.directory, 'calls.json'), 'utf8');
+  await f.flow.tick(first.id);
+  assert.equal(f.counts.status, 1); assert.equal(f.counts.begin, 1);
+  assert.equal(fs.readFileSync(path.join(f.directory, 'calls.json'), 'utf8'), bytes);
+  const next = await f.flow.resume(first.id, f.proof(`/broker/inbound/${first.id}/continue`));
+  assert.equal(f.counts.begin, 2); assert.equal(next.inbound!.remote?.state, 'pending');
+  assert.deepEqual(next.inbound!.begin, historical.inbound!.begin);
+  assert.equal(next.inbound!.waitUntil, historical.inbound!.waitUntil);
+});
+
+test('historical unknown attempt recovers absent without acquiring fresh authority from its digest', async t => {
+  const f = await fixture(t);
+  const first = await f.flow.accept(f.original);
+  const historical = structuredClone(first); historical.inbound!.beginAttemptedAt = first.createdAt;
+  f.restoreHistorical(historical); await f.flow.tick(first.id);
+  assert.equal(f.counts.recover, 1); assert.equal(f.counts.begin, 0);
+  assert.equal(f.store.get(first.id)!.inbound!.remote?.state, 'absent');
+  f.advance(120_000); await f.flow.tick(first.id);
+  assert.equal(f.counts.begin, 0); assert.equal(f.store.get(first.id)!.inbound!.remote?.state, 'cancelled');
+  assert.equal(f.store.get(first.id)!.inbound!.waitUntil, first.inbound!.waitUntil);
+});
+
+test('historical approved and consumed outcomes recover after token rotation with no new marker', async t => {
+  const f = await fixture(t); const first = await f.begin(); f.approve();
+  const historical = structuredClone(first); delete historical.inbound!.continuation;
+  f.restoreHistorical(historical); f.config.twilioAuthToken = 'rotated-test-secret';
+  const bound = await f.flow.tick(first.id);
+  assert.equal(bound.inbound!.remote?.state, 'bound'); assert.equal(f.counts.begin, 1);
+  assert.equal(bound.inbound!.continuation, undefined); assert.equal(f.counts.consume, 1);
+  const deadline = bound.inbound!.mediaStartBy;
+  f.restart(); await f.flow.tick(first.id);
+  assert.equal(f.counts.begin, 1); assert.equal(f.counts.consume, 1);
+  assert.equal(f.store.get(first.id)!.inbound!.mediaStartBy, deadline);
+  await f.flow.stop(first.id, 'caller_hangup'); f.restart(); await f.flow.tick(first.id);
+  assert.equal(f.counts.close, 1); assert.equal(f.store.get(first.id)!.inbound!.closure?.state, 'closed');
+});
+
+for (const code of ['inbound_carrier_attestation_required', 'inbound_enrollment_required'] as const) {
+  test(`${code} persists exact refusal and cancellation intent across restart`, async t => {
+    const f = await fixture(t); f.beginError(new PrimaryApiError('http_error', 403, { code, retryable: false }));
+    const stopped = await f.begin();
+    assert.equal(stopped.inbound!.admissionRefusal?.code, code);
+    assert.equal(stopped.inbound!.admissionRefusal?.beginBodyDigest, stopped.inbound!.beginBodyDigest);
+    assert.equal(stopped.inbound!.localStop?.reason, code);
+    assert.equal(stopped.inbound!.remote?.state, 'cancelled');
+    assert.equal(f.counts.consume, 0); assert.equal(f.counts.context, 0);
+    f.beginError(); f.restart(); await f.flow.tick(stopped.id);
+    assert.equal(f.counts.begin, 1); assert.equal(f.counts.consume, 0);
+  });
+}
+
+test('retryable carrier 503 retains original attempted identity and recovers before exact retry', async t => {
+  const f = await fixture(t);
+  f.beginError(new PrimaryApiError('http_error', 503, { code: 'inbound_carrier_admission_unavailable', retryable: true }));
+  await assert.rejects(f.begin(), error => error instanceof PrimaryApiError && error.status === 503);
+  const before = f.store.list()[0];
+  assert.equal(before.inbound!.admissionRefusal, undefined); assert.equal(before.inbound!.localStop, undefined);
+  f.beginError(); f.advance(5000); f.restart();
+  const next = await f.flow.tick(before.id);
+  assert.equal(f.counts.recover, 1); assert.equal(f.counts.begin, 2);
+  assert.deepEqual(next.inbound!.begin, before.inbound!.begin);
+  assert.deepEqual(next.inbound!.continuation, before.inbound!.continuation);
+  assert.equal(next.inbound!.beginAttemptedAt, before.inbound!.beginAttemptedAt);
+  assert.equal(next.inbound!.waitUntil, before.inbound!.waitUntil);
+});
+
+for (const [index, error] of [new PrimaryApiError('http_error', 403, { code: 'inbound_enrollment_required', retryable: true }),
+  new PrimaryApiError('http_error', 503, { code: 'inbound_enrollment_required', retryable: false }),
+  new PrimaryApiError('http_error', 403, { code: 'other_refusal', retryable: false }),
+  Object.assign(new Error('untrusted shape'), { status: 403, remoteCode: 'inbound_enrollment_required', retryable: false })].entries()) {
+  test(`nonmatching error ${index} is not converted into carrier refusal: ${error.message}`, async t => {
+    const f = await fixture(t); f.beginError(error);
+    await assert.rejects(f.begin());
+    assert.equal(f.store.list()[0].inbound!.admissionRefusal, undefined);
+    assert.equal(f.store.list()[0].inbound!.localStop, undefined);
+    assert.equal(f.counts.context, 0);
+  });
+}
+
+test('changed original attestation or continuation signature cannot create the marker', async t => {
+  const f = await fixture(t); const first = await f.flow.accept(f.original);
+  const altered = structuredClone(f.original); altered.params.StirVerstat = 'TN-Validation-Passed-B';
+  assert.throws(() => f.flow.accept(altered), /identity_mismatch/);
+  altered.signature = Twilio.getExpectedTwilioSignature(f.config.twilioAuthToken, altered.url, altered.params);
+  assert.throws(() => f.flow.accept(altered), /conflicts/);
+  const continuation = f.proof(`/broker/inbound/${first.id}/continue`); continuation.signature = 'invalid';
+  assert.throws(() => f.flow.resume(first.id, continuation), /identity_mismatch/);
+  assert.equal(f.store.get(first.id)!.inbound!.continuation, undefined); assert.equal(f.counts.begin, 0);
+  assert.deepEqual(f.store.get(first.id)!.inbound!.begin.providerProof, f.original);
+});
+
+for (const committed of [false, true]) {
+  test(`enrollment refusal at consume durably stops; committed winner=${committed} closes independently`, async t => {
+    const f = await fixture(t); const first = await f.begin(); f.approve();
+    f.consumeError(new PrimaryApiError('http_error', 403, { code: 'inbound_enrollment_required', retryable: false }), !committed);
+    const stopped = await f.flow.tick(first.id);
+    assert.equal(stopped.inbound!.admissionRefusal?.code, 'inbound_enrollment_required');
+    assert.equal(stopped.inbound!.localStop?.reason, 'inbound_enrollment_required');
+    assert.equal(stopped.inbound!.remote?.state, committed ? 'bound' : 'cancelled');
+    assert.equal(stopped.inbound!.closure?.state, committed ? 'closed' : undefined);
+    assert.equal(f.counts.context, 0); assert.equal(stopped.primary, undefined);
+    f.restart(); await f.flow.tick(first.id);
+    assert.equal(f.counts.consume, 1); assert.equal(f.counts.close, committed ? 1 : 0);
+  });
+}
+
+test('historical approved receipt remains valid after local refusal and cancellation', async t => {
+  const f = await fixture(t); const first = await f.begin(); f.approve();
+  const historical = structuredClone(first);
+  historical.inbound!.remote = f.remote();
+  if (historical.inbound!.remote?.state !== 'approved') throw new Error('fixture approval missing');
+  historical.inbound!.approvalRef = historical.inbound!.remote.approvalRef;
+  delete historical.inbound!.continuation; delete historical.inbound!.beginAttemptedAt;
+  f.restoreHistorical(historical);
+  // Current-context refusal can also be returned by an authenticated outcome read.
+  f.store.transitionInbound(first.id, { type: 'admission_refused', code: 'inbound_enrollment_required', observedAt: new Date(f.clock()).toISOString() });
+  const stopped = await f.flow.tick(first.id);
+  assert.equal(stopped.inbound!.remote?.state, 'cancelled');
+  assert.equal(stopped.inbound!.beginAttemptedAt, undefined);
+  assert.equal(stopped.inbound!.admissionRefusal?.code, 'inbound_enrollment_required');
+  f.restart(); assert.equal(f.store.get(first.id)!.inbound!.remote?.state, 'cancelled');
+  assert.equal(f.counts.consume, 0);
+});
+
+test('enrollment refusal on bound context recovery closes exact consumed receipt without fresh admission', async t => {
+  const f = await fixture(t); const first = await f.begin(); f.approve(); await f.flow.tick(first.id);
+  const deadline = f.store.get(first.id)!.inbound!.mediaStartBy;
+  f.contextError(new PrimaryApiError('http_error', 403, { code: 'inbound_enrollment_required', retryable: false }));
+  const closed = await f.flow.tick(first.id);
+  assert.equal(closed.inbound!.admissionRefusal?.code, 'inbound_enrollment_required');
+  assert.equal(closed.inbound!.closure?.state, 'closed');
+  assert.equal(closed.inbound!.mediaStartBy, deadline);
+  assert.equal(f.counts.begin, 1); assert.equal(f.counts.consume, 1); assert.equal(f.counts.close, 1);
 });

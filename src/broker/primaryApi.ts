@@ -1,3 +1,5 @@
+import { callbackProviderProofSchema } from './verificationCallbackContract.js';
+import { phoneVerificationCallbackErrorSchema, PHONE_VERIFICATION_CALLBACK_PROOF_MAX_BYTES, PHONE_VERIFICATION_CALLBACK_COMMAND_MAX_BYTES } from './verificationCallbackContract.js';
 import { createHmac } from 'node:crypto';
 import { z } from 'zod';
 import { phoneCallAssignmentSchema, phoneCallAssignmentRefSchema, sameCallAssignmentRef, type PhoneCallAssignment, type PhoneCallAssignmentRef } from './assignment.js';
@@ -5,6 +7,10 @@ export type { PhoneCallAssignment, PhoneCallAssignmentRef } from './assignment.j
 import { rawSubmissionDigest, turnBodyDigest, type PhoneNonAdmissionProof } from './reconciliation.js';
 import { canonicalJson } from '../outbound/canonical.js';
 import { associatedResultReferenceSchema, orderedAssociatedResultReference, type AssociatedResultReference } from './associatedResult.js';
+import { INBOUND_ENROLLMENT_PATH, INBOUND_ENROLLMENT_MAX_REQUEST_BYTES, enrollmentCompletionInputSchema,
+  enrollmentCommandSchema, enrollmentCommand, enrollmentCompletionResultSchema, enrollmentCompletionRecoverySchema,
+  sameEnrollmentCommand, enrollmentHttpErrorSchema, isEnrollmentHttpFailure, type EnrollmentCompletionInput, type EnrollmentCommand,
+  type EnrollmentCompletionResult, type EnrollmentCompletionRecovery } from './inboundEnrollment.js';
 import {
   inboundBeginIdentitySchema, inboundOutcomeSchema, recoverInboundResultSchema,
   consumeInboundApprovalSchema, closeConsumedInboundAttachmentSchema,
@@ -151,6 +157,8 @@ export interface PrimaryClosedCall {
 export interface PrimaryApiClient {
   readiness(callerNumber: string): Promise<PrimaryReadiness>;
   openCall(providerProof: PrimaryProviderProof, callAssignment?: PhoneCallAssignment): Promise<PrimaryCall>;
+  /** Proof-only callback route; API independently requires saved/current completed admission. */
+  openVerifiedCallbackCall?(providerProof: PrimaryProviderProof): Promise<PrimaryCall>;
   getContext(bindingId: string): Promise<PrimaryCall>;
   submit(bindingId: string, requestId: string, input: PrimarySubmission): Promise<PrimaryRequestResult>;
   result(bindingId: string, requestId: string): Promise<PrimaryRequestResult>;
@@ -165,6 +173,8 @@ export interface PrimaryApiClient {
   inboundStatus?(attachmentId: string): Promise<InboundOutcome>;
   closeInbound?(attachmentId: string, input: CloseConsumedInboundAttachment): Promise<ConsumedInboundClosureReceipt>;
   openInboundCall?(providerProof: PrimaryProviderProof, approvalRef: InboundApprovalRef): Promise<PrimaryCall>;
+  completeInboundEnrollment?(input: EnrollmentCompletionInput): Promise<EnrollmentCompletionResult>;
+  recoverInboundEnrollment?(command: EnrollmentCommand): Promise<EnrollmentCompletionRecovery>;
 }
 
 export type PrimaryApiErrorCode =
@@ -191,6 +201,16 @@ const MAX_BODY_BYTES = 64 * 1024;
 const MAX_REQUEST_BYTES = 24 * 1024;
 const MAX_HARK_CALL_REQUEST_BYTES = 48 * 1024;
 
+function isCallbackHttpFailure(status: number, error: { code: string; retryable: boolean }): boolean {
+  const allowed: Readonly<Record<number, readonly string[]>> = {
+    400: ['callback_invalid'], 401: ['direct_owner_session_required'],
+    403: ['callback_owner_required', 'callback_consent_required', 'callback_not_answered'], 404: ['callback_not_found'],
+    409: ['callback_conflict', 'callback_rate_limited', 'phone_tab_required', 'callback_financial_admission_required'],
+    410: ['callback_expired'], 413: ['callback_invalid'], 415: ['callback_invalid'], 503: ['callback_unavailable'],
+  };
+  return allowed[status]?.includes(error.code) === true && error.retryable === (status === 503);
+}
+
 function createTransport(options: PrimaryApiOptions) {
   let base: URL;
   try { base = new URL(options.apiBaseUrl); }
@@ -213,15 +233,34 @@ function createTransport(options: PrimaryApiOptions) {
   return async (method: 'GET' | 'POST', path: string,
     body?: unknown, headers?: Record<string, string>, expectedStatus: number | readonly number[] = 200,
     harkCallAssignment = false, control?: {
-      signal?: AbortSignal; validateResponse?: (status: number, body: unknown) => void;
+      signal?: AbortSignal; validateResponse?: (status: number, body: unknown) => void; callbackPrivateCall?: true;
     }): Promise<unknown> => {
     if (control?.signal?.aborted) throw new PrimaryApiError('request_failed');
+    const callbackId = '[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
+    const callbackRequest = path === '/verification-callbacks'
+      || new RegExp(`^/verification-callbacks/${callbackId}(?:/(?:dispatch|answer|complete|completions|cancel))?(?:\\?.*)?$`).test(path);
+    const callbackProof = method === 'POST' && (path === '/verification-callbacks'
+      || new RegExp(`^/verification-callbacks/${callbackId}/answer$`).test(path));
+    if (control?.callbackPrivateCall && (method !== 'POST' || path !== '/calls' || harkCallAssignment)) throw new PrimaryApiError('invalid_request');
+    const callbackCommand = method === 'POST' && new RegExp(`^/verification-callbacks/${callbackId}/(?:dispatch|complete|cancel)$`).test(path);
+    if (callbackRequest && method === 'GET' && body !== undefined) throw new PrimaryApiError('invalid_request');
+    if (control?.callbackPrivateCall) {
+      const input = parse(z.object({ providerProof: callbackProviderProofSchema }).strict(), body, 'invalid_request');
+      const url = new URL(input.providerProof.url);
+      if (url.search || !new RegExp(`^/broker/verification-callback/${callbackId}$`).test(url.pathname)
+        || input.providerProof.params.Direction !== 'outbound-api' || input.providerProof.params.CallStatus !== 'in-progress'
+        || Object.hasOwn(input.providerProof.params, 'Digits') || Object.hasOwn(input.providerProof.params, 'SpeechResult'))
+        throw new PrimaryApiError('invalid_request');
+    }
     let serialized: string | undefined;
     if (body !== undefined) {
       try { serialized = JSON.stringify(body); }
       catch { throw new PrimaryApiError('invalid_request'); }
-      const maxRequestBytes = method === 'POST' && path === '/calls' && harkCallAssignment
-        ? MAX_HARK_CALL_REQUEST_BYTES : MAX_REQUEST_BYTES;
+      const maxRequestBytes = callbackProof || control?.callbackPrivateCall ? PHONE_VERIFICATION_CALLBACK_PROOF_MAX_BYTES
+        : callbackCommand ? PHONE_VERIFICATION_CALLBACK_COMMAND_MAX_BYTES
+        : method === 'POST' && path === INBOUND_ENROLLMENT_PATH
+        ? INBOUND_ENROLLMENT_MAX_REQUEST_BYTES
+        : method === 'POST' && path === '/calls' && harkCallAssignment ? MAX_HARK_CALL_REQUEST_BYTES : MAX_REQUEST_BYTES;
       if (serialized === undefined || Buffer.byteLength(serialized) > maxRequestBytes) {
         throw new PrimaryApiError('invalid_request');
       }
@@ -262,6 +301,10 @@ function createTransport(options: PrimaryApiOptions) {
         void response.body?.cancel().catch(() => {});
         throw new PrimaryApiError('http_error', response.status);
       }
+      if (callbackRequest && !/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(response.headers.get('content-type') ?? '')) {
+        void response.body?.cancel().catch(() => {});
+        throw new PrimaryApiError(response.ok ? 'invalid_response' : 'http_error', response.status);
+      }
       const length = response.headers.get('content-length');
       if (length && /^\d+$/.test(length) && Number(length) > maxBodyBytes) {
         void response.body?.cancel().catch(() => {});
@@ -292,8 +335,11 @@ function createTransport(options: PrimaryApiOptions) {
         throw new PrimaryApiError(response.ok ? 'invalid_response' : 'http_error', response.status);
       }
       if (!response.ok) {
-        const remote = errorEnvelope.safeParse(decoded);
+        const enrollmentRequest = path === INBOUND_ENROLLMENT_PATH || path.startsWith(INBOUND_ENROLLMENT_PATH + '/');
+        const remote = (callbackRequest ? phoneVerificationCallbackErrorSchema : enrollmentRequest ? enrollmentHttpErrorSchema : errorEnvelope).safeParse(decoded);
         const safeRemote = remote.success
+          && (!enrollmentRequest || isEnrollmentHttpFailure(response.status, remote.data.error))
+          && (!callbackRequest || isCallbackHttpFailure(response.status, remote.data.error))
           && !remote.data.error.code.includes(bearer)
           && !remote.data.error.code.includes(options.phoneServiceSecret)
           ? remote.data.error : undefined;
@@ -575,7 +621,47 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
     if (known) { same(result.question.threadId, known.threadId); same(result.question.agent.id, known.primaryDexterId); }
     return result;
   };
+  async function open(providerProof: PrimaryProviderProof, callAssignment?: PhoneCallAssignment, callbackPrivateCall = false): Promise<PrimaryCall> {
+      const assignment = callAssignment === undefined ? undefined : parse(phoneCallAssignmentSchema, callAssignment, 'invalid_request');
+      const proof = parse(z.object({
+        url: z.string().url().max(2048), signature: z.string().min(1).max(512),
+        params: z.record(z.string().min(1).max(128), z.string().max(2048))
+          .refine((value) => Object.keys(value).length <= 80),
+      }).strict(), providerProof, 'invalid_request');
+      const proofUrl = new URL(proof.url);
+      if (proofUrl.protocol !== 'https:' || proofUrl.username || proofUrl.password || proofUrl.hash) {
+        throw new PrimaryApiError('invalid_request');
+      }
+      const expectedCallSid = parse(callSid, proof.params.CallSid, 'invalid_request');
+      for (const key of ['AccountSid', 'Direction', 'From', 'To']) {
+        if (!proof.params[key]) throw new PrimaryApiError('invalid_request');
+      }
+      const call = parseCall(await request('POST', '/calls', { providerProof: proof,
+        ...(assignment === undefined ? {} : { callAssignment: assignment }) }, contextHeaders, 200,
+      assignment !== undefined && 'hark' in assignment, callbackPrivateCall ? { callbackPrivateCall: true } : undefined));
+      if ((assignment === undefined) !== (call.callAssignmentRef === undefined)) throw new PrimaryApiError('identity_mismatch');
+      if (assignment && call.callAssignmentRef) {
+        same(call.callAssignmentRef.assignmentId, assignment.assignmentId); same(call.callAssignmentRef.revision, assignment.revision);
+      }
+      same(call.callSid, expectedCallSid);
+      return remember(call);
+    }
   return {
+    async completeInboundEnrollment(input) {
+      const value = parse(enrollmentCompletionInputSchema, input, 'invalid_request');
+      const command = enrollmentCommand(value);
+      const result = parse(enrollmentCompletionResultSchema,
+        await request('POST', INBOUND_ENROLLMENT_PATH, value), 'invalid_response');
+      if (!sameEnrollmentCommand(command, result.command)) throw new PrimaryApiError('identity_mismatch');
+      return result;
+    },
+    async recoverInboundEnrollment(input) {
+      const command = parse(enrollmentCommandSchema, input, 'invalid_request');
+      const path = `${INBOUND_ENROLLMENT_PATH}/${command.brokerCallId}/${command.beginDigest}/${command.digitProofDigest}/${command.commandDigest}`;
+      const result = parse(enrollmentCompletionRecoverySchema, await request('GET', path), 'invalid_response');
+      if (!sameEnrollmentCommand(command, result.command)) throw new PrimaryApiError('identity_mismatch');
+      return result;
+    },
     async beginInbound(input) {
       const begin = checkedBegin(input);
       return rememberInbound(parse(inboundOutcomeSchema,
@@ -697,31 +783,8 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
       parse(z.string().regex(/^\+[1-9]\d{7,14}$/), callerNumber, 'invalid_request');
       return parse(readinessSchema, await request('POST', '/readiness', { callerNumber }), 'invalid_response');
     },
-    async openCall(providerProof, callAssignment) {
-      const assignment = callAssignment === undefined ? undefined : parse(phoneCallAssignmentSchema, callAssignment, 'invalid_request');
-      const proof = parse(z.object({
-        url: z.string().url().max(2048), signature: z.string().min(1).max(512),
-        params: z.record(z.string().min(1).max(128), z.string().max(2048))
-          .refine((value) => Object.keys(value).length <= 80),
-      }).strict(), providerProof, 'invalid_request');
-      const proofUrl = new URL(proof.url);
-      if (proofUrl.protocol !== 'https:' || proofUrl.username || proofUrl.password || proofUrl.hash) {
-        throw new PrimaryApiError('invalid_request');
-      }
-      const expectedCallSid = parse(callSid, proof.params.CallSid, 'invalid_request');
-      for (const key of ['AccountSid', 'Direction', 'From', 'To']) {
-        if (!proof.params[key]) throw new PrimaryApiError('invalid_request');
-      }
-      const call = parseCall(await request('POST', '/calls', { providerProof: proof,
-        ...(assignment === undefined ? {} : { callAssignment: assignment }) }, contextHeaders, 200,
-      assignment !== undefined && 'hark' in assignment));
-      if ((assignment === undefined) !== (call.callAssignmentRef === undefined)) throw new PrimaryApiError('identity_mismatch');
-      if (assignment && call.callAssignmentRef) {
-        same(call.callAssignmentRef.assignmentId, assignment.assignmentId); same(call.callAssignmentRef.revision, assignment.revision);
-      }
-      same(call.callSid, expectedCallSid);
-      return remember(call);
-    },
+    openCall: (proof, assignment) => open(proof, assignment),
+    openVerifiedCallbackCall: proof => open(proof, undefined, true),
     async getContext(bindingId) {
       const call = parseCall(await request('GET', `/calls/${bindingId}/context`, undefined, { ...bindingHeaders(bindingId), ...contextHeaders }));
       same(call.bindingId, bindingId);

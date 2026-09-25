@@ -1,7 +1,10 @@
 import { createHash } from 'node:crypto';
+import { inboundModeSchema, enrollmentCommandSchema, enrollmentCompletionRecoverySchema, enrollmentTransportErrorSchema,
+  sameEnrollmentCommand, type InboundMode, type EnrollmentCommand, type EnrollmentCompletionRecovery,
+  type EnrollmentTransportError } from './inboundEnrollment.js';
 import { z } from 'zod';
 import { canonicalJson } from '../outbound/canonical.js';
-import { inboundBeginIdentitySchema, inboundBeginRef, inboundApprovalRefSchema, recoverInboundResultSchema,
+import { inboundBeginIdentitySchema, inboundProviderProofSchema, inboundBeginRef, inboundApprovalRefSchema, recoverInboundResultSchema,
   consumedInboundClosureReceiptSchema, type InboundBeginIdentity, type InboundApprovalRef,
   type RecoverInboundResult, type ConsumedInboundClosureReceipt } from './inboundContract.js';
 import type { PrimaryCall } from './primaryApi.js';
@@ -10,10 +13,15 @@ import type { BrokerCall } from './store.js';
 export interface InboundWaitPolicy { version: 1; waitMs: number; mediaGraceMs: number }
 export interface InboundJournal {
   version: 1;
+  mode?: InboundMode;
   begin: InboundBeginIdentity;
   beginBodyDigest: string;
   policy: InboundWaitPolicy;
   waitUntil: string;
+  /** Ordering evidence only; the API independently verifies carrier/account admission. */
+  continuation?: { observedAt: string; beginBodyDigest: string; providerProof: InboundBeginIdentity['providerProof'] };
+  admissionRefusal?: { observedAt: string; beginBodyDigest: string; status: 403; retryable: false;
+    code: 'inbound_carrier_attestation_required' | 'inbound_enrollment_required' };
   beginAttemptedAt?: string;
   consumeAttemptedAt?: string;
   remote?: RecoverInboundResult;
@@ -26,7 +34,13 @@ export interface InboundJournal {
   closure?: ConsumedInboundClosureReceipt;
 }
 export type InboundJournalEvent =
+  | { type: 'enrollment_dispatch'; command: EnrollmentCommand; observedAt: string }
+  | { type: 'enrollment_observation'; result: EnrollmentCompletionRecovery; observedAt: string }
+  | { type: 'enrollment_error'; error: EnrollmentTransportError; observedAt: string }
+  | { type: 'enrollment_end_requested' | 'enrollment_end_acknowledged'; observedAt: string }
   | { type: 'begin_attempted' | 'consume_attempted' | 'cancel_requested' | 'close_requested'; observedAt: string }
+  | { type: 'continuation'; providerProof: InboundBeginIdentity['providerProof']; observedAt: string }
+  | { type: 'admission_refused'; code: 'inbound_carrier_attestation_required' | 'inbound_enrollment_required'; observedAt: string }
   | { type: 'stop'; reason: string; observedAt: string }
   | { type: 'outcome'; outcome: RecoverInboundResult; observedAt?: string }
   | { type: 'closure'; receipt: ConsumedInboundClosureReceipt; observedAt?: string }
@@ -38,7 +52,13 @@ export const inboundWaitPolicySchema = z.object({ version: z.literal(1),
   waitMs: z.number().int().safe().positive(), mediaGraceMs: z.number().int().safe().positive() }).strict();
 const journalSchema = z.object({
   version: z.literal(1), begin: inboundBeginIdentitySchema, beginBodyDigest: z.string().regex(/^[0-9a-f]{64}$/),
+  mode: inboundModeSchema.optional(),
   policy: inboundWaitPolicySchema, waitUntil: time,
+  continuation: z.object({ observedAt: time, beginBodyDigest: z.string().regex(/^[0-9a-f]{64}$/),
+    providerProof: inboundProviderProofSchema }).strict().optional(),
+  admissionRefusal: z.object({ observedAt: time, beginBodyDigest: z.string().regex(/^[0-9a-f]{64}$/),
+    status: z.literal(403), retryable: z.literal(false),
+    code: z.enum(['inbound_carrier_attestation_required', 'inbound_enrollment_required']) }).strict().optional(),
   beginAttemptedAt: time.optional(), consumeAttemptedAt: time.optional(),
   remote: recoverInboundResultSchema.optional(), issuedExpiresAt: time.optional(), approvalRef: inboundApprovalRefSchema.optional(),
   mediaStartBy: time.optional(), localStop: z.object({ observedAt: time, reason: z.string().min(1).max(100) }).strict().optional(),
@@ -54,11 +74,13 @@ const timestampAfter = (timestamp: string, duration: number) => {
 export const inboundRequestId = (callSid: string) => createHash('sha256').update(`incoming:${callSid}`).digest('hex');
 export const inboundBeginBodyDigest = (begin: InboundBeginIdentity) => createHash('sha256').update(canonicalJson(begin)).digest('hex');
 
-export function createInboundJournal(begin: InboundBeginIdentity, policy: InboundWaitPolicy, reservedAt: string): InboundJournal {
+export function createInboundJournal(begin: InboundBeginIdentity, policy: InboundWaitPolicy, reservedAt: string,
+  enrollmentMode = false): InboundJournal {
   inboundBeginIdentitySchema.parse(begin);
   inboundWaitPolicySchema.parse(policy);
   return { version: 1, begin: structuredClone(begin), beginBodyDigest: inboundBeginBodyDigest(begin),
-    policy: structuredClone(policy), waitUntil: timestampAfter(reservedAt, policy.waitMs) };
+    policy: structuredClone(policy), waitUntil: timestampAfter(reservedAt, policy.waitMs),
+    ...(enrollmentMode ? { mode: { kind: 'undecided' as const } } : {}) };
 }
 
 function checkOutcomeIdentity(call: BrokerCall, outcome: RecoverInboundResult): void {
@@ -87,8 +109,20 @@ function checkClosure(call: BrokerCall, receipt: ConsumedInboundClosureReceipt):
   if (Date.parse(receipt.closedAt) < Date.parse(remote.consumedAt)) throw new Error('Inbound closure precedes consumption');
 }
 
+function checkContinuation(call: BrokerCall, proof: InboundBeginIdentity['providerProof'], at: string): void {
+  const journal = call.inbound!;
+  const original = journal.begin.providerProof;
+  const url = new URL(original.url);
+  url.pathname = `/broker/inbound/${call.id}/continue`;
+  if (url.search || url.hash || proof.url !== url.href || proof.params.Direction !== 'inbound'
+    || ['AccountSid', 'CallSid', 'From', 'To'].some(key => proof.params[key] !== original.params[key])
+    || Date.parse(at) < Date.parse(call.createdAt) || Date.parse(at) >= Date.parse(journal.waitUntil))
+    throw new Error('Inbound continuation identity mismatch');
+}
+
 /** Optional for old calls. This validates saved evidence without creating or renewing it. */
-export function validateInboundJournal(call: BrokerCall): void {
+export function validateInboundJournal(call: BrokerCall, previous?: BrokerCall): void {
+  if (previous?.inbound && call.inbound === undefined) throw new Error('Inbound journal cannot disappear');
   if (call.inbound === undefined) return;
   const journal = journalSchema.parse(call.inbound);
   const proof = journal.begin.providerProof;
@@ -101,6 +135,56 @@ export function validateInboundJournal(call: BrokerCall): void {
     throw new Error('Inbound journal call identity mismatch');
   if (journal.beginBodyDigest !== inboundBeginBodyDigest(journal.begin)) throw new Error('Inbound original proof changed');
   if (journal.waitUntil !== timestampAfter(call.createdAt, journal.policy.waitMs)) throw new Error('Inbound wait deadline changed');
+  const mode = journal.mode;
+  if (mode?.kind === 'ordinary' && (!journal.continuation || mode.selectedAt !== journal.continuation.observedAt))
+    throw new Error('Ordinary mode lacks its exact continuation');
+  if (mode && mode.kind !== 'undecided'
+    && (Date.parse(mode.selectedAt) < Date.parse(call.createdAt) || Date.parse(mode.selectedAt) >= Date.parse(journal.waitUntil)))
+    throw new Error('Inbound mode selection outside original wait');
+  if (mode && mode.kind !== 'ordinary') {
+    if (journal.continuation || journal.beginAttemptedAt || journal.consumeAttemptedAt || journal.remote
+      || journal.approvalRef || journal.issuedExpiresAt || journal.admissionRefusal || journal.cancelRequestedAt
+      || journal.closureRequestedAt || journal.closure || journal.mediaStartBy || call.primary || call.primaryClosed
+      || call.mediaStartedAt || call.liveSessionId || call.liveGenerations || call.transcript
+      || Object.keys(call.delegations).length) throw new Error('Enrollment mode has ordinary admission evidence');
+  }
+  if (mode?.kind === 'enrollment-only') {
+    if (mode.command.brokerCallId !== call.id || mode.command.beginDigest !== inboundBeginRef(journal.begin).digest
+      || mode.dispatchStartedAt !== mode.selectedAt) throw new Error('Enrollment command identity changed');
+    if (mode.observation && (!sameEnrollmentCommand(mode.observation.result.command, mode.command)
+      || Date.parse(mode.observation.observedAt) < Date.parse(mode.dispatchStartedAt)))
+      throw new Error('Enrollment observation identity changed');
+    if (mode.transportError && Date.parse(mode.transportError.observedAt) < Date.parse(mode.dispatchStartedAt))
+      throw new Error('Enrollment error precedes dispatch');
+    if (mode.endRequestedAt && (!journal.localStop || Date.parse(mode.endRequestedAt) < Date.parse(mode.selectedAt)))
+      throw new Error('Enrollment end lacks local stop');
+    if (mode.endAcknowledgedAt && (!mode.endRequestedAt || Date.parse(mode.endAcknowledgedAt) < Date.parse(mode.endRequestedAt)))
+      throw new Error('Enrollment end acknowledgment lacks request');
+  }
+  if (previous?.inbound) {
+    const old = previous.inbound.mode;
+    if (old === undefined && mode !== undefined) throw new Error('Historical inbound mode cannot change');
+    if (old && !mode) throw new Error('Inbound mode cannot disappear');
+    if (old?.kind === 'ordinary' && !same(old, mode)) throw new Error('Ordinary inbound mode cannot change');
+    if (old?.kind === 'enrollment-only') {
+      if (mode?.kind !== 'enrollment-only' || old.selectedAt !== mode.selectedAt
+        || old.dispatchStartedAt !== mode.dispatchStartedAt || !sameEnrollmentCommand(old.command, mode.command))
+        throw new Error('Enrollment dispatch fence cannot change');
+      if (old.observation?.result.state !== undefined && old.observation.result.state !== 'absent'
+        && !same(old.observation.result, mode.observation?.result)) throw new Error('Enrollment committed result cannot change');
+      for (const field of ['endRequestedAt', 'endAcknowledgedAt'] as const)
+        if (old[field] !== undefined && mode[field] !== old[field]) throw new Error('Enrollment end evidence cannot change');
+    }
+  }
+  if (journal.continuation) {
+    if (journal.continuation.beginBodyDigest !== journal.beginBodyDigest) throw new Error('Inbound continuation original proof changed');
+    checkContinuation(call, journal.continuation.providerProof, journal.continuation.observedAt);
+  }
+  if (journal.admissionRefusal && (journal.admissionRefusal.beginBodyDigest !== journal.beginBodyDigest
+    || (!journal.beginAttemptedAt && !journal.approvalRef)
+    || !journal.localStop || !journal.cancelRequestedAt
+    || Date.parse(journal.admissionRefusal.observedAt) < Date.parse(journal.beginAttemptedAt ?? call.createdAt)))
+    throw new Error('Inbound admission refusal lacks stopped attempt');
   if (journal.remote) checkOutcomeIdentity(call, journal.remote);
   const remote = journal.remote;
   if (remote && 'expiresAt' in remote && remote.expiresAt !== null && remote.expiresAt !== journal.issuedExpiresAt)
@@ -110,7 +194,8 @@ export function validateInboundJournal(call: BrokerCall): void {
     if (journal.mediaStartBy !== timestampAfter(remote.consumedAt, journal.policy.mediaGraceMs)) throw new Error('Inbound media deadline changed');
   } else if (journal.mediaStartBy !== undefined || journal.closure !== undefined || call.primary || call.primaryClosed)
     throw new Error('Inbound unbound call has binding evidence');
-  if (journal.localStop && !journal.cancelRequestedAt) throw new Error('Inbound stop lacks cancellation intent');
+  if (journal.localStop && (!mode || mode.kind === 'ordinary') && !journal.cancelRequestedAt)
+    throw new Error('Inbound stop lacks cancellation intent');
   if (journal.consumeAttemptedAt && (!journal.beginAttemptedAt || !journal.approvalRef)) throw new Error('Inbound consume lacks approval history');
   if (journal.closureRequestedAt && remote?.state !== 'bound') throw new Error('Inbound close lacks binding');
   if (call.primary && (remote?.state !== 'bound' || call.primary.bindingId !== remote.bindingId || call.primary.callAssignmentRef))
@@ -137,7 +222,7 @@ export function assertInboundMediaStart(call: BrokerCall, startedAt: string | un
   }
   if (!startedAt || !time.safeParse(startedAt).success) throw new Error('Invalid inbound media start');
   const journal = call.inbound;
-  if (journal.localStop || call.primaryClosed || !call.primary || journal.remote?.state !== 'bound'
+  if ((journal.mode && journal.mode.kind !== 'ordinary') || journal.localStop || call.primaryClosed || !call.primary || journal.remote?.state !== 'bound'
       || journal.remote.callState !== 'open' || !journal.mediaStartBy
       || ['completed', 'failed', 'busy', 'no-answer', 'canceled'].includes(call.status)
       || Date.parse(startedAt) < Date.parse(journal.remote.consumedAt)
@@ -153,8 +238,51 @@ export function reduceInboundJournal(call: BrokerCall, event: InboundJournalEven
   const next = structuredClone(call);
   const journal = next.inbound!;
   const stopped = () => !!journal.localStop || ['completed', 'failed', 'busy', 'no-answer', 'canceled'].includes(next.status);
-  if (event.type === 'begin_attempted') {
-    if (stopped() || Date.parse(at) >= Date.parse(journal.waitUntil)) throw new Error('Inbound wait stopped');
+  if (event.type === 'enrollment_dispatch') {
+    const command = enrollmentCommandSchema.parse(event.command);
+    if (journal.mode?.kind !== 'undecided' || stopped() || next.endedAt
+      || Date.parse(at) >= Date.parse(journal.waitUntil)) throw new Error('Enrollment mode unavailable');
+    journal.mode = { kind: 'enrollment-only', selectedAt: at, command, dispatchStartedAt: at };
+  } else if (event.type === 'enrollment_observation' || event.type === 'enrollment_error'
+    || event.type === 'enrollment_end_requested' || event.type === 'enrollment_end_acknowledged') {
+    const mode = journal.mode;
+    if (mode?.kind !== 'enrollment-only') throw new Error('Enrollment mode unavailable');
+    if (event.type === 'enrollment_observation') {
+      const result = enrollmentCompletionRecoverySchema.parse(event.result);
+      if (!sameEnrollmentCommand(mode.command, result.command)) throw new Error('Enrollment observation identity changed');
+      if (mode.observation?.result.state !== undefined && mode.observation.result.state !== 'absent') {
+        if (!same(mode.observation.result, result)) throw new Error('Enrollment committed result cannot change');
+      } else mode.observation = { observedAt: at, result };
+    } else if (event.type === 'enrollment_error') {
+      const error = enrollmentTransportErrorSchema.parse(event.error);
+      if (error.observedAt !== at) throw new Error('Enrollment error clock changed');
+      mode.transportError = error;
+    } else if (event.type === 'enrollment_end_requested') {
+      if (!journal.localStop) throw new Error('Enrollment end requires local stop');
+      mode.endRequestedAt ??= at;
+    } else {
+      if (!mode.endRequestedAt) throw new Error('Enrollment end acknowledgment lacks request');
+      mode.endAcknowledgedAt ??= at;
+    }
+  } else if (event.type === 'continuation') {
+    if (journal.mode?.kind === 'enrollment-only') throw new Error('Enrollment leg cannot continue ordinary admission');
+    const proof = inboundProviderProofSchema.parse(event.providerProof);
+    if (Object.prototype.hasOwnProperty.call(proof.params, 'Digits')) throw new Error('Digit form cannot enter ordinary continuation');
+    checkContinuation(call, proof, at);
+    if (stopped() || next.endedAt) throw new Error('Inbound wait stopped');
+    if (journal.mode?.kind === 'undecided') journal.mode = { kind: 'ordinary', selectedAt: at };
+    journal.continuation ??= { observedAt: at, beginBodyDigest: journal.beginBodyDigest, providerProof: structuredClone(proof) };
+  } else if (event.type === 'admission_refused') {
+    const code = z.enum(['inbound_carrier_attestation_required', 'inbound_enrollment_required']).parse(event.code);
+    if (!journal.beginAttemptedAt && journal.remote?.state !== 'approved' && journal.remote?.state !== 'bound')
+      throw new Error('Inbound refusal lacks attempt or admission');
+    if (journal.admissionRefusal && journal.admissionRefusal.code !== code) throw new Error('Inbound admission refusal changed');
+    journal.admissionRefusal ??= { observedAt: at, beginBodyDigest: journal.beginBodyDigest, status: 403, retryable: false, code };
+    journal.localStop ??= { observedAt: at, reason: code };
+    journal.cancelRequestedAt ??= at;
+  } else if (event.type === 'begin_attempted') {
+    if (stopped() || next.endedAt || Date.parse(at) >= Date.parse(journal.waitUntil)) throw new Error('Inbound wait stopped');
+    if (!journal.continuation) throw new Error('Inbound continuation required');
     journal.beginAttemptedAt ??= at;
   } else if (event.type === 'consume_attempted') {
     if (stopped() || journal.remote?.state !== 'approved' || Date.parse(at) >= Date.parse(journal.waitUntil)
@@ -164,7 +292,7 @@ export function reduceInboundJournal(call: BrokerCall, event: InboundJournalEven
   } else if (event.type === 'stop') {
     z.string().min(1).max(100).parse(event.reason);
     journal.localStop ??= { reason: event.reason, observedAt: at };
-    journal.cancelRequestedAt ??= at;
+    if (!journal.mode || journal.mode.kind === 'ordinary') journal.cancelRequestedAt ??= at;
   } else if (event.type === 'cancel_requested') {
     if (!journal.localStop) throw new Error('Inbound cancellation requires local stop');
     journal.cancelRequestedAt ??= at;
@@ -209,7 +337,7 @@ export function reduceInboundJournal(call: BrokerCall, event: InboundJournalEven
       primaryDexterId: context.context.primaryDexterId, threadId: context.context.threadId,
       context: context.context.messages.map(message => `${message.role}: ${message.text}`).join('\n').slice(-8_000) };
   } else throw new Error('Unknown inbound journal transition');
-  validateInboundJournal(next);
+  validateInboundJournal(next, call);
   if (same(next, call)) return call;
   next.updatedAt = at;
   return next;

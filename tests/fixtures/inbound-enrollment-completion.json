@@ -1,0 +1,56 @@
+{
+  "syntheticOnly": true,
+  "input": {
+    "begin": {
+      "brokerCallId": "11111111-1111-4111-8111-111111111111",
+      "providerProof": {
+        "url": "https://broker.example.test/broker/incoming",
+        "params": {
+          "AccountSid": "AC11111111111111111111111111111111",
+          "CallSid": "CA22222222222222222222222222222222",
+          "Direction": "inbound",
+          "From": "+15555550101",
+          "To": "+15555550202",
+          "StirVerstat": "TN-Validation-Passed-A"
+        },
+        "signature": "GUgVW4JopSpWrmr6olDQI2N8B+U="
+      }
+    },
+    "digitProof": {
+      "url": "https://broker.example.test/broker/inbound/enrollment-response",
+      "params": {
+        "AccountSid": "AC11111111111111111111111111111111",
+        "CallSid": "CA22222222222222222222222222222222",
+        "Direction": "inbound",
+        "From": "+15555550101",
+        "To": "+15555550202",
+        "Digits": "01234567"
+      },
+      "signature": "0idawCU75PRIsx76jcJj3i4ZPBQ="
+    }
+  },
+  "begin": {
+    "preimage": "[\"phone.inbound-begin.v1\",\"11111111-1111-4111-8111-111111111111\",\"AC11111111111111111111111111111111\",\"CA22222222222222222222222222222222\",\"inbound\",\"+15555550101\",\"+15555550202\",\"4f2f14cdaf94558165beb4c4c8eb9818d5eb80320f4b26ec39ba4180bbd38ea8\"]",
+    "sha256": "4a04b81d77e3eda689054d37f08a27adba40d5a0a98edba911c645f035f895df"
+  },
+  "digitProof": {
+    "preimage": "[\"dexter.phone.enrollment-digit-proof/v1\",\"79243b50d006b43b8b514112ea04e0c3d44a73e818a64b6ef070a142fa11097b\",\"0idawCU75PRIsx76jcJj3i4ZPBQ=\"]",
+    "sha256": "abac9ca803cde00ce243d49cdcf8eed253a2a738cc76bc4fbaf9c317fb83eba2"
+  },
+  "command": {
+    "preimage": "[\"dexter.phone.enrollment-voice-command/v1\",\"11111111-1111-4111-8111-111111111111\",\"4a04b81d77e3eda689054d37f08a27adba40d5a0a98edba911c645f035f895df\",\"abac9ca803cde00ce243d49cdcf8eed253a2a738cc76bc4fbaf9c317fb83eba2\"]",
+    "sha256": "4490770330dab72d04ef1d22a1c05e63770e72482117ed698e2eef305f9777e3"
+  },
+  "lookup": {
+    "rootKeyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "keyId": "fixture-v1",
+    "preimage": "[\"dexter-phone-inbound-enrollment-lookup/v1\",\"fixture-v1\",\"+15555550101\",\"01234567\"]",
+    "hmacSha256": "4ff12f2d4dbcbbc09dda8b768d42e6b6c4a7fcd33804d0860e7f116c70992072"
+  },
+  "safeRef": {
+    "brokerCallId": "11111111-1111-4111-8111-111111111111",
+    "beginDigest": "4a04b81d77e3eda689054d37f08a27adba40d5a0a98edba911c645f035f895df",
+    "digitProofDigest": "abac9ca803cde00ce243d49cdcf8eed253a2a738cc76bc4fbaf9c317fb83eba2",
+    "commandDigest": "4490770330dab72d04ef1d22a1c05e63770e72482117ed698e2eef305f9777e3"
+  }
+}

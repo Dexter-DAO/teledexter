@@ -1,3 +1,4 @@
+import { restrictedSetupFunctionTools, restrictedSetupBackendInstructions, restrictedSetupToolSchema, restrictedSetupToolResultSchema, type RestrictedSetupTool } from './restrictedSetupTools.js';
 import { createHash } from 'node:crypto';
 import OpenAI from 'openai';
 import { LiveWS } from 'openai/resources/live/ws';
@@ -60,11 +61,16 @@ type Delegation = {
   offsetMs: number;
   controller: AbortController;
   updates: Map<string, { signature: string; delivery: Promise<LiveDelivery> }>;
+  responseId?: string;
+  toolCalls?: Map<string, { itemId: string; signature: string }>;
 };
 
 /** Audio stays live while an injected backend owns account-bound, durable work. */
 export function createBrokerLiveSession(options: BrokerLiveSessionOptions): BrokerLiveSession {
   const voice = options.voice ?? 'marin';
+  const setup = options.restrictedSetupTools;
+  if (setup && (!id(setup.model) || typeof setup.execute !== 'function' || options.eligibleHistory
+    || (options.history?.length ?? 0) > 0)) throw new Error('invalid_restricted_setup_tools');
   if (!options.apiKey?.trim() || !id(options.callId) || !id(voice)
       || typeof options.instructions !== 'string' || !options.instructions.trim()
       || Buffer.byteLength(options.instructions) > 16_384) throw new Error('invalid_live_configuration');
@@ -95,6 +101,7 @@ export function createBrokerLiveSession(options: BrokerLiveSessionOptions): Brok
   let captureBarrier = Promise.resolve();
   let captureFailed = false;
   const delegations = new Map<string, Delegation>();
+  const setupToolOwners = new Map<string, string>();
   const appends = new Map<string, PendingAppend>();
   const issuedAppends = new Set<string>();
   const seenErrorEvents = new WeakSet<object>();
@@ -187,7 +194,8 @@ export function createBrokerLiveSession(options: BrokerLiveSessionOptions): Brok
     send({ type: 'session.start', event_id: commandId(), session: {
       model: 'gpt-live-1', instructions: options.instructions, input, store: false,
       audio: { format: { type: 'audio/pcmu', rate: 8000 }, output: { voice } },
-      delegation: { type: 'client' },
+      delegation: setup ? { type: 'responses', responses: { model: setup.model, instructions: restrictedSetupBackendInstructions,
+        tools: restrictedSetupFunctionTools, parallel_tool_calls: false, tool_choice: 'auto', max_output_tokens: 512 } } : { type: 'client' },
     } });
   };
   const startupTimer = later(() => fail('startup_timeout'), startupTimeout);
@@ -220,17 +228,24 @@ export function createBrokerLiveSession(options: BrokerLiveSessionOptions): Brok
   };
   const receiveDelegation = (event: Record<string, unknown>) => {
     const metadata = record(event.delegation);
-    if (!id(metadata.id) || metadata.type !== 'delegation' || metadata.target !== 'client'
+    if (!id(metadata.id) || metadata.type !== 'delegation' || metadata.target !== (setup ? 'responses' : 'client')
+        || (setup && !id(metadata.response_id))
         || !offset(event.offset_ms) || !sessionId) { fail('invalid_client_delegation'); return; }
     const delegationId = metadata.id;
     const existing = delegations.get(delegationId);
     if (existing) {
-      if (existing.offsetMs !== event.offset_ms) fail('delegation_identity_changed');
+      if (existing.offsetMs !== event.offset_ms || (setup && existing.responseId !== metadata.response_id)) fail('delegation_identity_changed');
       return;
     }
     if (delegations.size >= MAX_DELEGATIONS) { fail('delegation_limit'); return; }
     const state: Delegation = { offsetMs: event.offset_ms, controller: new AbortController(), updates: new Map() };
     delegations.set(delegationId, state);
+    if (setup) {
+      if (!id(metadata.response_id)) { fail('invalid_setup_response_identity'); return; }
+      state.responseId = metadata.response_id;
+      state.toolCalls = new Map();
+      return; // Metadata alone never invokes a restricted setup tool.
+    }
     const requestId = createHash('sha256').update(JSON.stringify(['dexter-broker/live/v1', options.callId, sessionId, delegationId])).digest('hex');
     const publish = (update: LiveBackendUpdate): Promise<LiveDelivery> => {
       if (!id(update.id)) return Promise.resolve({ eventId: '', status: 'rejected', reason: 'invalid_update_id' });
@@ -272,6 +287,57 @@ export function createBrokerLiveSession(options: BrokerLiveSessionOptions): Brok
       emit({ type: 'live.delegation.started', delegationId, requestId, revision: request.transcript.revision });
       await options.backend.delegate(request, channel);
     }).catch(() => emit({ type: 'live.delegation.error', delegationId, requestId, code: 'backend_failed' }));
+  };
+
+  const receiveSetupTool = (event: Record<string, unknown>) => {
+    const nested = record(event.event);
+    if (nested.type !== 'response.output_item.done') return;
+    const item = record(nested.item);
+    if (item.type !== 'function_call') return;
+    if (!setup || !ready || !sessionId || !id(event.delegation_id)) { fail('uncorrelated_setup_response'); return; }
+    const state = delegations.get(event.delegation_id);
+    if (!state?.toolCalls || !state.responseId) { fail('unknown_setup_delegation'); return; }
+    if (!id(item.id) || !id(item.call_id) || item.status !== 'completed' || typeof item.name !== 'string'
+      || typeof item.arguments !== 'string' || Buffer.byteLength(item.arguments) > 4096
+      || (item.caller !== undefined && item.caller !== null && record(item.caller).type !== 'direct')
+      || item.async === true || item.namespace !== undefined) { fail('invalid_setup_tool'); return; }
+    let tool: RestrictedSetupTool;
+    try { tool = restrictedSetupToolSchema.parse({ name: item.name, arguments: JSON.parse(item.arguments) }); }
+    catch { fail('invalid_setup_tool'); return; }
+    const owner = setupToolOwners.get(item.call_id);
+    if (owner && owner !== event.delegation_id) { fail('setup_tool_identity_changed'); return; }
+    const signature = JSON.stringify([tool.name, item.arguments]), previous = state.toolCalls.get(item.call_id);
+    if (previous) {
+      if (previous.itemId !== item.id || previous.signature !== signature) fail('setup_tool_identity_changed');
+      return;
+    }
+    if (state.toolCalls.size >= 8) { fail('setup_tool_limit'); return; }
+    state.toolCalls.set(item.call_id, { itemId: item.id, signature });
+    setupToolOwners.set(item.call_id, event.delegation_id);
+    const delegationId = event.delegation_id, toolCallId = item.call_id, acceptedSessionId = sessionId;
+    const requestId = createHash('sha256').update(JSON.stringify(['dexter-broker/live/v1', options.callId, acceptedSessionId, delegationId])).digest('hex');
+    const channel = {
+      getContext: () => clone(persistedTranscript),
+      subscribeContext: (listener: (snapshot: LiveTranscriptSnapshot) => void) => {
+        if (state.controller.signal.aborted) return () => {};
+        contextListeners.add(listener);
+        const unsubscribe = () => { contextListeners.delete(listener); state.controller.signal.removeEventListener('abort', unsubscribe); };
+        state.controller.signal.addEventListener('abort', unsubscribe, { once: true }); return unsubscribe;
+      },
+      signal: state.controller.signal,
+    };
+    const barrier = captureBarrier, toolTranscript = clone(transcript);
+    void barrier.then(async () => {
+      if (closing || closed || state.controller.signal.aborted) return;
+      const request: LiveDelegationRequest = { callId: options.callId, sessionId: acceptedSessionId,
+        delegationId, requestId, offsetMs: state.offsetMs, transcript: toolTranscript };
+      let output: string;
+      try { output = JSON.stringify(restrictedSetupToolResultSchema.parse(await setup.execute({ request, tool, toolCallId }, channel))); }
+      catch { output = JSON.stringify({ phase: 'checking' }); }
+      if (closing || closed || state.controller.signal.aborted) return;
+      if (!send({ type: 'response.item.create', event_id: commandId(), item: { type: 'function_call_output', call_id: toolCallId, output } })) return;
+      send({ type: 'response.create', event_id: commandId() });
+    }).catch(() => { if (!closed) fail('setup_tool_failed'); });
   };
 
   const receiveError = (event: Record<string, unknown>) => {
@@ -318,7 +384,7 @@ export function createBrokerLiveSession(options: BrokerLiveSessionOptions): Brok
       const session = record(event.session);
       if (ready) { if (session.id !== sessionId) fail('started_session_identity_changed'); return; }
       if (!started || !id(session.id) || session.model !== 'gpt-live-1'
-          || (session.delegation != null && record(session.delegation).type !== 'client')) { fail('invalid_started_session'); return; }
+          || (session.delegation != null && record(session.delegation).type !== (setup ? 'responses' : 'client'))) { fail('invalid_started_session'); return; }
       sessionId = session.id; ready = true; clearTimer(startupTimer);
       const queued = startupAudio; startupAudio = []; startupAudioBytes = 0;
       for (const audio of queued) if (!send({ type: 'session.input_audio.append', audio })) return;
@@ -336,7 +402,9 @@ export function createBrokerLiveSession(options: BrokerLiveSessionOptions): Brok
       if (offset(seconds)) { usageSeconds = seconds; emit({ type: 'live.usage', seconds }); }
     } else if (type === 'session.delegation.created') {
       if (!ready) fail('delegation_before_ready'); else receiveDelegation(event);
-    } else if (type === 'response.event') fail('unexpected_responses_backend');
+    } else if (type === 'response.event') {
+      if (!setup) fail('unexpected_responses_backend'); else receiveSetupTool(event);
+    }
   });
   transport.onError(error => {
     // The SDK emits a protocol error twice: as an event, then wrapped in its

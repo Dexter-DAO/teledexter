@@ -1,4 +1,6 @@
 import dotenv from 'dotenv';
+import { BrokerStore } from './store.js';
+import { createInboundHoldAdapter } from './inboundHold.js';
 import { brokerConfig } from './config.js';
 import { createBrokerServer } from './server.js';
 import { createEligibleContextClient } from './eligibleContext.js';
@@ -10,7 +12,13 @@ import { safeFailure } from './phone.js';
 dotenv.config({ path: process.env.BROKER_ENV_FILE || '.env' });
 try {
   const config = brokerConfig(process.env);
+  const setup = config.verificationSetup;
+  const setupStore = setup ? new BrokerStore(config.stateDir) : undefined;
   const broker = createBrokerServer({ config,
+    ...(setup && setupStore ? { store: setupStore,
+      inboundAttachment: createInboundHoldAdapter({ publicOrigin: config.publicOrigin, store: setupStore }),
+      restrictedSetup: { model: setup.model, receiptTransport: { apiBaseUrl: setup.apiBaseUrl, signingSecret: setup.signingSecret } },
+    } : {}),
     eligibleContext: createEligibleContextClient({ apiBaseUrl: config.apiBaseUrl,
       phoneServiceSecret: config.phoneServiceSecret }),
     selectedQuestion: {
