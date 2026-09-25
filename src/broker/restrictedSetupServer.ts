@@ -246,12 +246,20 @@ export function createRestrictedSetupServer(options: RestrictedSetupServerOption
     clearPrivateWaitDeadline(call.id);
     const saved = store.get(call.id); if (!saved) fail();
     const savedMedia = media(saved);
+    // A fully stopped original leg has no callback or Primary work to recover.
+    // Maintenance and shutdown may revisit it after its host has drained.
+    if (saved.restrictedSetup?.stoppedAt && saved.endedAt && terminal.has(saved.status)
+      && (!savedMedia || savedMedia.stoppedAt) && !saved.primaryClosePending
+      && !active.has(saved.id) && !claimed.has(saved.id)) {
+      validateRestrictedSetupCall(saved);
+      return;
+    }
     if (savedMedia && !savedMedia.stoppedAt) patchMedia(call.id, { stoppedAt: new Date().toISOString() });
     if (saved.verificationCallback) {
       if (reason === 'provider_terminal') await flow.recover(saved.verificationCallback.permit.request).catch(() => {});
       else await flow.stop(saved.verificationCallback.permit.request);
     } else if (saved.restrictedSetup) {
-      store.recordRestrictedSetup(call.id, stopRestrictedSetup(saved, new Date().toISOString()));
+      store.recordRestrictedSetup(call.id, stopRestrictedSetup(get(call.id), new Date().toISOString()));
       if (reason !== 'provider_terminal') await provider.calls(saved.callSid!).update({ status: 'completed' });
     }
     store.update(call.id, { endedAt: saved.endedAt ?? new Date().toISOString() });
