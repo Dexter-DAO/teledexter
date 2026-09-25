@@ -364,8 +364,17 @@ test('actual host retains the old follow-up admission while a delayed fresh-cont
     assert.equal(next.settled(), false); assert.equal(f.posts.length, 1);
     assert.equal(f.voices[0]!.closed.length, 0, 'source admission still owns the old transcript');
     const before = f.store.get(f.callId)!.liveGenerations!.inputNextSample;
-    f.audio(true);
-    await boundary('buffered audio', () => f.store.get(f.callId)!.liveGenerations!.inputNextSample === before + 160, work);
+    const marker = Buffer.from('buffered_audio_ingress');
+    let received = false, pingError: Error | undefined;
+    const onPong = (payload: Buffer) => { if (payload.equals(marker)) received = true; };
+    f.ws.on('pong', onPong);
+    try {
+      f.audio(true);
+      // The matching pong follows the synchronous server media handler. Queued
+      // input stays in memory until a later generation journal save.
+      f.ws.ping(marker, undefined, error => { if (error) pingError = error; });
+      await boundary('buffered audio ingress', () => { if (pingError) throw pingError; return received; }, work);
+    } finally { f.ws.off('pong', onPong); }
     assert.equal(f.voices[0]!.inputs.length, 71, 'new frame remains buffered after the barrier');
     followup.release();
     await boundary('follow-up submission and old source retirement', () => f.posts.length === 2 && f.voices[0]!.closed.length === 1, work);
