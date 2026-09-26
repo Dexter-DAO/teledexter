@@ -32,6 +32,17 @@ const clocksSchema = z.object({
     && Date.parse(value.mediaStartedAt) >= Date.parse(value.consumedAt)
     && Date.parse(value.mediaStartedAt) < Date.parse(value.mediaStartBy!)));
 export type LiveGenerationClocks = z.infer<typeof clocksSchema>;
+const startupFailureCodeSchema = z.enum([
+  'credit_balance_exhausted', 'insufficient_quota', 'invalid_api_key', 'model_not_found',
+  'rate_limit_exceeded', 'permission_denied', 'invalid_request_error', 'authentication_error', 'server_error',
+  'provider_error', 'provider_connection_error', 'connection_closed_without_final_usage',
+  'transport_send_failed', 'invalid_started_session', 'started_session_identity_changed',
+  'closed_session_identity_mismatch', 'invalid_output_audio', 'delegation_before_ready',
+  'unexpected_responses_backend', 'ready_observer_failed', 'startup_timeout', 'closed_before_ready',
+  'generation_start_timeout', 'generation_start_cancelled', 'generation_session_reused',
+  'invalid_live_configuration', 'invalid_live_history', 'ambiguous_live_history',
+  'history_payload_too_large', 'prepared_history_changed', 'generation_start_failed',
+]);
 const segmentSchema = z.object({
   generationId: uuid, ordinal: safeInteger.min(1), createdAt: timestamp,
   state: z.enum(['starting', 'active', 'retiring', 'closed', 'abandoned']),
@@ -121,6 +132,14 @@ export interface LiveGenerationOptions {
 }
 export class LiveGenerationError extends Error {
   constructor(readonly code: string) { super(code); this.name = 'LiveGenerationError'; }
+}
+/** Only known codes cross the adapter boundary; provider messages never enter the journal. */
+export class LiveGenerationStartupError extends LiveGenerationError {
+  constructor(reason: unknown) {
+    const parsed = startupFailureCodeSchema.safeParse(reason);
+    super(parsed.success ? parsed.data : 'generation_start_failed');
+    this.name = 'LiveGenerationStartupError';
+  }
 }
 export interface GenerationDeliveryOutcome {
   requestId: string;

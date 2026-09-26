@@ -1,5 +1,5 @@
 import { createPrimaryBackend, liveResultChunks, withCallerAdmission, type BrokerDelegationRecord, type PrimaryBackend } from './backend.js';
-import { createLiveGenerationController, LIVE_GENERATION_STARTUP_MS, type GenerationHandle, type GenerationPublication, type LiveGenerationAttachment } from './liveGeneration.js';
+import { createLiveGenerationController, LiveGenerationStartupError, LIVE_GENERATION_STARTUP_MS, type GenerationHandle, type GenerationPublication, type LiveGenerationAttachment } from './liveGeneration.js';
 import { prepareEligibleHistory } from './eligibleHistory.js';
 import { eligibleAssociatedDeliveryResponseSchema, eligibleDeliveryResponseSchema,
   type EligibleContextClient, type EligibleContextBinding } from './eligibleContext.js';
@@ -281,7 +281,9 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
       finally { observer.signal.removeEventListener('abort', resolveAbort); }
     },
     open(input) {
-      const prepared = prepareEligibleHistory(input.context, binding);
+      let prepared: ReturnType<typeof prepareEligibleHistory>;
+      try { prepared = prepareEligibleHistory(input.context, binding); }
+      catch (error) { throw new LiveGenerationStartupError(error instanceof Error ? error.message : undefined); }
       return new Promise<GenerationHandle>((resolve, reject) => {
         let voice: BrokerLiveSession;
         let backend: PrimaryBackend | undefined;
@@ -292,7 +294,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
         const pending = new Map<LiveDelegationRequest, { promise: Promise<void>; resolve(): void }>();
         admissions.set(input.generationId, pending);
         const rejectAfterClose = (reason: string) => {
-          const error = new Error(reason);
+          const error = new LiveGenerationStartupError(reason);
           if (!voice) { reject(error); return; }
           void voice.close(reason).then(() => reject(error), () => reject(error));
         };
@@ -344,7 +346,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
               if (sessions.has(value.sessionId) || controller.snapshot().segments.some(segment => segment.sessionId === value.sessionId)) {
                 startCancelled = true; clearTimeout(startTimer); input.signal.removeEventListener('abort', cancelStart);
                 void voice.close('generation_session_reused');
-                reject(new Error('generation_session_reused')); return;
+                reject(new LiveGenerationStartupError('generation_session_reused')); return;
               }
               sessionId = value.sessionId;
               backend = createPrimaryBackend({ callId: initialCall.id, callSid: binding.callSid, bindingId: binding.bindingId,
@@ -407,7 +409,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
             onClosed(result) {
               clearTimeout(startTimer); input.signal.removeEventListener('abort', cancelStart); finalResult = result;
               input.callbacks.onClosed(result);
-              if (!ready) { startCancelled = true; reject(new Error('generation_closed_before_ready')); }
+              if (!ready) { startCancelled = true; reject(new LiveGenerationStartupError(result.reason)); }
             },
             onPlaybackClear() {
               if (controller.snapshot().deliveryAttachment?.generationId === input.generationId) options.onPlaybackClear();
@@ -421,7 +423,8 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
             },
           });
         } catch (error) {
-          startCancelled = true; clearTimeout(startTimer); input.signal.removeEventListener('abort', cancelStart); reject(error);
+          startCancelled = true; clearTimeout(startTimer); input.signal.removeEventListener('abort', cancelStart);
+          reject(new LiveGenerationStartupError(error instanceof Error ? error.message : undefined));
         }
       });
     },
