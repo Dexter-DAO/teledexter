@@ -13,8 +13,9 @@ import type { BrokerConfig } from '../src/broker/config.js';
 import { PrimaryApiError, type PrimaryApiClient } from '../src/broker/primaryApi.js';
 import { createInboundHoldAdapter } from '../src/broker/inboundHold.js';
 import { streamToken } from '../src/broker/phone.js';
+import type { EligiblePhoneCall } from '../src/broker/eligibleContext.js';
 
-async function fixture(t: test.TestContext, options: { selected?: boolean; retained?: BrokerCall; initialRemote?: InboundOutcome } = {}) {
+async function fixture(t: test.TestContext, options: { selected?: boolean; retained?: BrokerCall; initialRemote?: InboundOutcome; eligible?: boolean } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-inbound-http-'));
   if (options.retained) fs.writeFileSync(path.join(dir, 'calls.json'), JSON.stringify({ version: 1, calls: { [options.retained.id]: options.retained } }));
   const store = new BrokerStore(dir);
@@ -29,6 +30,15 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
     : { attachmentId, approvalId: randomUUID(), digest: 'd'.repeat(64) };
   const bindingId = options.initialRemote?.state === 'bound' ? options.initialRemote.bindingId : randomUUID();
   const primaryDexterId = randomUUID(), threadId = randomUUID();
+  const eligiblePage: EligiblePhoneCall = { bindingId, callSid: params.CallSid, state: 'open', context: {
+    primaryDexterId, threadId, displayName: 'Branch', messages: [{ id: randomUUID(), role: 'user', text: 'The earlier caller request.',
+      eventSequence: '1', provenance: { messageCreatedAt: '2026-09-26T12:00:00.000Z', eventId: randomUUID(),
+        eventOccurredAt: '2026-09-26T12:00:00.000Z', runId: randomUUID() } }], history: {
+      version: { ownerPrincipalId: randomUUID(), primaryDexterId, threadId, contextEpoch: '1', threadEventSequence: '2', digest: 'a'.repeat(64) },
+      pageDigest: 'b'.repeat(64), localContext: 'The caller has an earlier conversation.', nextBeforeSequence: null, hasMore: false, omittedForBudget: false,
+    },
+  } };
+  const startupPages: EligiblePhoneCall[] = [];
   let remote = options.initialRemote;
   let loseConsume = false, lostBegin = false, authority = true, cancellationUnavailable = false;
   const lifecycle: string[] = [];
@@ -36,10 +46,12 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
   let providerEntered: (() => void) | undefined; let providerState = 'in-progress';
   let beginError: Error | undefined;
   let statusGate: Promise<void> | undefined; let releaseStatus: (() => void) | undefined;
-  const seen = { dial: 0, end: 0, voice: 0, begin: 0, consume: 0, context: 0, cancel: 0, close: 0, legacyClose: 0 };
+  const seen = { dial: 0, end: 0, voice: 0, begin: 0, consume: 0, context: 0, cancel: 0, close: 0, legacyClose: 0,
+    startupFetch: 0, contextAssert: 0, opening: 0 };
   const context = () => {
     seen.context++;
     if (!authority) throw new Error('authority_unavailable');
+    if (options.eligible) return structuredClone(eligiblePage);
     return { bindingId, callSid: params.CallSid, state: 'open' as const,
       context: { primaryDexterId, threadId, displayName: 'Branch', messages: [] } };
   };
@@ -89,11 +101,21 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
   }), { async create() { seen.dial++; throw new Error('inbound_must_not_dial'); } });
   const broker = createBrokerServer({ config, store, primary, provider: { calls: provider } as unknown as ReturnType<typeof Twilio>,
     ...(options.selected === false ? {} : { inboundAttachment: createInboundHoldAdapter({ publicOrigin: config.publicOrigin, store }) }),
+    ...(options.eligible ? { eligibleContext: {
+      async fetch() { seen.startupFetch++; return structuredClone(eligiblePage); },
+      async assert(binding, version) {
+        seen.contextAssert++; assert.equal(binding.bindingId, bindingId); assert.equal(binding.callSid, params.CallSid);
+        assert.deepEqual(version, eligiblePage.context.history.version);
+        return { bindingId, callSid: params.CallSid, current: true as const, version };
+      },
+      async delivery() { throw new Error('no_request_delivery_expected'); },
+    } } : {}),
     voiceFactory: settings => {
       seen.voice++;
+      if (settings.eligibleHistory) startupPages.push(structuredClone(settings.eligibleHistory.source));
       queueMicrotask(() => settings.onReady({ callId: settings.callId, sessionId: 'inbound-fixture' }));
       return { appendAudio() { return true; }, async appendContext() { return { eventId: 'c', status: 'accepted' }; },
-        async appendInstructions() { return { eventId: 'i', status: 'accepted' }; }, async interruptPlayback() { return { eventId: 'p', status: 'accepted' }; },
+        async appendInstructions() { seen.opening++; return { eventId: 'i', status: 'accepted' }; }, async interruptPlayback() { return { eventId: 'p', status: 'accepted' }; },
         resumePlayback() {}, getTranscript() { return { revision: 0, callerRevision: 0, fragments: [] }; },
         async close(reason) { lifecycle.push('live-close'); return { callId: settings.callId, sessionId: 'inbound-fixture', finalized: true,
           transcriptPersisted: true, outputAudioDiscarded: false, reason: reason ?? 'closed' }; } };
@@ -109,7 +131,7 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
   let closed = false;
   const close = async () => { if (!closed) { closed = true; await broker.close(); } };
   t.after(async () => { await close(); fs.rmSync(dir, { recursive: true, force: true }); });
-  return { broker, store, base, config, params, seen, lifecycle, webhook, close, remote: () => remote,
+  return { broker, store, base, config, params, seen, lifecycle, webhook, close, eligiblePage, startupPages, remote: () => remote,
     async waitForAdmission() { const call = store.list()[0]; await (await webhook(`/broker/inbound/${call.id}/continue`)).text(); },
     beginError(error?: Error) { beginError = error; },
     approve() { assert.ok(remote?.state === 'pending'); remote = { ...remote, state: 'approved', approvalRef }; },
@@ -147,6 +169,30 @@ test('actual HTTP incoming waits on same leg and approved continuation enters ex
   const repeat = await f.webhook(`/broker/inbound/${call.id}/continue`);
   assert.equal(repeat.status, 409); await repeat.text();
   assert.equal(f.seen.voice, 1);
+  ws.close(); await new Promise<void>(resolve => ws.once('close', () => resolve()));
+});
+
+test('admitted eligible history reaches first voice startup without a duplicate GET and keeps both original assertions', async t => {
+  const f = await fixture(t, { eligible: true });
+  await (await f.webhook('/broker/incoming-call')).text();
+  const call = f.store.list()[0]; await f.waitForAdmission(); f.approve();
+  assert.match(await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text(), /<Stream/);
+  assert.equal(f.seen.context, 1);
+  assert.equal('history' in f.store.get(call.id)!.primary!, false);
+  assert.doesNotMatch(fs.readFileSync(path.join(f.config.stateDir, 'calls.json'), 'utf8'), /"history":|"pageDigest":/);
+  const route = `/broker/media/${call.id}`;
+  const ws = new WebSocket(f.base.replace(/^http/, 'ws') + route, { headers: {
+    'x-twilio-signature': Twilio.getExpectedTwilioSignature(f.config.twilioAuthToken, f.config.publicOrigin + route, {}),
+  } });
+  t.after(() => ws.close());
+  await new Promise<void>((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
+  ws.send(JSON.stringify({ event: 'start', start: { accountSid: f.config.twilioAccountSid, callSid: f.params.CallSid,
+    streamSid: 'MZ' + '4'.repeat(32), customParameters: { token: streamToken(f.config.controlToken, call.id, f.params.CallSid) },
+    mediaFormat: { encoding: 'audio/x-mulaw', sampleRate: 8000, channels: 1 } } }));
+  for (let count = 0; count < 100 && f.seen.opening === 0; count++) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(f.seen.opening, 1); assert.equal(f.seen.contextAssert, 3);
+  assert.equal(f.seen.startupFetch, 0); assert.equal(f.seen.context, 1);
+  assert.deepEqual(f.startupPages, [f.eligiblePage]);
   ws.close(); await new Promise<void>(resolve => ws.once('close', () => resolve()));
 });
 

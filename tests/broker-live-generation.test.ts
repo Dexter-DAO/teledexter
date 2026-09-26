@@ -7,6 +7,7 @@ import { createLiveGenerationController, LiveGenerationError,
 import { PrimaryApiError } from '../src/broker/primaryApi.js';
 import type { EligibleContextClient, EligiblePhoneCall, HistoryVersion } from '../src/broker/eligibleContext.js';
 import type { LiveSessionClosed, LiveTranscriptSnapshot } from '../src/live/types.js';
+import { createInboundStartupContexts } from '../src/broker/startupContext.js';
 
 const callId = '11111111-1111-4111-8111-111111111111';
 const bindingId = '22222222-2222-4222-8222-222222222222';
@@ -106,6 +107,124 @@ function harness(initial?: LiveGenerationJournal, overrides: Partial<LiveGenerat
     get clears() { return clears; }, setTime: (value: number) => { time = value; },
     advanceVersion: () => { version = versionFor(Number(version.contextEpoch) + 1); } };
 }
+
+const startupCall = () => ({ id: callId, callSid, primary: { bindingId, primaryDexterId, threadId, name: 'Dexter', context: '' } });
+
+test('admitted startup page is snapshotted and consumed only once for its exact call', async () => {
+  const h = harness(), cache = createInboundStartupContexts(h.api), call = startupCall();
+  const page = contextFor(versionFor(1));
+  page.context.history.localContext = 'Retain the complete attributed history envelope.';
+  page.context.messages.push({ id: messageId, role: 'user', text: 'The earlier caller request.', eventSequence: '1',
+    provenance: { messageCreatedAt: when, eventId, eventOccurredAt: when, runId },
+    canonicalSource: { sourceEventId: eventId, revision: 1, occurredAt: when, storedProjectionKind: 'verbatim' } });
+  const expected = structuredClone(page);
+  cache.remember(call, page);
+  page.context.history.localContext = 'Changed after admission';
+  const client = cache.take(call);
+  assert.deepEqual(await client.fetch(binding), expected);
+  assert.deepEqual(h.operations.map(value => value.name), ['assert']);
+  await client.fetch(binding);
+  await cache.take(call).fetch(binding);
+  assert.deepEqual(h.operations.map(value => value.name), ['assert', 'fetch', 'fetch']);
+});
+
+test('admitted startup page still withholds audio until a fresh version assertion succeeds', async () => {
+  const h = harness(), cache = createInboundStartupContexts(h.api), call = startupCall();
+  cache.remember(call, contextFor(versionFor(1))); h.options.context = cache.take(call);
+  const asserted = pending<void>(), assertVersion = h.api.assert;
+  let assertions = 0;
+  h.api.assert = async (scope, version) => { if (++assertions === 2) await asserted.promise; return assertVersion(scope, version); };
+  const starting = h.controller.start();
+  await until(() => h.sessions.length === 1);
+  h.sessions[0].input.callbacks.onAudio('before_assert');
+  assert.equal(h.controller.snapshot().deliveryAttachment, undefined);
+  assert.deepEqual(h.audio, []);
+  asserted.resolve(); await starting;
+  assert.deepEqual(h.operations.map(value => value.name), ['assert', 'assert']);
+  h.sessions[0].input.callbacks.onAudio('after_assert');
+  assert.deepEqual(h.audio, [{ payload: 'after_assert', sessionId: 'session_1' }]);
+  await h.controller.stop();
+});
+
+test('stop during the retained-page eligibility check prevents a late page from opening Live', async () => {
+  const h = harness(), cache = createInboundStartupContexts(h.api), call = startupCall();
+  cache.remember(call, contextFor(versionFor(1))); h.options.context = cache.take(call);
+  const checked = pending<void>(), assertVersion = h.api.assert; let checking = false;
+  h.api.assert = async (scope, version) => { checking = true; await checked.promise; return assertVersion(scope, version); };
+  const starting = h.controller.start();
+  await until(() => checking);
+  const rejected = assert.rejects(starting);
+  await h.controller.stop(); await rejected;
+  checked.resolve(); await Promise.resolve(); await Promise.resolve();
+  assert.equal(h.sessions.length, 0); assert.equal(h.controller.snapshot().deliveryAttachment, undefined);
+});
+
+test('a stale admitted page is replaced from a fresh read before any retained text reaches Live', async () => {
+  const h = harness(), cache = createInboundStartupContexts(h.api), call = startupCall();
+  cache.remember(call, contextFor(versionFor(1))); h.options.context = cache.take(call); h.advanceVersion();
+  const open = h.options.open;
+  h.options.open = async input => { const result = await open(input); input.callbacks.onAudio('unasserted'); return result; };
+  assert.equal((await h.controller.start()).sessionId, 'session_1');
+  assert.deepEqual(h.operations.map(value => value.name), ['assert', 'fetch', 'assert']);
+  assert.equal(h.sessions.length, 1); assert.deepEqual(h.audio, []);
+  assert.deepEqual(h.sessions[0].input.context, contextFor(versionFor(2)));
+  await h.controller.stop();
+});
+
+test('unavailable authority after seeded startup never enables output or substitutes unasserted history', async () => {
+  const h = harness(), cache = createInboundStartupContexts(h.api), call = startupCall();
+  cache.remember(call, contextFor(versionFor(1))); h.options.context = cache.take(call);
+  h.api.assert = async () => { throw new PrimaryApiError('http_error', 403, { code: 'authority_unavailable', retryable: false }); };
+  await assert.rejects(h.controller.start());
+  assert.equal(h.sessions.length, 0);
+  assert.equal(h.controller.snapshot().deliveryAttachment, undefined); assert.deepEqual(h.audio, []);
+  assert.deepEqual(h.operations, []);
+  await h.controller.stop();
+});
+
+for (const key of ['bindingId', 'callSid', 'ownerPrincipalId', 'primaryDexterId', 'threadId'] as const) {
+  test(`an admitted page with a different requested ${key} falls back to a fresh read`, async () => {
+    const h = harness(), cache = createInboundStartupContexts(h.api), call = startupCall();
+    cache.remember(call, contextFor(versionFor(1)));
+    const expected = { ...binding, [key]: key === 'callSid' ? `CA${'2'.repeat(32)}` : requestId };
+    await cache.take(call).fetch(expected);
+    assert.deepEqual(h.operations.map(value => value.name), ['fetch']);
+  });
+}
+
+test('another call cannot consume the page and a changed saved binding cannot reuse it', async () => {
+  const h = harness(), cache = createInboundStartupContexts(h.api), call = startupCall();
+  cache.remember(call, contextFor(versionFor(1)));
+  await cache.take({ ...call, id: requestId }).fetch(binding);
+  assert.deepEqual(h.operations.map(value => value.name), ['fetch']);
+  await cache.take(call).fetch(binding);
+  assert.deepEqual(h.operations.map(value => value.name), ['fetch', 'assert']);
+  cache.remember(call, contextFor(versionFor(1)));
+  await cache.take({ ...call, primary: { ...call.primary, bindingId: requestId } }).fetch(binding);
+  assert.deepEqual(h.operations.map(value => value.name), ['fetch', 'assert', 'fetch']);
+});
+
+test('closed, missing, mismatched and discarded admission pages retain normal fresh startup', async () => {
+  const h = harness(), cache = createInboundStartupContexts(h.api), call = startupCall();
+  const page = contextFor(versionFor(1));
+  for (const response of [{ ...page, state: 'closed' as const }, { ...page, callSid: `CA${'2'.repeat(32)}` },
+    { ...page, context: { primaryDexterId, threadId, displayName: 'Dexter', messages: [] } }]) {
+    cache.remember(call, response); await cache.take(call).fetch(binding);
+  }
+  cache.remember(call, page); cache.discard(call.id); await cache.take(call).fetch(binding);
+  cache.remember(call, page); cache.clear(); await cache.take(call).fetch(binding);
+  await createInboundStartupContexts(h.api).take(call).fetch(binding);
+  assert.equal(h.operations.filter(value => value.name === 'fetch').length, 6);
+});
+
+test('an existing generation journal forces a fresh read even if admission context was retained', async () => {
+  const h = harness(), cache = createInboundStartupContexts(h.api), call = startupCall();
+  cache.remember(call, contextFor(versionFor(1)));
+  const restored = { ...call, liveGenerations: h.controller.snapshot() };
+  await cache.take(restored).fetch(binding);
+  cache.remember(restored, contextFor(versionFor(1))); await cache.take(restored).fetch(binding);
+  assert.deepEqual(h.operations.map(value => value.name), ['fetch', 'fetch']);
+});
 
 test('generation start pins the current eligible version and original clocks before enabling output', async () => {
   const h = harness();

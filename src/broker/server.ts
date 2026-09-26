@@ -9,6 +9,7 @@ import { createPrimaryApiClient, type PrimaryApiClient } from './primaryApi.js';
 import { createPrimaryBackend } from './backend.js';
 import { eligiblePhoneCallSchema, type EligibleContextClient } from './eligibleContext.js';
 import { createGenerationVoice, type GenerationVoiceOptions, type GenerationVoiceSession } from './generationVoice.js';
+import { createInboundStartupContexts } from './startupContext.js';
 import { createSelectedQuestionRecovery, selectedQuestionSourceAnchors } from './selectedQuestionVoice.js';
 import { recoverCallerRouteCaptures } from './mixedWork.js';
 import { createCallerIntentResolver } from './callerIntentResolver.js';
@@ -116,6 +117,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
   const provider = options.provider ?? Twilio(config.twilioAccountSid, config.twilioAuthToken, { autoRetry: false, timeout: 15_000 });
   const voiceFactory = options.voiceFactory ?? createBrokerLiveSession;
   const probe = options.probe ?? probeLive;
+  const startupContexts = options.eligibleContext ? createInboundStartupContexts(options.eligibleContext) : undefined;
   const resolveHarkAssignment = options.resolveHarkAssignment ?? (config.harkApiBaseUrl
     ? createHarkAssignmentResolver({ apiBaseUrl: config.harkApiBaseUrl }) : undefined);
   const harkLifecycle = config.harkApiBaseUrl && config.harkCallbackSigningSecret
@@ -189,6 +191,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
   });
 
   const inbound = createInboundFlow({ config, store, primary,
+    onContext: (call, context) => startupContexts?.remember(call, context),
     fetchCall: sid => provider.calls(sid).fetch(), closeBound: async call => {
       // Media may have started while a provider/account read was in flight.
       // Its owner must finalize Live and capture before closing account admission.
@@ -201,6 +204,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
     provider, voiceFactory, active, claimed, accepting: () => accepting, closePrimary }) : undefined;
 
   function closePrimary(call: BrokerCall): Promise<void> {
+    startupContexts?.discard(call.id);
     const inboundBound = call.inbound?.remote?.state === 'bound' ? call.inbound.remote : undefined;
     const bindingId = call.primary?.bindingId ?? inboundBound?.bindingId;
     if (!bindingId) return Promise.resolve();
@@ -833,7 +837,8 @@ export function createBrokerServer(options: BrokerServerOptions) {
             },
           };
           live = options.eligibleContext ? createGenerationVoice({ call: store.get(call.id)!, callDeadlineAt,
-            apiKey: config.apiKey, voice: config.voice, store, primary, context: options.eligibleContext, voiceFactory,
+            apiKey: config.apiKey, voice: config.voice, store, primary,
+            context: startupContexts!.take(store.get(call.id)!), voiceFactory,
             ...(options.selectedQuestion ? { selectedQuestion: options.selectedQuestion } : {}),
             ...(call.continuation && options.callerIntent ? { callerIntent: createCallerIntentResolver({
               callId: call.id, store, client: options.callerIntent.client, timeoutMs: options.callerIntent.timeoutMs,
@@ -937,6 +942,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
 
   async function close() {
     accepting = false;
+    startupContexts?.clear();
     // Freeze every saved wait before awaiting any in-flight begin/consume operation.
     for (const call of store.list()) if (call.inbound && !call.inbound.closure) inbound.stopLocal(call.id, 'service_shutdown');
     clearInterval(maintenanceTimer);
