@@ -17,6 +17,8 @@ export interface InboundFlowOptions {
   primary: PrimaryApiClient;
   fetchCall(sid: string): Promise<InboundProviderCall>;
   closeBound(call: BrokerCall): Promise<void>;
+  /** In-memory handoff after the original leg and context have been admitted. */
+  onContext?(call: BrokerCall, context: PrimaryCall): void;
   now?: () => number;
   /** Internal composition only. No entry gesture, route, settings or runtime activation is selected here. */
   enrollment?: { endLeg(call: BrokerCall): Promise<void> };
@@ -227,6 +229,7 @@ export function createInboundFlow(options: InboundFlowOptions) {
       stopLocal(id, context.state !== 'open' ? 'binding_closed' : 'media_start_expired'); return settle(id);
     }
     store.transitionInbound(id, { type: 'context', context, observedAt: timestamp() });
+    options.onContext?.(saved(id), context);
     return saved(id);
   }
   async function advance(id: string): Promise<BrokerCall> {
