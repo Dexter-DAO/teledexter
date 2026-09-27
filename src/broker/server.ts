@@ -12,6 +12,7 @@ import { createPrimaryBackend } from './backend.js';
 import { eligiblePhoneCallSchema, type EligibleContextClient } from './eligibleContext.js';
 import { createGenerationVoice, type GenerationVoiceOptions, type GenerationVoiceSession } from './generationVoice.js';
 import { createInboundStartupContexts } from './startupContext.js';
+import { createBrokerDependencyHealth, type BrokerDependencyHealth } from './dependencyHealth.js';
 import { createSelectedQuestionRecovery, selectedQuestionSourceAnchors } from './selectedQuestionVoice.js';
 import { recoverCallerRouteCaptures } from './mixedWork.js';
 import { createCallerIntentResolver } from './callerIntentResolver.js';
@@ -98,6 +99,7 @@ export interface BrokerServerOptions {
   provider?: ReturnType<typeof Twilio>;
   voiceFactory?: (options: BrokerLiveSessionOptions) => BrokerLiveSession;
   probe?: typeof probeLive;
+  dependencyHealth?: () => Promise<BrokerDependencyHealth>;
   resolveHarkAssignment?: HarkAssignmentResolver;
   harkStatusSender?: typeof deliverHarkStatus;
   harkBillingSender?: typeof deliverHarkBilling;
@@ -120,6 +122,9 @@ export function createBrokerServer(options: BrokerServerOptions) {
   const provider = options.provider ?? Twilio(config.twilioAccountSid, config.twilioAuthToken, { autoRetry: false, timeout: 15_000 });
   const voiceFactory = options.voiceFactory ?? createBrokerLiveSession;
   const probe = options.probe ?? probeLive;
+  const dependencyHealth = options.dependencyHealth ?? createBrokerDependencyHealth({
+    apiBaseUrl: config.apiBaseUrl, harkApiBaseUrl: config.harkApiBaseUrl,
+  });
   const startupContexts = options.eligibleContext ? createInboundStartupContexts(options.eligibleContext) : undefined;
   const resolveHarkAssignment = options.resolveHarkAssignment ?? (config.harkApiBaseUrl
     ? createHarkAssignmentResolver({ apiBaseUrl: config.harkApiBaseUrl }) : undefined);
@@ -453,7 +458,12 @@ export function createBrokerServer(options: BrokerServerOptions) {
   async function handle(request: IncomingMessage, response: ServerResponse) {
     const route = request.url || '/';
     if (restricted && await restricted.handle(request, response)) return;
-    if (request.method === 'GET' && route === '/broker/health') return json(response, 200, { ok: accepting, service: 'dexter-broker', model: config.model, revision: process.env.BROKER_REVISION || 'development', activeCalls: active.size });
+    if (request.method === 'GET' && route === '/broker/health') {
+      const dependencies = await dependencyHealth();
+      const ok = accepting && dependencies.ok;
+      return json(response, ok ? 200 : 503, { ok, service: 'dexter-broker', model: config.model,
+        revision: process.env.BROKER_REVISION || 'development', activeCalls: active.size, dependencies });
+    }
     if (route === '/internal/outbound-alerts' && request.method === 'POST') {
       if (!accepting || !resolveHarkAssignment || !config.harkInternalToken) return json(response, 503, { ok: false, error: 'hark_broker_not_configured' });
       if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(request.socket.remoteAddress ?? ''))

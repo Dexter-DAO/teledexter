@@ -53,7 +53,8 @@ This release supports answers within the original verified call. Attaching a lat
 | `TWILIO_ACCOUNT_SID` | Account owning the caller number. |
 | `TWILIO_AUTH_TOKEN` | Validates callbacks and authenticates the Twilio client. |
 | `TWILIO_PHONE_NUMBER` | E.164 caller number; must differ from allowed destinations. |
-| `DEXTER_API_URL` | API base URL, normally `https://api.dexter.cash`. HTTPS is required except for loopback. |
+| `DEXTER_API_URL` | Same-host production uses `http://127.0.0.1:3033`, the Nginx listener that follows the selected API release. Remote API origins require HTTPS. |
+| `BROKER_HARK_API_URL` | When Hark is enabled, use the same local origin: `http://127.0.0.1:3033`. |
 | `PHONE_SERVICE_SECRET` | At least 32 characters; must match the API's phone callback signing secret. |
 | `BROKER_REVISION` | Release identifier exposed by the health endpoint. The PM2 configuration defaults to the release directory name. |
 
@@ -162,3 +163,7 @@ During a call, GPT-Live transcript deltas are observed fragments. The primary We
 A call with status `unknown` and no provider SID needs operator investigation of the original dispatch. Preserve the request ID and journal, establish the provider outcome, and resolve that record before attempting another call. Generating a new request ID to bypass uncertainty risks a duplicate call. Do not delete the writer lock while its owning process is alive.
 
 Maintenance also reconciles inactive, unresolved calls older than 60 seconds by saved SID and ends a provider call that is still open. During shutdown the service drains HTTP requests, stops its active calls, and awaits closeout before releasing the journal lock. A forced exit leaves recovery evidence on disk for the next process.
+
+The API repository supplies `ops/nginx/dexter-api-loopback.conf`. Install that listener before pointing Broker at port 3033. It uses the public API's `dexter_api_backend` selector, so API deployment and rollback move both routes together. Application ports 3030, 3031 and 3032 belong to individual release slots.
+
+`GET /broker/health` checks the configured Primary and Hark API origins before answering. It returns HTTP 503 when either origin is unavailable, reports an invalid health identity or serves a different release. Each probe has a two-second limit and reads at most 16 KiB; concurrent checks share one request and results remain cached for at most five seconds. A later health request retries after that cache expires. This checks API transport and release identity. Account authority, provider access and completed call quality require their own checks. Call admission continues to use its existing authority checks.
