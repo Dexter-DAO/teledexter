@@ -2,6 +2,7 @@ import { validateRestrictedSetupCall, restrictedSetupJournalSchema, type Restric
 import { reserveVerificationCallback, parseVerificationCallbackJournal, validateVerificationCallbackCall, verificationCallbackPurpose, type VerificationCallbackJournal } from './verificationCallbackJournal.js';
 import { phoneVerificationCallbackPermitSchema, type PhoneVerificationCallbackPermit } from './verificationCallbackContract.js';
 import fs from 'node:fs';
+import { reduceInboundBilling, validateInboundBilling, type InboundBillingJournal, type InboundBillingCommand } from './inboundBilling.js';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
@@ -72,6 +73,7 @@ export interface BrokerCall {
   harkReceiptOutbox?: PrimaryHarkReceiptOutbox;
   harkDispatch?: HarkDispatch;
   inbound?: InboundJournal;
+  inboundBilling?: InboundBillingJournal;
   verificationCallback?: VerificationCallbackJournal;
   restrictedSetup?: RestrictedSetupJournal;
   voiceOpening?: { status: string; eventId?: string; reason?: string };
@@ -91,6 +93,7 @@ export interface BrokerCall {
     pending: number;
     unsupported: string[];
   };
+  journey?: { liveReadyAt?: string; firstAudioSentAt?: string; firstPlaybackConfirmedAt?: string };
   metrics?: { receivedAudioBytes: number; sentAudioBytes: number; playedAudioBytes: number; clearedAudioBytes: number };
   delegations: Record<string, { requestId: string; status: string; updatedAt: string; result?: string }>;
 }
@@ -357,12 +360,25 @@ function assertHarkReceiptUpdate(previous: BrokerCall, next: BrokerCall): void {
 
 interface State { version: 1; calls: Record<string, BrokerCall> }
 
+const journeySchema = z.object({ liveReadyAt: z.iso.datetime({ offset: true }).optional(),
+  firstAudioSentAt: z.iso.datetime({ offset: true }).optional(), firstPlaybackConfirmedAt: z.iso.datetime({ offset: true }).optional() }).strict();
+function validateCallJourney(call: BrokerCall, previous?: BrokerCall): void {
+  if (call.journey) {
+    journeySchema.parse(call.journey);
+    if (!call.mediaStartedAt || (call.journey.firstPlaybackConfirmedAt && !call.journey.firstAudioSentAt))
+      throw new Error('Call journey lacks media evidence');
+  }
+  for (const key of ['liveReadyAt', 'firstAudioSentAt', 'firstPlaybackConfirmedAt'] as const)
+    if (previous?.journey?.[key] && previous.journey[key] !== call.journey?.[key]) throw new Error('Call journey observation changed');
+}
+
 function validateBrokerState(state: State): void {
   if (state.version !== 1 || !state.calls || typeof state.calls !== 'object' || Array.isArray(state.calls)) throw new Error('Invalid broker call store');
   for (const [id, call] of Object.entries(state.calls)) {
     if (call.id !== id || !call.requestId || !call.number || !call.createdAt || !call.delegations) throw new Error('Invalid broker call record');
     validateAssignment(call);
     validatePrimaryIdentity(call);
+    validateCallJourney(call);
     validateGenerations(call);
     validateSelectedQuestionCall(call);
     validateSelectedVoice(call);
@@ -371,6 +387,7 @@ function validateBrokerState(state: State): void {
     validateHarkJournal(call);
     validateHarkDispatch(call);
     validateInboundJournal(call);
+    validateInboundBilling(call);
     validateVerificationCallbackCall(call);
     validateRestrictedSetupCall(call);
     validateHarkReceiptCall(call);
@@ -427,6 +444,8 @@ export class BrokerStore {
       validateBrokerAdmissionRefusals(call, this.state?.calls[id]);
       validateSelectedOutboundObservation(call, this.state?.calls[id]);
       validateInboundJournal(call, this.state?.calls[id]);
+      validateInboundBilling(call, this.state?.calls[id]);
+      validateCallJourney(call, this.state?.calls[id]);
       validateVerificationCallbackCall(call, this.state?.calls[id]);
       validateRestrictedSetupCall(call, this.state?.calls[id]);
     }
@@ -486,9 +505,26 @@ export class BrokerStore {
       number: proof.params.From, callSid, status: 'prepared', createdAt: now, updatedAt: now, delegations: {},
       inbound: createInboundJournal({ brokerCallId: id, providerProof: proof }, policy, now, enrollmentMode) };
     validateInboundJournal(call);
+    validateInboundBilling(call);
     validateSelectedVoice(call);
     this.persist({ version: 1, calls: { ...this.state.calls, [id]: call } });
     return { call: structuredClone(call), existing: false };
+  }
+
+  transitionInboundBilling(id: string, command: InboundBillingCommand): BrokerCall {
+    const call = this.get(id);
+    if (!call) throw new Error('Unknown broker call');
+    return this.saveHarkCall({ ...call, inboundBilling: reduceInboundBilling(call, command), updatedAt: new Date().toISOString() });
+  }
+
+  observeInboundProvider(id: string, status: CallStatus, observedAt: string): BrokerCall {
+    const call = this.get(id);
+    if (!call?.inboundBilling) throw new Error('Inbound billing unavailable');
+    if (call.inboundBilling.terminal && !terminalCallStatuses.has(status)) return call;
+    const inboundBilling = terminalCallStatuses.has(status) ? reduceInboundBilling(call, { kind: 'terminal',
+      status: status as NonNullable<InboundBillingJournal['terminal']>['status'], observedAt }) : call.inboundBilling;
+    return this.saveHarkCall({ ...call, status, inboundBilling, updatedAt: observedAt,
+      ...(inboundBilling.terminal ? { endedAt: call.endedAt ?? observedAt } : {}) });
   }
 
   transitionInbound(id: string, event: InboundJournalEvent): BrokerCall {
@@ -796,12 +832,17 @@ export class BrokerStore {
     return structuredClone(journal.records.find(record => record.frozen.turn.sourceEventId === ref.sourceEventId)!);
   }
 
-  update(id: string, patch: Partial<Omit<BrokerCall, 'id' | 'requestId' | 'number' | 'direction' | 'purpose' | 'createdAt' | 'callAssignment' | 'continuation' | 'selectedQuestion' | 'selectedQuestionVoice' | 'callerRouting' | 'harkJournal' | 'harkDispatch' | 'inbound' | 'outboundObservation' | 'retryOf' | 'retrySuccessor' | 'verificationCallback' | 'restrictedSetup'>>): BrokerCall {
+  update(id: string, patch: Partial<Omit<BrokerCall, 'id' | 'requestId' | 'number' | 'direction' | 'purpose' | 'createdAt' | 'callAssignment' | 'continuation' | 'selectedQuestion' | 'selectedQuestionVoice' | 'callerRouting' | 'harkJournal' | 'harkDispatch' | 'inbound' | 'inboundBilling' | 'outboundObservation' | 'retryOf' | 'retrySuccessor' | 'verificationCallback' | 'restrictedSetup'>>): BrokerCall {
     const previous = this.state.calls[id];
     if (!previous) throw new Error('Unknown broker call');
     // Runtime callers can bypass Omit. Check the same property snapshot that
     // will be persisted, so accessors cannot change a value after validation.
     const nextPatch = { ...patch };
+    if (Object.hasOwn(nextPatch, 'inboundBilling')) {
+      if (canonicalJson((nextPatch as Partial<BrokerCall>).inboundBilling) !== canonicalJson(previous.inboundBilling))
+        throw new Error('Inbound billing requires an explicit transition');
+      delete (nextPatch as Partial<BrokerCall>).inboundBilling;
+    }
     if (Object.hasOwn(nextPatch, 'restrictedSetup')) {
       if (canonicalJson((nextPatch as Partial<BrokerCall>).restrictedSetup) !== canonicalJson(previous.restrictedSetup))
         throw new Error('Restricted setup requires an explicit transition');
@@ -899,6 +940,7 @@ export class BrokerStore {
     const call: BrokerCall = { ...previous, ...nextPatch, updatedAt: new Date().toISOString() };
     assertPrimaryIdentityUnchanged(previous, call);
     validatePrimaryIdentity(call);
+    validateCallJourney(call);
     validateGenerations(call, previous);
     validateSelectedQuestionCall(call, previous);
     validateSelectedVoice(call, previous);
@@ -906,6 +948,7 @@ export class BrokerStore {
     validateHarkJournal(call);
     validateHarkDispatch(call);
     validateInboundJournal(call);
+    validateInboundBilling(call);
     validateVerificationCallbackCall(call);
     validateRestrictedSetupCall(call);
     validateHarkReceiptCall(call);
@@ -919,6 +962,7 @@ export class BrokerStore {
     if (previous) assertCallContinuationReplay(previous.continuation, call.continuation);
     if (previous) assertPrimaryIdentityUnchanged(previous, call);
     validatePrimaryIdentity(call);
+    validateCallJourney(call);
     validateGenerations(call, previous);
     validateSelectedQuestionCall(call, previous);
     validateSelectedVoice(call, previous);
@@ -926,6 +970,7 @@ export class BrokerStore {
     validateHarkJournal(call);
     validateHarkDispatch(call);
     validateInboundJournal(call);
+    validateInboundBilling(call);
     validateVerificationCallbackCall(call);
     validateRestrictedSetupCall(call);
     validateHarkReceiptCall(call);

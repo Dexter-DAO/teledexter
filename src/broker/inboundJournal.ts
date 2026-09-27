@@ -96,7 +96,7 @@ function checkOutcomeIdentity(call: BrokerCall, outcome: RecoverInboundResult): 
   if ('expiresAt' in outcome && journal.issuedExpiresAt && outcome.expiresAt !== journal.issuedExpiresAt)
     throw new Error('Inbound issued deadline changed');
   if (journal.remote?.state === 'bound' && outcome.state === 'bound'
-      && (journal.remote.bindingId !== outcome.bindingId || journal.remote.consumedAt !== outcome.consumedAt))
+      && (journal.remote.bindingId !== outcome.bindingId || journal.remote.consumedAt !== outcome.consumedAt || !same(journal.remote.billing, outcome.billing)))
     throw new Error('Inbound consumed binding changed');
 }
 
@@ -314,7 +314,10 @@ export function reduceInboundJournal(call: BrokerCall, event: InboundJournalEven
     if (journal.remote === outcome) {
       if ('expiresAt' in outcome && outcome.expiresAt !== null) journal.issuedExpiresAt ??= outcome.expiresAt;
       if ('approvalRef' in outcome) journal.approvalRef ??= outcome.approvalRef;
-      if (outcome.state === 'bound') journal.mediaStartBy ??= timestampAfter(outcome.consumedAt, journal.policy.mediaGraceMs);
+      if (outcome.state === 'bound') {
+        journal.mediaStartBy ??= timestampAfter(outcome.consumedAt, journal.policy.mediaGraceMs);
+        if (outcome.billing) next.inboundBilling ??= { version: 1, ref: structuredClone(outcome.billing) };
+      }
     }
   } else if (event.type === 'closure') {
     const receipt = consumedInboundClosureReceiptSchema.parse(event.receipt);
@@ -327,7 +330,7 @@ export function reduceInboundJournal(call: BrokerCall, event: InboundJournalEven
     const context = structuredClone(event.context);
     if (stopped() || next.primaryClosed || journal.remote?.state !== 'bound' || journal.remote.callState !== 'open'
         || context.state !== 'open' || context.bindingId !== journal.remote.bindingId || context.callSid !== next.callSid
-        || context.callAssignmentRef || !journal.mediaStartBy || Date.parse(at) >= Date.parse(journal.mediaStartBy))
+        || context.callAssignmentRef || !same(context.billing, journal.remote.billing) || !journal.mediaStartBy || Date.parse(at) >= Date.parse(journal.mediaStartBy))
       throw new Error('Inbound private context unavailable');
     if (!context.context || !primaryResultId.safeParse(context.context.primaryDexterId).success || !primaryResultId.safeParse(context.context.threadId).success
         || typeof context.context.displayName !== 'string' || !Array.isArray(context.context.messages)

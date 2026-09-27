@@ -4,6 +4,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { createServer } from 'node:http';
+import { createPhoneApiCallbackSignature } from '../src/outbound/PhoneApiCallback.js';
+import { inboundBillingSummary, inboundCallEndedSchema, inboundStatusEndedSchema, type InboundStatusEnded, type InboundCallEnded } from '../src/broker/inboundBilling.js';
+import { createInboundBillingLifecycle } from '../src/broker/inboundBillingLifecycle.js';
 import Twilio from 'twilio';
 import { WebSocket } from 'ws';
 import { createBrokerServer } from '../src/broker/server.js';
@@ -13,9 +17,241 @@ import type { BrokerConfig } from '../src/broker/config.js';
 import { PrimaryApiError, type PrimaryApiClient } from '../src/broker/primaryApi.js';
 import { createInboundHoldAdapter } from '../src/broker/inboundHold.js';
 import { streamToken } from '../src/broker/phone.js';
+import type { BrokerLiveSessionOptions } from '../src/live/session.js';
 import type { EligiblePhoneCall } from '../src/broker/eligibleContext.js';
 
-async function fixture(t: test.TestContext, options: { selected?: boolean; retained?: BrokerCall; initialRemote?: InboundOutcome; eligible?: boolean } = {}) {
+async function billingReceiver(t: test.TestContext, loseFirstReceipt = false) {
+  const bodies: InboundCallEnded[] = [], encodedBodies: string[] = [];
+  const receipt = { ok: true as const, id: randomUUID(), status: 'completed' as const };
+  const server = createServer(async (request, response) => {
+    const chunks = []; for await (const chunk of request) chunks.push(Buffer.from(chunk));
+    const encoded = Buffer.concat(chunks).toString('utf8');
+    const body = inboundCallEndedSchema.parse(JSON.parse(encoded));
+    assert.equal(request.url, '/internal/voice/call-ended');
+    assert.equal(request.headers['x-dexter-callback-signature'], createPhoneApiCallbackSignature('b'.repeat(40),
+      '/internal/voice/call-ended', String(request.headers['x-dexter-alert-timestamp']), String(request.headers['x-dexter-alert-nonce']), body));
+    bodies.push(body); encodedBodies.push(encoded);
+    if (loseFirstReceipt && bodies.length === 1) { response.destroy(); return; }
+    response.writeHead(200, { 'content-type': 'application/json' }); response.end(JSON.stringify(receipt));
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+  return { bodies, encodedBodies, receipt, url: `http://127.0.0.1:${(server.address() as { port: number }).port}` };
+}
+
+async function connectIncomingMedia(f: Awaited<ReturnType<typeof fixture>>) {
+  await (await f.webhook('/broker/incoming-call')).text();
+  const call = f.store.list()[0]; await f.waitForAdmission(); f.approve();
+  assert.match(await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text(), /<Stream/);
+  const route = `/broker/media/${call.id}`;
+  const ws = new WebSocket(f.base.replace(/^http/, 'ws') + route, { headers: {
+    'x-twilio-signature': Twilio.getExpectedTwilioSignature(f.config.twilioAuthToken, f.config.publicOrigin + route, {}),
+  } });
+  await new Promise<void>((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
+  ws.send(JSON.stringify({ event: 'start', start: { accountSid: f.config.twilioAccountSid, callSid: f.params.CallSid,
+    streamSid: 'MZ' + '4'.repeat(32), customParameters: { token: streamToken(f.config.controlToken, call.id, f.params.CallSid) },
+    mediaFormat: { encoding: 'audio/x-mulaw', sampleRate: 8000, channels: 1 } } }));
+  for (let count = 0; count < 100 && f.seen.voice === 0; count++) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(f.seen.voice, 1);
+  return { call, ws };
+}
+
+for (const duration of ['0', '93', '121', '180', '181']) test(`incoming HTTP/media closes with exact provider duration ${duration} in signed financial callback`, async t => {
+  const receiver = await billingReceiver(t);
+  const f = await fixture(t, { billing: true, billingUrl: receiver.url, duration });
+  const { call, ws } = await connectIncomingMedia(f); t.after(() => ws.close());
+  assert.equal(receiver.bodies.length, 0);
+  assert.deepEqual(f.store.get(call.id)!.inboundBilling?.ref, f.billing);
+  f.providerEnded();
+  assert.equal((await f.webhook('/broker/status', { CallStatus: 'completed' })).status, 200);
+  await f.broker.maintain();
+  assert.equal(receiver.bodies.length, 1);
+  const body = receiver.bodies[0];
+  assert.equal(body.duration_seconds, Number(duration));
+  assert.equal(body.provider_terminal.durationSeconds, Number(duration));
+  assert.equal(body.broker_call_id, call.id); assert.equal(body.billing_terms_digest, f.billing!.termsDigest);
+  assert.equal(body.phone_binding_id, f.billing!.bindingId); assert.equal(body.external_sid, f.params.CallSid);
+  assert.equal(f.store.get(call.id)!.inboundBilling?.event?.state, 'delivered');
+  assert.deepEqual(f.store.get(call.id)!.inboundBilling?.event?.receipt, receiver.receipt);
+  await f.broker.maintain(); assert.equal(receiver.bodies.length, 1);
+  assert.equal(f.seen.dial, 0);
+});
+
+test('incoming billing retries identical body after accepted callback loses reply and Broker restarts', async t => {
+  const receiver = await billingReceiver(t, true);
+  const f = await fixture(t, { billing: true, billingUrl: receiver.url, duration: '93' });
+  const { call, ws } = await connectIncomingMedia(f); t.after(() => ws.close());
+  f.providerEnded(); await (await f.webhook('/broker/status', { CallStatus: 'completed' })).text();
+  await f.broker.maintain();
+  assert.equal(receiver.bodies.length, 1);
+  assert.equal(f.store.get(call.id)!.inboundBilling?.event?.state, 'pending');
+  await f.close();
+  const restarted = new BrokerStore(f.config.stateDir); t.after(() => restarted.close());
+  const recovery = createInboundBillingLifecycle({ store: restarted, apiBaseUrl: receiver.url, signingSecret: 'b'.repeat(40),
+    now: () => Date.now() + 60_000, fetchCall: async () => { throw new Error('immutable timing must not be fetched again'); } });
+  await Promise.all([recovery.reconcile(call.id), recovery.reconcile(call.id)]);
+  assert.equal(receiver.bodies.length, 2); assert.equal(receiver.encodedBodies[0], receiver.encodedBodies[1]);
+  assert.deepEqual(restarted.get(call.id)!.inboundBilling?.event?.receipt, receiver.receipt);
+  await recovery.reconcile(call.id); assert.equal(receiver.bodies.length, 2);
+});
+
+test('incoming completed callback without provider duration remains pending and recovers timing without inventing a free call', async t => {
+  const receiver = await billingReceiver(t), f = await fixture(t, { billing: true, billingUrl: receiver.url });
+  const { call, ws } = await connectIncomingMedia(f); t.after(() => ws.close());
+  f.providerEnded(); await (await f.webhook('/broker/status', { CallStatus: 'completed' })).text();
+  await f.broker.maintain();
+  assert.equal(receiver.bodies.length, 0); assert.equal(f.store.get(call.id)!.inboundBilling?.timingError, 'provider_timing_unavailable');
+  f.providerEnded('93');
+  const recovery = createInboundBillingLifecycle({ store: f.store, apiBaseUrl: receiver.url, signingSecret: 'b'.repeat(40),
+    now: () => Date.now() + 60_000, fetchCall: sid => f.provider(sid).fetch() });
+  await recovery.reconcile(call.id); assert.equal(receiver.bodies.length, 1);
+  assert.equal(receiver.bodies[0].duration_seconds, 93);
+});
+
+test('incomplete provider duration remains refetchable instead of freezing an API-rejected financial event', async t => {
+  const receiver = await billingReceiver(t), f = await fixture(t, { billing: true, billingUrl: receiver.url, duration: '93' });
+  const { call, ws } = await connectIncomingMedia(f); t.after(() => ws.close());
+  f.providerEnded(); await (await f.webhook('/broker/status', { CallStatus: 'completed' })).text();
+  let observedAt = Date.now(), duration = '0';
+  const recovery = createInboundBillingLifecycle({ store: f.store, apiBaseUrl: receiver.url, signingSecret: 'b'.repeat(40),
+    now: () => observedAt, fetchCall: async sid => ({ ...await f.provider(sid).fetch(), duration }) });
+  for (const invalid of ['0', '-1', 'malformed']) {
+    duration = invalid; observedAt += 31_000; await recovery.reconcile(call.id);
+    assert.equal(f.store.get(call.id)!.inboundBilling?.event, undefined);
+    assert.equal(f.store.get(call.id)!.inboundBilling?.timingError, 'provider_timing_unavailable');
+    assert.equal(receiver.bodies.length, 0);
+  }
+  duration = '93'; observedAt += 31_000; await recovery.reconcile(call.id);
+  assert.equal(receiver.bodies.length, 1); assert.equal(receiver.bodies[0].duration_seconds, 93);
+});
+
+async function statusReceiver(t: test.TestContext, loseFirst = false) {
+  const bodies: InboundStatusEnded[] = [], encodedBodies: string[] = [];
+  const server = createServer(async (request, response) => {
+    const chunks = []; for await (const chunk of request) chunks.push(Buffer.from(chunk));
+    const encoded = Buffer.concat(chunks).toString('utf8'), body = inboundStatusEndedSchema.parse(JSON.parse(encoded));
+    assert.equal(request.url, '/internal/voice/call-ended');
+    assert.equal(request.headers['x-dexter-callback-signature'], createPhoneApiCallbackSignature('b'.repeat(40),
+      '/internal/voice/call-ended', String(request.headers['x-dexter-alert-timestamp']), String(request.headers['x-dexter-alert-nonce']), body));
+    bodies.push(body); encodedBodies.push(encoded);
+    if (loseFirst && bodies.length === 1) { response.destroy(); return; }
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ ok: true, id: body.phone_binding_id, status: body.provider_terminal.status }));
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+  return { bodies, encodedBodies, url: `http://127.0.0.1:${(server.address() as { port: number }).port}` };
+}
+
+for (const terminal of ['failed', 'busy', 'no-answer', 'canceled']) test(`incoming ${terminal} persists authenticated nonfinancial outcome once with unknown duration`, async t => {
+  const receiver = await statusReceiver(t), f = await fixture(t, { billing: true, billingUrl: receiver.url });
+  const { call, ws } = await connectIncomingMedia(f); t.after(() => ws.close());
+  await (await f.webhook('/broker/status', { CallStatus: terminal })).text();
+  let reads = 0;
+  const recovery = createInboundBillingLifecycle({ store: f.store, apiBaseUrl: receiver.url, signingSecret: 'b'.repeat(40),
+    now: () => Date.now() + 60_000, fetchCall: async sid => { reads++; return { ...await f.provider(sid).fetch(), status: terminal }; } });
+  await recovery.reconcile(call.id); await recovery.reconcile(call.id);
+  assert.equal(reads, 1); assert.equal(receiver.bodies.length, 1);
+  assert.equal(f.store.get(call.id)!.inboundBilling?.event, undefined);
+  assert.deepEqual(inboundBillingSummary(f.store.get(call.id)!), { state: 'not_billable', receiptId: f.billing!.bindingId,
+    providerStatus: terminal, durationSeconds: null, problem: null });
+  assert.equal(receiver.bodies[0].provider_terminal.startedAt, null);
+  assert.equal(receiver.bodies[0].provider_terminal.endedAt, null);
+  assert.equal('duration_seconds' in receiver.bodies[0], false);
+});
+
+test('noncompleted provider status preserves actual timing and retries identical saved report after restart and lost ACK', async t => {
+  const receiver = await statusReceiver(t, true), f = await fixture(t, { billing: true, billingUrl: receiver.url, duration: '93' });
+  const { call, ws } = await connectIncomingMedia(f); t.after(() => ws.close());
+  await (await f.webhook('/broker/status', { CallStatus: 'failed' })).text();
+  const recovery = createInboundBillingLifecycle({ store: f.store, apiBaseUrl: receiver.url, signingSecret: 'b'.repeat(40),
+    now: () => Date.now() + 60_000, fetchCall: async sid => ({ ...await f.provider(sid).fetch(), status: 'failed' }) });
+  await recovery.reconcile(call.id);
+  assert.equal(f.store.get(call.id)!.inboundBilling?.statusEvent?.state, 'pending');
+  assert.equal(receiver.bodies[0].provider_terminal.durationSeconds, 93);
+  await f.close();
+  const restarted = new BrokerStore(f.config.stateDir); t.after(() => restarted.close());
+  const retry = createInboundBillingLifecycle({ store: restarted, apiBaseUrl: receiver.url, signingSecret: 'b'.repeat(40),
+    now: () => Date.now() + 120_000, fetchCall: async () => { throw new Error('saved status must not refetch'); } });
+  await Promise.all([retry.reconcile(call.id), retry.reconcile(call.id)]);
+  assert.equal(receiver.bodies.length, 2); assert.equal(receiver.encodedBodies[0], receiver.encodedBodies[1]);
+  assert.equal(restarted.get(call.id)!.inboundBilling?.statusEvent?.state, 'delivered');
+  assert.equal(restarted.get(call.id)!.inboundBilling?.event, undefined);
+});
+
+test('noncompleted status with wrong leg or malformed timing remains refetchable', async t => {
+  const receiver = await statusReceiver(t), f = await fixture(t, { billing: true, billingUrl: receiver.url, duration: '93' });
+  const { call, ws } = await connectIncomingMedia(f); t.after(() => ws.close());
+  await (await f.webhook('/broker/status', { CallStatus: 'failed' })).text();
+  let now = Date.now() + 60_000, patch: Record<string, unknown> = { to: '+12025550999' };
+  const recovery = createInboundBillingLifecycle({ store: f.store, apiBaseUrl: receiver.url, signingSecret: 'b'.repeat(40),
+    now: () => now, fetchCall: async sid => ({ ...await f.provider(sid).fetch(), status: 'failed', ...patch }) });
+  for (patch of [{ to: '+12025550999' }, { status: 'completed' }, { duration: '-1' }, { duration: '0' },
+    { startTime: new Date(now + 600_000) }, { endTime: new Date(now + 600_000) }]) {
+    now += 31_000; await recovery.reconcile(call.id);
+    assert.equal(f.store.get(call.id)!.inboundBilling?.statusEvent, undefined);
+    assert.equal(receiver.bodies.length, 0);
+  }
+  patch = {}; now += 31_000; await recovery.reconcile(call.id);
+  assert.equal(receiver.bodies.length, 1);
+});
+
+test('incoming provider leg mismatch cannot create financial body', async t => {
+  const receiver = await billingReceiver(t), f = await fixture(t, { billing: true, billingUrl: receiver.url, duration: '93' });
+  const { call, ws } = await connectIncomingMedia(f); t.after(() => ws.close());
+  f.providerEnded(); f.wrongProviderIdentity(); await (await f.webhook('/broker/status', { CallStatus: 'completed' })).text();
+  await f.broker.maintain();
+  assert.equal(receiver.bodies.length, 0); assert.equal(f.store.get(call.id)!.inboundBilling?.timingError, 'provider_identity_mismatch');
+});
+
+test('incoming audio timing separates sent audio, cleared marks, and confirmed playback', async t => {
+  const f = await fixture(t), { call, ws } = await connectIncomingMedia(f); t.after(() => ws.close());
+  const marks: string[] = [];
+  ws.on('message', raw => { const frame = JSON.parse(String(raw)); if (frame.event === 'mark') marks.push(frame.mark.name); });
+  assert.ok(f.store.get(call.id)!.journey?.liveReadyAt);
+  assert.equal(f.store.get(call.id)!.journey?.firstAudioSentAt, undefined);
+  f.emitAudio();
+  for (let i = 0; i < 100 && !marks.length; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  const sentAt = f.store.get(call.id)!.journey!.firstAudioSentAt; assert.ok(sentAt);
+  assert.equal(f.store.get(call.id)!.journey?.firstPlaybackConfirmedAt, undefined);
+  f.clearAudio();
+  ws.send(JSON.stringify({ event: 'mark', streamSid: 'MZ' + '4'.repeat(32), mark: { name: marks[0] } }));
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(f.store.get(call.id)!.journey?.firstPlaybackConfirmedAt, undefined);
+  f.emitAudio();
+  for (let i = 0; i < 100 && marks.length < 2; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  ws.send(JSON.stringify({ event: 'mark', streamSid: 'MZ' + '4'.repeat(32), mark: { name: marks[1] } }));
+  for (let i = 0; i < 100 && !f.store.get(call.id)!.journey?.firstPlaybackConfirmedAt; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.ok(f.store.get(call.id)!.journey?.firstPlaybackConfirmedAt);
+  assert.equal(f.store.get(call.id)!.journey?.firstAudioSentAt, sentAt);
+});
+
+test('lost incoming context reply recovers billing reference from bound outcome after caller hangs up', async t => {
+  const receiver = await billingReceiver(t), f = await fixture(t, { billing: true, billingUrl: receiver.url, duration: '93' });
+  await (await f.webhook('/broker/incoming-call')).text();
+  const call = f.store.list()[0]; await f.waitForAdmission(); f.approve(); f.loseConsume();
+  await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text();
+  assert.equal(f.store.get(call.id)!.primary, undefined);
+  f.refuseContext(); f.providerEnded(); await (await f.webhook('/broker/status', { CallStatus: 'completed' })).text();
+  await f.broker.maintain();
+  assert.deepEqual(f.store.get(call.id)!.inboundBilling?.ref, f.billing);
+  assert.equal(receiver.bodies.length, 1);
+  assert.equal(f.seen.voice, 0); assert.equal(f.seen.dial, 0);
+});
+
+test('incoming legacy admission without frozen billing reference never posts a new financial event', async t => {
+  const receiver = await billingReceiver(t), f = await fixture(t, { billingUrl: receiver.url, duration: '181' });
+  const { call, ws } = await connectIncomingMedia(f); t.after(() => ws.close());
+  f.providerEnded(); await (await f.webhook('/broker/status', { CallStatus: 'completed' })).text();
+  await f.broker.maintain(); assert.equal(receiver.bodies.length, 0); assert.equal(f.store.get(call.id)!.inboundBilling, undefined);
+  const remote = f.store.get(call.id)!.inbound!.remote;
+  assert.equal(remote?.state, 'bound');
+  assert.throws(() => f.store.transitionInbound(call.id, { type: 'outcome', observedAt: new Date().toISOString(),
+    outcome: { ...remote!, state: 'bound', billing: { version: 1, bindingId: remote!.state === 'bound' ? remote!.bindingId : '',
+      callSid: call.callSid!, termsDigest: 'a'.repeat(64) } } as InboundOutcome }), /binding changed/);
+});
+
+async function fixture(t: test.TestContext, options: { selected?: boolean; retained?: BrokerCall; initialRemote?: InboundOutcome; eligible?: boolean; billing?: boolean; billingUrl?: string; duration?: string } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-inbound-http-'));
   if (options.retained) fs.writeFileSync(path.join(dir, 'calls.json'), JSON.stringify({ version: 1, calls: { [options.retained.id]: options.retained } }));
   const store = new BrokerStore(dir);
@@ -30,7 +266,9 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
     : { attachmentId, approvalId: randomUUID(), digest: 'd'.repeat(64) };
   const bindingId = options.initialRemote?.state === 'bound' ? options.initialRemote.bindingId : randomUUID();
   const primaryDexterId = randomUUID(), threadId = randomUUID();
-  const eligiblePage: EligiblePhoneCall = { bindingId, callSid: params.CallSid, state: 'open', context: {
+  const billing = options.billing ? { version: 1 as const, bindingId, callSid: params.CallSid, termsDigest: 'f'.repeat(64) } : undefined;
+  if (options.billingUrl) { config.harkApiBaseUrl = options.billingUrl; config.harkCallbackSigningSecret = 'b'.repeat(40); }
+  const eligiblePage: EligiblePhoneCall = { billing, bindingId, callSid: params.CallSid, state: 'open', context: {
     primaryDexterId, threadId, displayName: 'Branch', messages: [{ id: randomUUID(), role: 'user', text: 'The earlier caller request.',
       eventSequence: '1', provenance: { messageCreatedAt: '2026-09-26T12:00:00.000Z', eventId: randomUUID(),
         eventOccurredAt: '2026-09-26T12:00:00.000Z', runId: randomUUID() } }], history: {
@@ -39,11 +277,13 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
     },
   } };
   const startupPages: EligiblePhoneCall[] = [];
+  let voiceOptions: BrokerLiveSessionOptions | undefined;
   let remote = options.initialRemote;
   let loseConsume = false, lostBegin = false, authority = true, cancellationUnavailable = false;
   const lifecycle: string[] = [];
   let providerGate: Promise<void> | undefined; let releaseProvider: (() => void) | undefined;
   let providerEntered: (() => void) | undefined; let providerState = 'in-progress';
+  let providerDuration = options.duration; let providerWrongIdentity = false;
   let beginError: Error | undefined;
   let statusGate: Promise<void> | undefined; let releaseStatus: (() => void) | undefined;
   const seen = { dial: 0, end: 0, voice: 0, begin: 0, consume: 0, context: 0, cancel: 0, close: 0, legacyClose: 0,
@@ -52,7 +292,7 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
     seen.context++;
     if (!authority) throw new Error('authority_unavailable');
     if (options.eligible) return structuredClone(eligiblePage);
-    return { bindingId, callSid: params.CallSid, state: 'open' as const,
+    return { billing, bindingId, callSid: params.CallSid, state: 'open' as const,
       context: { primaryDexterId, threadId, displayName: 'Branch', messages: [] } };
   };
   const primary = {
@@ -79,7 +319,7 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
       seen.consume++; assert.deepEqual(ref, approvalRef); assert.equal(proof.params.Direction, 'inbound');
       assert.equal(proof.params.CallSid, params.CallSid);
       assert.equal(store.list()[0].inbound!.consumeAttemptedAt !== undefined, true);
-      remote = { attachmentId, beginRef: remote!.beginRef, state: 'bound', approvalRef, bindingId,
+      remote = { attachmentId, beginRef: remote!.beginRef, state: 'bound', approvalRef, bindingId, billing,
         consumedAt: new Date().toISOString(), callState: 'open' };
       if (loseConsume) { loseConsume = false; throw new Error('lost_consume'); }
       return context();
@@ -96,7 +336,8 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
     async close() { seen.legacyClose++; throw new Error('must_use_exact_inbound_closure'); },
   } as unknown as PrimaryApiClient;
   const provider = Object.assign((sid: string) => ({
-    async fetch() { if (providerGate) { providerEntered?.(); await providerGate; } return { sid, accountSid: config.twilioAccountSid, direction: 'inbound', from: params.From, to: params.To, status: providerState }; },
+    async fetch() { if (providerGate) { providerEntered?.(); await providerGate; } return { sid, accountSid: config.twilioAccountSid, direction: 'inbound', from: params.From, to: params.To, status: providerState, ...(providerWrongIdentity ? { to: '+12025550999' } : {}),
+      ...(providerDuration === undefined ? {} : { duration: providerDuration, startTime: new Date('2020-01-01T10:00:00Z'), endTime: new Date(1577872800000 + Number(providerDuration) * 1000) }) }; },
     async update() { seen.end++; return { sid, status: 'completed' }; },
   }), { async create() { seen.dial++; throw new Error('inbound_must_not_dial'); } });
   const broker = createBrokerServer({ config, store, primary, provider: { calls: provider } as unknown as ReturnType<typeof Twilio>,
@@ -111,7 +352,7 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
       async delivery() { throw new Error('no_request_delivery_expected'); },
     } } : {}),
     voiceFactory: settings => {
-      seen.voice++;
+      seen.voice++; voiceOptions = settings;
       if (settings.eligibleHistory) startupPages.push(structuredClone(settings.eligibleHistory.source));
       queueMicrotask(() => settings.onReady({ callId: settings.callId, sessionId: 'inbound-fixture' }));
       return { appendAudio() { return true; }, async appendContext() { return { eventId: 'c', status: 'accepted' }; },
@@ -131,7 +372,11 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
   let closed = false;
   const close = async () => { if (!closed) { closed = true; await broker.close(); } };
   t.after(async () => { await close(); fs.rmSync(dir, { recursive: true, force: true }); });
-  return { broker, store, base, config, params, seen, lifecycle, webhook, close, eligiblePage, startupPages, remote: () => remote,
+  return { broker, store, base, config, params, seen, lifecycle, webhook, close, provider, billing,
+    providerEnded(duration = providerDuration) { providerState = 'completed'; providerDuration = duration; },
+    wrongProviderIdentity() { providerWrongIdentity = true; },
+    emitAudio() { voiceOptions!.onAudio(Buffer.alloc(800, 0).toString('base64')); },
+    clearAudio() { voiceOptions!.onPlaybackClear?.(); }, eligiblePage, startupPages, remote: () => remote,
     async waitForAdmission() { const call = store.list()[0]; await (await webhook(`/broker/inbound/${call.id}/continue`)).text(); },
     beginError(error?: Error) { beginError = error; },
     approve() { assert.ok(remote?.state === 'pending'); remote = { ...remote, state: 'approved', approvalRef }; },

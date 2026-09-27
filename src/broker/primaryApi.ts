@@ -2,6 +2,7 @@ import { callbackProviderProofSchema } from './verificationCallbackContract.js';
 import { phoneVerificationCallbackErrorSchema, PHONE_VERIFICATION_CALLBACK_PROOF_MAX_BYTES, PHONE_VERIFICATION_CALLBACK_COMMAND_MAX_BYTES } from './verificationCallbackContract.js';
 import { createHmac } from 'node:crypto';
 import { z } from 'zod';
+import { phoneInboundBillingRefSchema, type PhoneInboundBillingRef } from './inboundBilling.js';
 import { phoneCallAssignmentSchema, phoneCallAssignmentRefSchema, sameCallAssignmentRef, type PhoneCallAssignment, type PhoneCallAssignmentRef } from './assignment.js';
 export type { PhoneCallAssignment, PhoneCallAssignmentRef } from './assignment.js';
 import { rawSubmissionDigest, turnBodyDigest, type PhoneNonAdmissionProof } from './reconciliation.js';
@@ -41,6 +42,7 @@ export interface PrimaryContext {
 }
 
 export interface PrimaryCall {
+  billing?: PhoneInboundBillingRef;
   bindingId: string;
   callSid: string;
   state: 'open' | 'closed';
@@ -387,9 +389,11 @@ const contextSchema = z.object({
   messages: z.array(z.object({ id: uuid, role: z.enum(['user', 'assistant']), text: textValue })).max(20),
 }).refine((value) => value.messages.reduce((size, message) => size + Buffer.byteLength(message.text), 0) <= MAX_REQUEST_BYTES);
 const callSchema = z.object({
+  billing: phoneInboundBillingRefSchema.optional(),
   bindingId: uuid, callSid, state: z.enum(['open', 'closed']), context: contextSchema, callAssignmentRef: phoneCallAssignmentRefSchema.optional(),
 });
 const inboundCallSchema = z.object({
+  billing: phoneInboundBillingRefSchema.optional(),
   bindingId: uuid, callSid, state: z.enum(['open', 'closed']),
   context: z.object({
     primaryDexterId: uuid, threadId: uuid, displayName: z.string().min(1).max(200),
@@ -487,12 +491,12 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
   // close. Recovery in a fresh process still validates exact wire identities.
   const calls = new Map<string, {
     callSid: string; primaryDexterId: string; threadId: string; state: 'open' | 'closed'; callAssignmentRef?: PhoneCallAssignmentRef;
-    ownerPrincipalId?: string;
+    ownerPrincipalId?: string; billing?: PhoneInboundBillingRef;
   }>();
   type InboundMemory = {
     beginRef?: InboundBeginRef; approvalRef?: InboundApprovalRef; callSid: string;
     bindingId?: string; state?: InboundOutcome['state']; expiresAt?: string | null;
-    consumedAt?: string; cancelledAt?: string; callState?: 'open' | 'closed'; closedAt?: string;
+    consumedAt?: string; cancelledAt?: string; callState?: 'open' | 'closed'; closedAt?: string; billing?: PhoneInboundBillingRef;
   };
   const inboundCalls = new Map<string, InboundMemory>();
   const inboundBegins = new Map<string, { body: string; callSid: string; beginRef?: InboundBeginRef; attachmentId?: string }>();
@@ -505,9 +509,11 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
     const ownerPrincipalId = options.contextProtocol
       ? parse(uuid, (call as ReturnType<NonNullable<PrimaryApiOptions['contextProtocol']>['parse']>).context.history.version.ownerPrincipalId, 'invalid_response')
       : undefined;
+    if (call.billing && (call.billing.bindingId !== call.bindingId || call.billing.callSid !== call.callSid)) throw new PrimaryApiError('identity_mismatch');
     const existing = calls.get(call.bindingId);
     if (existing) {
       same(call.callSid, existing.callSid);
+      if (canonicalJson(call.billing) !== canonicalJson(existing.billing)) throw new PrimaryApiError('identity_mismatch');
       same(call.context.primaryDexterId, existing.primaryDexterId);
       same(call.context.threadId, existing.threadId);
       if (existing.ownerPrincipalId !== undefined) {
@@ -522,7 +528,7 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
     // not erase the validated local receipt for this exact binding.
     const reference = call.callAssignmentRef ?? existing?.callAssignmentRef;
     calls.set(call.bindingId, {
-      callSid: call.callSid, primaryDexterId: call.context.primaryDexterId,
+      billing: call.billing, callSid: call.callSid, primaryDexterId: call.context.primaryDexterId,
       threadId: call.context.threadId, state: call.state,
       ...(ownerPrincipalId === undefined ? {} : { ownerPrincipalId }),
       ...(reference === undefined ? {} : { callAssignmentRef: { ...reference } }),
@@ -574,6 +580,7 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
         throw new PrimaryApiError('identity_mismatch');
       if (outcome.state === 'bound') {
         if (previous.consumedAt !== undefined) same(outcome.consumedAt, previous.consumedAt);
+        if (previous.state === 'bound' && canonicalJson(previous.billing) !== canonicalJson(outcome.billing)) throw new PrimaryApiError('identity_mismatch');
         if (previous.callState === 'closed' && outcome.callState !== 'closed') throw new PrimaryApiError('identity_mismatch');
       }
       if (outcome.state === 'cancelled' && previous.cancelledAt !== undefined) same(outcome.cancelledAt, previous.cancelledAt);
@@ -583,9 +590,11 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
     const beginMemory = inboundBegins.get(outcome.beginRef.brokerCallId);
     if (beginMemory?.attachmentId !== undefined) same(outcome.attachmentId, beginMemory.attachmentId);
     if (outcome.state === 'bound') {
+      if (outcome.billing && (outcome.billing.bindingId !== outcome.bindingId || outcome.billing.callSid !== outcome.beginRef.callSid)) throw new PrimaryApiError('identity_mismatch');
       const contextual = calls.get(outcome.bindingId);
       if (contextual) {
         same(outcome.beginRef.callSid, contextual.callSid);
+        if (canonicalJson(outcome.billing) !== canonicalJson(contextual.billing)) throw new PrimaryApiError('identity_mismatch');
         if (contextual.callAssignmentRef || (contextual.state === 'closed' && outcome.callState !== 'closed'))
           throw new PrimaryApiError('identity_mismatch');
       }
@@ -593,7 +602,7 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
     const next: InboundMemory = { ...previous, callSid: outcome.beginRef.callSid, beginRef: outcome.beginRef, state: outcome.state };
     if ('approvalRef' in outcome) next.approvalRef = outcome.approvalRef;
     if ('expiresAt' in outcome) next.expiresAt = outcome.expiresAt;
-    if (outcome.state === 'bound') Object.assign(next, { bindingId: outcome.bindingId, consumedAt: outcome.consumedAt, callState: outcome.callState });
+    if (outcome.state === 'bound') Object.assign(next, { bindingId: outcome.bindingId, consumedAt: outcome.consumedAt, callState: outcome.callState, billing: outcome.billing });
     if (outcome.state === 'cancelled') next.cancelledAt = outcome.cancelledAt;
     inboundCalls.set(outcome.attachmentId, structuredClone(next));
     inboundBySid.set(outcome.beginRef.callSid, outcome.attachmentId);

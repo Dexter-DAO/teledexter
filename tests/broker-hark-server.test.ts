@@ -390,11 +390,23 @@ test('API refusal or malformed assignment blocks readiness and dialing', async t
   assert.equal(f.broker.store.list().length, 0);
 });
 
-test('valid assignment to an unallowed destination is refused before reservation', async t => {
+test('API-authorized Hark destination can dial beyond the operator pilot list and exact retry never redials', async t => {
   const f = await fixture(t);
   f.setResolved({ ...f.resolved, to: '+12025550124' });
+  assert.equal((await f.post(f.notification())).status, 202);
+  assert.equal(f.counters.create, 1);
+  assert.equal(f.savedBeforeDial[0].number, '+12025550124');
+  assert.deepEqual(f.savedBeforeDial[0].callAssignment?.value, f.resolved.callAssignment);
+  assert.equal((await f.post(f.notification())).status, 200);
+  assert.equal(f.counters.create, 1);
+});
+
+test('Hark destination mismatch and owner-authority refusal cannot bypass resolver before reservation', async t => {
+  const f = await fixture(t);
+  assert.equal((await f.post({ ...f.notification(), to: '+12025550124' })).status, 503);
+  f.setApi(403, { error: 'watch_owner_mismatch' });
   assert.equal((await f.post(f.notification())).status, 403);
-  assert.equal(f.counters.create, 0);
+  assert.equal(f.counters.create, 0); assert.equal(f.counters.readiness, 0);
   assert.equal(f.broker.store.list().length, 0);
 });
 

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { phoneInboundBillingRefSchema } from './inboundBilling.js';
 import { phoneCallAssignmentRefSchema, sameCallAssignmentRef } from './assignment.js';
 import { createPrimaryApiTransport, PrimaryApiError, type PrimaryApiOptions } from './primaryApi.js';
 import { canonicalJson } from '../outbound/canonical.js';
@@ -82,6 +83,7 @@ export const eligiblePhoneContextSchema = z.object({
 });
 export const eligiblePhoneCallSchema = z.object({
   bindingId: uuid, callSid, state: z.enum(['open', 'closed']), context: eligiblePhoneContextSchema,
+  billing: phoneInboundBillingRefSchema.optional(),
   callAssignmentRef: phoneCallAssignmentRefSchema.optional(),
 }).strict();
 export type EligiblePhoneCall = z.infer<typeof eligiblePhoneCallSchema>;

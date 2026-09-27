@@ -145,6 +145,20 @@ test('accepted publication binds the next unchanged caller request and exact ret
   assert.deepEqual(f.saved()[1].submission, frozen, 'late evidence cannot rewrite an already submitted source');
 });
 
+test('request timing retains first dispatch, saved answer, and delivery acceptance through repeated observations', async t => {
+  const f = await fixture(t);
+  f.add('Show my portfolio.'); f.speech();
+  await f.backend.delegate(f.request(), f.channel);
+  const timing = structuredClone(f.saved()[0].timing);
+  assert.ok(timing?.firstSavedAt); assert.ok(timing.firstDispatchAt);
+  assert.ok(timing.firstAnswerAvailableAt); assert.ok(timing.firstDeliveryAcceptedAt);
+  assert.ok(Date.parse(timing.firstSavedAt) <= Date.parse(timing.firstDispatchAt));
+  assert.ok(Date.parse(timing.firstDispatchAt) <= Date.parse(timing.firstAnswerAvailableAt));
+  assert.ok(Date.parse(timing.firstAnswerAvailableAt) <= Date.parse(timing.firstDeliveryAcceptedAt));
+  await f.backend.delegate(f.request(), f.channel);
+  assert.deepEqual(f.saved()[0].timing, timing); assert.equal(f.posts.length, 1);
+});
+
 test('late rejection before the next caller source excludes that publication reference', async t => {
   const f = await fixture(t);
   f.add('Show my portfolio.'); f.speech();

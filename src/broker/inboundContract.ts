@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
+import { phoneInboundBillingRefSchema } from './inboundBilling.js';
 
 const uuid = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
 const sha256 = z.string().regex(/^[0-9a-f]{64}$/);
@@ -37,7 +38,7 @@ export const inboundOutcomeSchema = z.discriminatedUnion('state', [
   z.object({ ...envelope, state: z.literal('approved'), expiresAt: timestamp,
     approvalRef: inboundApprovalRefSchema }).strict(),
   z.object({ ...envelope, state: z.literal('bound'), approvalRef: inboundApprovalRefSchema,
-    bindingId: uuid, consumedAt: timestamp, callState: z.enum(['open', 'closed']) }).strict(),
+    bindingId: uuid, consumedAt: timestamp, callState: z.enum(['open', 'closed']), billing: phoneInboundBillingRefSchema.optional() }).strict(),
   z.object({ ...envelope, state: z.literal('expired'), expiresAt: timestamp }).strict(),
   z.object({ ...envelope, state: z.literal('cancelled'), cancelledAt: timestamp,
     expiresAt: timestamp.nullable() }).strict(),
