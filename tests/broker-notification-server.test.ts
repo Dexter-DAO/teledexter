@@ -126,7 +126,8 @@ test('unauthenticated dispatch and refused answer registration cannot obtain acc
 test('health advertises watcher-source reader capability before a producer can transfer an event', async t => {
   const f = await fixture(t), response = await f.health();
   assert.equal(response.status, 200);
-  const body = await response.json() as { notificationSourceKinds: string[] };
+  const body = await response.json() as { notificationSourceKinds: string[]; notificationWatcherProducers: string[] };
   assert.deepEqual(body.notificationSourceKinds, ['publication_v1', 'owner_destination_test_v1', 'portfolio_watch_event_v1', 'watcher_event_v1']);
+  assert.deepEqual(body.notificationWatcherProducers, ['market_pulse', 'founder_portfolio_pulse', 'cate_market_cap']);
   assert.equal(f.creates, 0);
 });

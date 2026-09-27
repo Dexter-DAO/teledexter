@@ -70,6 +70,36 @@ test('watcher source binds its producer and original event without claiming a Ha
   assert.equal(resolvedNotificationAssignmentSchema.safeParse(resolved).success, false);
 });
 
+test('CATE keeps its crossing identity through completed journal restart and rejects another producer prefix', t => {
+  const f = fixture(t), resolved = makeResolvedNotificationAssignment(), value = resolved.callAssignment.notification;
+  value.source = { kind: 'watcher_event_v1', producer: 'cate_market_cap', eventId: 'cate-pumpswap-market-cap-v1-7-down-6030000' };
+  value.eventId = value.source.eventId;
+  const { sourceDigest: _old, ...source } = value; value.sourceDigest = phoneNotificationSourceDigest(source);
+  assert.deepEqual(resolvedNotificationAssignmentSchema.parse(resolved), resolved);
+  const call = f.store.reserveNotification(resolved, digest).call;
+  f.store.beginHarkDispatch(call.id, started); f.store.acceptHarkDispatch(call.id, sid, started);
+  f.store.observeHarkProvider(call.id, 'completed', ended, { startedAt: started, endedAt: ended, durationSeconds: 60 });
+  f.restart();
+  assert.deepEqual(f.store.get(call.id)?.callAssignment?.value, resolved.callAssignment);
+  assert.equal(f.store.get(call.id)?.status, 'completed');
+  assert.equal(f.store.reserveNotification(resolved, digest).existing, true);
+  if (process.env.CATE_PREVIOUS_BROKER_ROOT) {
+    const older = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-cate-old-reader-'));
+    t.after(() => fs.rmSync(older, { recursive: true, force: true }));
+    fs.copyFileSync(path.join(f.directory, 'calls.json'), path.join(older, 'calls.json'));
+    const script = `import {pathToFileURL} from 'node:url'; const {BrokerStore}=await import(pathToFileURL(process.argv[1]+'/dist/broker/store.js'));
+try {const store=new BrokerStore(process.argv[2]);store.close();process.stdout.write('accepted');}
+catch {process.stdout.write('rejected');}`;
+    const old = spawnSync(process.execPath, ['--input-type=module','-e',script,process.env.CATE_PREVIOUS_BROKER_ROOT,older], {encoding:'utf8',timeout:10000});
+    assert.equal(old.status, 0, old.stderr); assert.equal(old.stdout, 'rejected');
+  }
+  const changed = structuredClone(resolved), wrong = changed.callAssignment.notification;
+  wrong.source = { kind: 'watcher_event_v1', producer: 'cate_market_cap', eventId: 'market-pulse:solcat:100:10:20' };
+  wrong.eventId = wrong.source.eventId;
+  const { sourceDigest: _changed, ...wrongSource } = wrong; wrong.sourceDigest = phoneNotificationSourceDigest(wrongSource);
+  assert.equal(resolvedNotificationAssignmentSchema.safeParse(changed).success, false);
+});
+
 test('frozen notification reservation, dispatch ambiguity and accepted identity survive restart without redial authorization', t => {
   const f = fixture(t), resolved = makeResolvedNotificationAssignment();
   assert.throws(() => f.store.reserveNotification(resolved, undefined as never));
