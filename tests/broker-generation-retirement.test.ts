@@ -45,9 +45,10 @@ async function fixture(t: test.TestContext) {
   let epoch = 1; let clears = 0;
   let beforeFetch: (() => Promise<void>) | undefined;
   let beforeReady: (() => Promise<void>) | undefined;
+  let beforeAssert: (() => Promise<void>) | undefined;
   const problems: string[] = [], audio: string[] = [], posts: PrimarySubmission[] = [];
   const voices: Array<{ options: BrokerLiveSessionOptions; voice: BrokerLiveSession; input: string[];
-    closes: string[]; caption: LiveTranscriptSnapshot; channel: LiveBackendChannel; closeGate?: Promise<void> }> = [];
+    closes: string[]; caption: LiveTranscriptSnapshot; channel: LiveBackendChannel; closeGate?: Promise<void>; playbackPaused: boolean }> = [];
   const primary = {
     async submit(_binding: string, requestId: string, input: PrimarySubmission) {
       posts.push(structuredClone(input)); return { bindingId, requestId, state: 'queued', replayed: false };
@@ -60,6 +61,7 @@ async function fixture(t: test.TestContext) {
   const eligible: EligibleContextClient = {
     async fetch() { await beforeFetch?.(); return context(epoch); },
     async assert(_binding, expected) {
+      await beforeAssert?.();
       if (expected.digest !== version(epoch).digest) throw new PrimaryApiError('http_error', 409, { code: 'context_changed' });
       return { bindingId, callSid, current: true, version: expected };
     },
@@ -72,7 +74,7 @@ async function fixture(t: test.TestContext) {
     voiceFactory(options) {
       const sessionId = `retirement_${voices.length + 1}`;
       const abort = new AbortController();
-      const saved = { options, input: [] as string[], closes: [] as string[], closeGate: undefined as Promise<void> | undefined,
+      const saved = { options, input: [] as string[], closes: [] as string[], closeGate: undefined as Promise<void> | undefined, playbackPaused: false,
         caption: { revision: 0, callerRevision: 0, fragments: [] } as LiveTranscriptSnapshot,
         voice: undefined as unknown as BrokerLiveSession, channel: undefined as unknown as LiveBackendChannel };
       saved.channel = { signal: abort.signal, getContext: () => structuredClone(saved.caption),
@@ -82,7 +84,9 @@ async function fixture(t: test.TestContext) {
         appendContext: async () => { throw new Error('Unexpected flattened context'); },
         appendInstructions: async () => ({ eventId: 'instructions', status: 'accepted' }),
         appendCommentary: async () => ({ eventId: 'commentary', status: 'accepted' }),
-        interruptPlayback: async () => ({ eventId: 'interrupt', status: 'accepted' }), resumePlayback() {},
+        interruptPlayback: async () => { saved.playbackPaused = true; return { eventId: 'interrupt', status: 'accepted' }; },
+        pausePlayback() { saved.playbackPaused = true; options.onPlaybackClear?.('application_interrupt'); },
+        resumePlayback() { saved.playbackPaused = false; },
         getTranscript: () => structuredClone(saved.caption),
         close(reason = 'closed') {
           if (closing) return closing;
@@ -105,8 +109,38 @@ async function fixture(t: test.TestContext) {
   t.after(async () => { await live.close(); store.close(); fs.rmSync(directory, { recursive: true, force: true }); });
   await until(() => store.get(call.id)!.liveGenerations?.phase === 'active');
   return { live, store, callId: call.id, voices, problems, audio, posts, get clears() { return clears; },
-    advance() { epoch++; }, fetching(fn?: () => Promise<void>) { beforeFetch = fn; }, starting(fn?: () => Promise<void>) { beforeReady = fn; } };
+    advance() { epoch++; }, fetching(fn?: () => Promise<void>) { beforeFetch = fn; }, starting(fn?: () => Promise<void>) { beforeReady = fn; },
+    checking(fn?: () => Promise<void>) { beforeAssert = fn; } };
 }
+
+test('caller interruption clears queued and new playback before a delayed context assertion completes', async t => {
+  const f = await fixture(t), gate = deferred();
+  f.checking(() => gate.promise);
+  const before = f.clears;
+  const interruption = f.live.interruptPlayback('Listen to the caller.');
+  try {
+    assert.equal(f.clears, before + 1, 'the caller must not wait for database I/O to silence playback');
+    f.voices[0].options.onAudio('old playback', { deliveryId: 'during_assert' });
+    assert.deepEqual(f.audio, []);
+    gate.resolve(); await interruption;
+    f.voices[0].options.onAudio('still paused', { deliveryId: 'before_resume' });
+    assert.deepEqual(f.audio, []);
+    f.live.resumePlayback();
+    f.voices[0].options.onAudio('resumed', { deliveryId: 'after_resume' });
+    assert.deepEqual(f.audio, ['resumed']);
+  } finally { gate.resolve(); await interruption.catch(() => {}); }
+});
+
+test('an interruption finishing after the caller resumes cannot pause provider playback again', async t => {
+  const f = await fixture(t), gate = deferred();
+  f.checking(() => gate.promise);
+  const interruption = f.live.interruptPlayback('Listen to the caller.');
+  try {
+    f.live.resumePlayback();
+    gate.resolve(); await interruption;
+    assert.equal(f.voices[0].playbackPaused, false);
+  } finally { gate.resolve(); await interruption.catch(() => {}); }
+});
 
 test('retired voice completion, playback clear and transport errors cannot disturb its active successor', async t => {
   const f = await fixture(t); const gate = deferred();

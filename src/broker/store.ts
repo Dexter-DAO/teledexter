@@ -19,7 +19,7 @@ import type { PrimaryCall } from './primaryApi.js';
 import { primaryHarkReceiptBindingFromCall, reducePrimaryHarkReceiptOutbox, validatePrimaryHarkReceiptOutbox,
   type PrimaryHarkReceiptBinding, type PrimaryHarkReceiptCommand, type PrimaryHarkReceiptOutbox } from './harkPrimaryReceiptOutbox.js';
 import { validateBrokerAdmissionRefusals, type BrokerDelegationRecord } from './backend.js';
-import { liveGenerationJournalSchema, type LiveGenerationJournal } from './liveGeneration.js';
+import { liveGenerationJournalSchema, type LiveGenerationJournal, type ContextReadFailure } from './liveGeneration.js';
 import { callContinuationPatch, assertCallContinuationReplay, requestDeliveryRequestForContinuation, validateCallContinuation, type CallContinuation } from './callContinuation.js';
 import { assertSelectedQuestionJournalUpdate, parseSelectedQuestionJournal, type SelectedQuestionJournal } from './selectedQuestion.js';
 
@@ -65,6 +65,7 @@ export interface BrokerCall {
     primaryDexterId?: string; threadId?: string };
   liveSessionId?: string; transcript?: unknown; transcriptRevision?: number;
   liveGenerations?: LiveGenerationJournal;
+  contextReadFailures?: ContextReadFailure[];
   sourceAcousticSpans?: Record<string, unknown>;
   mediaStartedAt?: string;
   harkJournal?: HarkJournal;

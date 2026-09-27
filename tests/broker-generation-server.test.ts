@@ -218,6 +218,31 @@ test('actual server preserves accepted work through replacement and speaks only 
   assert.equal(call.publications!.records.at(-1)!.sourceSessionId, 'generation_1');
 });
 
+test('a temporary context failure during a completed request preserves the call, result and next caller request', async t => {
+  const f = await host(t);
+  const first = observedWork(f.delegate());
+  await boundary('original accepted request', () => f.posts.length === 1, [first]);
+  const original = structuredClone(f.posts[0]);
+  const fetch = f.eligible.fetch; let attempts = 0;
+  f.eligible.fetch = async scope => {
+    if (++attempts === 1) throw new PrimaryApiError('http_error', 503, { code: 'temporarily_unavailable', retryable: true });
+    return fetch(scope);
+  };
+  f.release();
+  await boundary('recovered result', () => f.voices[1]?.spoken.join('') === f.eligibleText && first.settled(), [first]);
+  assert.equal(attempts, 2);
+  assert.equal(f.providerEnds(), 0);
+  assert.equal(f.ws.readyState, WebSocket.OPEN);
+  assert.deepEqual(f.posts, [original], 'a read retry never submits the work a second time');
+  assert.equal(f.store.get(f.callId)!.contextReadFailures?.some(value => value.stage === 'fetch'
+    && value.status === 503 && value.remoteCode === 'temporarily_unavailable'), true);
+  const next = observedWork(f.delegate(1));
+  await boundary('next caller request completed', () => f.posts.length === 2 && next.settled(), [next]);
+  assert.notEqual(f.posts[1].requestId, original.requestId);
+  assert.equal(f.providerEnds(), 0);
+  assert.equal(f.opening.length, 1);
+});
+
 test('actual host hangup starts before a deliberately stalled generation cleanup', async t => {
   const f = await host(t, true);
   f.ws.close();
@@ -377,9 +402,11 @@ test('actual host retains the old follow-up admission while a delayed fresh-cont
     } finally { f.ws.off('pong', onPong); }
     assert.equal(f.voices[0]!.inputs.length, 71, 'new frame remains buffered after the barrier');
     followup.release();
-    await boundary('follow-up submission and old source retirement', () => f.posts.length === 2 && f.voices[0]!.closed.length === 1, work);
+    await boundary('follow-up submission', () => f.posts.length === 2, work);
+    assert.equal(f.voices[0]!.closed.length, 0, 'keep the gated old transport until fresh context is available');
     releaseFetch();
     await boundary('replacement attachment', () => f.voices.length === 2 && f.voices[1]!.inputs.length === 1, work);
+    await boundary('old source retirement', () => f.voices[0]!.closed.length === 1, work);
     await boundary('both saved results', () => work.every(operation => operation.settled()), work);
     assert.deepEqual(f.posts[0], original); assert.equal(f.posts[1]!.input.text, ' Then compare Apple.');
     assert.notEqual(f.posts[1]!.input.source.sourceEventId, original.input.source.sourceEventId);

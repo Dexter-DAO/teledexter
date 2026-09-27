@@ -432,6 +432,7 @@ export function createBrokerLiveSession(options: BrokerLiveSessionOptions): Brok
     appendInstructions: text => append('instructions', text, null),
     appendCommentary: text => append('commentary', text, null),
     interruptPlayback: instruction => { clearPlayback('application_interrupt'); return append('instructions', instruction, null); },
+    pausePlayback: () => { clearPlayback('application_interrupt'); },
     resumePlayback: () => { if (!closing && !closed) playbackBlocked = false; },
     getTranscript: () => clone(transcript),
     close(reason = 'application_close') {
