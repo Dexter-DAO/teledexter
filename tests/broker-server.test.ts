@@ -15,10 +15,11 @@ import type { BrokerConfig } from '../src/broker/config.js';
 import type { BrokerCall } from '../src/broker/store.js';
 import type { PrimaryApiClient, PrimaryContextMessage } from '../src/broker/primaryApi.js';
 import type { BrokerLiveSessionOptions } from '../src/live/session.js';
+import type { BrokerDependencyHealth } from '../src/broker/dependencyHealth.js';
 import { factFreshnessScenarios, historicalAccountMessages } from './fixtures/broker-fact-freshness.js';
 import { loadSharedAssignmentParser, sharedAssignmentParserConfigured } from './helpers/shared-assignment-parser.js';
 
-async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; failVoice?: boolean; ambiguousDial?: boolean; deferVoiceReady?: boolean; history?: PrimaryContextMessage[]; assignmentResponse?: 'missing' | 'wrong'; assignmentParser?: { parse(value: unknown): unknown }; retainedCall?: BrokerCall } = {}) {
+async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; failVoice?: boolean; ambiguousDial?: boolean; deferVoiceReady?: boolean; history?: PrimaryContextMessage[]; assignmentResponse?: 'missing' | 'wrong'; assignmentParser?: { parse(value: unknown): unknown }; retainedCall?: BrokerCall; dependencyHealth?: () => Promise<BrokerDependencyHealth> } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-server-test-'));
   const config: BrokerConfig = { host: '127.0.0.1', port: 3213, publicOrigin: 'https://phone.example.test', stateDir: directory,
     controlToken: 'c'.repeat(40), apiKey: 'fixture-key', model: 'gpt-live-1', voice: 'marin',
@@ -63,6 +64,7 @@ async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; 
   if (overrides.retainedCall) fs.writeFileSync(path.join(directory, 'calls.json'),
     JSON.stringify({ version: 1, calls: { [overrides.retainedCall.id]: overrides.retainedCall } }, null, 2) + '\n');
   const broker = createBrokerServer({ config, primary, provider: { calls: provider } as unknown as ReturnType<typeof Twilio>,
+    dependencyHealth: overrides.dependencyHealth,
     probe: async () => {
       calls.preflight++;
       if (overrides.failVoice) throw Object.assign(new Error('Voice unavailable'), { code: 'credit_balance_exhausted' });
@@ -404,4 +406,24 @@ test('caller cannot inject assignment provenance through unauthenticated or extr
   assert.equal((await f.post('/internal/broker/calls', { ...input, callAssignment: { origin: 'owner' } })).status, 400);
   assert.equal(f.broker.store.list().length, 0);
   assert.equal(f.calls.create, 0);
+});
+
+test('HTTP health exposes an unavailable API and recovers without a call or provider probe', async t => {
+  let health: BrokerDependencyHealth = { ok: false, checkedAt: new Date().toISOString(),
+    primaryApi: { ok: false, reason: 'unavailable' } };
+  const f = await fixture(t, { dependencyHealth: async () => health });
+  const before = await fetch(f.base + '/broker/health');
+  assert.equal(before.status, 503);
+  const body = await before.json() as { ok: boolean; dependencies: BrokerDependencyHealth };
+  assert.equal(body.ok, false);
+  assert.deepEqual(body.dependencies, health);
+  health = { ok: true, checkedAt: new Date().toISOString(),
+    primaryApi: { ok: true, releaseId: 'repaired-release' } };
+  const after = await fetch(f.base + '/broker/health');
+  assert.equal(after.status, 200);
+  assert.equal((await after.json() as { ok: boolean }).ok, true);
+  assert.equal(f.calls.create, 0);
+  assert.equal(f.calls.preflight, 0);
+  assert.equal(f.calls.readiness, 0);
+  assert.equal(f.calls.bind, 0);
 });

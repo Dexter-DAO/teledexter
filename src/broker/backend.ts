@@ -101,6 +101,7 @@ export interface BrokerDelegationRecord {
   delegationAliases?: Array<{ sessionId: string; delegationId: string }>;
   status: 'prepared' | 'dispatching' | 'dispatch_unknown' | 'queued' | 'running' | 'waiting_for_reply' | 'completed' | 'failed' | 'cancelled' | 'not_admitted' | 'admission_refused' | 'admission_expired';
   updatedAt: string;
+  timing?: { firstSavedAt: string; firstDispatchAt?: string; firstAnswerAvailableAt?: string; firstDeliveryAcceptedAt?: string };
   submission: PrimarySubmission;
   frozenCallerRevision: number;
   firstSequence: number;
@@ -493,6 +494,12 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     const next = { ...entry, updatedAt: new Date(now()).toISOString(),
       submitError: previous?.submitError ?? apiErrors.submitError,
       lastResultReadError: apiErrors.lastResultReadError ?? previous?.lastResultReadError };
+    // These are local observations. Delivery acceptance is distinct from audio playback.
+    const timing = { ...(previous?.timing ?? entry.timing ?? { firstSavedAt: next.updatedAt }) };
+    if (next.status === 'dispatching') timing.firstDispatchAt ??= next.updatedAt;
+    if (next.primaryResult?.state === 'completed') timing.firstAnswerAvailableAt ??= next.updatedAt;
+    if (next.status === 'completed' && next.delivery === 'accepted') timing.firstDeliveryAcceptedAt ??= next.updatedAt;
+    next.timing = timing;
     const canonicalTurns = { ...call.canonicalTurns };
     // Refusal proves that reply admission did not capture this turn. Freeze its
     // original source/text atomically with the refusal, before STT can revise it.

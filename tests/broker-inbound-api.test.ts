@@ -59,6 +59,23 @@ function harness(replies: (Response | Error)[], options: Partial<PrimaryApiOptio
     phoneServiceSecret: secret, fetch: fetcher, ...options }) };
 }
 
+test('ordinary incoming transport retains frozen billing reference in context and bound recovery', async () => {
+  const billing = { version: 1, bindingId, callSid, termsDigest: 'a'.repeat(64) };
+  const h = harness([json({ ...call, billing }), json({ ...bound, billing }), json({ ...call, billing })]);
+  assert.deepEqual((await h.client.openInboundCall!(begin.providerProof, approvalRef)).billing, billing);
+  const recovered = await h.client.recoverInbound!(begin);
+  assert.equal(recovered.state, 'bound'); if (recovered.state === 'bound') assert.deepEqual(recovered.billing, billing);
+  assert.deepEqual((await h.client.getContext(bindingId, callSid)).billing, billing);
+  for (const changed of [undefined, { ...billing, termsDigest: 'b'.repeat(64) }, { ...billing, bindingId: foreignId }]) {
+    const contextChange = harness([json({ ...call, billing }), json({ ...call, billing: changed })]);
+    await contextChange.client.openInboundCall!(begin.providerProof, approvalRef);
+    await assert.rejects(contextChange.client.getContext(bindingId, callSid), code('identity_mismatch'));
+    const recoveryChange = harness([json({ ...bound, billing }), json({ ...bound, billing: changed })]);
+    await recoveryChange.client.recoverInbound!(begin);
+    await assert.rejects(recoveryChange.client.recoverInbound!(begin), code('identity_mismatch'));
+  }
+});
+
 test('exact shared begin identity includes signed values but excludes signature and normalizes only broker UUID', () => {
   assert.equal(inboundProofDigest(begin.providerProof), 'f355b816e711ba068e91ca96a4962c7d412d6bfaedeba9244b5d740505aeb448');
   assert.equal(beginRef.digest, 'be3c70c5048366b0b0a078a00c36c77fc04dd6345f608a9ca90463c05be14ecf');

@@ -1,3 +1,5 @@
+import { createInboundBillingLifecycle } from './inboundBillingLifecycle.js';
+import { inboundBillingSummary } from './inboundBilling.js';
 import { createRestrictedSetupServer, type RestrictedSetupServerOptions } from './restrictedSetupServer.js';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createHash } from 'node:crypto';
@@ -10,6 +12,7 @@ import { createPrimaryBackend } from './backend.js';
 import { eligiblePhoneCallSchema, type EligibleContextClient } from './eligibleContext.js';
 import { createGenerationVoice, type GenerationVoiceOptions, type GenerationVoiceSession } from './generationVoice.js';
 import { createInboundStartupContexts } from './startupContext.js';
+import { createBrokerDependencyHealth, type BrokerDependencyHealth } from './dependencyHealth.js';
 import { createSelectedQuestionRecovery, selectedQuestionSourceAnchors } from './selectedQuestionVoice.js';
 import { recoverCallerRouteCaptures } from './mixedWork.js';
 import { createCallerIntentResolver } from './callerIntentResolver.js';
@@ -68,12 +71,12 @@ const publicCall = (call: BrokerCall) => ({
   recipientLast4: call.number.slice(-4), callSid: call.callSid, status: call.status,
   createdAt: call.createdAt, updatedAt: call.updatedAt, endedAt: call.endedAt,
   primaryConnected: Boolean(call.primary), finalized: call.finalized, failure: call.failure,
-  voiceOpening: call.voiceOpening,
+  voiceOpening: call.voiceOpening, inboundBilling: inboundBillingSummary(call),
   primaryClosePending: call.primaryClosePending ?? false, transcriptCapture: call.transcriptCapture,
   callback: call.callback,
   ...callContinuationPatch(call.continuation),
   ...selectedTransportFields(call),
-  metrics: call.metrics, delegationCount: Object.keys(call.delegations).length,
+  metrics: call.metrics, journey: call.journey, delegationCount: Object.keys(call.delegations).length,
   ...(call.callAssignment?.origin === 'authenticated_hark_delivery' ? { watchDelivery: {
     deliveryId: call.callAssignment.value.hark.deliveryId,
     pendingCallbacks: Object.values(call.harkJournal?.events ?? {}).filter(event => event.state === 'pending').length,
@@ -96,9 +99,11 @@ export interface BrokerServerOptions {
   provider?: ReturnType<typeof Twilio>;
   voiceFactory?: (options: BrokerLiveSessionOptions) => BrokerLiveSession;
   probe?: typeof probeLive;
+  dependencyHealth?: () => Promise<BrokerDependencyHealth>;
   resolveHarkAssignment?: HarkAssignmentResolver;
   harkStatusSender?: typeof deliverHarkStatus;
   harkBillingSender?: typeof deliverHarkBilling;
+  inboundBillingSender?: typeof deliverHarkBilling;
   harkPrimaryReceiptSender?: PrimaryHarkReceiptSender;
   /** Explicit composition point for the chosen owner approval surface. Omitted in current production startup. */
   /** Main supplies this only for an explicitly configured verification model. */
@@ -117,6 +122,9 @@ export function createBrokerServer(options: BrokerServerOptions) {
   const provider = options.provider ?? Twilio(config.twilioAccountSid, config.twilioAuthToken, { autoRetry: false, timeout: 15_000 });
   const voiceFactory = options.voiceFactory ?? createBrokerLiveSession;
   const probe = options.probe ?? probeLive;
+  const dependencyHealth = options.dependencyHealth ?? createBrokerDependencyHealth({
+    apiBaseUrl: config.apiBaseUrl, harkApiBaseUrl: config.harkApiBaseUrl,
+  });
   const startupContexts = options.eligibleContext ? createInboundStartupContexts(options.eligibleContext) : undefined;
   const resolveHarkAssignment = options.resolveHarkAssignment ?? (config.harkApiBaseUrl
     ? createHarkAssignmentResolver({ apiBaseUrl: config.harkApiBaseUrl }) : undefined);
@@ -126,6 +134,9 @@ export function createBrokerServer(options: BrokerServerOptions) {
   const harkReceipts = createPrimaryHarkReceiptDispatcher({ store,
     send: options.harkPrimaryReceiptSender ?? createPrimaryHarkReceiptSender({
       apiBaseUrl: config.apiBaseUrl, phoneServiceSecret: config.phoneServiceSecret }) });
+  const inboundBilling = createInboundBillingLifecycle({ store, fetchCall: sid => provider.calls(sid).fetch(),
+    apiBaseUrl: config.verificationSetup?.apiBaseUrl ?? config.harkApiBaseUrl,
+    signingSecret: config.verificationSetup?.signingSecret ?? config.harkCallbackSigningSecret, send: options.inboundBillingSender });
   const active = new Map<string, { stop(reason: string): Promise<void> }>();
   const dialing = new Set<string>();
   const harkDispatching = new Set<string>();
@@ -151,6 +162,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
   function observeProviderState(id: string, status: HarkProviderStatus, timing?: HarkEndedTiming): BrokerCall {
     const call = store.get(id)!;
     const observedAt = new Date().toISOString();
+    if (call.inboundBilling) return store.observeInboundProvider(id, status, observedAt);
     if (call.callAssignment?.origin !== 'authenticated_hark_delivery')
       return store.update(id, { status, ...(terminalCallStatuses.has(status) ? { endedAt: observedAt } : {}) });
     return store.observeHarkProvider(id, status, observedAt, timing);
@@ -446,7 +458,12 @@ export function createBrokerServer(options: BrokerServerOptions) {
   async function handle(request: IncomingMessage, response: ServerResponse) {
     const route = request.url || '/';
     if (restricted && await restricted.handle(request, response)) return;
-    if (request.method === 'GET' && route === '/broker/health') return json(response, 200, { ok: accepting, service: 'dexter-broker', model: config.model, revision: process.env.BROKER_REVISION || 'development', activeCalls: active.size });
+    if (request.method === 'GET' && route === '/broker/health') {
+      const dependencies = await dependencyHealth();
+      const ok = accepting && dependencies.ok;
+      return json(response, ok ? 200 : 503, { ok, service: 'dexter-broker', model: config.model,
+        revision: process.env.BROKER_REVISION || 'development', activeCalls: active.size, dependencies });
+    }
     if (route === '/internal/outbound-alerts' && request.method === 'POST') {
       if (!accepting || !resolveHarkAssignment || !config.harkInternalToken) return json(response, 503, { ok: false, error: 'hark_broker_not_configured' });
       if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(request.socket.remoteAddress ?? ''))
@@ -470,7 +487,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
         if (saved && saved.harkDispatch?.state !== 'not_dispatched') throw new HarkAssignmentError(409, 'hark_dispatch_uncertain');
         if (saved && harkDispatching.has(saved.id)) throw new HarkAssignmentError(409, 'hark_dispatch_pending');
         const resolved = await resolveHarkAssignment(normalized, token);
-        if (!config.allowedTo.includes(resolved.to)) return json(response, 403, { ok: false, error: 'recipient_not_authorized' });
+        // The API resolution binds the owner's saved watch, verified destination, and billing authority.
         const result = await dialReserved(store.reserveHark(resolved, notificationDigest));
         return json(response, result.replayed ? 200 : 202, { ok: true, replay: result.replayed,
           intentId: result.call.id, callSid: result.call.callSid ?? null, state: result.call.status });
@@ -724,6 +741,8 @@ export function createBrokerServer(options: BrokerServerOptions) {
     let inputBytes = call.liveGenerations?.inputNextSample ?? 0;
     let lastSpeechAt = 0;
     const receipts = new PlaybackReceipts();
+    let audioSentRecorded = Boolean(call.journey?.firstAudioSentAt);
+    let playbackRecorded = Boolean(call.journey?.firstPlaybackConfirmedAt);
     const metrics = () => ({ receivedAudioBytes: inputBytes, sentAudioBytes: receipts.sentBytes, playedAudioBytes: receipts.playedBytes, clearedAudioBytes: receipts.clearedBytes });
     const startTimer = setTimeout(() => { void stop('media_start_timeout'); }, 8_000);
     const callDeadlineAt = call.liveGenerations?.clocks.callDeadlineAt ?? call.verificationCallback?.media?.deadlineAt ?? new Date(Date.now() + config.maxCallSeconds * 1000).toISOString();
@@ -801,6 +820,11 @@ export function createBrokerServer(options: BrokerServerOptions) {
               if (stopping || ws.readyState !== WebSocket.OPEN || !streamSid) return;
               if (ws.bufferedAmount > 256_000 || receipts.pendingCount > 300 || receipts.backlogMs > 6_000) { void stop('audio_backpressure'); return; }
               ws.send(JSON.stringify({ event: 'media', streamSid, media: { payload } }));
+              if (!audioSentRecorded) {
+                const saved = store.get(call.id)!;
+                store.update(call.id, { journey: { ...saved.journey, firstAudioSentAt: new Date().toISOString() } });
+                audioSentRecorded = true;
+              }
               const name = receipts.sent(Buffer.from(payload, 'base64').length);
               ws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name } }));
             },
@@ -810,6 +834,8 @@ export function createBrokerServer(options: BrokerServerOptions) {
             },
             onReady({ sessionId }) {
               connectedSessionId = sessionId;
+              const saved = store.get(call.id)!;
+              if (!saved.journey?.liveReadyAt) store.update(call.id, { journey: { ...saved.journey, liveReadyAt: new Date().toISOString() } });
               // The selected host publishes the exact eligible saved question.
               // Its operator purpose must never become an automatic new task.
               if (call.continuation) return;
@@ -862,7 +888,13 @@ export function createBrokerServer(options: BrokerServerOptions) {
           if (inputSpeechEnergy(bytes) > 0.012) { lastSpeechAt = Date.now(); backend?.noteCallerSpeech(lastSpeechAt, inputBytes / 8); }
           if (live?.appendAudio(frame.media.payload) === false) void stop('input_audio_refused');
         } else if (frame.event === 'mark' && frame.streamSid === streamSid && typeof frame.mark?.name === 'string') {
+          const previouslyPlayed = receipts.playedBytes;
           receipts.acknowledge(frame.mark.name);
+          if (receipts.playedBytes > previouslyPlayed && !playbackRecorded) {
+            const saved = store.get(call.id)!;
+            store.update(call.id, { journey: { ...saved.journey, firstPlaybackConfirmedAt: new Date().toISOString() } });
+            playbackRecorded = true;
+          }
         } else if (frame.event === 'stop') {
           if (streamSid && frame.streamSid !== streamSid) throw new Error('stop_stream_mismatch');
           void stop('caller_hangup');
@@ -893,6 +925,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
             const current = store.get(call.id)!;
             if (current.inbound?.localStop) await endWaitingCall(current);
           }
+          await inboundBilling.reconcile(call.id);
           continue;
         }
         // A terminal callback can be durable just before a process stops,

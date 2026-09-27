@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { z } from 'zod';
+import { inboundCallEndedSchema, inboundStatusEndedSchema, inboundStatusReceiptSchema, type InboundStatusEnded, type InboundCallEnded } from './inboundBilling.js';
 import { createPhoneApiCallbackSignature } from '../outbound/PhoneApiCallback.js';
 
 const uuid = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
@@ -37,7 +38,7 @@ export type HarkCallEndedBody = Readonly<z.infer<typeof HarkCallEndedBodySchema>
 export type HarkCallEndedReceipt = Readonly<z.infer<typeof HarkCallEndedReceiptSchema>>;
 export type HarkBillingDeliveryResult =
   | { state: 'delivered'; purpose: 'voice.outbound-status.v2'; httpStatus: 204 }
-  | { state: 'delivered'; purpose: 'voice.call-ended.v2'; httpStatus: 200; receipt: HarkCallEndedReceipt }
+  | { state: 'delivered'; purpose: 'voice.call-ended.v2'; httpStatus: 200; receipt: HarkCallEndedReceipt | z.infer<typeof inboundStatusReceiptSchema> }
   | { state: 'pending'; reason: 'configuration_unavailable' | 'request_failed' | 'http_retry' | 'invalid_response'; httpStatus?: number }
   | { state: 'rejected'; reason: 'invalid_callback_body' | 'http_refusal'; httpStatus?: number };
 
@@ -51,6 +52,8 @@ export type HarkBillingDeliveryOptions = {
 } & (
   | { kind: 'outbound-status'; body: HarkOutboundStatusBody }
   | { kind: 'call-ended'; body: HarkCallEndedBody }
+  | { kind: 'inbound-call-ended'; body: InboundCallEnded }
+  | { kind: 'inbound-status-ended'; body: InboundStatusEnded }
 );
 
 const MAX_RECEIPT_BYTES = 16 * 1024;
@@ -87,7 +90,9 @@ export async function deliverHarkBilling(options: HarkBillingDeliveryOptions): P
   let body: unknown;
   try {
     const schema = options.kind === 'outbound-status' ? HarkOutboundStatusBodySchema
-      : options.kind === 'call-ended' ? HarkCallEndedBodySchema : undefined;
+      : options.kind === 'call-ended' ? HarkCallEndedBodySchema
+      : options.kind === 'inbound-call-ended' ? inboundCallEndedSchema
+      : options.kind === 'inbound-status-ended' ? inboundStatusEndedSchema : undefined;
     if (!schema || !schema.safeParse(options.body).success) {
       return { state: 'rejected', reason: 'invalid_callback_body' };
     }
@@ -144,11 +149,12 @@ export async function deliverHarkBilling(options: HarkBillingDeliveryOptions): P
     if (options.kind === 'outbound-status' && httpStatus === 204 && text === '') {
       return { state: 'delivered', purpose: 'voice.outbound-status.v2', httpStatus: 204 };
     }
-    if (options.kind === 'call-ended' && httpStatus === 200 && text !== undefined) {
+    if ((options.kind === 'call-ended' || options.kind === 'inbound-call-ended' || options.kind === 'inbound-status-ended') && httpStatus === 200 && text !== undefined) {
       let parsed: unknown;
       try { parsed = JSON.parse(text) as unknown; } catch { /* Invalid receipt stays pending. */ }
-      const receipt = HarkCallEndedReceiptSchema.safeParse(parsed);
-      if (receipt.success) {
+      const receipt = (options.kind === 'inbound-status-ended' ? inboundStatusReceiptSchema : HarkCallEndedReceiptSchema).safeParse(parsed);
+      if (receipt.success && (options.kind !== 'inbound-status-ended'
+        || (receipt.data.id === options.body.phone_binding_id && receipt.data.status === options.body.provider_terminal.status))) {
         return { state: 'delivered', purpose: 'voice.call-ended.v2', httpStatus: 200, receipt: Object.freeze(receipt.data) };
       }
     }
