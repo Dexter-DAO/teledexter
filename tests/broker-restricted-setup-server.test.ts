@@ -35,7 +35,7 @@ async function fixture(t: test.TestContext, purpose: 'enrollment' | 'account_acc
     responseUrl: config.publicOrigin + `/broker/verification-callback-response/${id(1)}`, createdAt: new Date(now - 1000).toISOString(),
     expiresAt: new Date(now + 299000).toISOString(), maxDurationSeconds: 180,
     billing: { intentId: id(1), eventId: `phone-verification:${id(1)}`, mandateId: id(2), unitPriceMicro: 1000, freeSeconds: 0 } };
-  const counts = { get: 0, dispatch: 0, create: 0, complete: 0, completionGet: 0, privateOpen: 0, ordinarySubmit: 0, ended: 0 };
+  const counts = { get: 0, dispatch: 0, create: 0, complete: 0, completionGet: 0, privateOpen: 0, ordinarySubmit: 0, ended: 0, cancel: 0, providerFetch: 0 };
   const receipts: unknown[] = [], updates: Array<Record<string, unknown>> = [], voices: BrokerLiveSessionOptions[] = [];
   let remote: PhoneVerificationCallbackState = { v: 1, request: ref, state: 'reserved', permit };
   let completion: PhoneVerificationCallbackCompletionRecovery | undefined;
@@ -46,7 +46,7 @@ async function fixture(t: test.TestContext, purpose: 'enrollment' | 'account_acc
   const providerValue = () => ({ sid, accountSid: config.twilioAccountSid, from: permit.from, to: permit.to,
     direction: 'outbound-api', status: providerStatus, ...(providerStatus === 'completed' ? {
       startTime: new Date(now), endTime: new Date(now + 20000), duration: '19' } : {}) });
-  const calls = Object.assign((_sid: string) => ({ async fetch() { assert.equal(_sid, sid); return providerValue(); },
+  const calls = Object.assign((_sid: string) => ({ async fetch() { counts.providerFetch++; assert.equal(_sid, sid); return providerValue(); },
     async update(input: Record<string, unknown>) { updates.push(input); if (input.status === 'completed') providerStatus = 'completed'; return providerValue(); } }), {
     async create(input: Record<string, unknown>) { counts.create++; assert.equal(input.to, permit.to); assert.equal(input.url, permit.answerUrl);
       assert.ok(store.get(id(1))?.verificationCallback?.dispatch?.providerStartedAt);
@@ -66,9 +66,10 @@ async function fixture(t: test.TestContext, purpose: 'enrollment' | 'account_acc
         enrollmentRef: { id: id(50), revision: 1, digest: 'f'.repeat(64) }, possessionRef: { id: id(52), digest: '1'.repeat(64) },
         standingConsentRef: { id: id(53), revision: 1, digest: '2'.repeat(64) } } }
         : { v: 1, command: phoneVerificationCallbackCommandRef(input), state: 'admitted', admission: { id: id(9), digest: 'b'.repeat(64), expiresAt: permit.expiresAt } };
+      remote = { v: 1, request: ref, state: 'completed', result: completion };
       if (loseCompletion) throw new Error('lost completion'); return completion; },
     async recoverCompletion(command) { counts.completionGet++; return completion ?? { v: 1, command, state: 'absent' }; },
-    async cancel() { if (remote.state !== 'completed') remote = { v: 1, request: ref, state: 'cancelled', cancelledAt: new Date().toISOString() }; return remote; },
+    async cancel() { counts.cancel++; if (remote.state !== 'completed') remote = { v: 1, request: ref, state: 'cancelled', cancelledAt: new Date().toISOString() }; return remote; },
   };
   const legacyPrimary = { async openCall() { throw new Error('Ordinary proof cap must not be used'); },
     async openVerifiedCallbackCall(proof: unknown) { counts.privateOpen++;
@@ -214,6 +215,50 @@ test('ordinary silence during source freeze preserves explicit enrollment; prote
   assert.equal(fs.readFileSync(path.join(f.directory, 'calls.json'), 'utf8').includes('01234567'), false);
   assert.equal(f.voices.length, 1); assert.equal(f.store.get(id(1))?.transcript, undefined);
 });
+async function finishEnrollment(f: Awaited<ReturnType<typeof fixture>>) {
+  await f.kickoff(); await f.answer(); const ws = await f.connect();
+  await f.completeFromSpeech(ws);
+  await until(() => f.updates.some(value => String(value.twiml).includes('<Gather')), 'protected capture');
+  assert.equal((await f.post(`/broker/verification-callback-response/${id(1)}`, { ...f.params(), Digits: '01234567' })).status, 200);
+  await f.broker.maintain();
+  await until(() => ws.readyState === WebSocket.CLOSED && !!f.store.get(id(1))?.verificationCallback?.media?.stoppedAt,
+    'completed enrollment media stops');
+}
+
+test('completed enrollment with all receipts acknowledged stops remote recovery and leaves journal bytes unchanged', async t => {
+  const f = await fixture(t); await finishEnrollment(f);
+  await f.broker.maintain();
+  const saved = f.store.get(id(1))!;
+  assert.equal(saved.verificationCallback!.remote!.state, 'completed');
+  assert.equal(saved.verificationCallback!.completion!.observation!.state, 'enrolled');
+  assert.ok(saved.verificationCallback!.receipts!.every(receipt => receipt.acknowledgedAt));
+  assert.ok(saved.verificationCallback!.receipts!.some(receipt => receipt.kind === 'ended' && receipt.receipt));
+  const before = fs.readFileSync(path.join(f.directory, 'calls.json'), 'utf8');
+  const counts = { ...f.counts }, receiptCount = f.receipts.length, providerUpdates = f.updates.length;
+  await new Promise(resolve => setTimeout(resolve, 5));
+  await f.broker.maintain(); await f.broker.maintain();
+  assert.deepEqual(f.counts, counts, 'no repeated API recovery/cancel or provider request');
+  assert.equal(f.receipts.length, receiptCount);
+  assert.equal(f.updates.length, providerUpdates);
+  assert.equal(fs.readFileSync(path.join(f.directory, 'calls.json'), 'utf8'), before);
+});
+
+test('completed enrollment keeps delivering an unacknowledged ended receipt, then becomes idle', async t => {
+  const f = await fixture(t); f.dropReceipt(true); await finishEnrollment(f);
+  const pending = f.store.get(id(1))!.verificationCallback!;
+  assert.ok(pending.receipts!.some(receipt => !receipt.acknowledgedAt));
+  const attempts = f.receipts.length;
+  await f.broker.maintain();
+  assert.ok(f.receipts.length > attempts, 'pending callback delivery remains retryable');
+  f.dropReceipt(false); await f.broker.maintain();
+  assert.ok(f.store.get(id(1))!.verificationCallback!.receipts!.every(receipt => receipt.acknowledgedAt));
+  const counts = { ...f.counts }, receipts = f.receipts.length;
+  const bytes = fs.readFileSync(path.join(f.directory, 'calls.json'), 'utf8');
+  await f.broker.maintain();
+  assert.deepEqual(f.counts, counts); assert.equal(f.receipts.length, receipts);
+  assert.equal(fs.readFileSync(path.join(f.directory, 'calls.json'), 'utf8'), bytes);
+});
+
 test('protected form without an accepted same-leg tool instruction refuses before completion', async t => {
   const f = await fixture(t); await f.kickoff(); await f.answer(); await f.connect();
   assert.equal((await f.post(`/broker/verification-callback-response/${id(1)}`, { ...f.params(), Digits: '01234567' })).status, 503);
