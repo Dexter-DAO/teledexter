@@ -1,3 +1,4 @@
+import type { BrokerSmsBridge } from './sms.js';
 import { createInboundBillingLifecycle } from './inboundBillingLifecycle.js';
 import { inboundBillingSummary } from './inboundBilling.js';
 import { createRestrictedSetupServer, type RestrictedSetupServerOptions } from './restrictedSetupServer.js';
@@ -97,6 +98,7 @@ const publicCall = (call: BrokerCall) => ({
 });
 
 export interface BrokerServerOptions {
+  sms?: BrokerSmsBridge;
   config: BrokerConfig;
   store?: BrokerStore;
   primary?: PrimaryApiClient;
@@ -483,6 +485,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
 
   async function handle(request: IncomingMessage, response: ServerResponse) {
     const route = request.url || '/';
+    if (options.sms && await options.sms.handle(request, response)) return;
     if (restricted && await restricted.handle(request, response)) return;
     if (request.method === 'GET' && route === '/broker/health') {
       const dependencies = await dependencyHealth();
@@ -1010,12 +1013,14 @@ export function createBrokerServer(options: BrokerServerOptions) {
 
   async function close() {
     accepting = false;
+    options.sms?.stop();
     startupContexts?.clear();
     // Freeze every saved wait before awaiting any in-flight begin/consume operation.
     for (const call of store.list()) if (call.inbound && !call.inbound.closure) inbound.stopLocal(call.id, 'service_shutdown');
     clearInterval(maintenanceTimer);
     server.close();
     await Promise.allSettled([...pendingRequests]);
+    await options.sms?.close();
     await maintenance;
     await Promise.allSettled([...active.values()].map(call => call.stop('service_shutdown')));
     for (const call of store.list()) if (call.verificationCallback || call.restrictedSetup) {
