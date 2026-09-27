@@ -40,6 +40,7 @@ import type { deliverHarkBilling } from './harkBillingDelivery.js';
 import { rejectBrokerPublication } from './publications.js';
 import { createCallbackFlow } from './callback.js';
 import { createInboundFlow } from './inbound.js';
+import { logInboundTiming, observeInboundStreamResponse } from './inboundTiming.js';
 import { type BrokerConfig, isPhoneNumber } from './config.js';
 import { BrokerStore, type BrokerCall, type CallStatus, terminalCallStatuses } from './store.js';
 import { brokerInstructions, brokerHistory, brokerOpening } from './instructions.js';
@@ -227,6 +228,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
   });
 
   const inbound = createInboundFlow({ config, store, primary,
+    onTiming: logInboundTiming,
     onContext: (call, context) => startupContexts?.remember(call, context),
     fetchCall: sid => provider.calls(sid).fetch(), closeBound: async call => {
       // Media may have started while a provider/account read was in flight.
@@ -460,8 +462,10 @@ export function createBrokerServer(options: BrokerServerOptions) {
       return;
     }
     if (call.mediaStartedAt || active.has(call.id) || claimed.has(call.id)) return json(response, 409, { error: 'media_already_started' });
-    if (inbound.mediaAllowed(call)) return xml(response,
-      callTwiml(config.publicOrigin, call.id, streamToken(config.controlToken, call.id, call.callSid!)));
+    if (inbound.mediaAllowed(call)) {
+      observeInboundStreamResponse(call.id, response, logInboundTiming);
+      return xml(response, callTwiml(config.publicOrigin, call.id, streamToken(config.controlToken, call.id, call.callSid!)));
+    }
     const remote = call.inbound!.remote;
     try {
       const rendered = options.inboundAttachment!.waitingResponse({ callId: call.id,

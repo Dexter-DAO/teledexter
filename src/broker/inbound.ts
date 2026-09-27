@@ -4,6 +4,7 @@ import type { InboundOutcome } from './inboundContract.js';
 import { BrokerStore, type BrokerCall, terminalCallStatuses } from './store.js';
 import { verifyTwilio, type ProviderCallProof } from './phone.js';
 import { createHash } from 'node:crypto';
+import { createInboundAttemptTiming, type InboundTimingSink } from './inboundTiming.js';
 import { INBOUND_ENROLLMENT_RESPONSE_PATH, enrollmentCompletionInputSchema, enrollmentCommand,
   sameEnrollmentCommand, enrollmentTransportErrorSchema, isEnrollmentHttpFailure, type EnrollmentCommand,
   type EnrollmentCompletionRecovery } from './inboundEnrollment.js';
@@ -19,6 +20,7 @@ export interface InboundFlowOptions {
   closeBound(call: BrokerCall): Promise<void>;
   /** In-memory handoff after the original leg and context have been admitted. */
   onContext?(call: BrokerCall, context: PrimaryCall): void;
+  onTiming?: InboundTimingSink;
   now?: () => number;
   /** Internal composition only. No entry gesture, route, settings or runtime activation is selected here. */
   enrollment?: { endLeg(call: BrokerCall): Promise<void> };
@@ -147,6 +149,7 @@ export function createInboundFlow(options: InboundFlowOptions) {
     return result;
   }
   async function advanceAttempt(id: string): Promise<BrokerCall> {
+    const timing = createInboundAttemptTiming(id, options.onTiming);
     let call = saved(id);
     if (call.inbound?.mode?.kind === 'enrollment-only') return advanceEnrollment(id);
     if (stopped(call)) { stopLocal(id, call.inbound!.localStop?.reason ?? 'provider_terminal'); return settle(id); }
@@ -163,10 +166,11 @@ export function createInboundFlow(options: InboundFlowOptions) {
     // sealed outcomes need no new continuation marker or reconstructed attestation.
     if (!call.inbound!.remote || call.inbound!.remote.state === 'absent') {
       if (call.inbound!.beginAttemptedAt) {
-        call = store.transitionInbound(id, { type: 'outcome', outcome: await primary.recoverInbound(call.inbound!.begin), observedAt: timestamp() });
+        call = store.transitionInbound(id, { type: 'outcome', outcome: await timing.measure('recover_attachment', () => primary.recoverInbound!(call.inbound!.begin)), observedAt: timestamp() });
       }
     } else {
-      call = record(id, await primary.inboundStatus(call.inbound!.remote.attachmentId));
+      const attachmentId = call.inbound!.remote.attachmentId;
+      call = record(id, await timing.measure('poll_attachment', () => primary.inboundStatus!(attachmentId)));
     }
     call = saved(id);
     if (stopped(call)) return settle(id);
@@ -179,7 +183,7 @@ export function createInboundFlow(options: InboundFlowOptions) {
       store.transitionInbound(id, { type: 'begin_attempted', observedAt: timestamp() });
       // A retryable 503 or lost response preserves this attempt. The next
       // iteration reads the same outcome before any original-proof resubmission.
-      call = record(id, await primary.beginInbound(call.inbound!.begin));
+      call = record(id, await timing.measure('begin_admission', () => primary.beginInbound!(call.inbound!.begin)));
     }
     if (stopped(saved(id))) return settle(id);
     if (saved(id).mediaStartedAt) return saved(id);
@@ -188,7 +192,7 @@ export function createInboundFlow(options: InboundFlowOptions) {
     }
     if (now() >= Date.parse(call.inbound!.waitUntil) && !bound(call)) { stopLocal(id, 'broker_cancelled'); return settle(id); }
     if (call.inbound!.remote?.state === 'pending') return call;
-    const observed = await observe(call);
+    const observed = await timing.measure('provider_identity', () => observe(call));
     call = saved(id);
     if (terminalCallStatuses.has(observed.status as BrokerCall['status'])) {
       store.update(id, { status: observed.status as BrokerCall['status'], endedAt: call.endedAt ?? timestamp() });
@@ -204,12 +208,13 @@ export function createInboundFlow(options: InboundFlowOptions) {
         if (receipt.callState === 'closed' || now() >= Date.parse(call.inbound!.mediaStartBy!)) {
           stopLocal(id, receipt.callState === 'closed' ? 'binding_closed' : 'media_start_expired'); return settle(id);
         }
-        context = await primary.getContext(receipt.bindingId);
+        context = await timing.measure('refresh_context', () => primary.getContext(receipt.bindingId));
       } else if (call.inbound!.remote?.state === 'approved') {
         store.transitionInbound(id, { type: 'consume_attempted', observedAt: timestamp() });
-        context = await primary.openInboundCall(call.inbound!.begin.providerProof, call.inbound!.remote.approvalRef);
+        const approvalRef = call.inbound!.remote.approvalRef;
+        context = await timing.measure('open_context', () => primary.openInboundCall!(call.inbound!.begin.providerProof, approvalRef));
         // /calls carries private context, but only this persisted outcome anchors media grace.
-        const recovered = await primary.recoverInbound(call.inbound!.begin);
+        const recovered = await timing.measure('recover_binding', () => primary.recoverInbound!(call.inbound!.begin));
         if (recovered.state === 'absent') throw new Error('inbound_binding_outcome_unavailable');
         call = record(id, recovered);
         if (!bound(call)) throw new Error('inbound_binding_outcome_unavailable');

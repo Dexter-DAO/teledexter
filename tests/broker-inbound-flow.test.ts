@@ -6,6 +6,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import Twilio from 'twilio';
 import { createInboundFlow } from '../src/broker/inbound.js';
+import type { InboundTimingEvent } from '../src/broker/inboundTiming.js';
 import { inboundBeginRef, type InboundBeginIdentity, type InboundOutcome } from '../src/broker/inboundContract.js';
 import { BrokerStore } from '../src/broker/store.js';
 import { PrimaryApiError, type PrimaryApiClient } from '../src/broker/primaryApi.js';
@@ -43,6 +44,7 @@ async function fixture(t: test.TestContext) {
   let beginError: Error | undefined;
   let consumeError: Error | undefined, contextError: Error | undefined; let refuseBeforeConsume = false;
   const counts = { begin: 0, recover: 0, status: 0, consume: 0, context: 0, cancel: 0, close: 0, provider: 0, closeout: 0 };
+  const timings: InboundTimingEvent[] = [];
   const remember = (begin: InboundBeginIdentity) => {
     if (beginIdentity) assert.deepEqual(begin, beginIdentity); else beginIdentity = structuredClone(begin);
   };
@@ -98,6 +100,7 @@ async function fixture(t: test.TestContext) {
   };
   function build() {
     return createInboundFlow({ config, store, primary: primary as unknown as PrimaryApiClient, now: () => clock,
+      onTiming: event => timings.push(event),
       async fetchCall(sid) { counts.provider++; assert.equal(sid, params.CallSid); return { sid, accountSid: config.twilioAccountSid,
         direction: 'inbound', from: params.From, to: params.To, status: providerStatus }; },
       async closeBound(call) {
@@ -115,7 +118,7 @@ async function fixture(t: test.TestContext) {
   let flow = build();
   t.after(async () => { await flow.drain(); store.close(); fs.rmSync(directory, { recursive: true, force: true }); });
   return {
-    get flow() { return flow; }, get store() { return store; }, config, params, original, proof, counts, directory,
+    get flow() { return flow; }, get store() { return store; }, config, params, original, proof, counts, timings, directory,
     clock: () => clock, advance: (ms: number) => { clock += ms; },
     approve() { assert.ok(remote && remote.state === 'pending'); remote = { ...remote, state: 'approved', approvalRef }; },
     remote: () => remote,
@@ -151,6 +154,30 @@ test('pending inbound keeps original leg and proof; approval consumes that same 
   assert.equal(Date.parse(next.inbound!.mediaStartBy!), f.clock() + 30_000);
   assert.equal(f.counts.consume, 1);
   assert.deepEqual(next.inbound!.begin.providerProof, f.original);
+});
+
+test('setup timing identifies each real admission step and retains separate failed and recovered attempts', async t => {
+  const f = await fixture(t), first = await f.begin(); f.approve(); f.loseConsume();
+  await assert.rejects(f.flow.resume(first.id, f.proof(`/broker/inbound/${first.id}/continue`)), /lost_consume_response/);
+  const failed = f.timings.find(event => event.stage === 'open_context' && event.phase === 'failed');
+  assert.ok(failed);
+  f.restart();
+  const recovered = await f.flow.tick(first.id);
+  assert.ok(f.flow.mediaAllowed(recovered));
+  assert.equal(f.counts.consume, 1);
+  const refreshed = f.timings.find(event => event.stage === 'refresh_context' && event.phase === 'completed');
+  assert.ok(refreshed);
+  assert.notEqual(failed.attemptId, refreshed.attemptId);
+  assert.ok(f.timings.some(event => event.stage === 'recover_attachment' && event.phase === 'completed')
+    || f.timings.some(event => event.stage === 'poll_attachment' && event.phase === 'completed'));
+  for (const end of f.timings.filter(event => event.phase !== 'started')) {
+    const starts = f.timings.filter(event => event.spanId === end.spanId && event.phase === 'started');
+    assert.equal(starts.length, 1); assert.equal(starts[0].callId, first.id);
+    assert.ok(Number.isFinite(end.elapsedMs) && end.elapsedMs! >= 0);
+  }
+  const encoded = JSON.stringify(f.timings);
+  for (const secret of [f.params.From, f.params.To, f.params.CallSid, f.original.signature, f.config.twilioAuthToken])
+    assert.equal(encoded.includes(secret), false);
 });
 
 test('lost begin response recovers a sealed approval without another begin', async t => {
