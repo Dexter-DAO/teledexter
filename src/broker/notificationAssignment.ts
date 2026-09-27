@@ -9,6 +9,7 @@ export const NOTIFICATION_PHONE_PURPOSE = 'Discuss the saved notification with i
 export const phoneNotificationSourceSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('publication_v1'), publishId: uuid, topicId: uuid, subscriptionId: uuid }).strict(),
   z.object({ kind: z.literal('owner_destination_test_v1') }).strict(),
+  z.object({ kind: z.literal('watcher_event_v1'), producer: z.enum(['market_pulse', 'founder_portfolio_pulse']), eventId: text(160) }).strict(),
   z.object({ kind: z.literal('portfolio_watch_event_v1'), intentId: uuid, eventKey: text(200), bodySha256: digest }).strict(),
 ]);
 export const phoneNotificationSnapshotSchema = z.object({
@@ -28,6 +29,8 @@ export const phoneNotificationSnapshotSchema = z.object({
     || Date.parse(snapshot.observedAt) > Date.parse(snapshot.expiresAt)
     || (snapshot.source.kind === 'publication_v1' && snapshot.eventId !== `hark:${snapshot.source.publishId}:${snapshot.source.subscriptionId}`)
     || (snapshot.source.kind === 'owner_destination_test_v1' && !/^hark:self-test:[0-9a-f-]{36}$/.test(snapshot.eventId))
+    || (snapshot.source.kind === 'watcher_event_v1' && (snapshot.source.eventId !== snapshot.eventId
+      || !snapshot.eventId.startsWith(snapshot.source.producer === 'market_pulse' ? 'market-pulse:' : 'wallet-portfolio:')))
     || (snapshot.source.kind === 'portfolio_watch_event_v1'
       && (snapshot.source.intentId !== snapshot.intentId || snapshot.eventId !== `portfolio:${snapshot.intentId}`)))
     ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'notification_snapshot_invalid' });

@@ -484,7 +484,8 @@ export function createBrokerServer(options: BrokerServerOptions) {
       const dependencies = await dependencyHealth();
       const ok = accepting && dependencies.ok;
       return json(response, ok ? 200 : 503, { ok, service: 'dexter-broker', model: config.model,
-        revision: process.env.BROKER_REVISION || 'development', activeCalls: active.size, dependencies });
+        revision: process.env.BROKER_REVISION || 'development', activeCalls: active.size, dependencies,
+        notificationSourceKinds: ['publication_v1', 'owner_destination_test_v1', 'portfolio_watch_event_v1', 'watcher_event_v1'] });
     }
     if (route === '/internal/outbound-alerts' && request.method === 'POST') {
       if (!accepting || !config.harkInternalToken) return json(response, 503, { ok: false, error: 'hark_broker_not_configured' });

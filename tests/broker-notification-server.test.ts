@@ -18,6 +18,7 @@ async function fixture(t: test.TestContext, options: { ambiguous?: boolean; regi
   let apiStatus = 200, creates = 0, resolutions = 0, readiness = 0;
   const bindings: unknown[] = [], savedBeforeDial: unknown[] = [], callbacks: { path: string; body: unknown }[] = [];
   const api = createServer(async (request, response) => {
+    if (request.url === '/health') { response.writeHead(200, { 'content-type': 'application/json' }); response.end(JSON.stringify({ ok: true, service: 'dexter-api', release: { releaseId: 'fixture-api' } })); return; }
     const chunks = []; for await (const chunk of request) chunks.push(Buffer.from(chunk));
     const body = JSON.parse(Buffer.concat(chunks).toString());
     if (request.url === '/internal/phone/resolve-notification-assignment') {
@@ -65,6 +66,7 @@ async function fixture(t: test.TestContext, options: { ambiguous?: boolean; regi
   return { resolved, bindings, callbacks, savedBeforeDial, get broker() { return broker; }, get creates() { return creates; },
     get resolutions() { return resolutions; }, get readiness() { return readiness; }, setApiStatus(status: number) { apiStatus = status; },
     async restart() { await broker.close(); base = await start(); },
+    health() { return fetch(base + '/broker/health'); },
     post(value = notificationWire(resolved), token = 'fixture-token') { return fetch(base + '/internal/outbound-alerts', {
       method: 'POST', headers: { 'content-type': 'application/json', 'x-dexter-internal-auth': token }, body: JSON.stringify(value) }); },
     answer() {
@@ -119,4 +121,12 @@ test('unauthenticated dispatch and refused answer registration cannot obtain acc
   assert.equal((await f.post()).status, 202);
   const answer = await f.answer(); assert.doesNotMatch(await answer.text(), /<Stream/);
   assert.equal(f.broker.store.get(f.resolved.callAssignment.brokerCallId)?.primary, undefined);
+});
+
+test('health advertises watcher-source reader capability before a producer can transfer an event', async t => {
+  const f = await fixture(t), response = await f.health();
+  assert.equal(response.status, 200);
+  const body = await response.json() as { notificationSourceKinds: string[] };
+  assert.deepEqual(body.notificationSourceKinds, ['publication_v1', 'owner_destination_test_v1', 'portfolio_watch_event_v1', 'watcher_event_v1']);
+  assert.equal(f.creates, 0);
 });
