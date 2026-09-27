@@ -16,10 +16,10 @@ export function createInboundHoldAdapter(options: { publicOrigin: string; store:
         || call.inbound.begin.providerProof.url !== `${origin.origin}/broker/incoming-call`)
         throw new Error('Inbound hold call unavailable');
       const response = new Twilio.twiml.VoiceResponse();
-      // A leading Pause delays pickup. An authenticated continuation is the
-      // durable boundary after which the next hold can stay silent.
+      // Say answers the first leg before its authenticated continuation.
+      // Only later pending holds need a pause to pace repeated redirects.
       if (!call.inbound.continuation) response.say('One moment.');
-      response.pause({ length: 1 });
+      else response.pause({ length: 1 });
       response.redirect({ method: 'POST' }, input.continuationUrl);
       return response.toString();
     },

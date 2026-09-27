@@ -554,10 +554,11 @@ test('terminal provider result arriving after media starts finalizes voice befor
   if (ws.readyState !== WebSocket.CLOSED) await new Promise<void>(resolve => ws.once('close', () => resolve()));
 });
 
-test('actual HTTP hold answers before redirect; restart and maintenance cannot create fresh admission', async t => {
+test('actual HTTP hold answers then immediately redirects; restart and maintenance cannot create fresh admission', async t => {
   const f = await fixture(t);
   const first = await f.webhook('/broker/incoming-call'); const xml = await first.text();
-  assert.match(xml, /<Say>One moment\.<\/Say><Pause length="1"\/><Redirect method="POST">/);
+  assert.match(xml, /<Say>One moment\.<\/Say><Redirect method="POST">/);
+  assert.doesNotMatch(xml, /<Pause/);
   assert.equal(f.seen.begin, 0); assert.equal(f.seen.context, 0);
   const saved = f.store.list()[0]; const waitUntil = saved.inbound!.waitUntil;
   await f.broker.maintain(); assert.equal(f.seen.begin, 0);
@@ -567,7 +568,9 @@ test('actual HTTP hold answers before redirect; restart and maintenance cannot c
   assert.equal(bad.status, 403); await bad.text();
   assert.equal(restored.store.get(saved.id)!.inbound!.continuation, undefined);
   const continued = await restored.webhook(`/broker/inbound/${saved.id}/continue`, { CallStatus: 'in-progress' });
-  const silent = await continued.text(); assert.match(silent, /<Pause/); assert.doesNotMatch(silent, /<Say|<Stream|<Gather/);
+  const silent = await continued.text();
+  assert.match(silent, /<Pause length="1"\/><Redirect method="POST">/);
+  assert.doesNotMatch(silent, /<Say|<Stream|<Gather/);
   assert.equal(restored.seen.begin, 1); assert.equal(restored.seen.context, 0);
   assert.equal(restored.store.get(saved.id)!.inbound!.waitUntil, waitUntil);
   assert.deepEqual(restored.store.get(saved.id)!.inbound!.begin.providerProof, saved.inbound!.begin.providerProof);
