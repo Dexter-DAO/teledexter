@@ -44,32 +44,39 @@ const journalSchema = z.object({
 }).strict();
 
 function binding(call: BrokerCall) {
-  if (call.callAssignment?.origin !== 'authenticated_hark_delivery' || !call.callSid
-      || !/^CA[0-9a-fA-F]{32}$/.test(call.callSid)) throw new Error('Hark provider binding unavailable');
-  const snapshot = call.callAssignment.value.hark;
-  return { intentId: call.id, callSid: call.callSid, hark: { schemaVersion: 1 as const,
-    caseId: snapshot.caseId, watchId: snapshot.watch.id, eventId: snapshot.event.id,
-    deliveryId: snapshot.deliveryId, originTaskId: snapshot.originTaskId } };
+  if (!call.callSid || !/^CA[0-9a-fA-F]{32}$/.test(call.callSid)) throw new Error('Hark provider binding unavailable');
+  if (call.callAssignment?.origin === 'authenticated_hark_delivery') {
+    const snapshot = call.callAssignment.value.hark;
+    return { intentId: call.id, callSid: call.callSid, eventId: `hark:${call.id}`, ownerSupabaseUserId: snapshot.ownerSupabaseUserId,
+      hark: { schemaVersion: 1 as const, caseId: snapshot.caseId, watchId: snapshot.watch.id, eventId: snapshot.event.id,
+        deliveryId: snapshot.deliveryId, originTaskId: snapshot.originTaskId } };
+  }
+  if (call.callAssignment?.origin === 'authenticated_notification_delivery') {
+    const snapshot = call.callAssignment.value.notification;
+    return { intentId: call.id, callSid: call.callSid, eventId: snapshot.eventId, ownerSupabaseUserId: snapshot.ownerSupabaseUserId };
+  }
+  throw new Error('Hark provider binding unavailable');
 }
 
 function statusEvents(call: BrokerCall, status: ObservedStatus, observedAt: string): HarkJournalEvent[] {
   const bound = binding(call);
-  const hark = buildHarkStatusBody(bound, status, observedAt);
-  const outbound: HarkOutboundStatusBody = { intentId: call.id, eventId: `hark:${call.id}`, callSid: bound.callSid, state: status };
-  return [event('hark_status', hark.sourceEventId, hark, observedAt),
-    event('outbound_status', `voice-status:${call.id}:${status}`, outbound, observedAt)];
+  const outbound: HarkOutboundStatusBody = { intentId: call.id, eventId: bound.eventId, callSid: bound.callSid, state: status };
+  const outgoing = event('outbound_status', `voice-status:${call.id}:${status}`, outbound, observedAt);
+  if (!bound.hark) return [outgoing];
+  const hark = buildHarkStatusBody({ intentId: bound.intentId, callSid: bound.callSid, hark: bound.hark }, status, observedAt);
+  return [event('hark_status', hark.sourceEventId, hark, observedAt), outgoing];
 }
+
 function event(kind: HarkJournalEvent['kind'], id: string, body: HarkJournalEvent['body'], observedAt: string): HarkJournalEvent {
   return { kind, id, body: structuredClone(body), bodyDigest: sha256Hex(canonicalJson(body)),
     observedAt, state: 'pending', attempts: 0 } as HarkJournalEvent;
 }
 function endedEvent(call: BrokerCall, timing: HarkEndedTiming, observedAt: string): HarkJournalEvent {
-  binding(call);
-  if (call.callAssignment?.origin !== 'authenticated_hark_delivery') throw new Error('Hark assignment unavailable');
+  const bound = binding(call);
   const body: HarkCallEndedBody = { source: 'phone', direction: 'outbound-alert', alert_intent_id: call.id,
-    alert_event_id: `hark:${call.id}`, external_sid: call.callSid!, started_at: timing.startedAt,
+    alert_event_id: bound.eventId, external_sid: call.callSid!, started_at: timing.startedAt,
     ended_at: timing.endedAt, duration_seconds: timing.durationSeconds,
-    caller_user_id: call.callAssignment.value.hark.ownerSupabaseUserId };
+    caller_user_id: bound.ownerSupabaseUserId };
   return event('call_ended', `voice-ended:${call.id}`, body, observedAt);
 }
 

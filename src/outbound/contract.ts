@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { canonicalJson } from './canonical.js';
+import { phoneNotificationRefSchema } from '../broker/notificationAssignment.js';
 
 const MAX_FOLLOWUP_CONTEXT_BYTES = 24 * 1024;
 
@@ -241,6 +242,7 @@ export const OutboundAlertRequestSchema = z
     ttlSeconds: z.number().int().min(30).max(600).default(180),
     followupContext: z.record(z.string(), z.unknown()).default({}),
     hark: HarkPhoneBindingSchema.optional(),
+    notificationRef: phoneNotificationRefSchema.optional(),
   })
   .strict()
   .superRefine((value, ctx) => {
@@ -250,6 +252,10 @@ export const OutboundAlertRequestSchema = z
         path: ['followupContext'],
         message: `followupContext exceeds ${MAX_FOLLOWUP_CONTEXT_BYTES} bytes`,
       });
+    }
+    if (value.notificationRef) {
+      if (value.hark || value.idempotencyKey !== value.eventId) ctx.addIssue({ code: 'custom',
+        path: ['notificationRef'], message: 'Notification reference requires one source and its exact event identity' });
     }
     if (value.hark) {
       const expectedEventId = `hark:${value.hark.deliveryId}`;
@@ -280,7 +286,7 @@ export type OutboundAlertRequest = z.infer<typeof OutboundAlertRequestSchema>;
  */
 export const ServerAuthoredPhoneNotificationSchema = z
   .object({
-    source: z.literal('hark'),
+    source: z.enum(['hark', 'notification']),
     publishId: z.string().uuid().nullable(),
     topicId: z.string().uuid().nullable(),
     topicAddress: z.string().max(100).nullable(),

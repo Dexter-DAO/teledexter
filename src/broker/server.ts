@@ -12,6 +12,7 @@ import { createPrimaryBackend } from './backend.js';
 import { eligiblePhoneCallSchema, type EligibleContextClient } from './eligibleContext.js';
 import { createGenerationVoice, type GenerationVoiceOptions, type GenerationVoiceSession } from './generationVoice.js';
 import { createInboundStartupContexts } from './startupContext.js';
+import { createNotificationAssignmentResolver, NotificationAssignmentError, type NotificationAssignmentResolver } from './notificationResolver.js';
 import { createBrokerDependencyHealth, type BrokerDependencyHealth } from './dependencyHealth.js';
 import { createSelectedQuestionRecovery, selectedQuestionSourceAnchors } from './selectedQuestionVoice.js';
 import { recoverCallerRouteCaptures } from './mixedWork.js';
@@ -77,6 +78,14 @@ const publicCall = (call: BrokerCall) => ({
   ...callContinuationPatch(call.continuation),
   ...selectedTransportFields(call),
   metrics: call.metrics, journey: call.journey, delegationCount: Object.keys(call.delegations).length,
+  ...(call.callAssignment?.origin === 'authenticated_notification_delivery' ? { notificationDelivery: {
+    intentId: call.callAssignment.value.notification.intentId,
+    sourceKind: call.callAssignment.value.notification.source.kind,
+    pendingCallbacks: Object.values(call.harkJournal?.events ?? {}).filter(event => event.state === 'pending').length,
+    rejectedCallbacks: Object.values(call.harkJournal?.events ?? {}).filter(event => event.state === 'rejected').length,
+    awaitingCallTiming: call.harkJournal?.ended?.providerStatus === 'completed' && !call.harkJournal.ended.timing,
+    callReceiptRecorded: Object.values(call.harkJournal?.events ?? {}).some(event => event.kind === 'call_ended' && event.state === 'delivered'),
+  } } : {}),
   ...(call.callAssignment?.origin === 'authenticated_hark_delivery' ? { watchDelivery: {
     deliveryId: call.callAssignment.value.hark.deliveryId,
     pendingCallbacks: Object.values(call.harkJournal?.events ?? {}).filter(event => event.state === 'pending').length,
@@ -101,6 +110,7 @@ export interface BrokerServerOptions {
   probe?: typeof probeLive;
   dependencyHealth?: () => Promise<BrokerDependencyHealth>;
   resolveHarkAssignment?: HarkAssignmentResolver;
+  resolveNotificationAssignment?: NotificationAssignmentResolver;
   harkStatusSender?: typeof deliverHarkStatus;
   harkBillingSender?: typeof deliverHarkBilling;
   inboundBillingSender?: typeof deliverHarkBilling;
@@ -128,6 +138,20 @@ export function createBrokerServer(options: BrokerServerOptions) {
   const startupContexts = options.eligibleContext ? createInboundStartupContexts(options.eligibleContext) : undefined;
   const resolveHarkAssignment = options.resolveHarkAssignment ?? (config.harkApiBaseUrl
     ? createHarkAssignmentResolver({ apiBaseUrl: config.harkApiBaseUrl }) : undefined);
+  const resolveNotificationAssignment = options.resolveNotificationAssignment ?? (config.harkApiBaseUrl
+    ? createNotificationAssignmentResolver({ apiBaseUrl: config.harkApiBaseUrl }) : undefined);
+  const managedNotification = (call: BrokerCall) => call.callAssignment?.origin === 'authenticated_hark_delivery'
+    || call.callAssignment?.origin === 'authenticated_notification_delivery';
+  const notificationWindow = (call: BrokerCall) => {
+    if (call.callAssignment?.origin === 'authenticated_hark_delivery') return { expiresAt: call.callAssignment.value.hark.expiresAt };
+    if (call.callAssignment?.origin === 'authenticated_notification_delivery') return call.callAssignment.value.notification;
+    return undefined;
+  };
+  const notificationIsDue = (call: BrokerCall) => {
+    const window = notificationWindow(call);
+    return !window || (Date.parse(window.expiresAt) > Date.now()
+      && (!('deliveryNotBefore' in window) || Date.parse(window.deliveryNotBefore) <= Date.now()));
+  };
   const harkLifecycle = config.harkApiBaseUrl && config.harkCallbackSigningSecret
     ? createHarkLifecycleDelivery({ store, apiBaseUrl: config.harkApiBaseUrl, signingSecret: config.harkCallbackSigningSecret,
       statusSender: options.harkStatusSender, billingSender: options.harkBillingSender }) : undefined;
@@ -150,7 +174,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
   let accepting = true;
   const providerFinished = (call: BrokerCall) => call.verificationCallback ? Boolean(call.verificationCallback.providerTerminal) : call.outboundObservation
     ? outboundSettlementFromObservation(call)?.state === 'settled'
-    : call.callSid && call.callAssignment?.origin === 'authenticated_hark_delivery'
+    : call.callSid && managedNotification(call)
       ? Boolean(call.harkJournal?.ended) : terminalCallStatuses.has(call.status);
   const needsHarkTiming = (call: BrokerCall) => call.harkJournal?.ended?.providerStatus === 'completed' && !call.harkJournal.ended.timing;
   const flushHark = async () => {
@@ -163,7 +187,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
     const call = store.get(id)!;
     const observedAt = new Date().toISOString();
     if (call.inboundBilling) return store.observeInboundProvider(id, status, observedAt);
-    if (call.callAssignment?.origin !== 'authenticated_hark_delivery')
+    if (!managedNotification(call))
       return store.update(id, { status, ...(terminalCallStatuses.has(status) ? { endedAt: observedAt } : {}) });
     return store.observeHarkProvider(id, status, observedAt, timing);
   }
@@ -182,7 +206,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
   function observeProviderRecord(call: BrokerCall, observed: { status: string; sid?: string; accountSid?: string; from?: string; to?: string },
     source: 'authenticated_fetch' | 'authenticated_update'): BrokerCall {
     if (!providerStates.has(observed.status as CallStatus)) throw new Error('invalid_provider_call_state');
-    const hark = call.callAssignment?.origin === 'authenticated_hark_delivery';
+    const hark = managedNotification(call);
     if (hark && observed.sid !== undefined && observed.sid !== call.callSid) throw new Error('provider_call_identity_mismatch');
     const bound = observed.sid === call.callSid && observed.accountSid === config.twilioAccountSid
       && observed.from === config.from && observed.to === call.number;
@@ -325,7 +349,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
 
   async function dialReserved(reservation: { call: BrokerCall; existing: boolean }): Promise<{ replayed: boolean; call: BrokerCall }> {
     const call = store.get(reservation.call.id)!;
-    const hark = call.callAssignment?.origin === 'authenticated_hark_delivery';
+    const hark = managedNotification(call);
     if (hark) {
       if (call.harkDispatch?.state === 'provider_accepted' && call.callSid)
         return { replayed: true, call };
@@ -346,8 +370,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
     if (hark) harkDispatching.add(call.id);
     try {
       try {
-        if (call.callAssignment?.origin === 'authenticated_hark_delivery'
-            && Date.parse(call.callAssignment.value.hark.expiresAt) <= Date.now())
+        if (!notificationIsDue(call))
           throw new HarkAssignmentError(403, 'hark_event_expired');
         const readiness = await primary.readiness(to);
         if (!readiness.eligible) throw Object.assign(new Error('The account is not ready for this call'), { code: readiness.reason });
@@ -363,8 +386,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
           callId: call.id, requestId: call.requestId, observedAt: new Date().toISOString(), reason: 'service_stopping' });
         store.update(call.id, { status: 'canceled' }); throw new Error('service_shutting_down');
       }
-      if (call.callAssignment?.origin === 'authenticated_hark_delivery'
-          && Date.parse(call.callAssignment.value.hark.expiresAt) <= Date.now()) {
+      if (!notificationIsDue(call)) {
         store.update(call.id, { status: 'canceled', failure: { code: 'hark_event_expired', message: 'The saved watch event has expired' } });
         throw new HarkAssignmentError(403, 'hark_event_expired');
       }
@@ -465,7 +487,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
         revision: process.env.BROKER_REVISION || 'development', activeCalls: active.size, dependencies });
     }
     if (route === '/internal/outbound-alerts' && request.method === 'POST') {
-      if (!accepting || !resolveHarkAssignment || !config.harkInternalToken) return json(response, 503, { ok: false, error: 'hark_broker_not_configured' });
+      if (!accepting || !config.harkInternalToken) return json(response, 503, { ok: false, error: 'hark_broker_not_configured' });
       if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(request.socket.remoteAddress ?? ''))
         return json(response, 403, { ok: false, error: 'forbidden' });
       const token = request.headers['x-dexter-internal-auth'];
@@ -476,26 +498,33 @@ export function createBrokerServer(options: BrokerServerOptions) {
       catch { return json(response, 400, { ok: false, error: 'invalid_hark_notification' }); }
       try {
         const parsed = OutboundAlertRequestSchema.safeParse(notification);
-        if (!parsed.success || !parsed.data.hark) throw new HarkAssignmentError(400, 'invalid_hark_notification');
+        if (!parsed.success || (!parsed.data.hark && !parsed.data.notificationRef)) throw new HarkAssignmentError(400, 'invalid_hark_notification');
         const normalized = parsed.data;
-        const notificationDigest = sha256Hex(canonicalJson({ namespace: 'dexter-broker-hark-notification/v1', notification: normalized }));
-        const saved = store.byHarkNotification(normalized.hark!.deliveryId, notificationDigest);
+        const generic = Boolean(normalized.notificationRef);
+        const notificationDigest = sha256Hex(canonicalJson({ namespace: generic
+          ? 'dexter-broker-notification/v1' : 'dexter-broker-hark-notification/v1', notification: normalized }));
+        const saved = generic ? store.byNotification(normalized.notificationRef!.intentId, notificationDigest)
+          : store.byHarkNotification(normalized.hark!.deliveryId, notificationDigest);
         if (saved?.harkDispatch?.state === 'provider_accepted' && saved.callSid) {
           // Read-only recovery of the original receipt, not renewed dial authority.
           return json(response, 200, { ok: true, replay: true, intentId: saved.id, callSid: saved.callSid, state: saved.status });
         }
         if (saved && saved.harkDispatch?.state !== 'not_dispatched') throw new HarkAssignmentError(409, 'hark_dispatch_uncertain');
         if (saved && harkDispatching.has(saved.id)) throw new HarkAssignmentError(409, 'hark_dispatch_pending');
-        const resolved = await resolveHarkAssignment(normalized, token);
-        // The API resolution binds the owner's saved watch, verified destination, and billing authority.
-        const result = await dialReserved(store.reserveHark(resolved, notificationDigest));
+        // API resolution binds the current owner, saved source, destination and billing authority.
+        const reservation = generic
+          ? resolveNotificationAssignment ? store.reserveNotification(await resolveNotificationAssignment(normalized, token), notificationDigest)
+            : (() => { throw new NotificationAssignmentError(503, 'notification_broker_not_configured'); })()
+          : resolveHarkAssignment ? store.reserveHark(await resolveHarkAssignment(normalized, token), notificationDigest)
+            : (() => { throw new HarkAssignmentError(503, 'hark_broker_not_configured'); })();
+        const result = await dialReserved(reservation);
         return json(response, result.replayed ? 200 : 202, { ok: true, replay: result.replayed,
           intentId: result.call.id, callSid: result.call.callSid ?? null, state: result.call.status });
       } catch (error) {
-        if (error instanceof HarkAssignmentError) return json(response, error.status, { ok: false, error: error.code });
-        if (error instanceof Error && ['Hark delivery conflicts with its saved record', 'Hark notification conflicts with its saved record'].includes(error.message))
+        if (error instanceof HarkAssignmentError || error instanceof NotificationAssignmentError) return json(response, error.status, { ok: false, error: error.code });
+        if (error instanceof Error && ['Hark delivery conflicts with its saved record', 'Hark notification conflicts with its saved record', 'Notification delivery conflicts with its saved record', 'Notification conflicts with its saved record'].includes(error.message))
           return json(response, 409, { ok: false, error: 'hark_delivery_conflict' });
-        if (error instanceof Error && error.message === 'Hark notification identity unavailable')
+        if (error instanceof Error && ['Hark notification identity unavailable', 'Notification identity unavailable'].includes(error.message))
           return json(response, 409, { ok: false, error: 'hark_dispatch_history_unavailable' });
         if ((error as { code?: string }).code === 'call_already_open') return json(response, 409, { ok: false, error: 'call_already_open' });
         throw error;
@@ -685,7 +714,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
     }
     if (terminalCallStatuses.has(call.status)) return xml(response, '<Response><Hangup/></Response>');
     // This is the signed answer route, distinct from a ringing status callback.
-    if (call.callAssignment?.origin === 'authenticated_hark_delivery') call = observeProviderState(call.id, 'in-progress');
+    if (managedNotification(call)) call = observeProviderState(call.id, 'in-progress');
     try { call = await bind(call, proof); }
     catch (error) {
       store.update(call.id, { status: 'failed', failure: safeFailure(error) });
@@ -805,7 +834,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
           if (call.inbound && !inbound.mediaAllowed(store.get(call.id)!)) throw new Error('inbound_media_not_admitted');
           streamSid = mediaStart(frame.start, { accountSid: config.twilioAccountSid, callSid: call.callSid!, token: streamToken(config.controlToken, call.id, call.callSid!) });
           clearTimeout(startTimer);
-          if (call.callAssignment?.origin === 'authenticated_hark_delivery') {
+          if (managedNotification(call)) {
             store.update(call.id, { streamSid });
             store.observeHarkMediaStarted(call.id, new Date().toISOString());
           } else store.update(call.id, { streamSid, status: 'in-progress', mediaStartedAt: store.get(call.id)!.mediaStartedAt ?? new Date().toISOString() });
@@ -813,6 +842,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
           const voiceOptions: BrokerLiveSessionOptions = { apiKey: config.apiKey, callId: call.id, voice: config.voice,
             instructions: brokerInstructions({ direction: call.direction, purpose: call.purpose, registeredAssignment: !!call.callAssignment,
               ...(call.callAssignment?.origin === 'authenticated_hark_delivery' ? { watch: call.callAssignment.value.hark } : {}),
+              ...(call.callAssignment?.origin === 'authenticated_notification_delivery' ? { notification: call.callAssignment.value.notification } : {}),
               name: call.primary!.name, context: call.primary!.context }),
             history: brokerHistory({ name: call.primary!.name, context: call.primary!.context }),
             backend: backend ?? { async delegate() { throw new Error('generation_backend_required'); } },
@@ -845,7 +875,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
               // continues. Its receipt confirms context injection, not playback.
               queueMicrotask(() => {
                 if (stopping || !live) return;
-                void live.appendInstructions(brokerOpening(call.direction, !!call.callAssignment, call.callAssignment?.origin === 'authenticated_hark_delivery'))
+                void live.appendInstructions(brokerOpening(call.direction, !!call.callAssignment, call.callAssignment?.origin === 'authenticated_hark_delivery', call.callAssignment?.origin === 'authenticated_notification_delivery'))
                   .then(result => { store.update(call.id, { voiceOpening: result }); })
                   .catch(() => { if (!stopping) store.update(call.id, { voiceOpening: { status: 'unconfirmed', reason: 'opening_delivery_failed' } }); });
               });

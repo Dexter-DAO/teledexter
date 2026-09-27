@@ -323,6 +323,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
             instructions: continuation ? (options.callerIntent ? mixedSelectedInstructions : selectedInstructions) : brokerInstructions({ direction: initialCall.direction, purpose: initialCall.purpose,
               registeredAssignment: input.allowOpening && !initialCall.voiceOpening && Boolean(initialCall.callAssignment),
               ...(initialCall.callAssignment?.origin === 'authenticated_hark_delivery' ? { watch: initialCall.callAssignment.value.hark } : {}),
+              ...(initialCall.callAssignment?.origin === 'authenticated_notification_delivery' ? { notification: initialCall.callAssignment.value.notification } : {}),
               name: input.context.context.displayName }),
             backend: { async delegate(request, channel) {
               if (!ready || !backend || request.sessionId !== sessionId

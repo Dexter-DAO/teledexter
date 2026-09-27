@@ -9,6 +9,7 @@ import { z } from 'zod';
 import { brokerCallAssignmentSchema, phoneCallAssignmentSchema, retainedPhoneCallAssignmentRefSchema, sameCallAssignmentRef, type BrokerCallAssignment, type PhoneCallAssignmentRef } from './assignment.js';
 import { selectedQuestionPublicationReceiptsAccepted, validateSelectedQuestionPublications, type BrokerPublicationJournal } from './publications.js';
 import { resolvedHarkAssignmentSchema } from './harkAssignment.js';
+import { resolvedNotificationAssignmentSchema } from './notificationAssignment.js';
 import { canonicalJson } from '../outbound/canonical.js';
 import { observeHark, pendingHarkEvents, settleHarkJournalEvent, validateHarkJournal,
   type HarkDeliveryOutcome, type HarkEndedTiming, type HarkJournal, type HarkJournalEvent, type HarkProviderStatus } from './harkJournal.js';
@@ -109,9 +110,13 @@ const harkDispatchSchema = z.discriminatedUnion('state', [
   z.object({ ...dispatchBase, state: z.literal('provider_accepted'), dispatchStartedAt: dispatchTime, providerAcceptedAt: dispatchTime, preDispatchFailure }).strict(),
 ]);
 function validateHarkDispatch(call: BrokerCall): void {
-  if (call.harkDispatch === undefined) return;
+  if (call.harkDispatch === undefined) {
+    if (call.callAssignment?.origin === 'authenticated_notification_delivery') throw new Error('Notification dispatch history unavailable');
+    return;
+  }
   const dispatch = harkDispatchSchema.parse(call.harkDispatch);
-  if (call.callAssignment?.origin !== 'authenticated_hark_delivery') throw new Error('Hark dispatch requires its original assignment');
+  if (call.callAssignment?.origin !== 'authenticated_hark_delivery'
+      && call.callAssignment?.origin !== 'authenticated_notification_delivery') throw new Error('Hark dispatch requires its original assignment');
   if (dispatch.reservedAt !== call.createdAt) throw new Error('Hark dispatch reservation time changed');
   if (dispatch.state === 'provider_accepted') {
     if (!call.callSid || !/^CA[0-9a-fA-F]{32}$/.test(call.callSid)) throw new Error('Accepted Hark dispatch requires its provider SID');
@@ -546,7 +551,7 @@ export class BrokerStore {
     const existing = this.list().find(call => call.requestId === input.requestId || (input.callSid && call.callSid === input.callSid));
     if (existing) {
       assertCallContinuationReplay(existing.continuation, continuation);
-      if (existing.callAssignment?.origin === 'authenticated_hark_delivery') throw new Error('Call origin conflicts with its saved record');
+      if (existing.callAssignment && existing.callAssignment.origin !== 'authenticated_broker_control') throw new Error('Call origin conflicts with its saved record');
       if (existing.number !== input.number || existing.direction !== input.direction || existing.purpose !== input.purpose || (input.callSid && existing.callSid !== input.callSid)) throw new Error('Call request identity conflicts with its saved record');
       return { call: existing, existing: true };
     }
@@ -653,6 +658,49 @@ export class BrokerStore {
       throw new Error('Hark delivery conflicts with its saved record');
     if (!call.harkDispatch) throw new Error('Hark notification identity unavailable');
     if (call.harkDispatch.notificationDigest !== notificationDigest) throw new Error('Hark notification conflicts with its saved record');
+    validateHarkDispatch(call);
+    return call;
+  }
+
+  /** Only the API's resolved Notification snapshot supplies this reservation. */
+  reserveNotification(value: unknown, notificationDigest: string): { call: BrokerCall; existing: boolean } {
+    dispatchDigest.parse(notificationDigest);
+    const resolved = resolvedNotificationAssignmentSchema.parse(value);
+    const assignment = resolved.callAssignment;
+    const id = assignment.brokerCallId;
+    const existing = this.list().find(call => call.id === id || call.requestId === id);
+    if (existing) {
+      if (existing.id !== id || existing.requestId !== id || existing.direction !== 'outbound'
+          || existing.number !== resolved.to || existing.purpose !== assignment.purpose
+          || existing.callAssignment?.origin !== 'authenticated_notification_delivery'
+          || canonicalJson(existing.callAssignment.value) !== canonicalJson(assignment))
+        throw new Error('Notification delivery conflicts with its saved record');
+      if (existing.harkDispatch?.notificationDigest !== notificationDigest)
+        throw new Error('Notification conflicts with its saved record');
+      return { call: existing, existing: true };
+    }
+    const now = new Date().toISOString();
+    const call: BrokerCall = { id, requestId: id, direction: 'outbound', purpose: assignment.purpose,
+      number: resolved.to, status: 'prepared', createdAt: now, updatedAt: now, delegations: {},
+      callAssignment: { origin: 'authenticated_notification_delivery', value: assignment } };
+    call.harkDispatch = { version: 1, notificationDigest,
+      state: 'not_dispatched', reservedAt: now };
+    validateAssignment(call);
+    validateHarkDispatch(call);
+    validateSelectedVoice(call);
+    this.persist({ version: 1, calls: { ...this.state.calls, [id]: call } });
+    return { call: structuredClone(call), existing: false };
+  }
+
+  /** Caller authentication is separate; this only checks the saved notification identity. */
+  byNotification(deliveryId: string, notificationDigest: string): BrokerCall | undefined {
+    dispatchDigest.parse(notificationDigest);
+    const call = this.list().find(item => item.id === deliveryId || item.requestId === deliveryId);
+    if (!call) return undefined;
+    if (call.id !== deliveryId || call.requestId !== deliveryId || call.callAssignment?.origin !== 'authenticated_notification_delivery')
+      throw new Error('Notification delivery conflicts with its saved record');
+    if (!call.harkDispatch) throw new Error('Notification identity unavailable');
+    if (call.harkDispatch.notificationDigest !== notificationDigest) throw new Error('Notification conflicts with its saved record');
     validateHarkDispatch(call);
     return call;
   }
