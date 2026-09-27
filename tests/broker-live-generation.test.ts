@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createLiveGenerationController, LiveGenerationError,
   LIVE_GENERATION_TRANSITION_MS,
-  liveGenerationJournalSchema, type GenerationCallbacks, type GenerationHandle, type LiveGenerationJournal,
+  liveGenerationJournalSchema, type GenerationCallbacks, type GenerationHandle, type LiveGenerationJournal, type ContextReadFailure,
   type LiveGenerationOptions } from '../src/broker/liveGeneration.js';
 import { PrimaryApiError } from '../src/broker/primaryApi.js';
 import type { EligibleContextClient, EligiblePhoneCall, HistoryVersion } from '../src/broker/eligibleContext.js';
@@ -52,6 +52,7 @@ function harness(initial?: LiveGenerationJournal, overrides: Partial<LiveGenerat
   let ordinal = initial?.segments.length ?? 0;
   const persisted: LiveGenerationJournal[] = [];
   const problems: string[] = [];
+  const contextReadFailures: ContextReadFailure[] = [];
   const audio: Array<{ payload: string; sessionId: string }> = [];
   let clears = 0;
   const operations: Array<{ name: string; requestId?: string; version?: HistoryVersion }> = [];
@@ -79,6 +80,7 @@ function harness(initial?: LiveGenerationJournal, overrides: Partial<LiveGenerat
     newId: () => `aaaaaaaa-aaaa-4aaa-8aaa-${String(++ordinal).padStart(12, '0')}`,
     persist: value => { persisted.push(structuredClone(value)); },
     onProblem: code => { problems.push(code); },
+    onContextReadFailure: failure => { contextReadFailures.push(failure); },
     onAudio: (payload, attached) => { audio.push({ payload, sessionId: attached.sessionId }); },
     clearPlayback: () => { clears++; },
     async open(input) {
@@ -103,10 +105,136 @@ function harness(initial?: LiveGenerationJournal, overrides: Partial<LiveGenerat
     ...overrides,
   };
   const controller = createLiveGenerationController(options);
-  return { controller, options, sessions, persisted, problems, audio, api, operations,
+  return { controller, options, sessions, persisted, problems, contextReadFailures, audio, api, operations,
     get clears() { return clears; }, setTime: (value: number) => { time = value; },
     advanceVersion: () => { version = versionFor(Number(version.contextEpoch) + 1); } };
 }
+
+const temporarilyUnavailable = () => new PrimaryApiError('http_error', 503, { code: 'temporarily_unavailable', retryable: true });
+
+test('a transient refresh failure recovers the same call and saved result without publishing stale audio', async () => {
+  const h = harness(); await h.controller.start(); h.advanceVersion();
+  const fetch = h.api.fetch; let attempts = 0;
+  h.api.fetch = async scope => {
+    if (++attempts === 1) { h.sessions[0].input.callbacks.onAudio('stale'); throw temporarilyUnavailable(); }
+    return fetch(scope);
+  };
+  try {
+    const outcome = await h.controller.deliver(requestId, { kind: 'assistant', messageId });
+    assert.equal(attempts, 2);
+    assert.equal(outcome.attachment.sessionId, 'session_2');
+    assert.equal(h.sessions[1].publications[0].requestId, requestId);
+    assert.deepEqual(h.audio, []);
+    assert.deepEqual(h.problems, []);
+    assert.deepEqual(h.contextReadFailures.map(({ stage, attempt, code, status, remoteCode, retryable }) =>
+      ({ stage, attempt, code, status, remoteCode, retryable })), [{ stage: 'assert', attempt: 1, code: 'http_error',
+      status: 409, remoteCode: 'context_changed', retryable: false }, { stage: 'fetch', attempt: 1, code: 'http_error',
+      status: 503, remoteCode: 'temporarily_unavailable', retryable: true }]);
+  } finally { await h.controller.stop(); }
+});
+
+test('a transient assertion failure gates private audio and unsent input until the same version is revalidated', async () => {
+  const h = harness(); await h.controller.start();
+  const check = h.api.assert, waiting = pending<void>(); let attempts = 0;
+  h.api.assert = async (scope, version) => {
+    if (++attempts === 1) throw temporarilyUnavailable();
+    await waiting.promise; return check(scope, version);
+  };
+  const recovering = h.controller.beforeReuse();
+  try {
+    await until(() => h.controller.snapshot().phase !== 'active');
+    h.sessions[0].input.callbacks.onAudio('uncertain private output');
+    assert.equal(h.controller.appendAudio({ payload: 'AQI=', callInputStartSample: 0 }), 'buffered');
+    waiting.resolve();
+    const attached = await recovering;
+    assert.equal(attached.sessionId, 'session_1');
+    assert.equal(h.sessions.length, 1);
+    assert.equal(h.sessions[0].closes.length, 0);
+    assert.deepEqual(h.sessions[0].audio, [{ payload: 'AQI=', callInputStartSample: 0 }]);
+    assert.deepEqual(h.audio, []);
+    assert.deepEqual(h.problems, []);
+  } finally { waiting.resolve(); await recovering.catch(() => {}); await h.controller.stop(); }
+});
+
+test('a transient delivery failure revalidates the voice before restoring output and publishes exactly once', async () => {
+  const h = harness(); await h.controller.start();
+  const delivery = h.api.delivery; let attempts = 0;
+  h.api.delivery = async (...args) => { if (++attempts === 1) throw temporarilyUnavailable(); return delivery(...args); };
+  try {
+    const outcome = await h.controller.deliver(requestId, { kind: 'assistant', messageId });
+    assert.equal(outcome.publication?.status, 'accepted');
+    assert.equal(attempts, 2);
+    assert.equal(h.sessions.length, 1);
+    assert.equal(h.sessions[0].publications.length, 1);
+    assert.equal(h.sessions[0].closes.length, 0);
+    assert.deepEqual(h.problems, []);
+  } finally { await h.controller.stop(); }
+});
+
+test('confirmed authority denial after a transient failure remains terminal and never restores old audio', async () => {
+  const h = harness(); await h.controller.start(); let attempts = 0;
+  h.api.assert = async () => { if (++attempts === 1) throw temporarilyUnavailable();
+    throw new PrimaryApiError('http_error', 403, { code: 'authority_unavailable', retryable: false }); };
+  try {
+    await assert.rejects(h.controller.beforeReuse(), (error: unknown) => error instanceof PrimaryApiError && error.status === 403);
+    h.sessions[0].input.callbacks.onAudio('revoked');
+    assert.equal(attempts, 2);
+    assert.equal(h.controller.snapshot().phase, 'unavailable');
+    assert.equal(h.sessions.length, 1);
+    assert.deepEqual(h.audio, []);
+  } finally { await h.controller.stop(); }
+});
+
+test('repeated transient failures stop after three reads and retain each original failure without another voice', async () => {
+  const h = harness(); await h.controller.start(); let attempts = 0;
+  h.api.assert = async () => { attempts++; throw temporarilyUnavailable(); };
+  try {
+    await assert.rejects(h.controller.beforeReuse(), (error: unknown) => error instanceof PrimaryApiError && error.status === 503);
+    assert.equal(attempts, 3);
+    assert.equal(h.sessions.length, 1);
+    assert.equal(h.controller.snapshot().phase, 'unavailable');
+    assert.deepEqual(h.contextReadFailures.map(value => value.attempt), [1, 2, 3]);
+  } finally { await h.controller.stop(); }
+});
+
+test('a context change during transient recovery replaces the gated source instead of restoring it', async () => {
+  const h = harness(); await h.controller.start();
+  const check = h.api.assert; let attempts = 0;
+  h.api.assert = async (...args) => { if (++attempts === 1) { h.advanceVersion(); throw temporarilyUnavailable(); } return check(...args); };
+  try {
+    const next = await h.controller.beforeReuse();
+    assert.equal(next.sessionId, 'session_2');
+    h.sessions[0].input.callbacks.onAudio('retired');
+    assert.deepEqual(h.audio, []);
+    assert.deepEqual(h.problems, []);
+  } finally { await h.controller.stop(); }
+});
+
+test('call stop cancels a hung eligibility assertion immediately without restoring its late success', async () => {
+  const h = harness(); await h.controller.start();
+  const wait = pending<void>(), check = h.api.assert; let entered = false;
+  h.api.assert = async (...args) => { entered = true; await wait.promise; return check(...args); };
+  const checking = assert.rejects(h.controller.beforeReuse(), (error: unknown) => error instanceof LiveGenerationError && error.code === 'call_stopped');
+  try {
+    await until(() => entered);
+    await h.controller.stop();
+    await checking;
+    assert.equal(h.controller.snapshot().phase, 'stopped');
+    wait.resolve(); await Promise.resolve();
+    assert.equal(h.controller.snapshot().deliveryAttachment, undefined);
+  } finally { wait.resolve(); await checking; await h.controller.stop(); }
+});
+
+test('transient retries use the original transition deadline rather than restarting it', async () => {
+  const h = harness(undefined, { transitionTimeoutMs: 10 });
+  let attempts = 0;
+  h.api.fetch = async () => { attempts++; throw temporarilyUnavailable(); };
+  try {
+    await assert.rejects(h.controller.start(), (error: unknown) => error instanceof LiveGenerationError && error.code === 'generation_transition_timeout');
+    assert.equal(attempts, 1, 'backoff cannot outlive the original transition window');
+    assert.equal(h.sessions.length, 0);
+  } finally { await h.controller.stop(); }
+});
 
 const startupCall = () => ({ id: callId, callSid, primary: { bindingId, primaryDexterId, threadId, name: 'Dexter', context: '' } });
 

@@ -107,6 +107,10 @@ export interface GenerationCallbacks {
   onTranscript(snapshot: LiveTranscriptSnapshot): void;
   onClosed(result: LiveSessionClosed): void;
 }
+export interface ContextReadFailure {
+  stage: 'fetch' | 'assert' | 'delivery'; attempt: number; at: string; durationMs: number;
+  code: PrimaryApiError['code']; status?: number; remoteCode?: string; retryable: boolean;
+}
 export interface LiveGenerationOptions {
   callId: string;
   binding: EligibleContextBinding;
@@ -124,6 +128,7 @@ export interface LiveGenerationOptions {
   onAudio(payload: string, attachment: LiveGenerationAttachment): void;
   clearPlayback(): void;
   onProblem(code: string): void;
+  onContextReadFailure?(failure: ContextReadFailure): void;
   maxBufferedAudioBytes?: number;
   /** May tighten the shared fetch/start/assert budget, never extend it. */
   transitionTimeoutMs?: number;
@@ -188,6 +193,7 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
   const retirements = new Map<string, Promise<void>>();
   const openings = new Set<Promise<void>>();
   let transitionAbort: AbortController | undefined;
+  const reads = new Set<AbortController>();
   const canOpenInitially = state.segments.length === 0;
   let activated = false;
   let queued: Array<GenerationInputAudio & { bytes: number }> = [];
@@ -202,8 +208,8 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
     if (now() >= Date.parse(clocks.callDeadlineAt)) throw new LiveGenerationError('call_deadline');
     if (inputBlocked) throw new LiveGenerationError('input_unavailable');
   };
-  const serial = <T>(operation: () => Promise<T>): Promise<T> => {
-    const pending = tail.then(operation);
+  const serial = <T>(operation: (deadline: number) => Promise<T>): Promise<T> => {
+    const pending = tail.then(() => operation(Math.min(now() + transitionTimeout, Date.parse(clocks.callDeadlineAt))));
     tail = pending.catch(() => {});
     return pending;
   };
@@ -321,12 +327,80 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
     if (firstInput) save();
     return true;
   };
-  const replace = async (): Promise<LiveGenerationAttachment> => {
+  const flushInput = (check: () => void) => {
+    const buffered = queued; queued = []; queuedBytes = 0;
+    for (let index = 0; index < buffered.length; index++) {
+      let attempted = false;
+      try {
+        check(); attempted = true;
+        if (!sendInput(buffered[index])) throw new LiveGenerationError('input_transport_refused');
+      } catch (error) {
+        queued = buffered.slice(index + Number(attempted));
+        queuedBytes = queued.reduce((sum, frame) => sum + frame.bytes, 0);
+        throw error;
+      }
+    }
+    save();
+  };
+  const transient = (error: unknown): error is PrimaryApiError => error instanceof PrimaryApiError
+    && (error.code === 'request_timeout' || error.code === 'request_failed'
+      || (error.code === 'http_error' && error.retryable === true && [429, 502, 503, 504].includes(error.status ?? 0)));
+  /** These three endpoints only read eligibility. Retrying never submits work,
+   * answers a question or repeats an uncertain provider audio send. */
+  const readContext = async <T>(stage: 'fetch' | 'assert' | 'delivery', operation: () => Promise<T>,
+    deadline: number, onRetry?: () => void): Promise<T> => {
+    const abort = new AbortController(); reads.add(abort);
+    const interrupted = new Promise<never>((_resolve, reject) => {
+      abort.signal.addEventListener('abort', () => reject(abort.signal.reason), { once: true });
+    });
+    void interrupted.catch(() => {});
+    const check = () => {
+      expire();
+      if (abort.signal.aborted) throw abort.signal.reason;
+      if (now() >= deadline) throw new LiveGenerationError('generation_transition_timeout');
+    };
+    const timer = setTimeout(() => abort.abort(new LiveGenerationError(
+      now() >= Date.parse(clocks.callDeadlineAt) ? 'call_deadline' : 'generation_transition_timeout')),
+    Math.max(1, deadline - now()));
+    timer.unref?.();
+    try {
+      for (let attempt = 1; ; attempt++) {
+        check(); const startedAt = now();
+        try {
+          const value = await Promise.race([operation(), interrupted]); check(); return value;
+        } catch (error) {
+          check();
+          if (error instanceof PrimaryApiError) {
+            try { options.onContextReadFailure?.({ stage, attempt, at: stamp(),
+              durationMs: Math.max(0, now() - startedAt), code: error.code,
+              ...(error.status === undefined ? {} : { status: error.status }),
+              ...(error.remoteCode === undefined ? {} : { remoteCode: error.remoteCode }), retryable: transient(error) }); }
+            catch { /* Diagnostic storage must not turn a recoverable read into a hangup. */ }
+          }
+          if (!transient(error) || attempt === 3) throw error;
+          onRetry?.();
+          // A brief bounded backoff avoids hammering an unavailable service.
+          // The same deadline covers retries, replacement startup and delivery.
+          let retryTimer: ReturnType<typeof setTimeout> | undefined;
+          try { await Promise.race([new Promise<void>(resolve => { retryTimer = setTimeout(resolve, attempt * 100); }), interrupted]); }
+          finally { clearTimeout(retryTimer); }
+        }
+      }
+    } finally { clearTimeout(timer); reads.delete(abort); }
+  };
+  const restore = (current: LiveGenerationAttachment) => {
+    expire();
+    if (segment(current.generationId).state !== 'active' || handleId !== current.generationId || handle?.sessionId !== current.sessionId)
+      throw new LiveGenerationError('generation_closed_during_context_recovery');
+    activeId = current.generationId; state.phase = 'active'; state.deliveryAttachment = current; save();
+    flushInput(expire);
+    return attachment();
+  };
+  const replace = async (deadline: number): Promise<LiveGenerationAttachment> => {
     expire(); block('replacing');
-    void retire('context_replaced');
     const abort = new AbortController();
     transitionAbort = abort;
-    const transitionEndsAt = Math.min(now() + transitionTimeout, Date.parse(clocks.callDeadlineAt));
+    const transitionEndsAt = Math.min(deadline, now() + transitionTimeout, Date.parse(clocks.callDeadlineAt));
     const checkTransition = () => {
       expire();
       if (abort.signal.aborted) throw abort.signal.reason;
@@ -351,8 +425,11 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
       // A second commit can invalidate a candidate during startup. One fresh
       // candidate is allowed, within this same deadline and unsent-input queue.
       for (let attempt = 0; attempt < 2; attempt++) {
-        const context = parseEligiblePhoneCall(await wait(() => options.context.fetch(state.binding)), state.binding);
+        const context = parseEligiblePhoneCall(await wait(() => readContext('fetch', () => options.context.fetch(state.binding), transitionEndsAt)), state.binding);
         if (context.state !== 'open') throw new LiveGenerationError('call_not_open');
+        // Old output is already gated. Keep its transport and source capture
+        // until a fresh eligible page exists, then start the successor.
+        void retire('context_replaced');
         state.binding = { ...state.binding, ownerPrincipalId: context.context.history.version.ownerPrincipalId,
           ...(context.callAssignmentRef ? { callAssignmentRef: context.callAssignmentRef } : {}) };
         const current: LiveGenerationJournal['segments'][number] = {
@@ -379,7 +456,7 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
         if (state.segments.some(value => value !== current && value.sessionId === opened.sessionId))
           throw new LiveGenerationError('generation_session_reused');
         current.sessionId = opened.sessionId; current.readyAt = stamp(); save();
-        try { await wait(() => options.context.assert(state.binding, current.version)); }
+        try { await wait(() => readContext('assert', () => options.context.assert(state.binding, current.version), transitionEndsAt)); }
         catch (error) {
           if (attempt === 0 && changed(error)) { void retire('context_unavailable'); continue; }
           throw error;
@@ -390,22 +467,7 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
         save();
         // No await between attachment and the complete replay. Publications
         // queued behind this operation observe the entire input frontier.
-        const buffered = queued; queued = []; queuedBytes = 0;
-        for (let index = 0; index < buffered.length; index++) {
-          let attempted = false;
-          try {
-            checkTransition();
-            attempted = true;
-            if (!sendInput(buffered[index])) throw new LiveGenerationError('input_transport_refused');
-          } catch (error) {
-            // Once append was attempted its transport outcome may be unknown.
-            // Keep only the untouched suffix, including a frame gated by time.
-            queued = buffered.slice(index + Number(attempted));
-            queuedBytes = queued.reduce((sum, frame) => sum + frame.bytes, 0);
-            throw error;
-          }
-        }
-        save();
+        flushInput(checkTransition);
         return attachment();
       }
       throw new LiveGenerationError('context_unavailable');
@@ -413,6 +475,7 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
       abort.abort(error);
       if (!stopped) unavailable(error instanceof LiveGenerationError ? error.code : 'context_unavailable');
       if (candidate?.handle) void retire(stopped ? 'call_stopped' : 'context_unavailable', candidate.generationId, candidate.handle);
+      else if (!candidate) void retire(stopped ? 'call_stopped' : 'context_unavailable');
       else if (candidate) {
         const incomplete = segment(candidate.generationId);
         if (incomplete.state === 'starting') {
@@ -427,13 +490,20 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
     }
   };
   const changed = (error: unknown) => error instanceof PrimaryApiError && error.status === 409 && error.remoteCode === 'context_changed';
-  const beforeReuse = async (): Promise<LiveGenerationAttachment> => {
+  const beforeReuse = async (deadline: number): Promise<LiveGenerationAttachment> => {
     expire();
-    if (state.phase !== 'active') return replace();
-    const current = segment(attachment().generationId);
-    try { await options.context.assert(state.binding, current.version); }
+    if (state.phase !== 'active') return replace(deadline);
+    const attached = attachment();
+    const current = segment(attached.generationId);
+    let suspended = false;
+    try {
+      await readContext('assert', () => options.context.assert(state.binding, current.version), deadline, () => {
+        if (!suspended) { suspended = true; block('replacing'); }
+      });
+      if (suspended) return restore(attached);
+    }
     catch (error) {
-      if (changed(error)) return replace();
+      if (changed(error)) return replace(deadline);
       unavailable('context_assert_unavailable'); await retire('context_unavailable'); throw error;
     }
     return attachment();
@@ -448,8 +518,8 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
      * to interleave between chunks of a question. The callback must not recurse
      * into this controller's queued methods. */
     withCurrentAttachment<T>(publish: (current: LiveGenerationAttachment) => Promise<T>): Promise<T> {
-      return serial(async () => {
-        const current = await beforeReuse();
+      return serial(async deadline => {
+        const current = await beforeReuse(deadline);
         const result = await publish(current);
         if (attachment().generationId !== current.generationId)
           throw new LiveGenerationError('publication_generation_changed');
@@ -480,16 +550,27 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
       return 'buffered';
     },
     deliver(requestId: string, source: EligibleDeliveryTarget, laterCall?: RequestDeliveryJournal): Promise<GenerationDeliveryOutcome> {
-      return serial(async () => {
-        let currentAttachment = await beforeReuse();
+      return serial(async deadline => {
+        let currentAttachment = await beforeReuse(deadline);
         let current = segment(currentAttachment.generationId);
         let response: EligibleDeliveryResponse;
-        try { response = await options.context.delivery(state.binding, requestId, { version: current.version, source }, laterCall); }
+        const readDelivery = async () => {
+          let suspended = false;
+          const value = await readContext('delivery', () => options.context.delivery(state.binding, requestId, { version: current.version, source }, laterCall), deadline, () => {
+            if (!suspended) { suspended = true; block('replacing'); }
+          });
+          if (suspended) {
+            await readContext('assert', () => options.context.assert(state.binding, current.version), deadline);
+            restore(currentAttachment);
+          }
+          return value;
+        };
+        try { response = await readDelivery(); }
         catch (error) {
           if (!changed(error)) { unavailable('eligible_delivery_unavailable'); await retire('context_unavailable'); throw error; }
-          currentAttachment = await replace(); current = segment(currentAttachment.generationId);
+          currentAttachment = await replace(deadline); current = segment(currentAttachment.generationId);
           // One replacement for this refusal; a second refusal propagates, never loops.
-          try { response = await options.context.delivery(state.binding, requestId, { version: current.version, source }, laterCall); }
+          try { response = await readDelivery(); }
           catch (retryError) { unavailable('eligible_delivery_unavailable'); await retire('context_unavailable'); throw retryError; }
         }
         const stillCurrent = attachment();
@@ -511,6 +592,7 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
       // awaiting this queued Live cleanup; a stalled adapter cannot extend it.
       stopped = true; block('stopped');
       transitionAbort?.abort(new LiveGenerationError('call_stopped'));
+      for (const read of reads) read.abort(new LiveGenerationError('call_stopped'));
       if (queuedBytes) problem('undelivered_buffered_audio');
       return serial(async () => {
         await retire('call_stopped');

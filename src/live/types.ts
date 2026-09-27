@@ -121,6 +121,8 @@ export interface BrokerLiveSession {
   appendCommentary?(text: string): Promise<LiveDelivery>;
   /** Drops queued/new output until the application explicitly resumes playback. */
   interruptPlayback(instruction: string): Promise<LiveDelivery>;
+  /** Local playback-only interruption; sends no model instruction or request. */
+  pausePlayback?(): void;
   resumePlayback(): void;
   getTranscript(): LiveTranscriptSnapshot;
   close(reason?: string): Promise<LiveSessionClosed>;

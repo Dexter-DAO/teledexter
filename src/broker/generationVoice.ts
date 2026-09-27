@@ -79,6 +79,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
   const sessions = new Map<string, { voice: BrokerLiveSession; backend: PrimaryBackend; firstSample?: number }>();
   const admissions = new Map<string, Map<LiveDelegationRequest, { promise: Promise<void>; resolve(): void }>>();
   let stopped = false;
+  let playbackPaused = false;
   let readyReported = false;
   let lastSpeechAt = 0;
   let inputNextSample = initialCall.liveGenerations?.inputNextSample ?? 0;
@@ -268,9 +269,12 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
       options.store.update(initialCall.id, { liveGenerations: journal,
         ...(journal.deliveryAttachment ? { liveSessionId: journal.deliveryAttachment.sessionId } : {}) });
     },
-    onAudio: options.onAudio,
+    onAudio(payload) { if (!playbackPaused) options.onAudio(payload); },
     clearPlayback: options.onPlaybackClear,
     onProblem(code) { options.onProblem(code); },
+    onContextReadFailure(failure) {
+      options.store.update(initialCall.id, { contextReadFailures: [...(call().contextReadFailures ?? []), failure].slice(-16) });
+    },
     async beforeRetire(generationId) {
       const pending = admissions.get(generationId);
       if (!pending?.size || observer.signal.aborted) return;
@@ -596,10 +600,18 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
       return controller.withCurrentAttachment(attachment => sessions.get(attachment.sessionId)!.voice.appendInstructions(text));
     },
     async interruptPlayback(instruction) {
+      // Barge-in is a local playback action. Silence the current stream before
+      // any context I/O, then qualify the instruction against the current voice.
+      playbackPaused = true;
+      const voice = current()?.session?.voice;
+      if (voice?.pausePlayback) voice.pausePlayback();
+      else options.onPlaybackClear();
       const attachment = await controller.beforeReuse();
-      return sessions.get(attachment.sessionId)!.voice.interruptPlayback(instruction);
+      // A resume may have arrived while the assertion was in flight. Appending
+      // the instruction must not issue another late playback pause.
+      return sessions.get(attachment.sessionId)!.voice.appendInstructions(instruction);
     },
-    resumePlayback() { current()?.session?.voice.resumePlayback(); },
+    resumePlayback() { playbackPaused = false; current()?.session?.voice.resumePlayback(); },
     getTranscript() { return current()?.session?.voice.getTranscript() ?? emptyTranscript(); },
     close(reason = 'call_stopped') {
       if (closing) return closing;
