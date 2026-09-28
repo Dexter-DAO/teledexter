@@ -1,4 +1,6 @@
 import type { BrokerSmsBridge } from './sms.js';
+import { createResultSmsClient, type ResultSmsClient } from './resultSmsClient.js';
+import { dispatchResultSms, resultSmsFailure } from './resultSmsDispatch.js';
 import { createInboundBillingLifecycle } from './inboundBillingLifecycle.js';
 import { inboundBillingSummary } from './inboundBilling.js';
 import { createRestrictedSetupServer, type RestrictedSetupServerOptions } from './restrictedSetupServer.js';
@@ -99,6 +101,7 @@ const publicCall = (call: BrokerCall) => ({
 
 export interface BrokerServerOptions {
   sms?: BrokerSmsBridge;
+  resultSms?: ResultSmsClient;
   config: BrokerConfig;
   store?: BrokerStore;
   primary?: PrimaryApiClient;
@@ -132,6 +135,8 @@ export function createBrokerServer(options: BrokerServerOptions) {
   const primary = options.primary ?? createPrimaryApiClient({ apiBaseUrl: config.apiBaseUrl, phoneServiceSecret: config.phoneServiceSecret,
     ...(options.eligibleContext ? { contextProtocol: { version: 'memory-eligible-v1' as const,
       parse: (value: unknown) => eligiblePhoneCallSchema.parse(value) } } : {}) });
+  const resultSms = options.resultSms ?? createResultSmsClient({ apiBaseUrl: config.apiBaseUrl,
+    phoneServiceSecret: config.phoneServiceSecret });
   const provider = options.provider ?? Twilio(config.twilioAccountSid, config.twilioAuthToken, { autoRetry: false, timeout: 15_000 });
   const voiceFactory = options.voiceFactory ?? createBrokerLiveSession;
   const probe = options.probe ?? probeLive;
@@ -557,6 +562,50 @@ export function createBrokerServer(options: BrokerServerOptions) {
         }
       }
       if (!authorizedControl(request.headers.authorization, config.controlToken)) return json(response, 401, { error: 'unauthorized' });
+      if (request.method === 'POST' && route === '/internal/broker/result-sms') {
+        let input: unknown;
+        try { input = JSON.parse(await body(request, 2_048)); }
+        catch { return json(response, 400, { ok: false, error: 'invalid_request' }); }
+        const result = await dispatchResultSms(input, { client: resultSms, sms: options.sms, accepting: () => accepting });
+        return json(response, !result.ok && result.error === 'invalid_request' ? 400 : 200, result);
+      }
+      if (request.method === 'POST' && route === '/internal/broker/result-sms/eligibility') {
+        let input: Record<string, unknown>;
+        try {
+          input = JSON.parse(await body(request, 2_048));
+          const keys = ['bindingId', 'callSid', 'primaryDexterId', 'threadId'];
+          if (!input || Array.isArray(input) || Object.keys(input).length !== keys.length
+            || Object.keys(input).some(key => !keys.includes(key))
+            || !['bindingId', 'primaryDexterId', 'threadId'].every(key => typeof input[key] === 'string' && UUID.test(input[key] as string))
+            || typeof input.callSid !== 'string' || !CALL_SID.test(input.callSid)) throw new Error('invalid_request');
+        } catch { return json(response, 400, { ok: false, error: 'invalid_request' }); }
+        const admittedCall = () => {
+          if (!accepting) return undefined;
+          const calls = store.list().filter(call => call.callSid === input.callSid && call.primary?.bindingId === input.bindingId);
+          if (calls.length !== 1) return undefined;
+          const call = calls[0];
+          if (call.status !== 'in-progress' || !call.mediaStartedAt || call.endedAt || call.finalized
+            || call.primaryClosed || call.primaryClosePending || call.restrictedSetup
+            || !call.primary || call.primary.primaryDexterId !== input.primaryDexterId || call.primary.threadId !== input.threadId)
+            return undefined;
+          return call;
+        };
+        if (!admittedCall()) return json(response, 409, { ok: false, error: 'sms_call_unavailable' });
+        try {
+          const current = await primary.getContext(input.bindingId as string);
+          if (current.state !== 'open' || current.bindingId !== input.bindingId || current.callSid !== input.callSid
+            || current.context.primaryDexterId !== input.primaryDexterId || current.context.threadId !== input.threadId)
+            return json(response, 409, { ok: false, error: 'sms_call_unavailable' });
+        } catch { return json(response, 409, { ok: false, error: 'sms_call_unavailable' }); }
+        const call = admittedCall();
+        if (!call) return json(response, 409, { ok: false, error: 'sms_call_unavailable' });
+        if (!options.sms) return json(response, 503, { ok: false, error: 'sms_delivery_pending' });
+        try { return json(response, 200, options.sms.requestedEligibility(call.number)); }
+        catch (error) {
+          const failure = resultSmsFailure(error);
+          return json(response, ['sms_delivery_pending', 'sms_unavailable'].includes(failure.error) ? 503 : 409, failure);
+        }
+      }
       if (request.method === 'GET' && route === '/internal/broker/calls') return json(response, 200, { calls: store.list().slice(0, 50).map(publicCall) });
       if (request.method !== 'POST' || !accepting) return json(response, 405, { error: 'unavailable' });
       const input = JSON.parse(await body(request, 8_000) || '{}') as Record<string, unknown>;

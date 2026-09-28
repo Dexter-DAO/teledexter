@@ -68,8 +68,22 @@ The call tool accepts message text only. Its destination and call SID come from 
 
 Ordinary incoming SMS is stored as `pending_dispatch` for enrolled recipients and `suppressed` otherwise. The pending state means the message awaits an agent integration. It does not mean a reply was produced or queued.
 
+## Requested results after a call
+
+The deferred delivery transport accepts a request that the API saved during an admitted call. It can send the requested result after hangup. The API freezes the instruction, task, owner, verified number and first-send deadline; the completed task supplies one exact saved answer. The text contains an authenticated link to that answer. The model supplies neither the destination nor the link.
+
+`POST /internal/broker/result-sms` requires the existing Broker control bearer and a strict `{v,intentId,intentDigest,messageId}` reference. Broker resolves its immutable identity through the Phone API, then reads the SMS ledger. A saved receipt remains recoverable after expiry, STOP, account revocation or provider disablement. If no receipt exists, the API must admit a new send against current authority, verified number and result eligibility. Broker checks the deadline again after that request and enforces current consent and provider readiness before sending.
+
+The ledger reserves the existing deterministic message ID before carrier I/O. Concurrent retries return that reservation. An interrupted dispatch recovers as uncertain; it cannot produce a second carrier attempt. A receipt created while another admission request is in flight remains recoverable even if that admission subsequently fails. Shutdown waits for admitted carrier requests and durable outcomes before releasing the ledger.
+
+`POST /internal/broker/result-sms/eligibility` lets the API check availability before accepting a new caller instruction. It takes exactly `{bindingId,callSid,primaryDexterId,threadId}` with the same control bearer. Broker requires a current private call and uses its saved number. The check sends nothing and reserves no message or rate slot. Current number support is the application's NANP `+1` range; international destination qualification remains separate activation work.
+
+Deploy the compatible API schema, routes and worker before enabling the caller-routing version that admits deferred instructions. Recovery of saved deferred records requires a compatible API/Broker reader. Existing immediate `/internal/broker/sms` requests retain their active-call requirements. Carrier approval and an enrolled recipient are still required for delivery.
+
 ## Verification before activation
 
 Run `npm run typecheck` and `node --import tsx --test tests/sms.test.ts`. The tests use a fake provider and cover consent, OTP abuse limits, restart persistence, signatures, recipient binding, opt-out handling, delivery state, disabled sending, and ledger failures. `scripts/sms-preview.mts` runs the actual routes on loopback port 34118 with a temporary ledger and fixed test code `123456`; it never loads credentials or contacts Twilio.
+
+Run `node --import tsx --test tests/broker-result-sms.test.ts tests/broker-sms.test.ts tests/sms.test.ts` for the deferred HTTP transport and retained ledger. These tests cover hangup, concurrent requests, delayed admission, process exit during dispatch, restart, expiry, STOP, authority revocation, exact identity validation and shutdown. The API admission-to-completion crossing must also pass against PostgreSQL before release.
 
 Production activation still requires the approved campaign and number association, published matching disclosures, the proxy's trusted-IP configuration, and a controlled recipient test covering delivery, STOP, START, and HELP. Repository typechecking emits no release artifact. The deployment owner must prepare an immutable Phone release and preserve its external runtime state before any cutover.

@@ -5,8 +5,11 @@ import Twilio from 'twilio';
 import { configureSms } from '../sms/configureSms.js';
 import { registerSmsRoutes } from '../sms/registerSmsRoutes.js';
 import { createCallerSmsSender } from '../sms/createSmsTool.js';
+import { SmsError, type SmsService } from '../sms/SmsService.js';
 
 export interface BrokerSmsBridge {
+  requestedEligibility(phone: string): ReturnType<SmsService['requestedEligibility']>;
+  requestedReceipt(phone: string, callSid: string, message: string, messageId: string): ReturnType<SmsService['requestedReceipt']>;
   sendRequested(phone: string, callSid: string, message: string): ReturnType<ReturnType<typeof createCallerSmsSender>>;
   handle(request: IncomingMessage, response: ServerResponse): Promise<boolean>;
   stop(): void;
@@ -57,6 +60,13 @@ export async function createBrokerSmsBridge(env: NodeJS.ProcessEnv, releaseRoot:
     if (!response.destroyed) { response.writeHead(result.statusCode, result.headers); response.end(result.rawPayload); }
   }
   return {
+    requestedEligibility(phone) {
+      if (!accepting) throw new SmsError('sms_unavailable', 503);
+      return service.requestedEligibility(phone);
+    },
+    requestedReceipt(phone, callSid, message, messageId) {
+      return service.requestedReceipt(phone, callSid, message, messageId);
+    },
     async sendRequested(phone, callSid, message) {
       if (!accepting) return { ok: false, error: 'sms_unavailable', enrollmentUrl: 'https://dexter.cash/sms' };
       const task = createCallerSmsSender(service, phone, callSid)(message);
