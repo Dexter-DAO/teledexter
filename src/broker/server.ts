@@ -9,7 +9,7 @@ import Twilio from 'twilio';
 import { createBrokerLiveSession, type BrokerLiveSession, type BrokerLiveSessionOptions } from '../live/session.js';
 import type { LiveTranscriptSnapshot } from '../live/session.js';
 import { createPrimaryApiClient, type PrimaryApiClient } from './primaryApi.js';
-import { createPrimaryBackend } from './backend.js';
+import { createPrimaryBackend, type BrokerDelegationRecord } from './backend.js';
 import { eligiblePhoneCallSchema, type EligibleContextClient } from './eligibleContext.js';
 import { createGenerationVoice, type GenerationVoiceOptions, type GenerationVoiceSession } from './generationVoice.js';
 import { createInboundStartupContexts } from './startupContext.js';
@@ -560,6 +560,45 @@ export function createBrokerServer(options: BrokerServerOptions) {
       if (request.method === 'GET' && route === '/internal/broker/calls') return json(response, 200, { calls: store.list().slice(0, 50).map(publicCall) });
       if (request.method !== 'POST' || !accepting) return json(response, 405, { error: 'unavailable' });
       const input = JSON.parse(await body(request, 8_000) || '{}') as Record<string, unknown>;
+      if (route === '/internal/broker/sms') {
+        const keys = ['bindingId', 'requestId', 'callSid', 'primaryDexterId', 'threadId', 'sourceEventId', 'sourceItemId', 'sourceRevision', 'message'];
+        if (!input || Array.isArray(input) || Object.keys(input).some(key => !keys.includes(key))
+          || !['bindingId', 'requestId', 'primaryDexterId', 'threadId', 'sourceEventId'].every(key => typeof input[key] === 'string' && UUID.test(input[key] as string))
+          || typeof input.callSid !== 'string' || !CALL_SID.test(input.callSid)
+          || typeof input.sourceItemId !== 'string' || !input.sourceItemId || input.sourceItemId.length > 200
+          || input.sourceRevision !== 1 || typeof input.message !== 'string' || !input.message.trim()
+          || input.message.length > 1000 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(input.message))
+          return json(response, 400, { ok: false, error: 'invalid_request' });
+        const admittedCall = () => {
+          const call = store.bySid(input.callSid as string);
+          if (!call || call.status !== 'in-progress' || !call.mediaStartedAt || call.endedAt || call.finalized
+            || call.primaryClosed || call.primaryClosePending || call.restrictedSetup
+            || !call.primary || call.primary.bindingId !== input.bindingId || call.primary.primaryDexterId !== input.primaryDexterId
+            || call.primary.threadId !== input.threadId) return undefined;
+          const matching = (Object.values(call.delegations) as BrokerDelegationRecord[]).filter(entry =>
+            entry.version === 1 && entry.callId === call.id && entry.callSid === call.callSid && entry.bindingId === input.bindingId
+            && (entry.requestId === input.requestId || (entry.reconciliation?.outcome === 'admitted'
+              && entry.reconciliation.canonicalRequestId === input.requestId && entry.reconciliation.bindingId === input.bindingId))
+            && ['dispatching', 'dispatch_unknown', 'queued', 'running'].includes(entry.status)
+            && entry.submission?.source.role === 'user' && entry.submission.source.callSid === call.callSid
+            && entry.submission.source.sourceEventId === input.sourceEventId && entry.submission.source.itemId === input.sourceItemId
+            && entry.submission.source.revision === input.sourceRevision);
+          return matching.length === 1 ? call : undefined;
+        };
+        if (!admittedCall()) return json(response, 409, { ok: false, error: 'sms_call_unavailable' });
+        // Reuse the binding read's current owner, caller verification and Primary checks.
+        // Its context stays private; it supplies no instructions or text to this action.
+        try {
+          const current = await primary.getContext(input.bindingId as string);
+          if (current.state !== 'open' || current.bindingId !== input.bindingId || current.callSid !== input.callSid
+            || current.context.primaryDexterId !== input.primaryDexterId || current.context.threadId !== input.threadId)
+            return json(response, 409, { ok: false, error: 'sms_call_unavailable' });
+        } catch { return json(response, 409, { ok: false, error: 'sms_call_unavailable' }); }
+        const call = admittedCall();
+        if (!call || !accepting) return json(response, 409, { ok: false, error: 'sms_call_unavailable' });
+        if (!options.sms) return json(response, 200, { ok: false, error: 'sms_delivery_pending', enrollmentUrl: 'https://dexter.cash/sms' });
+        return json(response, 200, await options.sms.sendRequested(call.number, call.callSid!, input.message));
+      }
       if (route === '/internal/broker/preflight') return json(response, 200, await probe({ apiKey: config.apiKey, model: config.model, voice: config.voice }));
       if (route === '/internal/broker/calls') {
         if (typeof input.requestId !== 'string' || !UUID.test(input.requestId)

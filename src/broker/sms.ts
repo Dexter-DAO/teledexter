@@ -4,8 +4,10 @@ import formBody from '@fastify/formbody';
 import Twilio from 'twilio';
 import { configureSms } from '../sms/configureSms.js';
 import { registerSmsRoutes } from '../sms/registerSmsRoutes.js';
+import { createCallerSmsSender } from '../sms/createSmsTool.js';
 
 export interface BrokerSmsBridge {
+  sendRequested(phone: string, callSid: string, message: string): ReturnType<ReturnType<typeof createCallerSmsSender>>;
   handle(request: IncomingMessage, response: ServerResponse): Promise<boolean>;
   stop(): void;
   close(): Promise<void>;
@@ -25,7 +27,7 @@ export async function createBrokerSmsBridge(env: NodeJS.ProcessEnv, releaseRoot:
   if (!service) throw new Error('sms_state_admission_failed');
   const app = Fastify({ logger: false });
   let accepting = true;
-  const pending = new Set<Promise<void>>();
+  const pending = new Set<Promise<unknown>>();
   try {
     await app.register(formBody);
     registerSmsRoutes(app, { service, internalSecret: env.DEXTER_SMS_INTERNAL_SECRET || '',
@@ -55,6 +57,12 @@ export async function createBrokerSmsBridge(env: NodeJS.ProcessEnv, releaseRoot:
     if (!response.destroyed) { response.writeHead(result.statusCode, result.headers); response.end(result.rawPayload); }
   }
   return {
+    async sendRequested(phone, callSid, message) {
+      if (!accepting) return { ok: false, error: 'sms_unavailable', enrollmentUrl: 'https://dexter.cash/sms' };
+      const task = createCallerSmsSender(service, phone, callSid)(message);
+      pending.add(task);
+      try { return await task; } finally { pending.delete(task); }
+    },
     async handle(request, response) {
       const pathname = (request.url || '').split('?')[0];
       if (!pathname.startsWith('/internal/sms/') && pathname !== '/sms/incoming' && !pathname.startsWith('/sms/status/')) return false;
