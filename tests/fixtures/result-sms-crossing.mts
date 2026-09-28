@@ -7,6 +7,9 @@ import { once } from 'node:events';
 import type Twilio from 'twilio';
 import { createBrokerServer } from '../../src/broker/server.js';
 import { createBrokerSmsBridge } from '../../src/broker/sms.js';
+import { createPrimaryApiClient } from '../../src/broker/primaryApi.js';
+import { eligiblePhoneCallSchema } from '../../src/broker/eligibleContext.js';
+import { phoneResultSmsAdmissionSchema } from '../../src/broker/resultSmsContract.js';
 import type { BrokerConfig } from '../../src/broker/config.js';
 import { SmsService, SMS_DISCLOSURE_VERSION } from '../../src/sms/SmsService.js';
 
@@ -18,9 +21,9 @@ assert.ok(Buffer.byteLength(line) <= 8192, 'fixture_input_too_large');
 const input: unknown = JSON.parse(line);
 assert.ok(input && typeof input === 'object' && !Array.isArray(input), 'fixture_input_invalid');
 const configInput = input as Record<string, unknown>;
-assert.deepEqual(Object.keys(configInput).sort(),
+assert.deepEqual(Object.keys(configInput).filter(key => key !== 'admission').sort(),
   ['stateDir', 'apiBaseUrl', 'phoneServiceSecret', 'controlToken', 'phoneNumber'].sort());
-for (const key of Object.keys(configInput)) assert.equal(typeof configInput[key], 'string');
+for (const key of Object.keys(configInput).filter(key => key !== 'admission')) assert.equal(typeof configInput[key], 'string');
 const { stateDir, apiBaseUrl, phoneServiceSecret, controlToken, phoneNumber } = configInput as Record<string, string>;
 assert.ok(path.isAbsolute(stateDir!), 'fixture_state_must_be_absolute');
 assert.ok(fs.lstatSync(stateDir!).isDirectory() && !fs.lstatSync(stateDir!).isSymbolicLink(), 'fixture_state_directory_required');
@@ -94,4 +97,14 @@ await new Promise<void>((resolve, reject) => {
   broker.server.listen(0, '127.0.0.1', resolve);
 });
 assert.equal(broker.store.list().length, 0, 'fixture_must_have_no_live_calls');
-emit({ kind: 'ready', origin: `http://127.0.0.1:${(broker.server.address() as { port: number }).port}` });
+let admissionReceipt;
+if (configInput.admission !== undefined) {
+  const admission = configInput.admission as { bindingId: string; input: unknown };
+  assert.deepEqual(Object.keys(admission).sort(), ['bindingId', 'input']);
+  assert.match(admission.bindingId, /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  const api = createPrimaryApiClient({ apiBaseUrl: apiBaseUrl!, phoneServiceSecret: phoneServiceSecret!,
+    contextProtocol: { version: 'memory-eligible-v1', parse: value => eligiblePhoneCallSchema.parse(value) } });
+  admissionReceipt = await api.admitResultSms!(admission.bindingId, phoneResultSmsAdmissionSchema.parse(admission.input));
+}
+emit({ kind: 'ready', origin: `http://127.0.0.1:${(broker.server.address() as { port: number }).port}`,
+  ...(admissionReceipt ? { admissionReceipt } : {}) });
