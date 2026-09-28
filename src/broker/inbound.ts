@@ -213,8 +213,10 @@ export function createInboundFlow(options: InboundFlowOptions) {
         store.transitionInbound(id, { type: 'consume_attempted', observedAt: timestamp() });
         const approvalRef = call.inbound!.remote.approvalRef;
         context = await timing.measure('open_context', () => primary.openInboundCall!(call.inbound!.begin.providerProof, approvalRef));
-        // /calls carries private context, but only this persisted outcome anchors media grace.
-        const recovered = await timing.measure('recover_binding', () => primary.recoverInbound!(call.inbound!.begin));
+        // The negotiated response carries the same persisted outcome as recovery.
+        // Older APIs and uncertain replies retain the original recovery path.
+        const recovered = context.inboundOutcome
+          ?? await timing.measure('recover_binding', () => primary.recoverInbound!(call.inbound!.begin));
         if (recovered.state === 'absent') throw new Error('inbound_binding_outcome_unavailable');
         call = record(id, recovered);
         if (!bound(call)) throw new Error('inbound_binding_outcome_unavailable');

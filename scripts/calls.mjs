@@ -4,6 +4,8 @@
 //   npm run calls           -> full trace of the MOST RECENT call
 //   npm run calls -- watch  -> live tail (follow the call happening now)
 //   npm run calls -- brief  -> just the highlights of the last call
+//   npm run calls -- journey --journal /absolute/calls.json --log /absolute/broker.log
+//                          -> privacy-limited startup and result timing report
 //
 // A "call" is everything between a "Twilio media stream connected" marker and
 // the next one (or end of log). No memorized line numbers — the boundary is in
@@ -54,7 +56,15 @@ function brief(lines) {
   return lines.filter(keep);
 }
 
-if (mode === 'watch') {
+if (mode === 'journey') {
+  try {
+    const { runCallJourneyReport } = await import('./call-journey-report.mjs');
+    console.log(JSON.stringify(runCallJourneyReport(process.argv.slice(3)), null, 2));
+  } catch (error) {
+    const code = error instanceof Error && /^journey_[a-z_]+$/.test(error.message) ? error.message : 'journey_read_failed';
+    console.error(`[calls] ${code}`); process.exitCode = 1;
+  }
+} else if (mode === 'watch') {
   console.log(`[calls] live tail of ${OUT_LOG} — Ctrl-C to stop\n`);
   const tail = spawn('tail', ['-n', '0', '-F', OUT_LOG], { stdio: 'inherit' });
   process.on('SIGINT', () => {

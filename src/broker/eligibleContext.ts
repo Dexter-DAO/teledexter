@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { phoneInboundBillingRefSchema } from './inboundBilling.js';
+import { inboundBoundOutcomeSchema } from './inboundContract.js';
 import { phoneCallAssignmentRefSchema, sameCallAssignmentRef } from './assignment.js';
 import { createPrimaryApiTransport, PrimaryApiError, type PrimaryApiOptions } from './primaryApi.js';
 import { canonicalJson } from '../outbound/canonical.js';
@@ -85,7 +86,14 @@ export const eligiblePhoneCallSchema = z.object({
   bindingId: uuid, callSid, state: z.enum(['open', 'closed']), context: eligiblePhoneContextSchema,
   billing: phoneInboundBillingRefSchema.optional(),
   callAssignmentRef: phoneCallAssignmentRefSchema.optional(),
-}).strict();
+  inboundOutcome: inboundBoundOutcomeSchema.optional(),
+}).strict().superRefine((value, ctx) => {
+  const outcome = value.inboundOutcome;
+  if (outcome && (value.callAssignmentRef || outcome.bindingId !== value.bindingId
+    || outcome.beginRef.callSid !== value.callSid || outcome.callState !== value.state
+    || canonicalJson(outcome.billing) !== canonicalJson(value.billing)))
+    ctx.addIssue({ code: 'custom', message: 'Inbound outcome differs from context' });
+});
 export type EligiblePhoneCall = z.infer<typeof eligiblePhoneCallSchema>;
 
 export const eligibleContextBindingSchema = z.object({

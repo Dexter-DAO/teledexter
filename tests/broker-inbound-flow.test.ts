@@ -37,6 +37,7 @@ async function fixture(t: test.TestContext) {
   let providerStatus = 'in-progress';
   let contextAllowed = true;
   let loseBegin = false, loseConsume = false, loseClose = false;
+  let includeOutcome = false;
   let beginGate: ReturnType<typeof deferred<void>> | undefined;
   let contextGate: ReturnType<typeof deferred<void>> | undefined;
   let consumedAt: string | undefined, closedAt: string | undefined;
@@ -79,7 +80,8 @@ async function fixture(t: test.TestContext) {
       remote = { attachmentId, beginRef: remote.beginRef, approvalRef, bindingId, state: 'bound', consumedAt, callState: 'open' };
       if (consumeError) throw consumeError;
       if (loseConsume) { loseConsume = false; throw new Error('lost_consume_response'); }
-      return primary.getContext(bindingId);
+      const context = await primary.getContext(bindingId);
+      return { ...context, ...(includeOutcome ? { inboundOutcome: structuredClone(remote) } : {}) };
     },
     async getContext(id: string) {
       counts.context++; assert.equal(id, bindingId);
@@ -131,6 +133,7 @@ async function fixture(t: test.TestContext) {
       store = new BrokerStore(directory); flow = build();
     },
     loseBegin() { loseBegin = true; }, loseConsume() { loseConsume = true; }, loseClose() { loseClose = true; },
+    includeOutcome() { includeOutcome = true; },
     refuseContext() { contextAllowed = false; }, pendingAfterClose() { pendingAfterClose = true; },
     gateBegin() { beginGate = deferred<void>(); return beginGate; },
     gateContext() { contextGate = deferred<void>(); return contextGate; },
@@ -154,6 +157,47 @@ test('pending inbound keeps original leg and proof; approval consumes that same 
   assert.equal(Date.parse(next.inbound!.mediaStartBy!), f.clock() + 30_000);
   assert.equal(f.counts.consume, 1);
   assert.deepEqual(next.inbound!.begin.providerProof, f.original);
+});
+
+test('negotiated successful consumption removes one recovery read and preserves the persisted grace anchor', async t => {
+  const f = await fixture(t); f.includeOutcome();
+  const first = await f.begin(); f.approve();
+  const before = f.counts.recover;
+  const next = await f.flow.tick(first.id);
+  assert.ok(f.flow.mediaAllowed(next));
+  assert.equal(f.counts.recover, before);
+  assert.equal(f.counts.consume, 1);
+  assert.equal(next.inbound!.mediaStartBy, new Date(f.clock() + 30_000).toISOString());
+  assert.equal(f.timings.some(event => event.stage === 'recover_binding'), false);
+  f.restart(); f.advance(5_000);
+  const recovered = await f.flow.tick(first.id);
+  assert.equal(recovered.inbound!.mediaStartBy, next.inbound!.mediaStartBy);
+  assert.equal(f.counts.consume, 1);
+});
+
+test('lost negotiated response still recovers the original consumption after restart', async t => {
+  const f = await fixture(t); f.includeOutcome();
+  const first = await f.begin(); f.approve(); f.loseConsume();
+  await assert.rejects(f.flow.tick(first.id), /lost_consume_response/);
+  const consumed = f.clock(), before = f.counts.recover + f.counts.status;
+  f.restart(); f.advance(5_000);
+  const recovered = await f.flow.tick(first.id);
+  assert.ok(f.flow.mediaAllowed(recovered));
+  assert.equal(f.counts.recover + f.counts.status, before + 1);
+  assert.equal(f.counts.consume, 1);
+  assert.equal(recovered.inbound!.mediaStartBy, new Date(consumed + 30_000).toISOString());
+});
+
+test('slow negotiated context cannot renew expired media grace', async t => {
+  const f = await fixture(t); f.includeOutcome();
+  const first = await f.begin(); f.approve(); const gate = f.gateContext();
+  const pending = f.flow.tick(first.id);
+  while (!f.counts.context) await new Promise(resolve => setImmediate(resolve));
+  const consumed = f.clock(); f.advance(31_000); gate.resolve();
+  const next = await pending;
+  assert.equal(f.flow.mediaAllowed(next), false);
+  assert.equal(next.inbound!.mediaStartBy, new Date(consumed + 30_000).toISOString());
+  assert.equal(f.counts.close, 1);
 });
 
 test('setup timing identifies each real admission step and retains separate failed and recovered attempts', async t => {

@@ -16,6 +16,7 @@ import { INBOUND_ENROLLMENT_PATH, INBOUND_ENROLLMENT_MAX_REQUEST_BYTES, enrollme
   type EnrollmentCompletionResult, type EnrollmentCompletionRecovery } from './inboundEnrollment.js';
 import {
   inboundBeginIdentitySchema, inboundOutcomeSchema, recoverInboundResultSchema,
+  inboundBoundOutcomeSchema, INBOUND_OUTCOME_HEADER, INBOUND_OUTCOME_VERSION,
   consumeInboundApprovalSchema, closeConsumedInboundAttachmentSchema,
   consumedInboundClosureReceiptSchema, sameInboundBeginRef, sameInboundApprovalRef, inboundBeginRef,
   type InboundBeginIdentity, type InboundBeginRef, type InboundApprovalRef, type InboundOutcome,
@@ -44,6 +45,7 @@ export interface PrimaryContext {
 }
 
 export interface PrimaryCall {
+  inboundOutcome?: Extract<InboundOutcome, { state: 'bound' }>;
   billing?: PhoneInboundBillingRef;
   bindingId: string;
   callSid: string;
@@ -398,6 +400,7 @@ const callSchema = z.object({
   bindingId: uuid, callSid, state: z.enum(['open', 'closed']), context: contextSchema, callAssignmentRef: phoneCallAssignmentRefSchema.optional(),
 });
 const inboundCallSchema = z.object({
+  inboundOutcome: inboundBoundOutcomeSchema.optional(),
   billing: phoneInboundBillingRefSchema.optional(),
   bindingId: uuid, callSid, state: z.enum(['open', 'closed']),
   context: z.object({
@@ -488,10 +491,13 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
   const request = createTransport(options);
   const contextHeaders = options.contextProtocol ? { 'X-Dexter-Phone-Context-Version': 'memory-eligible-v1' } : undefined;
   const parseCall = (value: unknown, inbound = false): PrimaryCall => {
-    if (!options.contextProtocol) return parse(inbound ? inboundCallSchema : callSchema, value, 'invalid_response');
     let call: PrimaryCall;
-    try { call = options.contextProtocol.parse(value); } catch { throw new PrimaryApiError('invalid_response'); }
+    if (!options.contextProtocol) call = parse(inbound ? inboundCallSchema : callSchema, value, 'invalid_response');
+    else try { call = options.contextProtocol.parse(value); } catch { throw new PrimaryApiError('invalid_response'); }
     if (inbound && call.callAssignmentRef !== undefined) throw new PrimaryApiError('identity_mismatch');
+    if (call.inboundOutcome && (!inbound || call.inboundOutcome.bindingId !== call.bindingId
+      || call.inboundOutcome.beginRef.callSid !== call.callSid || call.inboundOutcome.callState !== call.state
+      || canonicalJson(call.inboundOutcome.billing) !== canonicalJson(call.billing))) throw new PrimaryApiError('identity_mismatch');
     return call;
   };
   // Known bindings add a second consistency check across open/context/submit/
@@ -727,18 +733,26 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
         return known;
       };
       validateKnown();
-      const call = parseCall(await request('POST', '/calls', input, contextHeaders), true);
+      const call = parseCall(await request('POST', '/calls', input,
+        { ...contextHeaders, [INBOUND_OUTCOME_HEADER]: INBOUND_OUTCOME_VERSION }), true);
       const known = validateKnown();
       same(call.callSid, sid);
       if (known?.bindingId !== undefined) same(call.bindingId, known.bindingId);
       if (known?.callState === 'closed' && call.state !== 'closed') throw new PrimaryApiError('identity_mismatch');
       if (calls.get(call.bindingId)?.callAssignmentRef) throw new PrimaryApiError('identity_mismatch');
+      if (call.inboundOutcome) {
+        same(call.inboundOutcome.attachmentId, input.inboundApprovalRef.attachmentId);
+        requireSameApproval(call.inboundOutcome.approvalRef, input.inboundApprovalRef);
+        checkBeginRef(call.inboundOutcome.beginRef, checkedBegin({
+          brokerCallId: call.inboundOutcome.beginRef.brokerCallId, providerProof: input.providerProof }));
+      }
       const result = remember(call);
       inboundCalls.set(input.inboundApprovalRef.attachmentId, structuredClone({ ...known,
         callSid: sid, approvalRef: input.inboundApprovalRef, bindingId: call.bindingId, callState: call.state }));
       inboundBySid.set(sid, input.inboundApprovalRef.attachmentId);
-      // The private context response has no consumedAt. Recover its separate
-      // receipt before deriving any media-start deadline.
+      // Older APIs omit the negotiated outcome; the flow then uses its original
+      // recovery read. A returned outcome must pass every retained identity check.
+      if (call.inboundOutcome) rememberInbound(call.inboundOutcome);
       return result;
     },
     async closeInbound(attachmentId, value) {

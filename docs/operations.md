@@ -74,6 +74,27 @@ Set `DEXTER_PHONE_LOG` if the log is somewhere other than
 `call-log.json` under `PHONE_RUNTIME_STORAGE_DIR` (default `storage/`).
 Call records include transcripts and tool activity; keep them private.
 
+For the Broker's durable call journal, use the read-only journey report:
+
+```bash
+npm run calls -- journey \
+  --journal /var/lib/dexter-broker/state/calls.json \
+  --log /absolute/path/to/current-broker-output.log
+```
+
+Add `--call-id <broker-call-uuid>` to select an earlier call. The JSON report
+joins admission and consumption times, media startup, provider readiness,
+first audio and carrier playback acknowledgment. It also shows each saved
+request's dispatch, answer availability and publication acceptance. Publication
+acceptance means the answer entered the voice session; the journal has no
+per-answer playback or individual tool spans. Missing timestamps remain null.
+Overlapping admission spans retain their separate durations.
+
+This mode reads at most 32 MiB of journal data and the final 8 MiB of the supplied
+log. Its coverage fields report truncation and omitted rows. It emits timing,
+status and Broker request IDs, excluding phone numbers, transcripts, provider
+proofs and raw errors. It opens neither the writer lock nor a network connection.
+
 ## Process management
 
 From the intended release directory, with the service environment configured:
@@ -114,7 +135,7 @@ The Hark hosted allowlist is defined in
 and `dexter_wallet_history`. These names must match the connected MCP server.
 Hark calls cannot prepare, execute, or reconcile the originating instruction.
 
-Paid API instructions use check → opaque intent → one approved fetch. An
+Paid API instructions use a check, an opaque intent, then one approved fetch. An
 uncertain result is inspected using the same intent, without automatically
 repeating the paid request. Asset instructions similarly prepare an exact action
 and use its durable execution/status contract. The source instructions live in
