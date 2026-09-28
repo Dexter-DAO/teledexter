@@ -121,7 +121,7 @@ export function createMixedWorkRouter(options: MixedWorkOptions) {
       }
     }
     if (!record.decision || stopping || channel.signal.aborted || !options.active(request.sessionId)) return;
-    if (record.decision.kind === 'task' || record.decision.kind === 'answer') {
+    if (record.decision.kind === 'task' || record.decision.kind === 'answer' || record.decision.kind === 'deliver_result') {
       // Each admission port rechecks current presentation/authority or requires
       // its own durable downstream record before recovery. No route is retargeted.
       await options.admit(request, callerRouteRef(record), record.decision, channel);

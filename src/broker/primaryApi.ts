@@ -2,6 +2,8 @@ import { callbackProviderProofSchema } from './verificationCallbackContract.js';
 import { phoneVerificationCallbackErrorSchema, PHONE_VERIFICATION_CALLBACK_PROOF_MAX_BYTES, PHONE_VERIFICATION_CALLBACK_COMMAND_MAX_BYTES } from './verificationCallbackContract.js';
 import { createHmac } from 'node:crypto';
 import { z } from 'zod';
+import { phoneResultSmsAdmissionSchema, phoneResultSmsAdmissionReceiptSchema,
+  type PhoneResultSmsAdmission, type PhoneResultSmsAdmissionReceipt } from './resultSmsContract.js';
 import { phoneInboundBillingRefSchema, type PhoneInboundBillingRef } from './inboundBilling.js';
 import { phoneCallAssignmentSchema, phoneCallAssignmentRefSchema, sameCallAssignmentRef, type PhoneCallAssignment, type PhoneCallAssignmentRef } from './assignment.js';
 export type { PhoneCallAssignment, PhoneCallAssignmentRef } from './assignment.js';
@@ -51,6 +53,7 @@ export interface PrimaryCall {
 }
 
 export interface PrimarySubmission {
+  resultSms?: PhoneResultSmsAdmission;
   source: {
     callSid: string;
     itemId: string;
@@ -123,6 +126,7 @@ export interface PrimaryQuestionResult {
 }
 
 export type PrimaryRequestResult = {
+  resultSms?: PhoneResultSmsAdmissionReceipt;
   requestId: string;
   bindingId: string;
   replayed?: boolean;
@@ -157,6 +161,7 @@ export interface PrimaryClosedCall {
 }
 
 export interface PrimaryApiClient {
+  admitResultSms?(bindingId: string, input: PhoneResultSmsAdmission): Promise<PhoneResultSmsAdmissionReceipt>;
   readiness(callerNumber: string): Promise<PrimaryReadiness>;
   openCall(providerProof: PrimaryProviderProof, callAssignment?: PhoneCallAssignment): Promise<PrimaryCall>;
   /** Proof-only callback route; API independently requires saved/current completed admission. */
@@ -417,7 +422,8 @@ const questionSchema = z.object({
     text: questionText(2000).nullable(), interpretedAnswer: questionText(2000), receivedAt: timestamp,
   }).refine(value => (value.answer === 'other') === (value.text !== null)).nullable(),
 }).refine(value => (value.state === 'answered') === (value.reply !== null));
-const requestBase = z.object({ requestId: uuid, bindingId: uuid, replayed: z.boolean().optional(), question: questionSchema.optional() });
+const requestBase = z.object({ requestId: uuid, bindingId: uuid, replayed: z.boolean().optional(), question: questionSchema.optional(),
+  resultSms:phoneResultSmsAdmissionReceiptSchema.optional() });
 export const requestSchema = z.discriminatedUnion('state', [
   requestBase.extend({ state: z.enum(['queued', 'running']), assistant: z.never().optional(), error: z.never().optional() }),
   requestBase.extend({ state: z.literal('completed'), error: z.never().optional(), assistant: z.object({
@@ -441,6 +447,7 @@ const submissionSchema = z.object({
   relatedPrimaryRequestId: uuid.optional(), referenceOrigin: z.literal('broker_status_publication').optional(),
   callAssignmentRef: phoneCallAssignmentRefSchema.optional(),
   associatedResultReference: associatedResultReferenceSchema.optional(),
+  resultSms:phoneResultSmsAdmissionSchema.optional(),
 }).strict().refine(value => (value.relatedPrimaryRequestId === undefined) === (value.referenceOrigin === undefined))
   .refine(value => value.associatedResultReference === undefined || value.relatedPrimaryRequestId === undefined);
 const turnSchema = z.object({
@@ -803,6 +810,7 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
       const headers = bindingHeaders(bindingId);
       parse(uuid, requestId, 'invalid_request');
       const parsed = parse(submissionSchema, input, 'invalid_request');
+      if(parsed.resultSms && parsed.resultSms.requestId!==requestId)throw new PrimaryApiError('invalid_request');
       if (parsed.relatedPrimaryRequestId === requestId) throw new PrimaryApiError('invalid_request');
       if (parsed.associatedResultReference && (!options.contextProtocol
         || parsed.associatedResultReference.originalRequestId === requestId)) throw new PrimaryApiError('invalid_request');
@@ -817,8 +825,14 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
       return decodeResult(await request('POST', '/requests', { bindingId, source, role, text: parsed.text, ...reference,
         ...(parsed.callAssignmentRef === undefined ? {} : { callAssignmentRef: parsed.callAssignmentRef }),
         ...(parsed.associatedResultReference === undefined ? {} : {
-          associatedResultReference: orderedAssociatedResultReference(parsed.associatedResultReference) }) },
-        { ...headers, ...(parsed.associatedResultReference ? contextHeaders : {}), 'Idempotency-Key': requestId }, 202), bindingId, requestId, true);
+          associatedResultReference: orderedAssociatedResultReference(parsed.associatedResultReference) }),
+        ...(parsed.resultSms ? {resultSms:parsed.resultSms} : {}) },
+        { ...headers, ...(parsed.associatedResultReference || parsed.resultSms ? contextHeaders : {}), 'Idempotency-Key': requestId }, 202), bindingId, requestId, true);
+    },
+    async admitResultSms(bindingId,input) {
+      const headers=bindingHeaders(bindingId),body=parse(phoneResultSmsAdmissionSchema,input,'invalid_request');
+      return parse(phoneResultSmsAdmissionReceiptSchema,await request('POST',`/calls/${bindingId}/result-sms`,body,
+        {...headers,...contextHeaders},202), 'invalid_response');
     },
     async result(bindingId, requestId) {
       const headers = bindingHeaders(bindingId);
@@ -840,13 +854,14 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
         if (!sameCallAssignmentRef(parsed.callAssignmentRef, known.callAssignmentRef)) throw new PrimaryApiError('identity_mismatch');
       }
       const { role, ...source } = parsed.source;
-      const body = parsed.associatedResultReference === undefined ? { bindingId, role, text: parsed.text, source, ...reference,
+      const rawBody = parsed.associatedResultReference === undefined ? { bindingId, role, text: parsed.text, source, ...reference,
         ...(parsed.callAssignmentRef === undefined ? {} : { callAssignmentRef: parsed.callAssignmentRef }) }
         : { bindingId, source, role, text: parsed.text,
           ...(parsed.callAssignmentRef === undefined ? {} : { callAssignmentRef: parsed.callAssignmentRef }),
           associatedResultReference: orderedAssociatedResultReference(parsed.associatedResultReference) };
+      const body={...rawBody,...(parsed.resultSms ? {resultSms:parsed.resultSms} : {})};
       const result = parse(reconciliationSchema, await request('POST', `/requests/${requestId}/reconcile`,
-        body, { ...headers, ...(parsed.associatedResultReference ? contextHeaders : {}) }), 'invalid_response');
+        body, { ...headers, ...(parsed.associatedResultReference || parsed.resultSms ? contextHeaders : {}) }), 'invalid_response');
       same(result.bindingId, bindingId); same(result.requestId, requestId);
       if (result.outcome === 'admitted') {
         return { ...result, result: decodeResult(result.result, bindingId, result.canonicalRequestId, false) };

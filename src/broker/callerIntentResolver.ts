@@ -1,6 +1,6 @@
 import { canonicalJson } from '../outbound/canonical.js';
 import { brokerIdentity, withCallerAdmission } from './backend.js';
-import { callerIntentV2InputSchema, type CallerIntentV2Input, type CallerIntentDecision } from './callerIntentContract.js';
+import { callerIntentV2InputSchema, callerIntentV3InputSchema, type CallerIntentV2Input, type CallerIntentDecision } from './callerIntentContract.js';
 import type { CallerIntentClient } from './callerIntentClient.js';
 import { callerIntentQuestionForTarget, callerRoutePresentationDigest, callerRouteRef,
   decideCallerRouting, getCallerRouteBySource, validateCallerRouting,
@@ -69,7 +69,9 @@ function routeDecision(call: BrokerCall, record: CallerRouteRecord, decision: Ca
     if (matches.length !== 1 || !matches[0]) refuse('caller_intent_target_not_offered');
     return { kind: 'answer', target: matches[0] };
   }
-  if (!decision.reference) return { kind: 'task' };
+  if (decision.kind === 'deliver_result') return {kind:'deliver_result',target:decision.target,delivery:decision.delivery};
+  const delivery=decision.delivery ? {delivery:decision.delivery} : {};
+  if (!decision.reference) return { kind: 'task',...delivery };
   const candidates = callerIntentResultPublicationCandidates(call, record.frozen.sessionId);
   const matches = record.resolutionInput.references.filter(ref => candidates.some(candidate =>
     candidate.id === ref.id && candidate.digest === ref.digest && same(candidate.reference, decision.reference)));
@@ -78,7 +80,7 @@ function routeDecision(call: BrokerCall, record: CallerRouteRecord, decision: Ca
   // Ordinary wire references identify the request, not one assistant message.
   // Equivalent matches keep the first frozen offer as the internal receipt
   // anchor; the complete ordered input remains saved and no recency is inferred.
-  return { kind: 'task', contextReference: matches[0] };
+  return { kind: 'task', contextReference: matches[0],...delivery };
 }
 
 export interface CallerIntentResolverOptions {
@@ -122,14 +124,19 @@ export function createCallerIntentResolver(options: CallerIntentResolverOptions)
     });
     const alive = () => { if (controller.signal.aborted) refuse('caller_intent_interrupted'); };
     try {
-      const prepared = await Promise.race([withCallerAdmission(options.store, options.callId, () => {
+      const prepared = await Promise.race([withCallerAdmission(options.store, options.callId, async () => {
         alive(); const { call, saved } = load(input.record);
         if (saved.intent && saved.intent.operationId !== input.operationId) refuse('caller_intent_operation_changed');
         if (saved.decision) return { record: saved, submit: false };
         current(call, saved, input.callDeadlineAt);
         if (saved.intent) return { record: saved, submit: false };
+        const base=buildCallerIntentInput(call,saved);
+        const candidates=await options.client.taskCandidates?.(saved.scope.bindingId,base.source,controller.signal);
+        alive();
+        current(load(input.record).call,saved,input.callDeadlineAt);
+        const body=candidates ? callerIntentV3InputSchema.parse({...base,v:'phone.caller-intent.v3',...candidates}) : base;
         const record = options.store.prepareCallerIntent(options.callId, callerRouteRef(saved), {
-          operationId: input.operationId, input: buildCallerIntentInput(call, saved) });
+          operationId: input.operationId, input: body });
         return { record, submit: true };
       }), interrupted]);
       alive();
@@ -144,8 +151,8 @@ export function createCallerIntentResolver(options: CallerIntentResolverOptions)
         const beforeHttp = load(input.record);
         if (beforeHttp.saved.decision) return { inputDigest: beforeHttp.saved.inputDigest, decision: beforeHttp.saved.decision };
         current(beforeHttp.call, prepared.record, input.callDeadlineAt);
-        if (prepared.submit && intent.input.v !== 'phone.caller-intent.v2') refuse('caller_intent_legacy_dispatch_refused');
-        const operation = prepared.submit && intent.input.v === 'phone.caller-intent.v2'
+        if (prepared.submit && intent.input.v === 'phone.caller-intent.v1') refuse('caller_intent_legacy_dispatch_refused');
+        const operation = prepared.submit && intent.input.v !== 'phone.caller-intent.v1'
           ? options.client.submit(prepared.record.scope.bindingId, intent.operationId, structuredClone(intent.input), controller.signal)
           : options.client.recover(prepared.record.scope.bindingId, intent.operationId, structuredClone(intent.input), controller.signal);
         response = await Promise.race([operation, interrupted]);
@@ -162,7 +169,7 @@ export function createCallerIntentResolver(options: CallerIntentResolverOptions)
         current(call, saved, input.callDeadlineAt);
         const receipt = saved.intent?.response;
         if (!receipt || receipt.state !== 'resolved') refuse('caller_intent_pending');
-        if (saved.intent?.input.v !== 'phone.caller-intent.v2' || receipt.v !== 'phone.caller-intent.v2')
+        if (!saved.intent || saved.intent.input.v === 'phone.caller-intent.v1' || receipt.v === 'phone.caller-intent.v1')
           refuse('caller_intent_legacy_dispatch_refused');
         if (Date.now() >= Date.parse(receipt.validUntil)) refuse('caller_intent_expired');
         const decision = routeDecision(call, saved, receipt.decision);

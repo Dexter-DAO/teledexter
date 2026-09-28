@@ -170,6 +170,8 @@ async function fixture(t: test.TestContext, options: { ordinaryQuestion?: boolea
   };
   const client = createPrimaryCallerIntentClient({ apiBaseUrl: config.apiBaseUrl, phoneServiceSecret: config.phoneServiceSecret,
     fetch: async (url, init) => {
+      // This suite exercises compatibility with an API that supports caller intent v2.
+      if (String(url).endsWith('/caller-intents/candidates')) return Response.json({ error: 'not_found' }, { status: 404 });
       const headers = new Headers(init?.headers), operationId = headers.get('Idempotency-Key');
       assert.equal(String(url), config.apiBaseUrl + `/internal/primary-dexter/channels/phone/calls/${bindingId}/caller-intents`);
       assert.equal(init?.method, 'POST'); assert.ok(operationId);

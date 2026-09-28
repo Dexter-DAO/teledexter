@@ -32,7 +32,9 @@ export function rawSubmissionDigest(bindingId: string, input: PrimarySubmission)
     ...(input.callAssignmentRef === undefined ? {} : { callAssignmentRef: {
       assignmentId: input.callAssignmentRef.assignmentId, revision: input.callAssignmentRef.revision, digest: input.callAssignmentRef.digest } }),
     ...(input.associatedResultReference === undefined ? {} : {
-      associatedResultReference: orderedAssociatedResultReference(input.associatedResultReference) }) });
+      associatedResultReference: orderedAssociatedResultReference(input.associatedResultReference) }),
+    ...(input.resultSms === undefined ? {} : { resultSms:{v:input.resultSms.v,
+      callerIntentOperationId:input.resultSms.callerIntentOperationId,requestId:input.resultSms.requestId} }) });
 }
 export function acknowledgedTurn(bindingId: string, turn: PrimaryTurn, receipt: PrimaryTurnReceipt): AcknowledgedTurnReceipt {
   if (receipt.bindingId !== bindingId || receipt.sourceEventId !== turn.sourceEventId

@@ -547,6 +547,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
       const backend = sessions.get(request.sessionId)?.backend;
       if (!backend) throw new Error('caller_route_source_missing');
       if (decision.kind === 'task') await backend.delegateFrozenTask(request, ref, channel);
+      else if(decision.kind==='deliver_result')await backend.deliverFrozenResult(request,ref,channel);
       else if (decision.kind === 'answer' && decision.target.kind === 'ordinary') await backend.answerFrozenQuestion(request, ref, channel);
       else if (decision.kind === 'answer' && selected) await selected.answerFrozen(request, ref, channel);
       else throw new Error('caller_route_admission_unavailable');
@@ -555,6 +556,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
       await controller.withCurrentAttachment(async attached => {
         if (!selectedActive() || attached.sessionId !== request.sessionId) return;
         const text = reason === 'mixed_intent' ? 'Please give me the answer and the new task separately.'
+          : reason === 'ambiguous_target' ? 'Which earlier request do you mean?'
           : reason === 'unavailable' ? 'I could not work out that request. Please say what you want me to do.'
           : 'Are you answering the saved question, or asking me to do something else?';
         await sessions.get(attached.sessionId)?.voice.appendCommentary?.(text);

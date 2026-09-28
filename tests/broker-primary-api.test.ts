@@ -32,6 +32,23 @@ const submission: PrimarySubmission = { source: {
   callSid, itemId: 'item_caller_1', sourceEventId, revision: 1, receivedAt: when, role: 'user',
 }, text: 'Tell me my current portfolio.' };
 
+test('combined delivery and standalone receipt recovery retain exact admission identity over HTTP',async()=>{
+  const resultSms={v:'phone.result-sms.v1' as const,callerIntentOperationId:eventId,requestId};
+  const receipt={v:'phone.result-sms.v1',intentId:messageId,intentDigest:'a'.repeat(64),state:'waiting_result',replayed:false};
+  const h=harness([json({bindingId,requestId,state:'queued',replayed:false,resultSms:receipt},202),json({...receipt,replayed:true},202)],{
+    contextProtocol:{version:'memory-eligible-v1',parse(){throw new Error('No context');}},
+  });
+  assert.deepEqual((await h.client.submit(bindingId,requestId,{...submission,resultSms})).resultSms,receipt);
+  assert.deepEqual(await h.client.admitResultSms!(bindingId,resultSms),{...receipt,replayed:true});
+  assert.deepEqual(JSON.parse(String(h.requests[0]!.init.body)).resultSms,resultSms);
+  assert.deepEqual(JSON.parse(String(h.requests[1]!.init.body)),resultSms);
+  assert.ok(String(h.requests[1]!.url).endsWith(`/calls/${bindingId}/result-sms`));
+  for(const item of h.requests)assert.equal(new Headers(item.init.headers).get('X-Dexter-Phone-Context-Version'),'memory-eligible-v1');
+  const wrong=harness([]);
+  await assert.rejects(wrong.client.submit(bindingId,requestId,{...submission,resultSms:{...resultSms,requestId:messageId}}),code('invalid_request'));
+  assert.equal(wrong.requests.length,0);
+});
+
 test('associated-result frozen wire preserves all eight literal digests and exact new submit/reconcile bodies', async () => {
   const fixtures = JSON.parse(fs.readFileSync(new URL('./fixtures/associated-result-digests.json', import.meta.url), 'utf8')) as Array<{
     name: string; bindingId: string; input: PrimarySubmission; rawDigest: string;

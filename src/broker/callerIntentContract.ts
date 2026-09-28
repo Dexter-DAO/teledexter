@@ -78,7 +78,7 @@ export const callerIntentDecisionSchema = z.discriminatedUnion('kind', [
     'provider_unavailable', 'provider_uncertain', 'invalid_output']) }).strict(),
   z.object({ kind: z.literal('conversation') }).strict(),
 ]);
-export type CallerIntentDecision = z.infer<typeof callerIntentDecisionSchema>;
+
 const responseFields = { v: z.literal('phone.caller-intent.v1'), operationId: uuid, bindingId: uuid,
   inputDigest: digest, brokerInputDigest: digest, presentationDigest: digest, generationId: uuid,
   sourceSessionId: opaque, callDeadlineAt: time, questions, results, reservedAt: time, validUntil: time,
@@ -171,15 +171,101 @@ export const callerIntentV2ResponseSchema = z.discriminatedUnion('state', [
   }
 });
 export type CallerIntentV2Response = z.infer<typeof callerIntentV2ResponseSchema>;
-export const callerIntentInputSchema = z.discriminatedUnion('v', [callerIntentV1InputSchema, callerIntentV2InputSchema]);
-export const callerIntentResponseSchema = z.discriminatedUnion('v', [callerIntentV1ResponseSchema, callerIntentV2ResponseSchema]);
-export type CallerIntentInput = CallerIntentV1Input | CallerIntentV2Input;
-export type CallerIntentResponse = CallerIntentV1Response | CallerIntentV2Response;
+export const PHONE_CALLER_INTENT_V3_VERSION = 'phone.caller-intent.v3';
+export const callerIntentTaskIdentitySchema = z.object({ bindingId: uuid, requestId: uuid, runId: uuid }).strict();
+export type CallerIntentTaskIdentity = z.infer<typeof callerIntentTaskIdentitySchema>;
+export const callerIntentV3TaskSchema = z.object({ execution: callerIntentTaskIdentitySchema }).strict();
+export const callerIntentV3TaskCoverageSchema = z.discriminatedUnion('state', [
+  z.object({ state: z.literal('complete'), count: z.number().int().min(0).max(16), inventoryDigest: z.string().regex(/^[a-f0-9]{64}$/) }).strict(),
+  z.object({ state: z.literal('partial'), count: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER), inventoryDigest: z.string().regex(/^[a-f0-9]{64}$/) }).strict(),
+]);
+const delivery = z.object({ kind: z.literal('sms_result') }).strict();
+const v3Task = callerIntentDecisionSchema.options[0].extend({ delivery: delivery.optional() });
+export const callerIntentV3DecisionSchema = z.discriminatedUnion('kind', [
+  v3Task, callerIntentDecisionSchema.options[1], callerIntentDecisionSchema.options[2],
+  callerIntentDecisionSchema.options[3],
+  z.object({ kind: z.literal('deliver_result'), target: callerIntentTaskIdentitySchema, delivery }).strict(),
+]);
+export type CallerIntentV3Decision = z.infer<typeof callerIntentV3DecisionSchema>;
+const taskFields = { tasks: z.array(callerIntentV3TaskSchema).max(16), taskCoverage: callerIntentV3TaskCoverageSchema };
+type V3Tasks = { tasks: Array<z.infer<typeof callerIntentV3TaskSchema>>; taskCoverage: z.infer<typeof callerIntentV3TaskCoverageSchema>;
+  questions: Array<{ execution: CallerIntentTaskIdentity }>; results: Array<{ execution: CallerIntentTaskIdentity }> };
+const tuple = (value: CallerIntentTaskIdentity) => JSON.stringify([value.bindingId, value.requestId, value.runId]);
+function validateTasks(value: V3Tasks, ctx: z.RefinementCtx) {
+  if (value.taskCoverage.state === 'complete' ? value.tasks.length !== value.taskCoverage.count : value.tasks.length >= value.taskCoverage.count)
+    ctx.addIssue({ code: 'custom', path: ['taskCoverage'], message: 'Task inventory differs from declared coverage.' });
+  if (new Set(value.tasks.map(task => task.execution.requestId)).size !== value.tasks.length
+    || new Set(value.tasks.map(task => task.execution.runId)).size !== value.tasks.length)
+    ctx.addIssue({ code: 'custom', path: ['tasks'], message: 'Task identity is duplicated.' });
+  const requests = new Map<string, string>(), runs = new Map<string, string>();
+  for (const candidate of [...value.tasks, ...value.questions, ...value.results]) {
+    const e = candidate.execution, exact = tuple(e);
+    if ((requests.has(e.requestId) && requests.get(e.requestId) !== exact)
+      || (runs.has(e.runId) && runs.get(e.runId) !== exact))
+      ctx.addIssue({ code: 'custom', path: ['tasks'], message: 'Candidate execution identities disagree.' });
+    requests.set(e.requestId, exact); runs.set(e.runId, exact);
+  }
+}
+
+export function callerIntentV3BaseInput(value: CallerIntentV3Input): CallerIntentV2Input {
+  const { tasks: _tasks, taskCoverage: _coverage, ...base } = value;
+  return callerIntentV2InputSchema.parse({ ...base, v: 'phone.caller-intent.v2' });
+}
+export const callerIntentV3InputSchema = z.object({...callerIntentV2InputSchema.shape,
+  v: z.literal(PHONE_CALLER_INTENT_V3_VERSION), ...taskFields,
+}).strict().superRefine((value, ctx) => {
+  validateTasks(value, ctx);
+  const { tasks: _tasks, taskCoverage: _coverage, ...base } = value;
+  const checked = callerIntentV2InputSchema.safeParse({ ...base, v: 'phone.caller-intent.v2' });
+  if (!checked.success) for (const issue of checked.error.issues) ctx.addIssue({code:'custom',path:issue.path,message:issue.message});
+});
+export type CallerIntentV3Input = z.infer<typeof callerIntentV3InputSchema>;
+
+const previousResponse = callerIntentV2ResponseSchema.options;
+const common = { v: z.literal(PHONE_CALLER_INTENT_V3_VERSION), ...taskFields };
+export const callerIntentV3ResponseSchema = z.discriminatedUnion('state', [
+  previousResponse[0].extend(common).strict(),
+  previousResponse[1].extend({ ...common, decision: callerIntentV3DecisionSchema }).strict(),
+]).superRefine((value, ctx) => {
+  validateTasks(value, ctx);
+  if (value.tasks.some(task => task.execution.bindingId !== value.bindingId))
+    ctx.addIssue({ code: 'custom', path: ['tasks'], message: 'Task belongs to another call.' });
+  const { tasks: _tasks, taskCoverage: _coverage, ...base } = value;
+  const decision = value.state === 'resolved' ? value.decision : undefined;
+  const oldDecision = decision?.kind === 'deliver_result' ? { kind: 'conversation' }
+    : decision?.kind === 'task' ? { kind: 'task', ...(decision.reference ? { reference: decision.reference } : {}) } : decision;
+  const checked = callerIntentV2ResponseSchema.safeParse({ ...base, v: 'phone.caller-intent.v2',
+    ...(oldDecision ? { decision: oldDecision } : {}) });
+  if (!checked.success) for (const issue of checked.error.issues) ctx.addIssue({code:'custom',path:issue.path,message:issue.message});
+  if (decision?.kind === 'deliver_result' && (!value.tasks.some(task => tuple(task.execution) === tuple(decision.target))))
+    ctx.addIssue({ code: 'custom', path: ['decision'], message: 'Delivery target is not an exact offered task.' });
+});
+export type CallerIntentV3Response = z.infer<typeof callerIntentV3ResponseSchema>;
+
+export function assertCallerIntentV3Scope(bindingId: string, input: CallerIntentV3Input) {
+  uuid.parse(bindingId); callerIntentV3InputSchema.parse(input);
+  if (input.tasks.some(task => task.execution.bindingId !== bindingId)) throw new Error('caller_intent_candidate_binding_mismatch');
+  // The existing v2 digest checks the ordinary question/result binding scopes.
+  callerIntentV2InputDigest(bindingId, bindingId, callerIntentV3BaseInput(input));
+}
+export function callerIntentV3InputDigest(operationId: string, bindingId: string, input: CallerIntentV3Input): string {
+  assertCallerIntentV3Scope(bindingId, input);
+  const baseDigest = callerIntentV2InputDigest(operationId, bindingId, callerIntentV3BaseInput(input));
+  return createHash('sha256').update(JSON.stringify(['dexter-phone-caller-intent-input/v3', baseDigest,
+    input.tasks.map(task => tuple(task.execution)), [input.taskCoverage.state, input.taskCoverage.count, input.taskCoverage.inventoryDigest]])).digest('hex');
+}
+
+export type CallerIntentDecision = z.infer<typeof callerIntentV3DecisionSchema>;
+export const callerIntentInputSchema = z.discriminatedUnion('v', [callerIntentV1InputSchema, callerIntentV2InputSchema, callerIntentV3InputSchema]);
+export const callerIntentResponseSchema = z.union([callerIntentV1ResponseSchema, callerIntentV2ResponseSchema, callerIntentV3ResponseSchema]);
+export type CallerIntentInput = CallerIntentV1Input | CallerIntentV2Input | CallerIntentV3Input;
+export type CallerIntentResponse = CallerIntentV1Response | CallerIntentV2Response | CallerIntentV3Response;
 export const callerIntentV1OperationSchema = z.object({ operationId: uuid, input: callerIntentV1InputSchema,
   response: callerIntentV1ResponseSchema.optional() }).strict();
 export const callerIntentV2OperationSchema = z.object({ operationId: uuid, input: callerIntentV2InputSchema,
   response: callerIntentV2ResponseSchema.optional() }).strict();
-export const callerIntentOperationSchema = z.union([callerIntentV1OperationSchema, callerIntentV2OperationSchema]);
+export const callerIntentV3OperationSchema = z.object({operationId:uuid,input:callerIntentV3InputSchema,response:callerIntentV3ResponseSchema.optional()}).strict();
+export const callerIntentOperationSchema = z.union([callerIntentV1OperationSchema, callerIntentV2OperationSchema, callerIntentV3OperationSchema]);
 export type CallerIntentOperation = z.infer<typeof callerIntentOperationSchema>;
 
 export function callerIntentV1InputDigest(operationId: string, bindingId: string, value: CallerIntentV1Input): string {
@@ -215,7 +301,8 @@ export function callerIntentV2InputDigest(operationId: string, bindingId: string
 export function callerIntentInputDigest(operationId: string, bindingId: string, value: CallerIntentInput): string {
   const input = callerIntentInputSchema.parse(value);
   return input.v === 'phone.caller-intent.v1'
-    ? callerIntentV1InputDigest(operationId, bindingId, input) : callerIntentV2InputDigest(operationId, bindingId, input);
+    ? callerIntentV1InputDigest(operationId, bindingId, input) : input.v === 'phone.caller-intent.v3'
+      ? callerIntentV3InputDigest(operationId,bindingId,input) : callerIntentV2InputDigest(operationId, bindingId, input);
 }
 
 /** Validate both the transport envelope and its exact immutable submitted input. */
@@ -231,13 +318,16 @@ export function validateCallerIntentResponse(bindingId: string, operationId: str
     || !same(response.questions, input.questions) || !same(response.results, input.results)
     || Date.parse(response.validUntil) !== Math.min(Date.parse(input.callDeadlineAt), Date.parse(response.reservedAt) + 10_000))
     throw new Error('caller_intent_response_identity_changed');
-  if (input.v === 'phone.caller-intent.v2'
+  if (input.v !== 'phone.caller-intent.v1'
     && (response.v !== input.v || !same(response.resultCoverage, input.resultCoverage)))
+    throw new Error('caller_intent_response_identity_changed');
+  if (input.v === 'phone.caller-intent.v3' && (response.v !== input.v
+    || !same(response.tasks,input.tasks) || !same(response.taskCoverage,input.taskCoverage)))
     throw new Error('caller_intent_response_identity_changed');
   if (previous) {
     const saved = validateCallerIntentResponse(bindingId, operationId, input, previous);
     if (saved.reservedAt !== response.reservedAt || saved.validUntil !== response.validUntil
-      || (saved.v === 'phone.caller-intent.v2'
+      || (saved.v !== 'phone.caller-intent.v1'
         && (response.v !== saved.v || !same(saved.resultContextCoverage, response.resultContextCoverage)))
       || (saved.state === 'resolved' && !same(saved, response)))
       throw new Error('caller_intent_response_changed');

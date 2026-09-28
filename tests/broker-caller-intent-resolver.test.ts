@@ -16,7 +16,7 @@ import { callerRouteRef, findCallerRoute, requireCallerRoute, callerRouteUsedSou
   callerRoutePendingCaptures, callerQuestionPresentationDigest, type CallerRoutePreparation,
   callerIntentQuestionForTarget, requireCallerRouteDispatch, CallerRouteExpiredError,
   type CallerQuestionTarget, type CallerRouteDecision, type CallerRouteRecord } from '../src/broker/callerRouting.js';
-import { callerIntentInputDigest, type CallerIntentInput, type CallerIntentResponse, type CallerIntentDecision } from '../src/broker/callerIntentContract.js';
+import { callerIntentInputDigest, callerIntentResponseSchema, type CallerIntentInput, type CallerIntentResponse, type CallerIntentDecision } from '../src/broker/callerIntentContract.js';
 import { turnBodyDigest } from '../src/broker/reconciliation.js';
 import type { PrimaryTurnReceipt, PrimaryQuestion } from '../src/broker/primaryApi.js';
 import type { LiveDelegationRequest } from '../src/live/types.js';
@@ -90,17 +90,17 @@ function fixture(t: TestContext, selected = false) {
     reservedAt = new Date().toISOString()): CallerIntentResponse => {
     assert.ok(record.intent);
     const value = record.intent.input;
-    const versionFields = value.v === 'phone.caller-intent.v2'
+    const versionFields = value.v !== 'phone.caller-intent.v1'
       ? { v: value.v, resultCoverage: value.resultCoverage, resultContextCoverage: value.resultCoverage.state === 'overflow'
         ? { state: 'unavailable' as const, reason: 'inventory_overflow' as const } : { state: 'complete' as const } }
       : { v: value.v };
-    const fields = { ...versionFields, operationId: record.intent.operationId, bindingId,
+    const fields = { ...versionFields, ...(value.v==='phone.caller-intent.v3' ? {tasks:value.tasks,taskCoverage:value.taskCoverage} : {}), operationId: record.intent.operationId, bindingId,
       inputDigest: callerIntentInputDigest(record.intent.operationId, bindingId, value), brokerInputDigest: value.brokerInputDigest,
       presentationDigest: value.presentationDigest, generationId: value.generationId, sourceSessionId: value.sourceSessionId,
       callDeadlineAt: value.callDeadlineAt, questions: value.questions, results: value.results,
       reservedAt, validUntil: new Date(Math.min(Date.parse(value.callDeadlineAt), Date.parse(reservedAt) + 10_000)).toISOString(),
       version: value.version };
-    return decision ? { ...fields, state: 'resolved', decision } : { ...fields, state: 'pending' };
+    return callerIntentResponseSchema.parse(decision ? { ...fields, state: 'resolved', decision } : { ...fields, state: 'pending' });
   };
   const recordResponse = (response: CallerIntentResponse, record = read().callerRouting!.records[0]!) =>
     store.recordCallerIntentResponse(call.id, callerRouteRef(record), response);
@@ -204,10 +204,11 @@ function invoke(f: ReturnType<typeof fixture>, resolver: ReturnType<typeof creat
   return resolver.resolve({ operationId: operationId(f, record), record,
     callDeadlineAt: f.read().liveGenerations!.clocks.callDeadlineAt }, signal);
 }
-function transport(f: ReturnType<typeof fixture>, fetcher: NonNullable<Parameters<typeof createPrimaryCallerIntentClient>[0]['fetch']>, timeoutMs = 1000) {
+function transport(f: ReturnType<typeof fixture>, fetcher: NonNullable<Parameters<typeof createPrimaryCallerIntentClient>[0]['fetch']>, timeoutMs = 1000, compatible = false) {
   return createCallerIntentResolver({ callId: f.call.id, store: f.store(), timeoutMs,
     client: createPrimaryCallerIntentClient({ apiBaseUrl: 'https://api.example.test',
-      phoneServiceSecret: 'x'.repeat(40), fetch: fetcher }) });
+      phoneServiceSecret: 'x'.repeat(40), fetch: async(url,init)=>!compatible && String(url).endsWith('/caller-intents/candidates')
+      ? Response.json({error:{code:'caller_intent_not_found',retryable:false}},{status:404}) : fetcher(url,init) }) });
 }
 
 // Load a retained v1 operation as a historical disk fixture. Fresh store methods
@@ -311,6 +312,44 @@ test('unknown POST survives restart and exact recovery uses only GET with origin
   assert.deepEqual(result.decision, { kind: 'conversation' }); assert.deepEqual(methods, ['POST', 'GET']);
   assert.deepEqual(f.read().callerRouting!.records[0]!.intent!.input, saved.intent.input);
   assert.deepEqual(f.read().delegations, {});
+});
+
+test('compatible task lookup is frozen before one v3 intent POST and survives restart unchanged',async t=>{
+  const f=fixture(t);f.prepare();const calls:string[]=[];
+  const target={bindingId,requestId:uuid(71),runId:uuid(72)};
+  const offered={v:'phone.caller-intent.v3',tasks:[{execution:target}],taskCoverage:{state:'partial',count:21,inventoryDigest:'a'.repeat(64)}};
+  const first=transport(f,async(url,init)=>{
+    if(String(url).endsWith('/candidates')) {
+      calls.push('candidates');assert.equal(f.read().callerRouting!.records[0]!.intent,undefined);
+      assert.equal(JSON.parse(String(init?.body)).source.text,f.frozen.turn.text);
+      return Response.json(offered);
+    }
+    calls.push(init!.method!);
+    const saved=JSON.parse(f.bytes()).calls[f.call.id].callerRouting.records[0];
+    assert.equal(saved.intent.input.v,'phone.caller-intent.v3');assert.deepEqual(saved.intent.input.tasks,offered.tasks);
+    assert.deepEqual(saved.intent.input.taskCoverage,offered.taskCoverage);
+    assert.equal(saved.intent.response,undefined);throw new Error('response lost after possible admission');
+  },1000,true);
+  await assert.rejects(invoke(f,first));const original=structuredClone(f.read().callerRouting!.records[0]!.intent!);
+  f.restart();
+  const second=transport(f,async(url,init)=>{
+    assert.ok(!String(url).endsWith('/candidates'));calls.push(init!.method!);assert.equal(init!.method,'GET');
+    assert.deepEqual(f.read().callerRouting!.records[0]!.intent,original);
+    return Response.json(f.intentResponse(f.read().callerRouting!.records[0]!,{kind:'deliver_result',target,delivery:{kind:'sms_result'}}));
+  },1000,true);
+  const resolution=await invoke(f,second);
+  assert.deepEqual(resolution.decision,{kind:'deliver_result',target,delivery:{kind:'sms_result'}});
+  assert.deepEqual(calls,['candidates','POST','GET']);
+});
+
+test('an unavailable compatible task lookup does not silently downgrade or post a new research request',async t=>{
+  const f=fixture(t);f.prepare();let contacts=0;
+  const resolver=transport(f,async(url)=>{
+    contacts++;assert.ok(String(url).endsWith('/candidates'));
+    return Response.json({error:{code:'caller_task_inventory_unavailable',retryable:true}},{status:503});
+  },1000,true);
+  await assert.rejects(invoke(f,resolver));assert.equal(contacts,1);
+  assert.equal(f.read().callerRouting!.records[0]!.intent,undefined);assert.deepEqual(f.read().delegations,{});
 });
 
 test('crash after durable preparation and authoritative GET404 cannot trigger a POST', async t => {

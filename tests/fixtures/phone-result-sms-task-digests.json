@@ -1,0 +1,24 @@
+{
+  "input": {
+    "bindingId": "00000003-1111-4111-8111-111111111111",
+    "requestId": "00000007-1111-4111-8111-111111111111",
+    "source": {
+      "callSid": "CA11111111111111111111111111111111",
+      "itemId": "speech-1",
+      "sourceEventId": "00000008-1111-4111-8111-111111111111",
+      "revision": 1,
+      "receivedAt": "2026-09-22T14:00:00.000Z"
+    },
+    "role": "user",
+    "text": " Hello",
+    "resultSms": {
+      "v": "phone.result-sms.v1",
+      "callerIntentOperationId": "00000009-1111-4111-8111-111111111111",
+      "requestId": "00000007-1111-4111-8111-111111111111"
+    }
+  },
+  "rawPreimage": "{\"bindingId\":\"00000003-1111-4111-8111-111111111111\",\"callSid\":\"CA11111111111111111111111111111111\",\"itemId\":\"speech-1\",\"sourceEventId\":\"00000008-1111-4111-8111-111111111111\",\"revision\":1,\"receivedAt\":\"2026-09-22T14:00:00.000Z\",\"role\":\"user\",\"text\":\" Hello\",\"resultSms\":{\"v\":\"phone.result-sms.v1\",\"callerIntentOperationId\":\"00000009-1111-4111-8111-111111111111\",\"requestId\":\"00000007-1111-4111-8111-111111111111\"}}",
+  "requestPreimage": "{\"bindingId\":\"00000003-1111-4111-8111-111111111111\",\"callSid\":\"CA11111111111111111111111111111111\",\"itemId\":\"speech-1\",\"sourceEventId\":\"00000008-1111-4111-8111-111111111111\",\"revision\":1,\"receivedAt\":\"2026-09-22T14:00:00.000Z\",\"role\":\"user\",\"text\":\" Hello\",\"resultSms\":{\"v\":\"phone.result-sms.v1\",\"callerIntentOperationId\":\"00000009-1111-4111-8111-111111111111\",\"requestId\":\"00000007-1111-4111-8111-111111111111\"},\"primaryRendering\":{\"text\":\"Hello\",\"projection\":{\"kind\":\"derived\"}}}",
+  "rawSubmissionDigest": "2551d74eb6a69f5d5cbe81623ec2e0e4c21a4eaeb626a51d163d3b7835e9439a",
+  "requestDigest": "29dbb9533a7f323e63d4e5d93175d6e38faa0c693b400ac6de05da9cfba0621d"
+}

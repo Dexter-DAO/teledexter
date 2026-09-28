@@ -15,6 +15,8 @@ import { requireCallerRoute, requireCallerRouteDispatch, CallerRouteExpiredError
 import { canonicalJson } from '../outbound/canonical.js';
 import { orderedAssociatedResultReference } from './associatedResult.js';
 import { callerIntentDecisionSchema, type CallerIntentDecision } from './callerIntentContract.js';
+import { resultSmsAcknowledgement, resultSmsResearchRefusal } from './resultSmsAcknowledgement.js';
+import { phoneResultSmsAdmissionReceiptSchema, type PhoneResultSmsAdmissionReceipt } from './resultSmsContract.js';
 
 export interface CallerSourceAnchor {
   frozen: FrozenCallerTurn;
@@ -29,7 +31,7 @@ export interface PrimaryBackendOptions {
   callId: string;
   callSid: string;
   bindingId: string;
-  api: Pick<PrimaryApiClient, 'submit' | 'result' | 'captureTurn' | 'question' | 'reply'> & Partial<Pick<PrimaryApiClient, 'reconcile'>>;
+  api: Pick<PrimaryApiClient, 'submit' | 'result' | 'captureTurn' | 'question' | 'reply'> & Partial<Pick<PrimaryApiClient, 'reconcile'|'admitResultSms'>>;
   store: Pick<BrokerStore, 'get' | 'update'>;
   stabilityMs?: number;
   maxWaitMs?: number;
@@ -64,6 +66,7 @@ export interface PrimaryBackendOptions {
 }
 
 export interface PrimaryBackend extends BrokerLiveBackend {
+  deliverFrozenResult(request: LiveDelegationRequest, route: CallerRouteRef, channel: LiveBackendChannel): Promise<void>;
   delegateFrozenTask(request: LiveDelegationRequest, route: CallerRouteRef, channel: LiveBackendChannel): Promise<void>;
   answerFrozenQuestion(request: LiveDelegationRequest, route: CallerRouteRef, channel: LiveBackendChannel): Promise<void>;
   questionTargets(sessionId: string): CallerQuestionTarget[];
@@ -116,11 +119,13 @@ export interface BrokerDelegationRecord {
   laterCallerRevision?: number;
   correctionState?: 'recorded_not_applied';
   primaryResult?: PrimaryResult;
+  /** Receipt-only recovery never supplies task content or resolves task dispatch uncertainty. */
+  resultSmsAdmission?: PhoneResultSmsAdmissionReceipt;
   result?: string;
   delivery?: string;
   submitError?: PrimaryApiDiagnostic;
-  admissionRefusal?: { origin: 'api_non_admission'; status: 409;
-    code: 'delivery_association_mismatch' | 'associated_result_unavailable'; submissionDigest: string };
+  admissionRefusal?: { origin: 'api_non_admission'; status: 409 | 503;
+    code: 'delivery_association_mismatch' | 'associated_result_unavailable' | SmsAdmissionRefusalCode; submissionDigest: string };
   admissionExpiry?: { origin: 'caller_intent_expiry'; validUntil: string; inputDigest: string };
   lastResultReadError?: PrimaryApiDiagnostic;
   originalCapture?: { turn: PrimaryTurn; state: 'dispatching' | 'unknown' | 'accepted'; receipt?: AcknowledgedTurnReceipt };
@@ -189,12 +194,32 @@ export interface BrokerQuestionReplyRecord {
   refusal?: { origin: 'local_validation' | 'api_non_admission'; code: string; status?: number };
 }
 
+const smsAdmissionRefusalCodes = ['sms_unsupported_number','carrier_opted_out','sms_consent_required',
+  'sms_delivery_pending','sms_call_unavailable','sms_authority_revoked','sms_number_changed'] as const;
+type SmsAdmissionRefusalCode = typeof smsAdmissionRefusalCodes[number];
+const isSmsAdmissionRefusal = (status: number, code: string): code is SmsAdmissionRefusalCode =>
+  (smsAdmissionRefusalCodes as readonly string[]).includes(code) && status === (code==='sms_delivery_pending' ? 503 : 409);
+const taskAdmissionRefusalText = (entry: BrokerDelegationRecord) => entry.submission.resultSms
+  ? resultSmsResearchRefusal(entry.admissionRefusal?.code)
+  : 'I could not start that request from the saved result. Please tell me what you want me to check or do.';
 const terminal = (state: string) => ['completed', 'failed', 'cancelled', 'not_admitted', 'admission_refused', 'admission_expired'].includes(state);
 /** Store startup and every write enforce this independently of routed admission. */
 export function validateBrokerAdmissionRefusals(call: BrokerCall, previous?: BrokerCall): void {
   for (const [requestId, raw] of Object.entries(call.delegations)) {
     if (!raw || typeof raw !== 'object') continue;
     const entry = raw as BrokerDelegationRecord, old = previous?.delegations[requestId] as BrokerDelegationRecord | undefined;
+    if (entry.resultSmsAdmission) {
+      phoneResultSmsAdmissionReceiptSchema.parse(entry.resultSmsAdmission);
+      if (!entry.submission.resultSms || entry.submission.resultSms.requestId!==entry.requestId
+        || ['prepared','admission_refused','admission_expired'].includes(entry.status) || !entry.timing?.firstDispatchAt)
+        throw new Error('invalid_saved_sms_admission_recovery');
+      if (previous && !old?.resultSmsAdmission && (!old || !['dispatching','dispatch_unknown'].includes(old.status) || !['dispatching','dispatch_unknown'].includes(entry.status)))
+        throw new Error('sms_admission_recovery_requires_attempted_dispatch');
+      if (old?.resultSmsAdmission && (old.resultSmsAdmission.intentId!==entry.resultSmsAdmission.intentId
+        || old.resultSmsAdmission.intentDigest!==entry.resultSmsAdmission.intentDigest))
+        throw new Error('saved_sms_admission_recovery_changed');
+    }
+    if (old?.resultSmsAdmission && !entry.resultSmsAdmission) throw new Error('saved_sms_admission_recovery_removed');
     if (old?.admissionExpiry && (entry.status !== 'admission_expired'
       || canonicalJson(entry.admissionExpiry) !== canonicalJson(old.admissionExpiry)
       || canonicalJson(entry.submission) !== canonicalJson(old.submission))) throw new Error('admission_expiry_changed');
@@ -225,19 +250,23 @@ export function validateBrokerAdmissionRefusals(call: BrokerCall, previous?: Bro
       || old.submitError !== undefined || old.lastResultReadError !== undefined || old.primaryResult !== undefined
       || old.reconciliation !== undefined || canonicalJson(old.submission) !== canonicalJson(entry.submission)))
       throw new Error('admission_refusal_requires_first_dispatch');
-    if (entry.status !== 'admission_refused' || !entry.submission.associatedResultReference || !refusal
-      || refusal.origin !== 'api_non_admission' || refusal.status !== 409
-      || !['delivery_association_mismatch', 'associated_result_unavailable'].includes(refusal.code)
+    const associatedRefusal=!!entry.submission.associatedResultReference && refusal?.status===409
+      && ['delivery_association_mismatch','associated_result_unavailable'].includes(refusal.code);
+    const smsRefusal=!!entry.submission.resultSms && entry.submission.resultSms.requestId===entry.requestId
+      && !!refusal && isSmsAdmissionRefusal(refusal.status,refusal.code);
+    if (entry.status !== 'admission_refused' || !refusal || (!associatedRefusal && !smsRefusal)
+      || refusal.origin !== 'api_non_admission'
       || Object.keys(refusal).sort().join(',') !== 'code,origin,status,submissionDigest'
       || refusal.submissionDigest !== rawSubmissionDigest(entry.bindingId, entry.submission)
-      || entry.submission.relatedPrimaryRequestId !== undefined || entry.submission.referenceOrigin !== undefined
+      || (associatedRefusal && (entry.submission.relatedPrimaryRequestId !== undefined || entry.submission.referenceOrigin !== undefined))
       || entry.primaryResult !== undefined || entry.result !== undefined || entry.submitError !== undefined
       || entry.lastResultReadError !== undefined || entry.reconciliation !== undefined || Object.keys(entry.questions ?? {}).length)
       throw new Error('invalid_saved_admission_refusal');
-    orderedAssociatedResultReference(entry.submission.associatedResultReference);
+    if(associatedRefusal) orderedAssociatedResultReference(entry.submission.associatedResultReference!);
   }
   for (const [id, raw] of Object.entries(previous?.delegations ?? {}))
-    if (((raw as BrokerDelegationRecord | null)?.admissionRefusal || (raw as BrokerDelegationRecord | null)?.admissionExpiry) && !call.delegations[id])
+    if (((raw as BrokerDelegationRecord | null)?.admissionRefusal || (raw as BrokerDelegationRecord | null)?.admissionExpiry
+      || (raw as BrokerDelegationRecord | null)?.resultSmsAdmission) && !call.delegations[id])
       throw new Error('admission_refusal_removed');
 }
 const admissionUnknown = (state: string) => ['prepared', 'dispatching', 'dispatch_unknown'].includes(state);
@@ -542,11 +571,15 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
   /** Called only by the catch for an initial POST, including queue promotion. */
   const firstSubmitFailure = async (entry: BrokerDelegationRecord, error: unknown): Promise<BrokerDelegationRecord> => {
     const current = load(entry);
-    if (current.status === 'dispatching' && current.submission.associatedResultReference && !current.submitError && !current.lastResultReadError
-      && error instanceof PrimaryApiError && error.code === 'http_error' && error.status === 409
-      && (error.remoteCode === 'delivery_association_mismatch' || error.remoteCode === 'associated_result_unavailable')) {
+    if (current.status === 'dispatching' && !current.submitError && !current.lastResultReadError
+      && error instanceof PrimaryApiError && error.code === 'http_error' && error.remoteCode
+      && ((current.submission.associatedResultReference && error.status===409
+        && (error.remoteCode==='delivery_association_mismatch' || error.remoteCode==='associated_result_unavailable'))
+        || (current.submission.resultSms && current.submission.resultSms.requestId===current.requestId
+          && isSmsAdmissionRefusal(error.status ?? 0,error.remoteCode)))) {
       const refused = save({ ...current, status: 'admission_refused', admissionRefusal: {
-        origin: 'api_non_admission', status: 409, code: error.remoteCode,
+        origin: 'api_non_admission', status: error.status as 409|503,
+        code: error.remoteCode as NonNullable<BrokerDelegationRecord['admissionRefusal']>['code'],
         submissionDigest: rawSubmissionDigest(options.bindingId, current.submission) } });
       return captureUnadmittedSubmission(refused);
     }
@@ -957,6 +990,11 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     const route = requireCallerRoute(boundCall(request.sessionId), request, ref, 'task');
     if (route.decision?.kind !== 'task') throw new Error('caller_route_kind_mismatch');
     const submission = frozenSubmission(frozen);
+    if(route.decision.delivery) {
+      if(route.intent?.response?.v!=='phone.caller-intent.v3')throw new Error('caller_route_intent_decision_changed');
+      submission.resultSms={v:'phone.result-sms.v1',callerIntentOperationId:route.intent.operationId,
+        requestId:brokerIdentity('request',options.callId,request.sessionId,request.delegationId)};
+    }
     if (route.decision.contextReference !== undefined) {
       if (!options.resolveCallerTaskReference) throw new Error('caller_route_context_reference_unsupported');
       const reference = await options.resolveCallerTaskReference(structuredClone(route));
@@ -979,7 +1017,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     }
     const active = all.find(entry => !terminal(entry.status))
       ?? all.find(entry => entry.deferredTurns?.some(turn => turn.status === 'queued'));
-    if (active) {
+    if (active && !submission.resultSms) {
       const queuedTurns = all.flatMap(entry => (entry.deferredTurns ?? []).map(turn => ({ turn, session: turn.sourceSessionId ?? entry.sessionId })))
         .filter(value => value.turn.status === 'queued').sort((a, b) => sessionOrder(a.session) - sessionOrder(b.session)
           || a.turn.firstSequence - b.turn.firstSequence).map(value => value.turn);
@@ -1366,7 +1404,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
         return result.delivery.status;
       };
       if (state.status === 'admission_refused') {
-        await tell('I could not start that request from the saved result. Please tell me what you want me to check or do.', 'admission_refused');
+        await tell(taskAdmissionRefusalText(state), 'admission_refused');
         return;
       }
       if (state.status === 'admission_expired') {
@@ -1435,7 +1473,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     const changed = current.callerRevision !== reviewedRevision;
     let text: string;
     if (entry.status === 'completed') text = entry.primaryResult!.assistant!.text;
-    else if (entry.status === 'admission_refused') text = 'I could not start that request from the saved result. Please tell me what you want me to check or do.';
+    else if (entry.status === 'admission_refused') text = taskAdmissionRefusalText(entry);
     else if (entry.status === 'admission_expired') text = 'The request took too long to confirm. Please tell me what you want me to do now.';
     else if (entry.status === 'failed') text = 'I could not get an answer to that request.';
     else if (entry.status === 'cancelled') text = 'The request was cancelled.';
@@ -1874,7 +1912,59 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       if (options.callerRouteSources) return Promise.reject(new Error('explicit_caller_route_required'));
       return observeDelegation(request, channel, () => accept(request, channel));
     },
-    delegateFrozenTask(request, route, channel) {
+    async deliverFrozenResult(request,ref,channel) {
+      let receipt:PhoneResultSmsAdmissionReceipt|undefined,error:string|undefined;
+      try {
+        receipt=await locked(async()=>{
+          if(!options.api.admitResultSms)throw new Error('sms_delivery_pending');
+          const route=requireCallerRoute(boundCall(request.sessionId),request,ref,'deliver_result');
+          if(route.decision?.kind!=='deliver_result' || route.intent?.response?.v!=='phone.caller-intent.v3')
+            throw new Error('caller_route_intent_decision_changed');
+          assertFrozenSpeech(route.frozen);
+          if(channel.signal.aborted || options.observation?.signal.aborted)return;
+          if(!route.capture) {
+            const captured=await options.api.captureTurn(options.bindingId,structuredClone(route.frozen.turn));
+            acknowledgedTurn(options.bindingId,route.frozen.turn,captured);
+            options.callerRouteCaptureAccepted?.(route.frozen.turn.sourceEventId,captured);
+          }
+          requireCallerRoute(boundCall(request.sessionId),request,ref,'deliver_result');
+          assertFrozenSpeech(route.frozen);
+          return options.api.admitResultSms(options.bindingId,{v:'phone.result-sms.v1',
+            callerIntentOperationId:route.intent.operationId,requestId:route.decision.target.requestId});
+        });
+      } catch(cause) { error=cause instanceof PrimaryApiError ? cause.remoteCode : undefined; }
+      finally { settleAdmission(request); }
+      if(!channel.signal.aborted && !boundCall(request.sessionId).endedAt)
+        await channel.publish({id:`${request.requestId}_sms_admission`,kind:'result',
+          text:resultSmsAcknowledgement(receipt,error),expectedCallerRevision:channel.getContext().callerRevision});
+    },
+    async delegateFrozenTask(request, route, channel) {
+      const record=requireCallerRoute(boundCall(request.sessionId),request,route,'task','recover');
+      if(record.decision?.kind==='task' && record.decision.delivery) {
+        let entry:BrokerDelegationRecord|undefined;
+        try { entry=await acceptFrozenTask(request,route,channel); }
+        finally { settleAdmission(request); }
+        if (entry && ['dispatching','dispatch_unknown'].includes(entry.status) && entry.submission.resultSms && entry.timing?.firstDispatchAt
+          && !entry.resultSmsAdmission && options.api.admitResultSms) {
+          const exact=entry;
+          try {
+            const receipt=await options.api.admitResultSms(options.bindingId,structuredClone(entry.submission.resultSms));
+            entry=await locked(async()=>{
+              const current=load(exact);
+              if(!['dispatching','dispatch_unknown'].includes(current.status) || !current.timing?.firstDispatchAt) return current;
+              return save({...current,resultSmsAdmission:phoneResultSmsAdmissionReceiptSchema.parse(receipt)});
+            });
+          } catch { /* The original task and SMS receipt remain uncertain; never submit new identities. */ }
+        }
+        // API's durable queue owns this explicit deferred-result request. It
+        // must be admitted before hangup; an existing voice observer continues
+        // on its original request and is never replaced by this acknowledgement.
+        if(!channel.signal.aborted && !boundCall(request.sessionId).endedAt)
+          await channel.publish({id:`${request.requestId}_sms_admission`,kind:'result',
+            text:entry?.admissionRefusal ? taskAdmissionRefusalText(entry) : resultSmsAcknowledgement(entry?.primaryResult?.resultSms ?? entry?.resultSmsAdmission,entry?.submitError?.remoteCode),
+            expectedCallerRevision:channel.getContext().callerRevision});
+        return;
+      }
       return observeDelegation(request, channel, () => acceptFrozenTask(request, route, channel));
     },
     answerFrozenQuestion(request, route, channel) {
