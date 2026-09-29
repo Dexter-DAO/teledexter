@@ -17,6 +17,7 @@ import { orderedAssociatedResultReference } from './associatedResult.js';
 import { callerIntentDecisionSchema, type CallerIntentDecision } from './callerIntentContract.js';
 import { resultSmsAcknowledgement, resultSmsResearchRefusal } from './resultSmsAcknowledgement.js';
 import { phoneResultSmsAdmissionReceiptSchema, type PhoneResultSmsAdmissionReceipt } from './resultSmsContract.js';
+import { failedRequestSpeech } from './voicePresentation.js';
 
 export interface CallerSourceAnchor {
   frozen: FrozenCallerTurn;
@@ -1475,7 +1476,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     if (entry.status === 'completed') text = entry.primaryResult!.assistant!.text;
     else if (entry.status === 'admission_refused') text = taskAdmissionRefusalText(entry);
     else if (entry.status === 'admission_expired') text = 'The request took too long to confirm. Please tell me what you want me to do now.';
-    else if (entry.status === 'failed') text = 'I could not get an answer to that request.';
+    else if (entry.status === 'failed') text = failedRequestSpeech(entry);
     else if (entry.status === 'cancelled') text = 'The request was cancelled.';
     else if (['dispatching', 'dispatch_unknown', 'prepared'].includes(entry.status))
       text = 'I could not confirm the outcome. Please check the request status before trying again.';

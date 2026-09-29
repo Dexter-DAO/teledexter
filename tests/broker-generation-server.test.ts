@@ -3,7 +3,7 @@ import test from 'node:test';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
 import Twilio from 'twilio';
 import { WebSocket } from 'ws';
@@ -71,7 +71,8 @@ test('successor registration/context crosses actual HTTP with negotiated full me
   assert.throws(() => createPrimaryApiClient({ ...options, contextProtocol: { version: 'unknown', parse: value => value } } as never));
 });
 
-async function host(t: test.TestContext, slowClose = false, questionMode = false, boundedCleanup = false) {
+async function host(t: test.TestContext, slowClose = false, questionMode = false, boundedCleanup = false,
+  settings: { failed?: boolean; sameEpoch?: boolean } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-generation-server-'));
   const config: BrokerConfig = { host: '127.0.0.1', port: 3213, publicOrigin: 'https://phone.example.test', stateDir: directory,
     controlToken: 'c'.repeat(40), apiKey: 'fixture-key', model: 'gpt-live-1', voice: 'marin',
@@ -80,7 +81,11 @@ async function host(t: test.TestContext, slowClose = false, questionMode = false
   const store = new BrokerStore(directory);
   const reserved = store.reserve({ requestId: randomUUID(), number: proof.params.To, direction: 'outbound', purpose: 'Discuss my portfolio', callSid: sid }).call;
   store.recordPrimaryBinding(reserved.id, context());
-  let generation = 1, released = false, providerEnds = 0;
+  let generation = 1, released = false, providerEnds = 0, cursor = 280;
+  const currentContext = () => { const value = context(generation);
+    if (settings.sameEpoch) value.context.history.version = { ...value.context.history.version,
+      threadEventSequence: String(cursor), digest: createHash('sha256').update(String(cursor)).digest('hex') };
+    return value; };
   let beforeResult: (() => void) | undefined;
   const posts: Array<{ requestId: string; input: PrimarySubmission }> = [];
   const questionId = '88888888-8888-4888-8888-888888888888';
@@ -98,7 +103,7 @@ async function host(t: test.TestContext, slowClose = false, questionMode = false
       posts.push({ requestId, input: structuredClone(input) }); return { bindingId, requestId, state: 'queued', replayed: false };
     },
     async result(_binding: string, requestId: string) {
-      if (released) { const callback = beforeResult; beforeResult = undefined; callback?.(); generation = 2; return questionMode ? { bindingId, requestId, state: 'waiting_for_reply', question } : completed(requestId); }
+      if (released) { const callback = beforeResult; beforeResult = undefined; callback?.(); generation = 2; if (settings.failed) return { bindingId, requestId, state: 'failed', error: { code: 'primary_financial_result_unknown', retryable: false } }; return questionMode ? { bindingId, requestId, state: 'waiting_for_reply', question } : completed(requestId); }
       return { bindingId, requestId, state: 'running' };
     },
     async close() { return { bindingId, callSid: sid, state: 'closed' }; },
@@ -107,9 +112,9 @@ async function host(t: test.TestContext, slowClose = false, questionMode = false
     },
   } as unknown as PrimaryApiClient;
   const eligible: EligibleContextClient = {
-    async fetch() { return context(generation); },
+    async fetch() { return currentContext(); },
     async assert(_binding, requested) {
-      if (requested.digest !== version(generation).digest) throw new PrimaryApiError('http_error', 409, { code: 'context_changed', retryable: false });
+      if (requested.digest !== currentContext().context.history.version.digest) throw new PrimaryApiError('http_error', 409, { code: 'context_changed', retryable: false });
       return { bindingId, callSid: sid, current: true, version: requested };
     },
     async delivery(_binding, requestId, input) {
@@ -190,7 +195,8 @@ async function host(t: test.TestContext, slowClose = false, questionMode = false
     return voice.options.backend.delegate({ callId: reserved.id, sessionId: `generation_${index + 1}`,
       delegationId: 'explicit_request', requestId: 'provider_delegate', offsetMs: 20, transcript: structuredClone(voice.captions) }, voice.channel);
   };
-  return { broker, store, callId: reserved.id, ws, voices, posts, opening, eligible, eligibleText, delegate,
+  return { broker, store, callId: reserved.id, ws, streamSid, voices, posts, opening, eligible, eligibleText, delegate,
+    advanceWork: () => { cursor++; },
     release: (callback?: () => void) => { beforeResult = callback; released = true; }, providerEnds: () => providerEnds,
     finishSlow: () => finishSlowClose?.(), finishQuestion: () => finishQuestion?.(), questionId, audio };
 }
@@ -466,4 +472,96 @@ test('late question-chunk rejection crosses actual host callbacks and forces a d
   const attempts = call.publications!.records.filter(record => record.kind === 'result').map(record => record.updateId);
   assert.ok(attempts.some(id => id.includes('_attempt_1_'))); assert.ok(attempts.some(id => id.includes('_attempt_2_')));
   assert.equal(f.posts.length, 1); f.ws.close(); await work;
+});
+
+
+test('actual server waits for carrier playback acknowledgement before rotating and presenting the result', async t => {
+  const f = await host(t); const work = f.delegate();
+  await until(() => f.posts.length === 1);
+  const messages: Array<{ event: string; mark?: { name: string } }> = [];
+  f.ws.on('message', value => { messages.push(JSON.parse(String(value))); });
+  f.voices[0].options.onAudio(Buffer.alloc(160, 255).toString('base64'), { deliveryId: 'synthetic_active_playback' });
+  await until(() => messages.some(message => message.event === 'mark'));
+  f.release(); await wait(1000);
+  assert.equal(f.voices.length, 1); assert.deepEqual(f.voices[0].spoken, []);
+  const mark = messages.find(message => message.event === 'mark')!.mark!;
+  f.ws.send(JSON.stringify({ event: 'mark', streamSid: f.streamSid, mark }));
+  await until(() => f.voices[1]?.spoken.join('') === f.eligibleText); await work;
+  assert.equal(f.posts.length, 1); assert.equal(f.providerEnds(), 0);
+});
+
+test('actual cleared carrier playback releases a queued result without waiting for a cleared mark', async t => {
+  const f = await host(t); const work = f.delegate();
+  await until(() => f.posts.length === 1);
+  f.voices[0].options.onAudio(Buffer.alloc(160, 255).toString('base64'), { deliveryId: 'cleared_playback' });
+  f.release(); await wait(1000); assert.equal(f.voices.length, 1);
+  f.voices[0].options.onPlaybackClear?.('application_interrupt');
+  await until(() => f.voices[1]?.spoken.join('') === f.eligibleText); await work;
+  assert.equal(f.posts.length, 1);
+});
+
+test('carrier disconnect cancels waiting result presentation and retains the result without another voice', async t => {
+  const f = await host(t); const work = f.delegate();
+  await until(() => f.posts.length === 1);
+  f.voices[0].options.onAudio(Buffer.alloc(160, 255).toString('base64'), { deliveryId: 'disconnect_playback' });
+  f.release(); await wait(1000); f.ws.close();
+  await until(() => Boolean(f.store.get(f.callId)!.endedAt)); await work;
+  assert.equal(f.voices.length, 1); assert.deepEqual(f.voices[0].spoken, []);
+  assert.equal((f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord).status, 'completed');
+});
+
+test('a caller turn during actual context replacement withholds the old result from the empty successor', async t => {
+  const f = await host(t); const work = f.delegate();
+  await until(() => f.posts.length === 1);
+  const fetch = f.eligible.fetch;
+  f.eligible.fetch = async scope => {
+    const source = f.voices[0];
+    source.captions.revision++; source.captions.callerRevision++;
+    source.captions.fragments.push({ eventId: 'new_topic', role: 'user', text: 'What are your suggestions?',
+      startMs: 21, endMs: 40, sequence: source.captions.revision });
+    source.options.onTranscript(source.captions);
+    return fetch(scope);
+  };
+  f.release(); await work;
+  assert.equal(f.voices.length, 2, 'a genuine eligibility change still requires strict replacement');
+  assert.deepEqual(f.voices.flatMap(value => value.spoken), []);
+  const saved = f.store.get(f.callId)!;
+  assert.equal((saved.delegations[f.posts[0].requestId] as BrokerDelegationRecord).delivery, 'stale');
+  assert.equal((saved.delegations[f.posts[0].requestId] as BrokerDelegationRecord).primaryResult?.state, 'completed');
+  assert.equal(saved.liveGenerations!.segments[0].transcript.fragments.at(-1)!.text, 'What are your suggestions?');
+});
+
+test('actual generation retains the failed financial request and speaks bounded uncertainty without a new submit', async t => {
+  const f = await host(t, false, false, false, { failed: true }); const work = f.delegate();
+  await until(() => f.posts.length === 1); f.release(); await work;
+  assert.deepEqual(f.voices.flatMap(value => value.spoken), [
+    "I couldn't confirm the trade request. We need to check that same request before continuing.",
+  ]);
+  const saved = f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord;
+  assert.equal(saved.status, 'failed'); assert.equal(saved.primaryResult?.state, 'failed');
+  assert.equal(saved.primaryResult?.error?.code, 'primary_financial_result_unknown');
+  assert.equal(f.posts.length, 1); assert.equal(saved.primaryResult?.assistant, undefined);
+});
+
+test('actual default backend work progress keeps its existing voice and persists a separate immutable-source audit', async t => {
+  const f = await host(t, false, false, false, { sameEpoch: true }); const work = f.delegate();
+  await until(() => f.posts.length === 1);
+  const original = structuredClone(f.store.get(f.callId)!.liveGenerations!.segments[0].version);
+  f.advanceWork();
+  await until(() => Boolean(f.store.get(f.callId)!.statusContextRefreshes?.length), 21000);
+  assert.equal(f.voices.length, 1); assert.equal(f.voices[0].closed.length, 0);
+  assert.deepEqual(f.voices[0].spoken, ['Your request is still being handled. I am waiting for its result.']);
+  assert.deepEqual(f.store.get(f.callId)!.liveGenerations!.segments[0].version, original);
+  assert.equal(f.store.get(f.callId)!.statusContextRefreshes![0].version.threadEventSequence, '281');
+  assert.equal(f.posts.length, 1);
+  const source = f.voices[0];
+  source.captions.revision++; source.captions.callerRevision++;
+  source.captions.fragments.push({ eventId: 'suggestion_topic', role: 'user', text: 'What are your suggestions?',
+    startMs: 21, endMs: 40, sequence: source.captions.revision });
+  source.options.onTranscript(source.captions); f.advanceWork();
+  await wait(18500);
+  assert.equal(f.voices.length, 1, 'later conversation cannot be reset by old waiting notices');
+  assert.equal(f.store.get(f.callId)!.statusContextRefreshes!.length, 1, 'obsolete progress is suppressed before context I/O');
+  assert.equal(source.spoken.length, 1, 'the old request must not repeatedly interrupt suggestions');
+  f.ws.close(); await work;
 });

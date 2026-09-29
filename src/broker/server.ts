@@ -14,6 +14,7 @@ import { createPrimaryApiClient, type PrimaryApiClient } from './primaryApi.js';
 import { createPrimaryBackend, type BrokerDelegationRecord } from './backend.js';
 import { eligiblePhoneCallSchema, type EligibleContextClient } from './eligibleContext.js';
 import { createGenerationVoice, type GenerationVoiceOptions, type GenerationVoiceSession } from './generationVoice.js';
+import { carrierPlaybackState } from './voicePresentation.js';
 import { createInboundStartupContexts } from './startupContext.js';
 import { createNotificationAssignmentResolver, NotificationAssignmentError, type NotificationAssignmentResolver } from './notificationResolver.js';
 import { createBrokerDependencyHealth, type BrokerDependencyHealth } from './dependencyHealth.js';
@@ -991,6 +992,8 @@ export function createBrokerServer(options: BrokerServerOptions) {
           };
           live = options.eligibleContext ? createGenerationVoice({ call: store.get(call.id)!, callDeadlineAt,
             apiKey: config.apiKey, voice: config.voice, store, primary,
+            playbackState: () => carrierPlaybackState(!stopping && ws.readyState === WebSocket.OPEN,
+              receipts.sentBytes, receipts.playedBytes, receipts.clearedBytes),
             context: startupContexts!.take(store.get(call.id)!), voiceFactory,
             ...(options.selectedQuestion ? { selectedQuestion: options.selectedQuestion } : {}),
             ...(call.continuation && options.callerIntent ? { callerIntent: createCallerIntentResolver({

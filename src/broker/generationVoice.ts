@@ -1,5 +1,6 @@
 import { createPrimaryBackend, liveResultChunks, withCallerAdmission, type BrokerDelegationRecord, type PrimaryBackend } from './backend.js';
-import { createLiveGenerationController, LiveGenerationStartupError, LIVE_GENERATION_STARTUP_MS, type GenerationHandle, type GenerationPublication, type LiveGenerationAttachment } from './liveGeneration.js';
+import { createLiveGenerationController, LiveGenerationError, LiveGenerationStartupError, LIVE_GENERATION_STARTUP_MS, type GenerationHandle, type GenerationPublication, type LiveGenerationAttachment } from './liveGeneration.js';
+import { callerPresentationFrontier, failedRequestSpeech, hasLaterCallerSpeech, hasNewerCallerWork, isFixedPendingStatus } from './voicePresentation.js';
 import { prepareEligibleHistory } from './eligibleHistory.js';
 import { eligibleAssociatedDeliveryResponseSchema, eligibleDeliveryResponseSchema,
   type EligibleContextClient, type EligibleContextBinding } from './eligibleContext.js';
@@ -44,6 +45,7 @@ export interface GenerationVoiceOptions {
   onClosed(value: LiveSessionClosed): void;
   onPlaybackClear(): void;
   onProblem(code: string): void;
+  playbackState?(): 'idle' | 'pending' | 'unavailable';
 }
 
 export interface GenerationVoiceSession extends BrokerLiveSession {
@@ -82,6 +84,8 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
   let playbackPaused = false;
   let readyReported = false;
   let lastSpeechAt = 0;
+  let speechRevision = 0;
+  let lastOutputAt = 0;
   let inputNextSample = initialCall.liveGenerations?.inputNextSample ?? 0;
   let closing: Promise<LiveSessionClosed> | undefined;
   let finalResult: LiveSessionClosed | undefined;
@@ -97,6 +101,18 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
     return attachment ? { attachment, session: sessions.get(attachment.sessionId) } : undefined;
   };
   const closedDelivery = (): LiveDelivery => ({ eventId: '', status: 'closed' });
+  const presentationFrontier = () => `${speechRevision}:${callerPresentationFrontier(call())}`;
+  const quiet = () => (options.playbackState?.() ?? 'idle') === 'idle'
+    && Date.now() - Math.max(lastSpeechAt, lastOutputAt) >= 800;
+  const atSpeechBoundary = async (entry: BrokerDelegationRecord) => {
+    const deadline = Date.now() + 5_000;
+    while (!stopped && !observer.signal.aborted && !call().endedAt && Date.now() < deadline) {
+      if (hasNewerCallerWork(call(), entry) || options.playbackState?.() === 'unavailable') return false;
+      if (quiet()) return true;
+      await new Promise<void>(resolve => setTimeout(resolve, 50));
+    }
+    return false;
+  };
 
   const selectedActive = () => !stopped && !selectedClosing && !observer.signal.aborted && !call().endedAt
     && !call().primaryClosed && !terminalCallStatuses.has(call().status)
@@ -235,6 +251,18 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
 
   const publish = async (entry: BrokerDelegationRecord, update?: LiveBackendUpdate) => {
     if (stopped || observer.signal.aborted || call().endedAt) return { delivery: closedDelivery() };
+    const pendingStatus = isFixedPendingStatus(entry, update);
+    const ordinaryResult = !update && ['completed', 'failed', 'cancelled', 'waiting_for_reply'].includes(entry.status);
+    const deferred = () => ({ delivery: { eventId: '', status: 'stale' as const, reason: 'caller_presentation_deferred' } });
+    if (pendingStatus && (hasLaterCallerSpeech(call(), entry) || !quiet())) return deferred();
+    if (ordinaryResult && !await atSpeechBoundary(entry)) return deferred();
+    // Freeze before context I/O. A successor's empty transcript cannot make an
+    // old answer current after the caller has started another turn.
+    const frontier = presentationFrontier();
+    const stillRelevant = () => !stopped && !observer.signal.aborted && !call().endedAt
+      && frontier === presentationFrontier()
+      && (!ordinaryResult || (!hasNewerCallerWork(call(), entry) && quiet()))
+      && (!pendingStatus || (!hasLaterCallerSpeech(call(), entry) && quiet()));
     const canonicalRequestId = entry.reconciliation?.outcome === 'admitted' ? entry.reconciliation.canonicalRequestId : entry.requestId;
     let attachment: LiveGenerationAttachment;
     let delivery: GenerationPublication;
@@ -243,15 +271,29 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
         ? { kind: 'assistant' as const, messageId: entry.primaryResult.assistant.messageId }
         : entry.currentQuestionId ? { kind: 'question' as const, questionId: entry.currentQuestionId, questionRevision: 1 as const } : undefined;
       if (!source) return { delivery: { eventId: '', status: 'unconfirmed' as const, reason: 'eligible_source_unavailable' } };
-      const outcome = await controller.deliver(canonicalRequestId, source);
+      let outcome;
+      try { outcome = await controller.deliver(canonicalRequestId, source, undefined, stillRelevant); }
+      catch (error) {
+        if (error instanceof LiveGenerationError && error.code === 'presentation_deferred') return deferred();
+        throw error;
+      }
       attachment = outcome.attachment;
       delivery = outcome.publication ?? { eventId: '', status: 'unconfirmed', reason: outcome.response.delivery.state === 'unavailable'
         ? outcome.response.delivery.reason : 'publication_unconfirmed' };
     } else {
-      const text = update?.text ?? (entry.status === 'failed' ? 'I could not get an answer to that request.'
+      const text = update?.text ?? (entry.status === 'failed' ? failedRequestSpeech(entry)
         : entry.status === 'cancelled' ? 'The request was cancelled.' : 'I am checking the saved request status.');
-      const published = await controller.withCurrentAttachment(async currentAttachment => ({ attachment: currentAttachment,
-        delivery: await publishText(entry, currentAttachment, text, update?.kind ?? 'result', update?.id ?? `${entry.requestId}_${entry.status}`) }));
+      const present = async (currentAttachment: LiveGenerationAttachment) => ({ attachment: currentAttachment,
+        delivery: stillRelevant()
+          ? await publishText(entry, currentAttachment, text, update?.kind ?? 'result', update?.id ?? `${entry.requestId}_${entry.status}`)
+          : { eventId: '', status: 'stale' as const, reason: 'caller_context_changed' } });
+      let published: Awaited<ReturnType<typeof present>>;
+      try { published = pendingStatus ? await controller.withStatusAttachment(stillRelevant, present)
+        : await controller.withCurrentAttachment(present, stillRelevant); }
+      catch (error) {
+        if (error instanceof LiveGenerationError && error.code === 'presentation_deferred') return deferred();
+        throw error;
+      }
       attachment = published.attachment; delivery = published.delivery;
     }
     const segment = controller.snapshot().segments.find(value => value.generationId === attachment.generationId)!;
@@ -269,11 +311,16 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
       options.store.update(initialCall.id, { liveGenerations: journal,
         ...(journal.deliveryAttachment ? { liveSessionId: journal.deliveryAttachment.sessionId } : {}) });
     },
-    onAudio(payload) { if (!playbackPaused) options.onAudio(payload); },
+    onAudio(payload) { if (!playbackPaused) { lastOutputAt = Date.now(); options.onAudio(payload); } },
     clearPlayback: options.onPlaybackClear,
     onProblem(code) { options.onProblem(code); },
     onContextReadFailure(failure) {
       options.store.update(initialCall.id, { contextReadFailures: [...(call().contextReadFailures ?? []), failure].slice(-16) });
+    },
+    onStatusContextRefresh(refresh) {
+      const prior = call().statusContextRefreshes ?? [];
+      if (prior.length >= 1000) throw new LiveGenerationError('status_context_evidence_limit');
+      options.store.update(initialCall.id, { statusContextRefreshes: [...prior, refresh] });
     },
     async beforeRetire(generationId) {
       const pending = admissions.get(generationId);
@@ -593,7 +640,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
     appendAudio(payload) {
       const bytes = Buffer.from(payload, 'base64');
       const observedAt = Date.now();
-      if (inputSpeechEnergy(bytes) > 0.012) lastSpeechAt = observedAt;
+      if (inputSpeechEnergy(bytes) > 0.012) { lastSpeechAt = observedAt; speechRevision++; }
       const outcome = controller.appendAudio({ payload, callInputStartSample: inputNextSample, observedAt });
       inputNextSample = controller.snapshot().inputNextSample;
       return outcome !== 'refused';

@@ -107,6 +107,7 @@ function harness(initial?: LiveGenerationJournal, overrides: Partial<LiveGenerat
   const controller = createLiveGenerationController(options);
   return { controller, options, sessions, persisted, problems, contextReadFailures, audio, api, operations,
     get clears() { return clears; }, setTime: (value: number) => { time = value; },
+    setVersion: (value: HistoryVersion) => { version = structuredClone(value); },
     advanceVersion: () => { version = versionFor(Number(version.contextEpoch) + 1); } };
 }
 
@@ -809,4 +810,111 @@ test('replacement refuses a repeated provider session ID and restart refuses a d
   const saved = f.controller.snapshot();
   saved.segments.at(-1)!.sessionId = existing;
   assert.equal(liveGenerationJournalSchema.safeParse(saved).success, false);
+});
+
+// These are the observed work-event cursors from the Apple call. They carry no
+// new eligible message in this fixture; epoch and bound content remain exact.
+test('incident work cursors retain one voice for fixed pending status and never rewrite its source version', async () => {
+  const refreshes: unknown[] = [];
+  const h = harness(undefined, { onStatusContextRefresh: value => { refreshes.push(structuredClone(value)); } });
+  const initial = { ...versionFor(1), contextEpoch: '10', threadEventSequence: '280' };
+  h.setVersion(initial); await h.controller.start();
+  const original = h.controller.snapshot().segments[0], clears = h.clears;
+  try {
+    for (const sequence of ['281', '282', '283', '284', '285']) {
+      h.setVersion({ ...initial, threadEventSequence: sequence, digest: sequence.padStart(64, '0') });
+      const attached = await h.controller.withStatusAttachment(() => true, async value => value);
+      assert.equal(attached.sessionId, 'session_1');
+    }
+    assert.equal(h.sessions.length, 1); assert.equal(h.clears, clears);
+    assert.deepEqual(h.controller.snapshot().segments[0], original);
+    assert.equal(refreshes.length, 5); assert.equal(h.sessions[0].closes.length, 0);
+    // A result continues through the strict source/version guard, not the status exception.
+    const result = await h.controller.deliver(requestId, { kind: 'assistant', messageId });
+    assert.equal(result.attachment.sessionId, 'session_2');
+    assert.equal(h.sessions[1].publications.length, 1);
+    assert.deepEqual(h.controller.snapshot().segments[0].version, initial);
+  } finally { await h.controller.stop(); }
+});
+
+for (const change of ['epoch', 'forgotten-context', 'omission', 'name'] as const) {
+  test(`fixed status replaces the old voice when ${change} changes`, async () => {
+    const h = harness(); await h.controller.start();
+    if (change === 'epoch') h.advanceVersion();
+    else {
+      const fetch = h.api.fetch;
+      h.api.fetch = async scope => {
+        const value = await fetch(scope);
+        if (change === 'forgotten-context') value.context.history.localContext = 'An updated eligible context.';
+        if (change === 'omission') value.context.history.omittedForBudget = true;
+        if (change === 'name') value.context.displayName = 'Updated name';
+        return value;
+      };
+    }
+    try {
+      const result = await h.controller.withStatusAttachment(() => true, async value => value);
+      assert.equal(result.sessionId, 'session_2');
+      assert.equal(h.sessions[0].closes.length, 1);
+    } finally { await h.controller.stop(); }
+  });
+}
+
+for (const change of ['owner', 'binding', 'revocation'] as const) {
+  test(`fixed status refuses ${change} without publishing`, async () => {
+    const h = harness(); await h.controller.start(); let publishes = 0;
+    if (change === 'revocation') h.api.assert = async () => {
+      throw new PrimaryApiError('http_error', 403, { code: 'authority_unavailable', retryable: false });
+    };
+    else {
+      const fetch = h.api.fetch;
+      h.api.fetch = async scope => { const value = await fetch(scope);
+        if (change === 'owner') value.context.history.version.ownerPrincipalId = requestId;
+        else value.bindingId = requestId; return value; };
+    }
+    try {
+      await assert.rejects(h.controller.withStatusAttachment(() => true, async () => { publishes++; }));
+      assert.equal(publishes, 0);
+      h.sessions[0].input.callbacks.onAudio('denied audio'); assert.deepEqual(h.audio, []);
+    } finally { await h.controller.stop(); }
+  });
+}
+
+test('status transient retry silences unvalidated output and restores the exact same voice after validation', async () => {
+  const h = harness(); await h.controller.start();
+  const fetch = h.api.fetch, waiting = pending<void>(); let attempts = 0;
+  h.api.fetch = async scope => { if (++attempts === 1) throw temporarilyUnavailable(); await waiting.promise; return fetch(scope); };
+  const recovering = h.controller.withStatusAttachment(() => true, async value => value);
+  try {
+    await until(() => h.controller.snapshot().phase !== 'active');
+    h.sessions[0].input.callbacks.onAudio('unvalidated');
+    assert.equal(h.controller.appendAudio({ payload: 'AQI=', callInputStartSample: 0 }), 'buffered');
+    waiting.resolve();
+    assert.equal((await recovering).sessionId, 'session_1');
+    assert.equal(h.sessions.length, 1); assert.deepEqual(h.audio, []);
+    assert.equal(h.sessions[0].audio.length, 1);
+  } finally { waiting.resolve(); await recovering.catch(() => {}); await h.controller.stop(); }
+});
+
+test('status frontier changes during context fetch withhold publication without rewriting the voice', async () => {
+  const h = harness(); await h.controller.start(); let relevant = true, publishes = 0;
+  const fetch = h.api.fetch; h.api.fetch = async scope => { relevant = false; return fetch(scope); };
+  try {
+    await assert.rejects(h.controller.withStatusAttachment(() => relevant, async () => { publishes++; }),
+      (error: unknown) => error instanceof LiveGenerationError && error.code === 'presentation_deferred');
+    assert.equal(publishes, 0); assert.equal(h.sessions.length, 1);
+  } finally { await h.controller.stop(); }
+});
+
+test('late result frontier is checked before I/O and again after eligible delivery', async () => {
+  const h = harness(); await h.controller.start(); let relevant = false;
+  const before = h.operations.length;
+  try {
+    await assert.rejects(h.controller.deliver(requestId, { kind: 'assistant', messageId }, undefined, () => relevant));
+    assert.equal(h.operations.length, before);
+    relevant = true; const read = h.api.delivery;
+    h.api.delivery = async (...args) => { relevant = false; return read(...args); };
+    const result = await h.controller.deliver(requestId, { kind: 'assistant', messageId }, undefined, () => relevant);
+    assert.equal(result.publication?.status, 'stale');
+    assert.equal(h.sessions[0].publications.length, 0);
+  } finally { await h.controller.stop(); }
 });
