@@ -62,3 +62,11 @@ The offline incident sequence includes the sale, progress question, queued buy, 
 A composed regression also exposed starvation under continuous digital-silence output: the old boundary treated every audio frame as speech. The corrected boundary distinguishes the two PCMU zero encodings from nonzero samples. Tests keep silence streaming while a saved result waits for an audible mark and caller speech to finish. Total transport accounting and backpressure remain unchanged. The call's audio bytes were not recorded, so this fixture establishes the defect without claiming its exact contribution to that call.
 
 Opening measurements retain the original first-frame journal timestamps. The `broker_audio_timing` log separately records the first sent frame containing a nonzero PCMU sample and the first carrier acknowledgment of such an uncleared frame. Digital silence, empty frames, cleared audio and duplicate marks do not count. These observations do not identify words or prove that the caller heard the greeting. The log leaves the journal schema unchanged so the previous release can still read it.
+
+### Opening the voice transport during account lookup
+
+An approved inbound call can open its initial voice-provider connection while the account context loads. The Broker first checks the saved approval and the provider's exact, active call identity. It sends the voice session and conversation history only after authenticated media arrives and the existing eligibility check passes. The post-start eligibility check still controls audio activation.
+
+The initial connection belongs to that call. A failed connection is closed without an automatic replacement. Consume failure, revocation, admission expiry, media failure, hangup and shutdown close an unused connection. Terminal cleanup removes its saved in-memory slot. After adoption, the voice session owns cleanup, and an intentional later generation replacement uses the normal connection path.
+
+`broker_inbound_transport` logs connection start, socket open, adoption and discard with call ID and elapsed time. These logs can measure handshake overlap against the existing account-read spans. Local composition tests establish the authorization and cleanup behavior; customer opening latency still requires a subsequent call measurement.

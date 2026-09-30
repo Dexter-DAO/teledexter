@@ -21,6 +21,9 @@ export interface InboundFlowOptions {
   /** In-memory handoff after the original leg and context have been admitted. */
   onContext?(call: BrokerCall, context: PrimaryCall): void;
   onTiming?: InboundTimingSink;
+  /** After canonical approval and a fresh exact in-progress provider identity, before context I/O. */
+  onApprovedTransport?(call: BrokerCall): void;
+  onTransportDiscard?(callId: string, terminal?: boolean): void;
   now?: () => number;
   /** Internal composition only. No entry gesture, route, settings or runtime activation is selected here. */
   enrollment?: { endLeg(call: BrokerCall): Promise<void> };
@@ -69,7 +72,9 @@ export function createInboundFlow(options: InboundFlowOptions) {
       && call.inbound?.mediaStartBy && now() < Date.parse(call.inbound.mediaStartBy));
   }
   function stopLocal(id: string, reason: string): BrokerCall {
-    return store.transitionInbound(id, { type: 'stop', reason, observedAt: timestamp() });
+    const call = store.transitionInbound(id, { type: 'stop', reason, observedAt: timestamp() });
+    options.onTransportDiscard?.(id, true);
+    return call;
   }
   function record(id: string, outcome: InboundOutcome): BrokerCall {
     return store.transitionInbound(id, { type: 'outcome', outcome, observedAt: timestamp() });
@@ -210,6 +215,7 @@ export function createInboundFlow(options: InboundFlowOptions) {
         }
         context = await timing.measure('refresh_context', () => primary.getContext(receipt.bindingId));
       } else if (call.inbound!.remote?.state === 'approved') {
+        options.onApprovedTransport?.(call);
         store.transitionInbound(id, { type: 'consume_attempted', observedAt: timestamp() });
         const approvalRef = call.inbound!.remote.approvalRef;
         context = await timing.measure('open_context', () => primary.openInboundCall!(call.inbound!.begin.providerProof, approvalRef));
@@ -242,6 +248,7 @@ export function createInboundFlow(options: InboundFlowOptions) {
   async function advance(id: string): Promise<BrokerCall> {
     try { return await advanceAttempt(id); }
     catch (error) {
+      options.onTransportDiscard?.(id);
       if (error instanceof PrimaryApiError && error.status === 403 && error.retryable === false
         && (error.remoteCode === 'inbound_carrier_attestation_required' || error.remoteCode === 'inbound_enrollment_required')
         && (!saved(id).inbound!.mode || saved(id).inbound!.mode?.kind === 'ordinary')

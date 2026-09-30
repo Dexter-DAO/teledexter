@@ -16,6 +16,7 @@ import { eligiblePhoneCallSchema, type EligibleContextClient } from './eligibleC
 import { createGenerationVoice, type GenerationVoiceOptions, type GenerationVoiceSession } from './generationVoice.js';
 import { carrierPlaybackState } from './voicePresentation.js';
 import { createInboundStartupContexts } from './startupContext.js';
+import { createInboundPreconnect } from './inboundPreconnect.js';
 import { createNotificationAssignmentResolver, NotificationAssignmentError, type NotificationAssignmentResolver } from './notificationResolver.js';
 import { createBrokerDependencyHealth, type BrokerDependencyHealth } from './dependencyHealth.js';
 import { createSelectedQuestionRecovery, selectedQuestionSourceAnchors } from './selectedQuestionVoice.js';
@@ -101,6 +102,8 @@ const publicCall = (call: BrokerCall) => ({
 });
 
 export interface BrokerServerOptions {
+  /** Ordinary inbound transport only; production supplies the same Live connector as the session adapter. */
+  inboundPreconnect?: () => import('../live/types.js').BrokerLiveConnection;
   sms?: BrokerSmsBridge;
   resultSms?: ResultSmsClient;
   config: BrokerConfig;
@@ -144,6 +147,8 @@ export function createBrokerServer(options: BrokerServerOptions) {
   const dependencyHealth = options.dependencyHealth ?? createBrokerDependencyHealth({
     apiBaseUrl: config.apiBaseUrl, harkApiBaseUrl: config.harkApiBaseUrl,
   });
+  const preconnect = options.eligibleContext && options.inboundPreconnect ? createInboundPreconnect(options.inboundPreconnect,
+    event => console.info(JSON.stringify(event))) : undefined;
   const startupContexts = options.eligibleContext ? createInboundStartupContexts(options.eligibleContext) : undefined;
   const resolveHarkAssignment = options.resolveHarkAssignment ?? (config.harkApiBaseUrl
     ? createHarkAssignmentResolver({ apiBaseUrl: config.harkApiBaseUrl }) : undefined);
@@ -237,6 +242,8 @@ export function createBrokerServer(options: BrokerServerOptions) {
 
   const inbound = createInboundFlow({ config, store, primary,
     onTiming: logInboundTiming,
+    onApprovedTransport: call => preconnect?.begin(call),
+    onTransportDiscard: (id, terminal) => terminal ? preconnect?.forget(id) : preconnect?.discard(id),
     onContext: (call, context) => startupContexts?.remember(call, context),
     fetchCall: sid => provider.calls(sid).fetch(), closeBound: async call => {
       // Media may have started while a provider/account read was in flight.
@@ -251,6 +258,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
 
   function closePrimary(call: BrokerCall): Promise<void> {
     startupContexts?.discard(call.id);
+    preconnect?.forget(call.id);
     const inboundBound = call.inbound?.remote?.state === 'bound' ? call.inbound.remote : undefined;
     const bindingId = call.primary?.bindingId ?? inboundBound?.bindingId;
     if (!bindingId) return Promise.resolve();
@@ -883,6 +891,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
     function stop(reason: string): Promise<void> {
       if (stopPromise) return stopPromise;
       stopping = true;
+      preconnect?.discard(call.id);
       clearTimeout(startTimer); clearTimeout(durationTimer);
       const previous = store.get(call.id)!;
       if (previous.inbound) inbound.stopLocal(call.id, reason);
@@ -1004,7 +1013,11 @@ export function createBrokerServer(options: BrokerServerOptions) {
             apiKey: config.apiKey, voice: config.voice, store, primary,
             playbackState: () => carrierPlaybackState(!stopping && ws.readyState === WebSocket.OPEN,
               receipts.audibleSentBytes, receipts.audiblePlayedBytes, receipts.audibleClearedBytes),
-            context: startupContexts!.take(store.get(call.id)!), voiceFactory,
+            context: startupContexts!.take(store.get(call.id)!),
+            voiceFactory(settings) {
+              const connectionFactory = preconnect?.factory(store.get(call.id)!);
+              return voiceFactory(connectionFactory ? { ...settings, connectionFactory } : settings);
+            },
             ...(options.selectedQuestion ? { selectedQuestion: options.selectedQuestion } : {}),
             ...(call.continuation && options.callerIntent ? { callerIntent: createCallerIntentResolver({
               callId: call.id, store, client: options.callerIntent.client, timeoutMs: options.callerIntent.timeoutMs,
@@ -1120,6 +1133,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
     accepting = false;
     options.sms?.stop();
     startupContexts?.clear();
+    preconnect?.close();
     // Freeze every saved wait before awaiting any in-flight begin/consume operation.
     for (const call of store.list()) if (call.inbound && !call.inbound.closure) inbound.stopLocal(call.id, 'service_shutdown');
     clearInterval(maintenanceTimer);

@@ -17,7 +17,8 @@ import type { BrokerConfig } from '../src/broker/config.js';
 import { PrimaryApiError, type PrimaryApiClient } from '../src/broker/primaryApi.js';
 import { createInboundHoldAdapter } from '../src/broker/inboundHold.js';
 import { streamToken } from '../src/broker/phone.js';
-import type { BrokerLiveSessionOptions } from '../src/live/session.js';
+import { createBrokerLiveSession, type BrokerLiveSessionOptions } from '../src/live/session.js';
+import { PreconnectTransport } from './helpers/preconnectTransport.js';
 import type { EligiblePhoneCall } from '../src/broker/eligibleContext.js';
 
 async function billingReceiver(t: test.TestContext, loseFirstReceipt = false) {
@@ -295,7 +296,7 @@ test('incoming legacy admission without frozen billing reference never posts a n
       callSid: call.callSid!, termsDigest: 'a'.repeat(64) } } as InboundOutcome }), /binding changed/);
 });
 
-async function fixture(t: test.TestContext, options: { selected?: boolean; retained?: BrokerCall; initialRemote?: InboundOutcome; eligible?: boolean; billing?: boolean; billingUrl?: string; duration?: string } = {}) {
+async function fixture(t: test.TestContext, options: { selected?: boolean; retained?: BrokerCall; initialRemote?: InboundOutcome; eligible?: boolean; billing?: boolean; billingUrl?: string; duration?: string; preconnect?: boolean; replaceFirstGeneration?: boolean } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-inbound-http-'));
   if (options.retained) fs.writeFileSync(path.join(dir, 'calls.json'), JSON.stringify({ version: 1, calls: { [options.retained.id]: options.retained } }));
   const store = new BrokerStore(dir);
@@ -321,6 +322,9 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
     },
   } };
   const startupPages: EligiblePhoneCall[] = [];
+  const transports: PreconnectTransport[] = [];
+  let consumeGate: Promise<void> | undefined, releaseConsume: (() => void) | undefined;
+  let assertGate: Promise<void> | undefined, releaseAssert: (() => void) | undefined;
   let voiceOptions: BrokerLiveSessionOptions | undefined;
   let remote = options.initialRemote;
   let loseConsume = false, lostBegin = false, authority = true, cancellationUnavailable = false;
@@ -365,6 +369,7 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
       assert.equal(store.list()[0].inbound!.consumeAttemptedAt !== undefined, true);
       remote = { attachmentId, beginRef: remote!.beginRef, state: 'bound', approvalRef, bindingId, billing,
         consumedAt: new Date().toISOString(), callState: 'open' };
+      if (consumeGate) await consumeGate;
       if (loseConsume) { loseConsume = false; throw new Error('lost_consume'); }
       return context();
     },
@@ -386,10 +391,19 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
   }), { async create() { seen.dial++; throw new Error('inbound_must_not_dial'); } });
   const broker = createBrokerServer({ config, store, primary, provider: { calls: provider } as unknown as ReturnType<typeof Twilio>,
     ...(options.selected === false ? {} : { inboundAttachment: createInboundHoldAdapter({ publicOrigin: config.publicOrigin, store }) }),
+    ...(options.preconnect ? { inboundPreconnect: () => {
+      const connection = new PreconnectTransport(`preconnect_${transports.length + 1}`); transports.push(connection); return connection;
+    } } : {}),
     ...(options.eligible ? { eligibleContext: {
       async fetch() { seen.startupFetch++; return structuredClone(eligiblePage); },
       async assert(binding, version) {
         seen.contextAssert++; assert.equal(binding.bindingId, bindingId); assert.equal(binding.callSid, params.CallSid);
+        if (assertGate) await assertGate;
+        if (!authority) throw new PrimaryApiError('http_error', 403, { code: 'binding_revoked', retryable: false });
+        if (options.replaceFirstGeneration && seen.voice === 1 && seen.contextAssert === 2) {
+          eligiblePage.context.history.version = { ...eligiblePage.context.history.version, contextEpoch: '2', digest: 'c'.repeat(64) };
+          throw new PrimaryApiError('http_error', 409, { code: 'context_changed', retryable: false });
+        }
         assert.deepEqual(version, eligiblePage.context.history.version);
         return { bindingId, callSid: params.CallSid, current: true as const, version };
       },
@@ -398,6 +412,11 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
     voiceFactory: settings => {
       seen.voice++; voiceOptions = settings;
       if (settings.eligibleHistory) startupPages.push(structuredClone(settings.eligibleHistory.source));
+      if (options.preconnect) return createBrokerLiveSession({ ...settings, closeTimeoutMs: 100,
+        connectionFactory: settings.connectionFactory ?? (() => {
+          const connection = new PreconnectTransport(`preconnect_${transports.length + 1}`); transports.push(connection); queueMicrotask(() => connection.open()); return connection;
+        }),
+      });
       queueMicrotask(() => settings.onReady({ callId: settings.callId, sessionId: 'inbound-fixture' }));
       return { appendAudio() { return true; }, async appendContext() { return { eventId: 'c', status: 'accepted' }; },
         async appendInstructions() { seen.opening++; return { eventId: 'i', status: 'accepted' }; }, async interruptPlayback() { return { eventId: 'p', status: 'accepted' }; },
@@ -416,7 +435,9 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
   let closed = false;
   const close = async () => { if (!closed) { closed = true; await broker.close(); } };
   t.after(async () => { await close(); fs.rmSync(dir, { recursive: true, force: true }); });
-  return { broker, store, base, config, params, seen, lifecycle, webhook, close, provider, billing,
+  return { broker, store, base, config, params, seen, lifecycle, webhook, close, provider, billing, transports,
+    gateConsume() { consumeGate = new Promise<void>(resolve => { releaseConsume = resolve; }); return () => releaseConsume!(); },
+    gateAssert() { assertGate = new Promise<void>(resolve => { releaseAssert = resolve; }); return () => releaseAssert!(); },
     providerEnded(duration = providerDuration) { providerState = 'completed'; providerDuration = duration; },
     wrongProviderIdentity() { providerWrongIdentity = true; },
     emitAudio(bytes = Buffer.alloc(800, 0)) { voiceOptions!.onAudio(bytes.toString('base64')); },
@@ -661,3 +682,123 @@ test('hold adapter refuses a different continuation destination', async t => {
   assert.throws(() => adapter.waitingResponse({ callId: call.id, continuationUrl: 'https://other.example/broker/inbound/' + call.id + '/continue' }), /mismatch/);
   assert.equal(f.seen.begin, 0);
 });
+
+async function preconnectApproved(f: Awaited<ReturnType<typeof fixture>>) {
+  await (await f.webhook('/broker/incoming-call')).text();
+  await f.waitForAdmission(); f.approve(); return f.store.list()[0];
+}
+async function preconnectUntil(predicate: () => boolean) {
+  for (let n = 0; n < 150 && !predicate(); n++) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(predicate(), true, 'expected preconnect boundary');
+}
+async function preconnectMedia(f: Awaited<ReturnType<typeof fixture>>, call: BrokerCall, token?: string) {
+  const route = `/broker/media/${call.id}`;
+  const ws = new WebSocket(f.base.replace(/^http/, 'ws') + route, { headers: {
+    'x-twilio-signature': Twilio.getExpectedTwilioSignature(f.config.twilioAuthToken, f.config.publicOrigin + route, {}),
+  } });
+  await new Promise<void>((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
+  ws.send(JSON.stringify({ event: 'start', start: { accountSid: f.config.twilioAccountSid, callSid: f.params.CallSid,
+    streamSid: 'MZ' + '4'.repeat(32), customParameters: { token: token ?? streamToken(f.config.controlToken, call.id, f.params.CallSid) },
+    mediaFormat: { encoding: 'audio/x-mulaw', sampleRate: 8000, channels: 1 } } }));
+  return ws;
+}
+
+test('approved inbound transport overlaps context I/O and stays command-free through media and pre-start assertion', async t => {
+  const f = await fixture(t, { eligible: true, preconnect: true });
+  const call = await preconnectApproved(f), release = f.gateConsume();
+  const response = f.webhook(`/broker/inbound/${call.id}/continue`);
+  await preconnectUntil(() => f.seen.consume === 1);
+  assert.equal(f.transports.length, 1); const transport = f.transports[0];
+  transport.open(); // The handshake finishes while the ordinary account lookup is still pending.
+  assert.equal(f.seen.context, 0); assert.deepEqual(transport.sent, []);
+  release(); assert.match(await (await response).text(), /<Stream/);
+  assert.deepEqual(transport.sent, []);
+  const releaseAssert = f.gateAssert(), ws = await preconnectMedia(f, call); t.after(() => ws.close());
+  await preconnectUntil(() => f.seen.contextAssert === 1);
+  assert.deepEqual(transport.sent, []); assert.equal(f.seen.voice, 0);
+  releaseAssert();
+  await preconnectUntil(() => f.store.get(call.id)!.voiceOpening?.status === 'accepted');
+  assert.equal(f.transports.length, 1); assert.equal(f.seen.contextAssert, 3);
+  assert.equal(f.seen.startupFetch, 0); assert.equal(f.seen.context, 1);
+  assert.equal(transport.sent.filter(event => event.type === 'session.start').length, 1);
+  assert.deepEqual(f.startupPages, [f.eligiblePage]);
+});
+
+test('duplicate approved continuations share the original transport and account consume', async t => {
+  const f = await fixture(t, { eligible: true, preconnect: true });
+  const call = await preconnectApproved(f), release = f.gateConsume();
+  const first = f.webhook(`/broker/inbound/${call.id}/continue`);
+  await preconnectUntil(() => f.seen.consume === 1);
+  const duplicate = f.webhook(`/broker/inbound/${call.id}/continue`);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(f.transports.length, 1); assert.equal(f.seen.consume, 1);
+  release(); await (await first).text(); await (await duplicate).text();
+  assert.equal(f.transports.length, 1); assert.deepEqual(f.transports[0].sent, []);
+  await f.close(); assert.equal(f.transports[0].terminated, 1);
+});
+
+for (const refusal of ['unapproved', 'wrong-provider', 'provider-ended'] as const)
+  test(`inbound preconnect refuses ${refusal} before opening any socket`, async t => {
+    const f = await fixture(t, { eligible: true, preconnect: true });
+    await (await f.webhook('/broker/incoming-call')).text(); await f.waitForAdmission();
+    if (refusal !== 'unapproved') f.approve();
+    if (refusal === 'wrong-provider') f.wrongProviderIdentity();
+    if (refusal === 'provider-ended') f.providerEnded();
+    const call = f.store.list()[0]; await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text();
+    assert.equal(f.transports.length, 0); assert.equal(f.seen.consume, 0);
+  });
+
+for (const failure of ['consume', 'early-error', 'early-close', 'media-token', 'revoked', 'hangup', 'shutdown'] as const)
+  test(`inbound preconnect cleans ${failure} without private commands or automatic replacement`, async t => {
+    const f = await fixture(t, { eligible: true, preconnect: true });
+    const call = await preconnectApproved(f);
+    if (failure === 'consume') f.loseConsume();
+    await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text();
+    assert.equal(f.transports.length, 1); const transport = f.transports[0]; transport.open();
+    if (failure === 'early-error') transport.fail();
+    if (failure === 'early-close') transport.end();
+    if (failure === 'revoked') f.refuseContext();
+    if (failure === 'hangup') await (await f.webhook('/broker/status', { CallStatus: 'completed' })).text();
+    else if (failure === 'shutdown') await f.close();
+    else {
+      if (failure === 'consume') await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text();
+      const ws = await preconnectMedia(f, call, failure === 'media-token' ? 'wrong' : undefined);
+      t.after(() => ws.close());
+      await preconnectUntil(() => ws.readyState === WebSocket.CLOSED);
+    }
+    assert.equal(transport.terminated, 1); assert.deepEqual(transport.sent, []);
+    assert.equal(f.transports.length, 1);
+  });
+
+test('inbound preconnect adoption preserves a managed generation replacement after context changes', async t => {
+  const f = await fixture(t, { eligible: true, preconnect: true, replaceFirstGeneration: true });
+  const call = await preconnectApproved(f);
+  await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text(); f.transports[0].open();
+  const ws = await preconnectMedia(f, call); t.after(() => ws.close());
+  await preconnectUntil(() => f.store.get(call.id)!.voiceOpening?.status === 'accepted');
+  assert.equal(f.transports.length, 2); assert.equal(f.seen.voice, 2);
+  assert.equal(f.seen.consume, 1); assert.equal(f.seen.startupFetch, 1);
+  assert.ok(f.transports.every(transport => transport.sent.filter(event => event.type === 'session.start').length === 1));
+  assert.ok(f.transports[0].closed >= 1);
+  const generations = f.store.get(call.id)!.liveGenerations!;
+  assert.equal(generations.segments.length, 2); assert.equal(generations.segments[1].state, 'active');
+});
+
+for (const cancellation of ['revoked', 'hangup', 'shutdown'] as const)
+  test(`inbound preconnect cleans ${cancellation} while account consumption is in flight`, async t => {
+    const f = await fixture(t, { eligible: true, preconnect: true });
+    const call = await preconnectApproved(f), release = f.gateConsume();
+    const continuation = f.webhook(`/broker/inbound/${call.id}/continue`);
+    await preconnectUntil(() => f.seen.consume === 1);
+    const transport = f.transports[0]; transport.open();
+    let stopping: Promise<unknown> | undefined;
+    if (cancellation === 'revoked') f.refuseContext();
+    if (cancellation === 'hangup') {
+      stopping = f.webhook('/broker/status', { CallStatus: 'completed' }).then(response => response.text());
+      await preconnectUntil(() => !!f.store.get(call.id)!.endedAt);
+    }
+    if (cancellation === 'shutdown') stopping = f.close();
+    release(); await (await continuation).text(); await stopping;
+    assert.equal(transport.terminated, 1); assert.equal(f.transports.length, 1);
+    assert.deepEqual(transport.sent, []); assert.equal(f.seen.voice, 0);
+  });

@@ -9,6 +9,7 @@ import { createSelectedQuestionAssociationClient } from './selectedQuestion.js';
 import { createRequestDeliveryClient } from './requestDelivery.js';
 import { createPrimaryCallerIntentClient } from './callerIntentClient.js';
 import { safeFailure } from './phone.js';
+import { createOpenAILiveConnection } from '../live/session.js';
 
 dotenv.config({ path: process.env.BROKER_ENV_FILE || '.env' });
 let sms: BrokerSmsBridge | undefined;
@@ -18,6 +19,7 @@ try {
   const setup = config.verificationSetup;
   const setupStore = setup ? new BrokerStore(config.stateDir) : undefined;
   const broker = createBrokerServer({ config, sms,
+    inboundPreconnect: () => createOpenAILiveConnection(config.apiKey),
     ...(setup && setupStore ? { store: setupStore,
       inboundAttachment: createInboundHoldAdapter({ publicOrigin: config.publicOrigin, store: setupStore }),
       restrictedSetup: { model: setup.model, receiptTransport: { apiBaseUrl: setup.apiBaseUrl, signingSecret: setup.signingSecret } },
