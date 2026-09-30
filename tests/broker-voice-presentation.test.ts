@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { carrierPlaybackState, callerPresentationFrontier, hasLaterCallerSpeech, hasNewerCallerWork,
   isFixedPendingStatus, failedRequestSpeech } from '../src/broker/voicePresentation.js';
+import { hasAudiblePcmu, PlaybackReceipts } from '../src/broker/phone.js';
 import type { BrokerCall } from '../src/broker/store.js';
 import type { BrokerDelegationRecord } from '../src/broker/backend.js';
 
@@ -79,4 +80,38 @@ test('late transcript correction cannot move the original task past new caller s
   f.first.transcript.fragments.push({ role: 'user', sequence: 3 }); f.first.transcript.callerRevision++;
   f.entry.lastSequence = 3;
   assert.equal(hasLaterCallerSpeech(f.call, f.entry), true);
+});
+
+test('fixed status must agree with the current queued and unavailable observation', () => {
+  const { entry } = fixture(); entry.resultReadUnavailable = true;
+  const old = { id: 'request_a_pending_1', kind: 'progress' as const,
+    text: 'Your request is still being handled. I am waiting for its result.' };
+  assert.equal(isFixedPendingStatus(entry, old), false);
+  assert.equal(isFixedPendingStatus(entry, { ...old,
+    text: 'I cannot get the latest status of your request. Its outcome is still unconfirmed.' }), true);
+  entry.deferredTurns = [{ status: 'queued', sourceEventId: 'new_buy' }] as BrokerDelegationRecord['deferredTurns'];
+  assert.equal(isFixedPendingStatus(entry, { ...old,
+    text: 'I cannot get the latest status of the earlier request. Your later requests are queued and have not started.' }), true);
+  entry.resultReadUnavailable = false;
+  assert.equal(isFixedPendingStatus(entry, { ...old,
+    text: 'Your later requests are queued behind the earlier request. They have not started.' }), true);
+});
+
+
+test('digital silence keeps total accounting without holding audible playback; even one quiet sample needs its mark', () => {
+  const receipts = new PlaybackReceipts();
+  const silence = Buffer.from([0xff, 0x7f, 0xff]);
+  assert.equal(hasAudiblePcmu(silence), false);
+  assert.equal(hasAudiblePcmu(Buffer.from([0xff, 0xfe, 0x7f])), true);
+  assert.equal(hasAudiblePcmu(Buffer.alloc(0)), true);
+  const quiet = receipts.sent(silence.length, hasAudiblePcmu(silence));
+  const speech = receipts.sent(160, true);
+  receipts.acknowledge(quiet);
+  assert.equal(receipts.audiblePlayedBytes, 0);
+  assert.equal(carrierPlaybackState(true, receipts.audibleSentBytes, receipts.audiblePlayedBytes, receipts.audibleClearedBytes), 'pending');
+  receipts.acknowledge(speech);
+  assert.equal(carrierPlaybackState(true, receipts.audibleSentBytes, receipts.audiblePlayedBytes, receipts.audibleClearedBytes), 'idle');
+  receipts.sent(320, true); receipts.clear(); receipts.acknowledge(speech);
+  assert.equal(receipts.sentBytes, 483); assert.equal(receipts.playedBytes, 163); assert.equal(receipts.clearedBytes, 320);
+  assert.equal(receipts.audibleSentBytes, 480); assert.equal(receipts.audiblePlayedBytes, 160); assert.equal(receipts.audibleClearedBytes, 320);
 });

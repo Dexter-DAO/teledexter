@@ -1,6 +1,6 @@
 import { createPrimaryBackend, liveResultChunks, withCallerAdmission, type BrokerDelegationRecord, type PrimaryBackend } from './backend.js';
 import { createLiveGenerationController, LiveGenerationError, LiveGenerationStartupError, LIVE_GENERATION_STARTUP_MS, type GenerationHandle, type GenerationPublication, type LiveGenerationAttachment } from './liveGeneration.js';
-import { callerPresentationFrontier, failedRequestSpeech, hasLaterCallerSpeech, hasNewerCallerWork, isFixedPendingStatus } from './voicePresentation.js';
+import { callerPresentationFrontier, failedRequestSpeech, hasLaterCallerSpeech, hasNewerCallerWork, isFixedPendingStatus, pendingRequestState } from './voicePresentation.js';
 import { prepareEligibleHistory } from './eligibleHistory.js';
 import { eligibleAssociatedDeliveryResponseSchema, eligibleDeliveryResponseSchema,
   type EligibleContextClient, type EligibleContextBinding } from './eligibleContext.js';
@@ -19,7 +19,7 @@ import type { RequestDeliveryClient } from './requestDelivery.js';
 import { createSelectedQuestionVoiceAdapter, createSelectedQuestionRecovery, selectedQuestionSourceAnchors,
   type SelectedQuestionCloseout } from './selectedQuestionVoice.js';
 import { brokerInstructions } from './instructions.js';
-import { inputSpeechEnergy } from './phone.js';
+import { inputSpeechEnergy, hasAudiblePcmu } from './phone.js';
 import type { BrokerLiveSession, BrokerLiveSessionOptions, LiveBackendUpdate, LiveDelivery,
   LiveDelegationRequest, LiveSessionClosed, LiveTranscriptSnapshot } from '../live/types.js';
 
@@ -107,10 +107,10 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
   const blocksEarlierPresentation = (entry: BrokerDelegationRecord) =>
     !(['completed', 'failed', 'cancelled'].includes(entry.status) && entry.primaryResult?.state === entry.status)
       && hasNewerCallerWork(call(), entry);
-  const atSpeechBoundary = async (entry: BrokerDelegationRecord) => {
+  const atSpeechBoundary = async (entry: BrokerDelegationRecord, fixedStatus = false) => {
     const deadline = Date.now() + 5_000;
     while (!stopped && !observer.signal.aborted && !call().endedAt && Date.now() < deadline) {
-      if (blocksEarlierPresentation(entry) || options.playbackState?.() === 'unavailable') return false;
+      if ((!fixedStatus && blocksEarlierPresentation(entry)) || options.playbackState?.() === 'unavailable') return false;
       if (quiet()) return true;
       await new Promise<void>(resolve => setTimeout(resolve, 50));
     }
@@ -257,15 +257,19 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
     const pendingStatus = isFixedPendingStatus(entry, update);
     const ordinaryResult = !update && ['completed', 'failed', 'cancelled', 'waiting_for_reply'].includes(entry.status);
     const deferred = () => ({ delivery: { eventId: '', status: 'stale' as const, reason: 'caller_presentation_deferred' } });
-    if (pendingStatus && (hasLaterCallerSpeech(call(), entry) || !quiet())) return deferred();
-    if (ordinaryResult && !await atSpeechBoundary(entry)) return deferred();
+    if ((ordinaryResult || pendingStatus) && !await atSpeechBoundary(entry, pendingStatus)) return deferred();
+    const statusCurrent = () => {
+      const latest = call().delegations[entry.requestId] as BrokerDelegationRecord | undefined;
+      return !!latest && pendingRequestState(latest) === pendingRequestState(entry)
+        && isFixedPendingStatus(latest, update);
+    };
     // Freeze before context I/O. A successor's empty transcript cannot make an
     // old answer current after the caller has started another turn.
     const frontier = presentationFrontier();
     const stillRelevant = () => !stopped && !observer.signal.aborted && !call().endedAt
       && frontier === presentationFrontier()
       && (!ordinaryResult || (!blocksEarlierPresentation(entry) && quiet()))
-      && (!pendingStatus || (!hasLaterCallerSpeech(call(), entry) && quiet()));
+      && (!pendingStatus || (statusCurrent() && quiet()));
     const canonicalRequestId = entry.reconciliation?.outcome === 'admitted' ? entry.reconciliation.canonicalRequestId : entry.requestId;
     let attachment: LiveGenerationAttachment;
     let delivery: GenerationPublication;
@@ -316,7 +320,10 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
       options.store.update(initialCall.id, { liveGenerations: journal,
         ...(journal.deliveryAttachment ? { liveSessionId: journal.deliveryAttachment.sessionId } : {}) });
     },
-    onAudio(payload) { if (!playbackPaused) { lastOutputAt = Date.now(); options.onAudio(payload); } },
+    onAudio(payload) { if (!playbackPaused) {
+      if (hasAudiblePcmu(Buffer.from(payload, 'base64'))) lastOutputAt = Date.now();
+      options.onAudio(payload);
+    } },
     clearPlayback: options.onPlaybackClear,
     onProblem(code) { options.onProblem(code); },
     onContextReadFailure(failure) {

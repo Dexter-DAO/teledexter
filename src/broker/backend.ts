@@ -17,7 +17,7 @@ import { orderedAssociatedResultReference } from './associatedResult.js';
 import { callerIntentDecisionSchema, type CallerIntentDecision } from './callerIntentContract.js';
 import { resultSmsAcknowledgement, resultSmsResearchRefusal } from './resultSmsAcknowledgement.js';
 import { phoneResultSmsAdmissionReceiptSchema, type PhoneResultSmsAdmissionReceipt } from './resultSmsContract.js';
-import { failedRequestSpeech } from './voicePresentation.js';
+import { failedRequestSpeech, pendingRequestSpeech, pendingRequestState } from './voicePresentation.js';
 
 export interface CallerSourceAnchor {
   frozen: FrozenCallerTurn;
@@ -129,6 +129,8 @@ export interface BrokerDelegationRecord {
     code: 'delivery_association_mismatch' | 'associated_result_unavailable' | SmsAdmissionRefusalCode; submissionDigest: string };
   admissionExpiry?: { origin: 'caller_intent_expiry'; validUntil: string; inputDigest: string };
   lastResultReadError?: PrimaryApiDiagnostic;
+  /** Presentation only; keep the last diagnostic even after a successful read. */
+  resultReadUnavailable?: boolean;
   originalCapture?: { turn: PrimaryTurn; state: 'dispatching' | 'unknown' | 'accepted'; receipt?: AcknowledgedTurnReceipt };
   reconciliation?: PrimaryReconciliation;
   reconciliationError?: PrimaryApiDiagnostic;
@@ -340,6 +342,7 @@ const storeWorkers = new WeakMap<object, Map<string, Promise<void>>>();
 // reservations without changing its admission or transcript journal.
 const storeNotices = new WeakMap<object, Map<string, {
   submitAnnounced: boolean; progressCount: number; lastAt: number; inFlight: boolean;
+  stateKey?: string; attempt?: number; deferred?: boolean; uncertainKey?: string; wake?: () => void;
 }>>();
 
 /** Timestamp grouping is application presentation state, not a provider turn-complete event. */
@@ -613,7 +616,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       ...(error.retryable === undefined ? {} : { retryable: error.retryable }), observedAt: new Date(now()).toISOString() }
     : undefined;
   const recordReadError = (entry: BrokerDelegationRecord, error: unknown) =>
-    save(load(entry), { lastResultReadError: diagnostic(error) });
+    save({ ...load(entry), resultReadUnavailable: true }, { lastResultReadError: diagnostic(error) });
   const knownReply = (sessionId: string, sourceEventId: string) => {
     for (const entry of entries(sessionId, true)) for (const [questionId, record] of Object.entries(entry.questions ?? {})) {
       const reply = replyAttempts(record).find(attempt => attempt.input.source.sourceEventId === sourceEventId);
@@ -1277,7 +1280,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       throw new Error('primary_terminal_result_changed');
     if (result.question) current = observeQuestion(current, result.question);
     if (result.state === 'waiting_for_reply' && !result.question) throw new Error('invalid_primary_result');
-    return save({ ...current, status: result.state, primaryResult: structuredClone(result),
+    return save({ ...current, status: result.state, primaryResult: structuredClone(result), resultReadUnavailable: false,
       ...(reconciliation ? { reconciliation: structuredClone(reconciliation) } : {}),
       ...(result.question ? { currentQuestionId: result.question.id } : {}),
       ...(result.assistant ? { result: result.assistant.text } : {}) });
@@ -1596,6 +1599,9 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
           expectedCallerRevision: channel.getContext().callerRevision });
         return;
       }
+      // The active observer owns status speech; queue admission can wake it
+      // without waiting for the earlier result GET or starting the queued task.
+      notices!.get(`${options.callId}:${entry.requestId}`)?.wake?.();
       const workerKey = options.observation ? options.callId : `${options.callId}:${request.sessionId}`;
       while (workers!.has(workerKey)) {
         await workers!.get(workerKey);
@@ -1640,32 +1646,38 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
               const revision = channel.getContext().callerRevision;
               const lastSpeech = speechTime();
               if (lastSpeech !== undefined && now() - lastSpeech < stabilityMs) return;
+              const stateKey = JSON.stringify([pendingRequestState(current), revision]);
+              const changed = notice!.stateKey !== undefined && notice!.stateKey !== stateKey;
+              const queued = current.deferredTurns?.some(turn => turn.status === 'queued') === true;
+              const urgent = (changed || notice!.stateKey === undefined) && (queued || current.resultReadUnavailable
+                || revision !== reviewedRevision);
               const announceSubmit = immediate && current.status === 'dispatch_unknown' && !notice!.submitAnnounced;
-              if (!announceSubmit && (immediate || notice!.progressCount >= 4 || now() - notice!.lastAt < progressIntervalMs
-                  || now() >= deadline)) return;
-              const text = announceSubmit
-                ? current.submitError?.code === 'http_error'
-                  ? 'My connection to your account tools returned an error. I am checking whether your request was saved.'
-                  : 'I have not confirmed whether your request was saved. I am checking the original request.'
-                : ['prepared', 'dispatching', 'dispatch_unknown'].includes(current.status)
-                  ? revision !== reviewedRevision
-                    ? 'I am still checking whether your earlier request was saved.'
-                    : 'I am still checking whether your request was saved.'
-                  : revision !== reviewedRevision
-                    ? 'I am still waiting for the result of your earlier request.'
-                    : 'Your request is still being handled. I am waiting for its result.';
-              if (announceSubmit) notice!.submitAnnounced = true;
-              else notice!.progressCount++;
+              const retryAfter = notice!.deferred ? Math.min(progressIntervalMs, 1000) : progressIntervalMs;
+              if (notice!.uncertainKey === stateKey) return; // An unknown append is not authority to speak it again.
+              if (!announceSubmit && !urgent && (immediate || now() - notice!.lastAt < retryAfter)) return;
+              if (!options.watchUntilCallEnds && now() >= deadline) return;
+              if (changed) { notice!.progressCount = 0; notice!.deferred = false; }
+              if (notice!.progressCount >= 4) return;
+              notice!.stateKey = stateKey;
+              const text = pendingRequestSpeech(current, revision !== reviewedRevision);
               notice!.lastAt = now();
               notice!.inFlight = true;
-              // Audio acceptance must not delay the result GET. This continuation only
-              // releases the notice reservation; its publication receipt settles before Live closes.
-              try {
-                void publishRequest(current, channel, { id: `${current.requestId}_${revision}_${announceSubmit ? 'submit_unknown' : `pending_${notice!.progressCount}`}`,
-                  kind: 'progress', speak: true, text, expectedCallerRevision: revision })
-                  .catch(() => undefined).finally(() => { notice!.inFlight = false; });
-              } catch { notice!.inFlight = false; }
+              const attempt = notice!.attempt = (notice!.attempt ?? 0) + 1;
+              // Receipt acceptance consumes the budget. Deferred speech remains
+              // eligible at a later quiet boundary, without blocking result reads.
+              void Promise.resolve().then(() => publishRequest(current, channel, { id: `${current.requestId}_${revision}_${announceSubmit ? 'submit_unknown' : `pending_${attempt}`}`,
+                kind: 'progress', speak: true, text, expectedCallerRevision: revision }))
+                .then(delivery => {
+                  if (delivery.status === 'accepted') {
+                    if (announceSubmit) notice!.submitAnnounced = true;
+                    else notice!.progressCount++;
+                    notice!.deferred = false;
+                  } else if (delivery.status === 'unconfirmed') notice!.uncertainKey = stateKey;
+                  else notice!.deferred = delivery.status === 'stale' || delivery.status === 'rejected';
+                }, () => { notice!.uncertainKey = stateKey; })
+                .finally(() => { notice!.inFlight = false; });
             };
+            notice.wake = () => publishStatus(false);
             publishStatus(true);
             const progressTimer = setInterval(() => publishStatus(false), progressIntervalMs);
             progressTimer.unref();
@@ -1695,6 +1707,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
                 if (entry.sessionId === request.sessionId && !channel.signal.aborted) entry = await captureRevision(entry, channel);
                 if (observationSignal.aborted) return;
                 if (terminal(entry.status)) break;
+                publishStatus(false);
                 // A terminal answer can wait across later work without replaying
                 // that work. Questions keep control of their own reply boundary.
                 if (entry.status !== 'waiting_for_reply') {
@@ -1714,7 +1727,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
                 if (!(await delay(pollIntervalMs, observationSignal))) return;
               }
               await deliver(load(entry), channel);
-            } finally { clearInterval(progressTimer); unsubscribe(); }
+            } finally { notice.wake = undefined; clearInterval(progressTimer); unsubscribe(); }
           }
           const next = await promoteDeferred(entry.sessionId, { ...channel, signal: observationSignal });
           if (next && next.requestId !== entry.requestId) { entry = next; continue; }

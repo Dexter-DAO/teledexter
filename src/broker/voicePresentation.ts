@@ -51,16 +51,32 @@ export function hasNewerCallerWork(call: BrokerCall, entry: BrokerDelegationReco
   });
 }
 
-const FIXED_PENDING_TEXT = new Set([
-  'My connection to your account tools returned an error. I am checking whether your request was saved.',
-  'I have not confirmed whether your request was saved. I am checking the original request.',
-  'I am still checking whether your earlier request was saved.',
-  'I am still checking whether your request was saved.',
-  'I am still waiting for the result of your earlier request.',
-  'Your request is still being handled. I am waiting for its result.',
-]);
+/** Only local observation and queue facts; none of these states authorize an action. */
+export function pendingRequestState(entry: BrokerDelegationRecord): string {
+  return JSON.stringify([entry.status, entry.resultReadUnavailable === true, entry.submitError?.code ?? null,
+    (entry.deferredTurns ?? []).filter(turn => turn.status === 'queued').map(turn => turn.sourceEventId),
+    entry.currentQuestionId ?? null]);
+}
+
+export function pendingRequestSpeech(entry: BrokerDelegationRecord, earlier: boolean): string {
+  const queued = entry.deferredTurns?.some(turn => turn.status === 'queued');
+  if (entry.resultReadUnavailable) return queued
+    ? 'I cannot get the latest status of the earlier request. Your later requests are queued and have not started.'
+    : 'I cannot get the latest status of your request. Its outcome is still unconfirmed.';
+  if (queued) return 'Your later requests are queued behind the earlier request. They have not started.';
+  if (['prepared', 'dispatching', 'dispatch_unknown'].includes(entry.status)) {
+    if (entry.status === 'dispatch_unknown' && entry.submitError?.code === 'http_error')
+      return 'My connection to your account tools returned an error. I am checking whether your request was saved.';
+    return earlier ? 'I am still checking whether your earlier request was saved.'
+      : 'I have not confirmed whether your request was saved. I am checking the original request.';
+  }
+  return earlier ? 'I am still waiting for the result of your earlier request.'
+    : 'Your request is still being handled. I am waiting for its result.';
+}
+
 export function isFixedPendingStatus(entry: BrokerDelegationRecord, update?: LiveBackendUpdate): boolean {
-  return !!update && update.kind === 'progress' && FIXED_PENDING_TEXT.has(update.text)
+  return !!update && update.kind === 'progress'
+    && [pendingRequestSpeech(entry, false), pendingRequestSpeech(entry, true)].includes(update.text)
     && ['prepared', 'dispatching', 'dispatch_unknown', 'queued', 'running'].includes(entry.status)
     && update.id.startsWith(`${entry.requestId}_`);
 }

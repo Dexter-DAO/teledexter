@@ -341,12 +341,13 @@ async function boundary(label: string, predicate: () => boolean, work: ReturnTyp
   }
 }
 
-async function preparedFollowup(f: Awaited<ReturnType<typeof host>>, work: ReturnType<typeof observedWork>[]) {
+async function preparedFollowup(f: Awaited<ReturnType<typeof host>>, work: ReturnType<typeof observedWork>[],
+  text = ' Then compare Apple.') {
   const first = f.voices[0]!;
   for (let index = 0; index < 69; index++) f.audio(true);
   f.audio(); await boundary('follow-up audio', () => first.inputs.length === 71, work);
   first.captions.revision = 2; first.captions.callerRevision = 2;
-  first.captions.fragments.push({ eventId: 'explicit_followup', role: 'user', text: ' Then compare Apple.', startMs: 1400, endMs: 1420, sequence: 2 });
+  first.captions.fragments.push({ eventId: 'explicit_followup', role: 'user', text, startMs: 1400, endMs: 1420, sequence: 2 });
   first.options.onTranscript(first.captions);
   const snapshot = structuredClone(first.captions);
   const listeners = new Set<(snapshot: LiveTranscriptSnapshot) => void>();
@@ -480,7 +481,7 @@ test('actual server waits for carrier playback acknowledgement before rotating a
   await until(() => f.posts.length === 1);
   const messages: Array<{ event: string; mark?: { name: string } }> = [];
   f.ws.on('message', value => { messages.push(JSON.parse(String(value))); });
-  f.voices[0].options.onAudio(Buffer.alloc(160, 255).toString('base64'), { deliveryId: 'synthetic_active_playback' });
+  f.voices[0].options.onAudio(Buffer.alloc(160, 0).toString('base64'), { deliveryId: 'synthetic_active_playback' });
   await until(() => messages.some(message => message.event === 'mark'));
   f.release(); await wait(1000);
   assert.equal(f.voices.length, 1); assert.deepEqual(f.voices[0].spoken, []);
@@ -493,7 +494,7 @@ test('actual server waits for carrier playback acknowledgement before rotating a
 test('actual cleared carrier playback releases a queued result without waiting for a cleared mark', async t => {
   const f = await host(t); const work = f.delegate();
   await until(() => f.posts.length === 1);
-  f.voices[0].options.onAudio(Buffer.alloc(160, 255).toString('base64'), { deliveryId: 'cleared_playback' });
+  f.voices[0].options.onAudio(Buffer.alloc(160, 0).toString('base64'), { deliveryId: 'cleared_playback' });
   f.release(); await wait(1000); assert.equal(f.voices.length, 1);
   f.voices[0].options.onPlaybackClear?.('application_interrupt');
   await until(() => f.voices[1]?.spoken.join('') === f.eligibleText); await work;
@@ -503,7 +504,7 @@ test('actual cleared carrier playback releases a queued result without waiting f
 test('carrier disconnect cancels waiting result presentation and retains the result without another voice', async t => {
   const f = await host(t); const work = f.delegate();
   await until(() => f.posts.length === 1);
-  f.voices[0].options.onAudio(Buffer.alloc(160, 255).toString('base64'), { deliveryId: 'disconnect_playback' });
+  f.voices[0].options.onAudio(Buffer.alloc(160, 0).toString('base64'), { deliveryId: 'disconnect_playback' });
   f.release(); await wait(1000); f.ws.close();
   await until(() => Boolean(f.store.get(f.callId)!.endedAt)); await work;
   assert.equal(f.voices.length, 1); assert.deepEqual(f.voices[0].spoken, []);
@@ -562,8 +563,9 @@ test('actual default backend work progress keeps its existing voice and persists
   source.options.onTranscript(source.captions); f.advanceWork();
   await wait(18500);
   assert.equal(f.voices.length, 1, 'later conversation cannot be reset by old waiting notices');
-  assert.equal(f.store.get(f.callId)!.statusContextRefreshes!.length, 1, 'obsolete progress is suppressed before context I/O');
-  assert.equal(source.spoken.length, 1, 'the old request must not repeatedly interrupt suggestions');
+  assert.ok(f.store.get(f.callId)!.statusContextRefreshes!.length >= 2, 'the later quiet boundary permits current status');
+  assert.ok(source.spoken.slice(1).every(text => text === 'I am still waiting for the result of your earlier request.'));
+  assert.ok(source.spoken.length <= 5, 'unchanged status has a bounded accepted notice budget');
   f.ws.close(); await work;
 });
 
@@ -615,7 +617,7 @@ test('carrier playback beyond the first wait defers a completed answer without l
   const f = await host(t, false, false, false, { resultText: incidentResult });
   const work = observedWork(f.delegate());
   await boundary('original submission', () => f.posts.length === 1, [work]);
-  f.voices[0].options.onAudio(Buffer.alloc(160, 255).toString('base64'), { deliveryId: 'long_existing_playback' });
+  f.voices[0].options.onAudio(Buffer.alloc(160, 0).toString('base64'), { deliveryId: 'long_existing_playback' });
   f.release();
   await boundary('first completed presentation deferred', () => (f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord).delivery === 'stale', [work], 8000);
   assert.deepEqual(f.voices.flatMap(v => v.spoken), []);
@@ -673,7 +675,7 @@ test('historical framing survives real playback and is not repeated after a new 
         && record.updateId.includes('_earlier_') && record.outcome?.status === 'accepted')) {
       prefixed = true;
       const current = f.voices.at(-1)!;
-      current.options.onAudio(Buffer.alloc(160, 255).toString('base64'), { deliveryId: 'earlier_prefix_audio' });
+      current.options.onAudio(Buffer.alloc(160, 0).toString('base64'), { deliveryId: 'earlier_prefix_audio' });
       current.captions.revision++; current.captions.callerRevision++;
       current.captions.fragments.push({ eventId: 'interrupt_prefix', role: 'user', text: 'Yes?',
         startMs: 1, endMs: 20, sequence: current.captions.revision });
@@ -731,5 +733,102 @@ for (const outcome of ['cancelled', 'failed', 'financial_unknown'] as const) {
     assert.equal((f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord).delivery, 'accepted');
     assert.equal(f.voices.flatMap(voice => voice.spoken).filter(text => text === expected).length, 1);
     assert.ok(!f.voices.flatMap(voice => voice.spoken).some(text => text.includes('Bought')));
+  });
+}
+
+
+test('recorded pending sale and queued buy deliver truthful status through the actual voice path', async t => {
+  const f = await host(t, false, false, false, { sameEpoch: true,
+    callerText: 'Um, I probably want to sell four dollars of the Apple stock that I just bought recently' });
+  const work = observedWork(f.delegate());
+  await boundary('sale submitted', () => f.posts.length === 1, [work]);
+  const later = await preparedFollowup(f, [work], 'How about you buy a dollar worth');
+  const next = observedWork(later.start());
+  await boundary('buy admission started', later.entered, [work, next]); later.release();
+  await boundary('queued notice accepted', () => f.voices.flatMap(v => v.spoken).includes(
+    'Your later requests are queued behind the earlier request. They have not started.'), [work, next]);
+  assert.equal(f.posts.length, 1, 'a spoken queue receipt does not submit the buy');
+  f.primary.result = async () => { throw new PrimaryApiError('http_error', 503,
+    { code: 'temporarily_unavailable', retryable: true }); };
+  await boundary('status error spoken', () => f.voices.flatMap(v => v.spoken).includes(
+    'I cannot get the latest status of the earlier request. Your later requests are queued and have not started.'), [work, next]);
+  const call = f.store.get(f.callId)!;
+  assert.ok(call.publications!.records.some(record => record.kind === 'progress' && record.outcome?.status === 'accepted'));
+  assert.equal(call.liveGenerations!.segments.length, 1);
+  assert.equal((call.delegations[f.posts[0].requestId] as BrokerDelegationRecord).primaryResult?.state, 'running');
+  f.ws.close(); await boundary('hangup closes both observers', () => work.settled() && next.settled(), [work, next]);
+  assert.equal(f.posts.length, 1);
+});
+
+test('continuous digital silence does not starve a saved result, while audible frames and late marks still block it', async t => {
+  const f = await host(t, false, false, false, { resultText: incidentResult });
+  const work = observedWork(f.delegate());
+  await boundary('request submitted', () => f.posts.length === 1, [work]);
+  const source = f.voices[0];
+  const marks: string[] = [];
+  f.ws.on('message', data => { const event = JSON.parse(data.toString()); if (event.event === 'mark') marks.push(event.mark.name); });
+  source.options.onAudio(Buffer.alloc(160, 0xfe).toString('base64'), { deliveryId: 'audible' });
+  await boundary('audible mark received', () => marks.length === 1, [work]);
+  const audibleMark = marks[0];
+  const silence = setInterval(() => {
+    source.options.onAudio(Buffer.alloc(160, 255).toString('base64'), { deliveryId: 'digital_silence' });
+    // Keep only digital silence acknowledged late; actual speech remains outstanding.
+    for (const name of marks.splice(0).filter(name => name !== audibleMark))
+      f.ws.send(JSON.stringify({ event: 'mark', streamSid: f.streamSid, mark: { name } }));
+  }, 20);
+  t.after(() => clearInterval(silence));
+  f.release(); await wait(1100);
+  assert.deepEqual(f.voices.flatMap(v => v.spoken), [], 'audible mark is mandatory even with a transcript result');
+  f.ws.send(JSON.stringify({ event: 'mark', streamSid: f.streamSid, mark: { name: audibleMark } }));
+  source.captions.revision++; source.captions.callerRevision++;
+  source.captions.fragments.push({ eventId: 'caller_interrupts_silence', role: 'user', text: 'Wait, what happened?',
+    startMs: 1400, endMs: 1420, sequence: source.captions.revision });
+  await source.options.onTranscript(source.captions);
+  const callerSpeech = setInterval(() => f.audio(), 20);
+  try { await wait(500); assert.deepEqual(f.voices.flatMap(v => v.spoken), [], 'caller speech still owns the boundary'); }
+  finally { clearInterval(callerSpeech); }
+  await boundary('saved result delivered through continuous silence', work.settled, [work], 8000);
+  clearInterval(silence);
+  assert.deepEqual(f.voices.flatMap(v => v.spoken), ['For your earlier request:', incidentResult]);
+  assert.equal(f.posts.length, 1);
+});
+
+
+for (const change of ['queued', 'recovered'] as const) {
+  test(`pending error speech is discarded when ${change} facts change during eligible-context I/O`, async t => {
+    const f = await host(t, false, false, false, { sameEpoch: true, callerText: 'Sell four dollars of Apple.' });
+    f.primary.result = async () => { throw new PrimaryApiError('http_error', 503,
+      { code: 'temporarily_unavailable', retryable: true }); };
+    const fetch = f.eligible.fetch;
+    let entered = false, gateOpen = false, release!: () => void;
+    const gate = new Promise<void>(resolve => { release = () => { gateOpen = true; resolve(); }; });
+    f.eligible.fetch = async (...args) => { entered = true; if (!gateOpen) await gate; return fetch(...args); };
+    const work = observedWork(f.delegate());
+    const workers = [work];
+    try {
+      await boundary('status context read begins', () => entered, workers);
+      assert.deepEqual(f.voices.flatMap(v => v.spoken), []);
+      if (change === 'queued') {
+        const later = await preparedFollowup(f, workers, 'How about you buy a dollar worth');
+        const next = observedWork(later.start()); workers.push(next);
+        await boundary('later admission begins', later.entered, workers); later.release();
+        await boundary('queue saved during context read', () => (f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord)
+          .deferredTurns?.some(turn => turn.status === 'queued') === true, workers);
+      } else {
+        f.primary.result = async (_binding, requestId) => ({ bindingId, requestId, state: 'running' });
+        await boundary('GET recovery saved during context read', () =>
+          (f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord).resultReadUnavailable === false, workers);
+      }
+      release();
+      if (change === 'queued') await boundary('current queue error is spoken', () => f.voices.flatMap(v => v.spoken).includes(
+        'I cannot get the latest status of the earlier request. Your later requests are queued and have not started.'), workers);
+      else await wait(1000);
+      assert.ok(!f.voices.flatMap(v => v.spoken).includes('I cannot get the latest status of your request. Its outcome is still unconfirmed.'),
+        'the obsolete error facts must not be published after context returns');
+      assert.equal(f.posts.length, 1);
+    } finally {
+      release(); f.ws.close();
+      await boundary('observers close after test', () => workers.every(w => w.settled()), workers);
+    }
   });
 }

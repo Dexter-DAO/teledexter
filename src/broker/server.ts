@@ -49,7 +49,7 @@ import { type BrokerConfig, isPhoneNumber } from './config.js';
 import { BrokerStore, type BrokerCall, type CallStatus, terminalCallStatuses } from './store.js';
 import { brokerInstructions, brokerHistory, brokerOpening } from './instructions.js';
 import { probeLive } from './preflight.js';
-import { authorizedControl, callTwiml, fallbackTwiml, inputSpeechEnergy, mediaStart, PlaybackReceipts, safeFailure, streamToken, verifyTwilio, type ProviderCallProof } from './phone.js';
+import { authorizedControl, callTwiml, fallbackTwiml, inputSpeechEnergy, mediaStart, PlaybackReceipts, hasAudiblePcmu, safeFailure, streamToken, verifyTwilio, type ProviderCallProof } from './phone.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const CALL_SID = /^CA[0-9a-f]{32}$/i;
@@ -953,7 +953,8 @@ export function createBrokerServer(options: BrokerServerOptions) {
                 store.update(call.id, { journey: { ...saved.journey, firstAudioSentAt: new Date().toISOString() } });
                 audioSentRecorded = true;
               }
-              const name = receipts.sent(Buffer.from(payload, 'base64').length);
+              const bytes = Buffer.from(payload, 'base64');
+              const name = receipts.sent(bytes.length, hasAudiblePcmu(bytes));
               ws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name } }));
             },
             onTranscript(snapshot) {
@@ -993,7 +994,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
           live = options.eligibleContext ? createGenerationVoice({ call: store.get(call.id)!, callDeadlineAt,
             apiKey: config.apiKey, voice: config.voice, store, primary,
             playbackState: () => carrierPlaybackState(!stopping && ws.readyState === WebSocket.OPEN,
-              receipts.sentBytes, receipts.playedBytes, receipts.clearedBytes),
+              receipts.audibleSentBytes, receipts.audiblePlayedBytes, receipts.audibleClearedBytes),
             context: startupContexts!.take(store.get(call.id)!), voiceFactory,
             ...(options.selectedQuestion ? { selectedQuestion: options.selectedQuestion } : {}),
             ...(call.continuation && options.callerIntent ? { callerIntent: createCallerIntentResolver({
