@@ -719,17 +719,30 @@ for (const outcome of ['cancelled', 'failed', 'financial_unknown'] as const) {
     await boundary('later capture started', later.entered, [work, followup]); later.release();
     await boundary('later request queued', () => (f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord)
       .deferredTurns?.some(turn => turn.status === 'queued') === true, [work, followup]);
+    const queued = 'Your later requests are queued behind the earlier request. They have not started.';
+    await boundary('truthful queued notice', () => f.voices.flatMap(voice => voice.spoken).includes(queued), [work, followup]);
     const expected = 'For your earlier request: ' + (outcome === 'cancelled' ? 'The request was cancelled.'
       : outcome === 'financial_unknown' ? "I couldn't confirm the trade request. We need to check that same request before continuing."
       : 'I could not get an answer to that request.');
     const submit = f.primary.submit;
+    let beforeSecondSubmit: { speech: string[]; delivery: string | undefined } | undefined;
     f.primary.submit = async (...args) => {
-      assert.deepEqual(f.voices.flatMap(voice => voice.spoken), [expected]);
+      // Capture the boundary; assertions inside this transport would fabricate
+      // a dispatch-unknown response if legitimate progress had also been spoken.
+      beforeSecondSubmit = { speech: f.voices.flatMap(voice => voice.spoken),
+        delivery: (f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord).delivery };
       return submit(...args);
     };
     f.release();
     await boundary('terminal answer and later request completed', () => work.settled() && followup.settled(), [work, followup]);
     assert.equal(f.posts.length, 2);
+    assert.ok(beforeSecondSubmit, 'second submission must be observed');
+    assert.equal(beforeSecondSubmit.delivery, 'accepted');
+    assert.equal(beforeSecondSubmit.speech.filter(text => text === expected).length, 1);
+    assert.ok(beforeSecondSubmit.speech.indexOf(queued) < beforeSecondSubmit.speech.indexOf(expected),
+      'the queued notice precedes the once-delivered terminal result');
+    assert.equal(beforeSecondSubmit.speech.at(-1), expected);
+    assert.notDeepEqual(beforeSecondSubmit.speech, [expected], 'legitimate earlier progress is preserved');
     assert.equal((f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord).delivery, 'accepted');
     assert.equal(f.voices.flatMap(voice => voice.spoken).filter(text => text === expected).length, 1);
     assert.ok(!f.voices.flatMap(voice => voice.spoken).some(text => text.includes('Bought')));

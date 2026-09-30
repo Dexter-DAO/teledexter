@@ -600,15 +600,39 @@ test('spoken progress continues during a blocked result read and is bounded acro
 });
 
 test('pending status notices are periodic rather than emitted by every result poll', async t => {
-  const f = await fixture(t, { progressIntervalMs: 25, maxPollMs: 100, pollIntervalMs: 1 });
+  let clock: number | undefined;
+  const f = await fixture(t, { progressIntervalMs: 25, pollIntervalMs: 1, watchUntilCallEnds: true,
+    now: () => clock ?? Date.now() });
   f.add('Read my balance.'); f.speech();
+  // Let the existing quiet/admission gate finish, then freeze the clock before
+  // the observer starts. Poll count cannot consume the notice's time budget.
+  const submit = f.behavior.submit;
+  f.behavior.submit = async id => { clock = Date.now() + 10; return submit(id); };
   f.behavior.result = async id => ({ bindingId, requestId: id, state: 'running' });
-  await f.backend.delegate(f.request(), f.channel);
-  const progress = f.updates.filter(update => update.kind === 'progress');
-  assert.ok(progress.length >= 1 && progress.length <= 4);
-  assert.ok(f.reads.length > progress.length);
-  assert.ok(progress.every(update => update.speak === true));
-  assert.equal(f.posts.length, 1);
+  let failure: unknown;
+  const work = f.backend.delegate(f.request(), f.channel);
+  void work.catch(error => { failure = error; });
+  const progress = () => f.updates.filter(update => update.kind === 'progress');
+  const until = async (label: string, predicate: () => boolean) => {
+    const deadline = Date.now() + 6000;
+    while (!predicate()) {
+      if (failure) throw failure;
+      assert.ok(Date.now() < deadline, `timed out waiting for ${label}; reads=${f.reads.length}, progress=${progress().length}`);
+      await wait(5);
+    }
+  };
+  try {
+    await until('five initial polls', () => f.reads.length >= 5);
+    assert.equal(progress().length, 0, 'polls alone must not produce a periodic notice');
+    clock! += 25;
+    await until('one due notice', () => progress().length === 1);
+    const readsAtNotice = f.reads.length;
+    await until('five more polls', () => f.reads.length >= readsAtNotice + 5);
+    assert.equal(progress().length, 1, 'more polls at the same time must not repeat the notice');
+    assert.ok(progress().length <= 4, 'the notice budget remains bounded');
+    assert.ok(progress().every(update => update.speak === true), 'periodic notices must be spoken');
+    assert.equal(f.posts.length, 1);
+  } finally { f.controller.abort(); await work; }
 });
 
 for (const change of ['abort', 'call_ended'] as const)
