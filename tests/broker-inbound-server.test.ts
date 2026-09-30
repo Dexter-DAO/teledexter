@@ -226,6 +226,50 @@ test('incoming audio timing separates sent audio, cleared marks, and confirmed p
   assert.equal(f.store.get(call.id)!.journey?.firstAudioSentAt, sentAt);
 });
 
+test('audible timing excludes silence, empty audio, cleared and duplicate marks without changing the journal', async t => {
+  const events: Array<{ event: string; callId: string; stage: string; observedAt: string }> = [];
+  t.mock.method(console, 'info', (value: string) => { const event = JSON.parse(value); if (event.event === 'broker_audio_timing') events.push(event); });
+  const f = await fixture(t), { call, ws } = await connectIncomingMedia(f); t.after(() => ws.close());
+  const marks: string[] = [];
+  ws.on('message', raw => { const frame = JSON.parse(String(raw)); if (frame.event === 'mark') marks.push(frame.mark.name); });
+  const send = async (bytes: Buffer) => {
+    const count = marks.length; f.emitAudio(bytes);
+    for (let i = 0; i < 100 && marks.length === count; i++) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(marks.length, count + 1); return marks.at(-1)!;
+  };
+  const mark = async (name: string) => {
+    ws.send(JSON.stringify({ event: 'mark', streamSid: 'MZ' + '4'.repeat(32), mark: { name } }));
+    await new Promise(resolve => setTimeout(resolve, 10));
+  };
+  await mark('not-issued');
+  await mark(await send(Buffer.alloc(0)));
+  await mark(await send(Buffer.from([0xff, 0x7f])));
+  assert.equal(events.length, 0);
+  assert.ok(f.store.get(call.id)!.journey?.firstPlaybackConfirmedAt, 'original all-frame timing stays intact');
+  const cleared = await send(Buffer.from([0xfe]));
+  assert.deepEqual(events.map(event => event.stage), ['firstAudibleAudioSentAt']);
+  f.clearAudio(); await mark(cleared);
+  assert.equal(events.length, 1, 'a cleared audible frame cannot count as played');
+  const audible = await send(Buffer.from([0xfe, 0xff]));
+  await mark(audible); await mark(audible);
+  await mark(await send(Buffer.from([0x80])));
+  assert.deepEqual(events.map(event => event.stage), ['firstAudibleAudioSentAt', 'firstAudiblePlaybackAcknowledgedAt']);
+  assert.ok(events.every(event => event.callId === call.id && Number.isFinite(Date.parse(event.observedAt))));
+  assert.deepEqual(Object.keys(events[0]).sort(), ['callId', 'event', 'observedAt', 'stage', 'version']);
+  assert.deepEqual(Object.keys(f.store.get(call.id)!.journey!).sort(), ['firstAudioSentAt', 'firstPlaybackConfirmedAt', 'liveReadyAt']);
+});
+
+test('audible timing logger failure cannot interrupt sent audio or carrier playback', async t => {
+  let failures = 0;
+  t.mock.method(console, 'info', (value: string) => { if (JSON.parse(value).event === 'broker_audio_timing') { failures++; throw new Error('sink_unavailable'); } });
+  const f = await fixture(t), { call, ws } = await connectIncomingMedia(f); t.after(() => ws.close());
+  ws.on('message', raw => { const frame = JSON.parse(String(raw)); if (frame.event === 'mark') ws.send(JSON.stringify(frame)); });
+  f.emitAudio();
+  for (let i = 0; i < 100 && !f.store.get(call.id)!.journey?.firstPlaybackConfirmedAt; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.ok(f.store.get(call.id)!.journey?.firstPlaybackConfirmedAt); assert.equal(failures, 2);
+  assert.equal(f.store.get(call.id)!.endedAt, undefined);
+});
+
 test('lost incoming context reply recovers billing reference from bound outcome after caller hangs up', async t => {
   const receiver = await billingReceiver(t), f = await fixture(t, { billing: true, billingUrl: receiver.url, duration: '93' });
   await (await f.webhook('/broker/incoming-call')).text();
@@ -375,7 +419,7 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
   return { broker, store, base, config, params, seen, lifecycle, webhook, close, provider, billing,
     providerEnded(duration = providerDuration) { providerState = 'completed'; providerDuration = duration; },
     wrongProviderIdentity() { providerWrongIdentity = true; },
-    emitAudio() { voiceOptions!.onAudio(Buffer.alloc(800, 0).toString('base64')); },
+    emitAudio(bytes = Buffer.alloc(800, 0)) { voiceOptions!.onAudio(bytes.toString('base64')); },
     clearAudio() { voiceOptions!.onPlaybackClear?.(); }, eligiblePage, startupPages, remote: () => remote,
     async waitForAdmission() { const call = store.list()[0]; await (await webhook(`/broker/inbound/${call.id}/continue`)).text(); },
     beginError(error?: Error) { beginError = error; },

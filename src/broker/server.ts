@@ -870,6 +870,11 @@ export function createBrokerServer(options: BrokerServerOptions) {
     const receipts = new PlaybackReceipts();
     let audioSentRecorded = Boolean(call.journey?.firstAudioSentAt);
     let playbackRecorded = Boolean(call.journey?.firstPlaybackConfirmedAt);
+    let audibleSentRecorded = false, audiblePlaybackRecorded = false;
+    const recordAudibleTiming = (stage: 'firstAudibleAudioSentAt' | 'firstAudiblePlaybackAcknowledgedAt') => {
+      try { console.info(JSON.stringify({ event: 'broker_audio_timing', version: 1, callId: call.id,
+        stage, observedAt: new Date().toISOString() })); } catch { /* Timing cannot interrupt audio or playback. */ }
+    };
     const metrics = () => ({ receivedAudioBytes: inputBytes, sentAudioBytes: receipts.sentBytes, playedAudioBytes: receipts.playedBytes, clearedAudioBytes: receipts.clearedBytes });
     const startTimer = setTimeout(() => { void stop('media_start_timeout'); }, 8_000);
     const callDeadlineAt = call.liveGenerations?.clocks.callDeadlineAt ?? call.verificationCallback?.media?.deadlineAt ?? new Date(Date.now() + config.maxCallSeconds * 1000).toISOString();
@@ -954,7 +959,11 @@ export function createBrokerServer(options: BrokerServerOptions) {
                 audioSentRecorded = true;
               }
               const bytes = Buffer.from(payload, 'base64');
-              const name = receipts.sent(bytes.length, hasAudiblePcmu(bytes));
+              const audible = hasAudiblePcmu(bytes);
+              if (bytes.length > 0 && audible && !audibleSentRecorded) {
+                audibleSentRecorded = true; recordAudibleTiming('firstAudibleAudioSentAt');
+              }
+              const name = receipts.sent(bytes.length, audible);
               ws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name } }));
             },
             onTranscript(snapshot) {
@@ -1019,8 +1028,11 @@ export function createBrokerServer(options: BrokerServerOptions) {
           if (inputSpeechEnergy(bytes) > 0.012) { lastSpeechAt = Date.now(); backend?.noteCallerSpeech(lastSpeechAt, inputBytes / 8); }
           if (live?.appendAudio(frame.media.payload) === false) void stop('input_audio_refused');
         } else if (frame.event === 'mark' && frame.streamSid === streamSid && typeof frame.mark?.name === 'string') {
-          const previouslyPlayed = receipts.playedBytes;
+          const previouslyPlayed = receipts.playedBytes, previouslyAudiblePlayed = receipts.audiblePlayedBytes;
           receipts.acknowledge(frame.mark.name);
+          if (audibleSentRecorded && !audiblePlaybackRecorded && receipts.audiblePlayedBytes > previouslyAudiblePlayed) {
+            audiblePlaybackRecorded = true; recordAudibleTiming('firstAudiblePlaybackAcknowledgedAt');
+          }
           if (receipts.playedBytes > previouslyPlayed && !playbackRecorded) {
             const saved = store.get(call.id)!;
             store.update(call.id, { journey: { ...saved.journey, firstPlaybackConfirmedAt: new Date().toISOString() } });
