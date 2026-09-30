@@ -1606,10 +1606,22 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
             && !saved.some(value => value.deferredTurns?.some(turn => turn.status === 'queued'))) return;
       }
       const run = async () => {
+        let lastDeferredResult: string | undefined;
+        const deferredResult = (exceptRequestId?: string) => {
+          if (!options.observation || !options.watchUntilCallEnds || observationSignal.aborted
+              || boundCall(request.sessionId).endedAt) return;
+          const pending = entries(request.sessionId, true).filter(value => value.requestId !== exceptRequestId
+            && ['completed', 'failed', 'cancelled'].includes(value.status)
+            && value.primaryResult?.state === value.status && value.delivery === 'stale');
+          if (!pending.length) return;
+          const last = pending.findIndex(value => value.requestId === lastDeferredResult);
+          const next = pending[(last + 1) % pending.length];
+          if (next) lastDeferredResult = next.requestId;
+          return next;
+        };
         while (!observationSignal.aborted) {
           entry = load(entry!);
-          const alreadyDelivered = terminal(entry.status) && entry.delivery === 'accepted'
-            && entries(entry.sessionId, Boolean(options.observation)).some(value => value.deferredTurns?.some(turn => turn.status === 'queued'));
+          const alreadyDelivered = terminal(entry.status) && entry.delivery === 'accepted';
           if (!alreadyDelivered) {
             const deadline = now() + maxPollMs;
             const noticeKey = `${options.callId}:${entry.requestId}`;
@@ -1683,6 +1695,12 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
                 if (entry.sessionId === request.sessionId && !channel.signal.aborted) entry = await captureRevision(entry, channel);
                 if (observationSignal.aborted) return;
                 if (terminal(entry.status)) break;
+                // A terminal answer can wait across later work without replaying
+                // that work. Questions keep control of their own reply boundary.
+                if (entry.status !== 'waiting_for_reply') {
+                  const deferred = deferredResult(entry.requestId);
+                  if (deferred) await deliver(deferred, channel);
+                }
                 if (entry.status === 'waiting_for_reply') {
                   if (!options.watchUntilCallEnds) break;
                   const questionRecord = entry.currentQuestionId ? entry.questions?.[entry.currentQuestionId] : undefined;
@@ -1699,8 +1717,10 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
             } finally { clearInterval(progressTimer); unsubscribe(); }
           }
           const next = await promoteDeferred(entry.sessionId, { ...channel, signal: observationSignal });
-          if (!next || next.requestId === entry.requestId) return;
-          entry = next;
+          if (next && next.requestId !== entry.requestId) { entry = next; continue; }
+          const deferred = deferredResult();
+          if (!deferred || !await delay(pollIntervalMs, observationSignal)) return;
+          entry = deferred;
         }
       };
       const work = run();

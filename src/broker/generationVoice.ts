@@ -104,10 +104,13 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
   const presentationFrontier = () => `${speechRevision}:${callerPresentationFrontier(call())}`;
   const quiet = () => (options.playbackState?.() ?? 'idle') === 'idle'
     && Date.now() - Math.max(lastSpeechAt, lastOutputAt) >= 800;
+  const blocksEarlierPresentation = (entry: BrokerDelegationRecord) =>
+    !(['completed', 'failed', 'cancelled'].includes(entry.status) && entry.primaryResult?.state === entry.status)
+      && hasNewerCallerWork(call(), entry);
   const atSpeechBoundary = async (entry: BrokerDelegationRecord) => {
     const deadline = Date.now() + 5_000;
     while (!stopped && !observer.signal.aborted && !call().endedAt && Date.now() < deadline) {
-      if (hasNewerCallerWork(call(), entry) || options.playbackState?.() === 'unavailable') return false;
+      if (blocksEarlierPresentation(entry) || options.playbackState?.() === 'unavailable') return false;
       if (quiet()) return true;
       await new Promise<void>(resolve => setTimeout(resolve, 50));
     }
@@ -261,7 +264,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
     const frontier = presentationFrontier();
     const stillRelevant = () => !stopped && !observer.signal.aborted && !call().endedAt
       && frontier === presentationFrontier()
-      && (!ordinaryResult || (!hasNewerCallerWork(call(), entry) && quiet()))
+      && (!ordinaryResult || (!blocksEarlierPresentation(entry) && quiet()))
       && (!pendingStatus || (!hasLaterCallerSpeech(call(), entry) && quiet()));
     const canonicalRequestId = entry.reconciliation?.outcome === 'admitted' ? entry.reconciliation.canonicalRequestId : entry.requestId;
     let attachment: LiveGenerationAttachment;
@@ -281,8 +284,10 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
       delivery = outcome.publication ?? { eventId: '', status: 'unconfirmed', reason: outcome.response.delivery.state === 'unavailable'
         ? outcome.response.delivery.reason : 'publication_unconfirmed' };
     } else {
-      const text = update?.text ?? (entry.status === 'failed' ? failedRequestSpeech(entry)
+      const outcomeText = update?.text ?? (entry.status === 'failed' ? failedRequestSpeech(entry)
         : entry.status === 'cancelled' ? 'The request was cancelled.' : 'I am checking the saved request status.');
+      const text = !update && ['failed', 'cancelled'].includes(entry.status) && entry.primaryResult?.state === entry.status
+        && hasLaterCallerSpeech(call(), entry) ? `For your earlier request: ${outcomeText}` : outcomeText;
       const present = async (currentAttachment: LiveGenerationAttachment) => ({ attachment: currentAttachment,
         delivery: stillRelevant()
           ? await publishText(entry, currentAttachment, text, update?.kind ?? 'result', update?.id ?? `${entry.requestId}_${entry.status}`)
@@ -452,6 +457,17 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
                   const evidence = result.delivery.source.kind === 'assistant'
                     ? eligibleDeliveryResponseSchema.parse({ bindingId: binding.bindingId, callSid: binding.callSid,
                       requestId: result.requestId, version: result.version, delivery: result.delivery }) : undefined;
+                  const noticeId = `${entry.requestId}_${result.delivery.source.messageId}_earlier`;
+                  const noticeAccepted = call().publications?.records.some(record => record.requestId === entry.requestId
+                    && record.updateId.startsWith(`${noticeId}_caller_`) && record.kind === 'progress'
+                    && record.outcome?.status === 'accepted' && !call().publications?.rejections.some(rejection =>
+                      rejection.sessionId === record.sessionId && rejection.eventId === record.outcome!.eventId));
+                  if (evidence && hasLaterCallerSpeech(call(), entry) && !noticeAccepted) {
+                    const frontier = presentationFrontier();
+                    const notice = await publishText(entry, attachment, 'For your earlier request:', 'progress', noticeId);
+                    if (notice.status !== 'accepted') return notice;
+                    if (frontier !== presentationFrontier()) return { eventId: '', status: 'stale', reason: 'caller_context_changed' };
+                  }
                   return publishText(entry, attachment, result.delivery.text, 'result',
                     `${entry.requestId}_${result.delivery.source.messageId}`, evidence);
                 },

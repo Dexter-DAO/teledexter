@@ -1844,3 +1844,71 @@ test('a pre-admission-looking error during GET cannot turn an older unknown POST
   assert.equal(f.saved()[0].questions![firstQuestionId].reply!.status, 'unknown');
   assert.equal(f.replies.length, 1); assert.equal(f.posts.length, 1);
 });
+
+
+test('duplicate saved delegation cannot republish an already accepted completed answer', async t => {
+  const f = await fixture(t);
+  let publications = 0;
+  f.options.observation = { signal: f.controller.signal, async publish() {
+    publications++; return { delivery: { eventId: 'accepted_original', status: 'accepted' } };
+  } };
+  f.add('Read my balance.'); f.speech();
+  await f.backend.delegate(f.request(), f.channel);
+  assert.equal(f.saved()[0].delivery, 'accepted');
+  await f.backend.delegate(f.request('duplicate_completed_source'), f.channel);
+  assert.equal(publications, 1); assert.equal(f.posts.length, 1);
+});
+
+
+test('completed presentation survives more than three interruptions without another action', async t => {
+  const f = await fixture(t, { watchUntilCallEnds: true });
+  let publications = 0;
+  f.options.observation = { signal: f.controller.signal, async publish() {
+    publications++;
+    return { delivery: { eventId: publications < 8 ? '' : 'accepted_original',
+      status: publications < 8 ? 'stale' : 'accepted', reason: 'caller_context_changed' } };
+  } };
+  f.add('Read my balance.'); f.speech();
+  await f.backend.delegate(f.request(), f.channel);
+  assert.equal(publications, 8); assert.equal(f.posts.length, 1); assert.equal(f.reads.length, 1);
+  assert.equal(f.saved()[0].delivery, 'accepted');
+});
+
+test('hangup preserves an undelivered completed result without another action', async t => {
+  const f = await fixture(t, { watchUntilCallEnds: true });
+  let publications = 0;
+  f.options.observation = { signal: f.controller.signal, async publish() {
+    publications++;
+    if (publications === 3) f.controller.abort();
+    return { delivery: { eventId: '', status: 'stale' } };
+  } };
+  f.add('Read my balance.'); f.speech();
+  await f.backend.delegate(f.request(), f.channel);
+  assert.equal(publications, 3); assert.equal(f.posts.length, 1); assert.equal(f.reads.length, 1);
+  assert.equal(f.saved()[0].status, 'completed'); assert.equal(f.saved()[0].primaryResult?.state, 'completed');
+});
+
+test('a deferred completed answer yields to queued work and resumes during its running polls', async t => {
+  const f = await blockedQueueFixture(t);
+  f.options.watchUntilCallEnds = true;
+  const presented: string[] = [];
+  let attempts = 0;
+  f.options.observation = { signal: f.controller.signal, async publish(entry) {
+    if (entry.requestId === f.posts[0].requestId) {
+      attempts++;
+      if (attempts < 6) return { delivery: { eventId: '', status: 'stale' } };
+      assert.equal(f.posts.length, 2, 'the later request must not starve behind repeated interruptions');
+    }
+    presented.push(entry.requestId);
+    return { delivery: { eventId: `accepted_${entry.requestId}`, status: 'accepted' } };
+  } };
+  const result = f.behavior.result;
+  f.behavior.result = async id => {
+    if (id === f.posts[0].requestId) return result(id);
+    return presented.includes(f.posts[0].requestId) ? f.completed(id) : { bindingId, requestId: id, state: 'running' };
+  };
+  f.release(); await Promise.all([f.first, f.second]);
+  assert.equal(attempts, 6); assert.equal(f.posts.length, 2);
+  assert.deepEqual(presented, f.posts.map(post => post.requestId));
+  assert.equal(f.saved()[0].delivery, 'accepted');
+});
