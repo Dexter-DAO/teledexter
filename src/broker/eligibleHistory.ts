@@ -39,9 +39,10 @@ export function prepareEligibleHistory(value: EligiblePhoneCall, expected: Eligi
   const source = parseEligiblePhoneCall(value, expected);
   if (source.state !== 'open') throw new EligibleHistoryError('call_not_open');
   const omitted=[...new Set(omittedMessageIds)].filter(id=>source.context.messages.some(message=>message.id===id && message.role==='assistant'));
+  const { admission: _admission, ...providerHistory } = source.context.history;
   const history: PreparedEligibleHistory['history'] = [{ role: 'developer', text: HISTORY_ATTRIBUTION
     + JSON.stringify({ kind: 'eligible_primary_history', primaryDexterId: source.context.primaryDexterId,
-      threadId: source.context.threadId, displayName: source.context.displayName, history: source.context.history }) }];
+      threadId: source.context.threadId, displayName: source.context.displayName, history: providerHistory }) }];
   for (const message of source.context.messages) {
     if(omitted.includes(message.id)) continue;
     history.push({ role: message.role, text: JSON.stringify({ kind: 'primary_conversation_message', ...message }) });

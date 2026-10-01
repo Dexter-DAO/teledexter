@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
-import { prepareEligibleHistory, EligibleHistoryError, ELIGIBLE_HISTORY_MAX_TEXT_BYTES,
+import { prepareEligibleHistory, validatePreparedEligibleHistory, EligibleHistoryError, ELIGIBLE_HISTORY_MAX_TEXT_BYTES,
   ELIGIBLE_HISTORY_MAX_INPUT_BYTES } from '../src/broker/eligibleHistory.js';
 import { PrimaryApiError } from '../src/broker/primaryApi.js';
 import type { EligiblePhoneCall } from '../src/broker/eligibleContext.js';
@@ -92,4 +92,22 @@ test('an oversized serialized plan refuses whole input without clipping message 
   assert.throws(() => prepareEligibleHistory(original, binding),
     (error: unknown) => error instanceof EligibleHistoryError && error.code === 'history_payload_too_large');
   assert.equal(original.context.messages[0].text, text);
+});
+
+
+test('internal admission hashes stay in the authoritative source and never inflate provider startup history', () => {
+  const original=context();
+  original.context.history.admission={invalidationDigest:'d'.repeat(64),messages:[{messageId,digest:'e'.repeat(64)}],memories:[]};
+  const prepared=prepareEligibleHistory(original,binding);
+  assert.deepEqual(prepared.source,original);
+  assert.deepEqual(validatePreparedEligibleHistory(prepared),prepared);
+  const without=structuredClone(original);delete without.context.history.admission;
+  const legacy=prepareEligibleHistory(without,binding);
+  assert.deepEqual(prepared.initialItems,legacy.initialItems);
+  assert.equal(prepared.initialInputBytes,legacy.initialInputBytes);
+  assert.equal(prepared.initialInputDigest,legacy.initialInputDigest);
+  assert.ok(!JSON.stringify(prepared.initialItems).includes('invalidationDigest'));
+  assert.ok(!JSON.stringify(prepared.initialItems).includes('e'.repeat(64)));
+  assert.deepEqual(prepared.version,original.context.history.version);
+  assert.equal(prepared.pageDigest,original.context.history.pageDigest);
 });
