@@ -181,7 +181,8 @@ function validateGenerations(call: BrokerCall, previous?: BrokerCall): void {
   if (!Array.isArray(refreshes) || refreshes.length > 1000) throw new Error('Invalid status context evidence');
   for (const refresh of refreshes) {
     const checked = z.object({ generationId: z.string().uuid(), observedAt: z.iso.datetime(),
-      version: historyVersionSchema, contentDigest: z.string().regex(/^[a-f0-9]{64}$/) }).strict().parse(refresh);
+      version: historyVersionSchema, contentDigest: z.string().regex(/^[a-f0-9]{64}$/),
+      kind:z.literal('admitted_sources').optional() }).strict().parse(refresh);
     const source = next.segments.find(segment => segment.generationId === checked.generationId);
     if (!source || checked.version.ownerPrincipalId !== source.version.ownerPrincipalId
       || checked.version.primaryDexterId !== source.version.primaryDexterId || checked.version.threadId !== source.version.threadId

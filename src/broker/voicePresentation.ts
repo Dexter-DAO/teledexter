@@ -82,7 +82,14 @@ export function isFixedPendingStatus(entry: BrokerDelegationRecord, update?: Liv
 }
 
 export function failedRequestSpeech(entry: BrokerDelegationRecord): string {
-  return entry.primaryResult?.error?.code === 'primary_financial_result_unknown'
-    ? "I couldn't confirm the trade request. We need to check that same request before continuing."
-    : 'I could not get an answer to that request.';
+  const code=entry.primaryResult?.error?.code;
+  if(code==='primary_financial_result_unknown') return "I couldn't confirm the trade request. We need to check that same request before continuing.";
+  const provider:Record<string,string>={
+    provider_busy: 'The AI service is busy and could not answer this request.',
+    provider_request_budget_exceeded: 'The AI service could not process this request within its service limit.',
+    provider_credit_limit: 'The AI service has reached its service credit limit.',
+    provider_credits_unavailable: 'The AI service could not cover the processing cost for this request.',
+    provider_rate_limited: 'The AI service is receiving too many requests to answer right now.',
+  };
+  return code && provider[code] || 'I could not get an answer to that request.';
 }

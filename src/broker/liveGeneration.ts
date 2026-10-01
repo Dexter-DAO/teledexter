@@ -3,7 +3,7 @@ import { z } from 'zod';
 import {
   eligibleContextBindingSchema, historyVersionSchema, parseEligiblePhoneCall, sameHistoryVersion,
   type EligibleContextBinding, type EligibleContextClient, type EligibleDeliveryResponse,
-  type EligibleDeliveryTarget, type EligiblePhoneCall, type HistoryVersion,
+  type EligibleDeliveryTarget, type EligiblePhoneCall, type HistoryVersion, type HistoryAdmission,
 } from './eligibleContext.js';
 import { PrimaryApiError } from './primaryApi.js';
 import { sameCallAssignmentRef } from './assignment.js';
@@ -113,6 +113,7 @@ export interface ContextReadFailure {
 }
 export interface StatusContextRefresh {
   generationId: string; observedAt: string; version: HistoryVersion; contentDigest: string;
+  kind?: 'admitted_sources';
 }
 export interface LiveGenerationOptions {
   callId: string;
@@ -199,6 +200,16 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
   // Original provider input stays immutable. This cache is never reconstructed
   // from a caller supplied version or from an old process's journal.
   const admittedContexts = new Map<string, EligiblePhoneCall>();
+  const admissions = new Map<string, HistoryAdmission>();
+  const observedVersions = new Map<string, HistoryVersion>();
+  const observedVersion = (generationId:string) => observedVersions.get(generationId) ?? segment(generationId).version;
+  const recordVersion = (generationId:string,version:HistoryVersion) => {
+    const prior=observedVersion(generationId);
+    if(sameHistoryVersion(prior,version)) return;
+    options.onStatusContextRefresh?.({generationId,observedAt:stamp(),version,kind:'admitted_sources',
+      contentDigest:createHash('sha256').update(JSON.stringify(admissions.get(generationId))).digest('hex')});
+    observedVersions.set(generationId,version);
+  };
   let transitionAbort: AbortController | undefined;
   const reads = new Set<AbortController>();
   const canOpenInitially = state.segments.length === 0;
@@ -446,6 +457,7 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
         };
         state.segments.push(current); save();
         admittedContexts.set(current.generationId, structuredClone(context));
+        if(context.context.history.admission) admissions.set(current.generationId,structuredClone(context.context.history.admission));
         candidate = { generationId: current.generationId };
         const ownedCandidate = candidate;
         checkTransition();
@@ -464,7 +476,8 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
         if (state.segments.some(value => value !== current && value.sessionId === opened.sessionId))
           throw new LiveGenerationError('generation_session_reused');
         current.sessionId = opened.sessionId; current.readyAt = stamp(); save();
-        try { await wait(() => readContext('assert', () => options.context.assert(state.binding, current.version), transitionEndsAt)); }
+        try { const checked=await wait(() => readContext('assert', () => options.context.assert(state.binding, observedVersion(current.generationId),admissions.get(current.generationId)), transitionEndsAt));
+          recordVersion(current.generationId,checked.version); }
         catch (error) {
           if (attempt === 0 && changed(error)) { void retire('context_unavailable'); continue; }
           throw error;
@@ -505,9 +518,10 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
     const current = segment(attached.generationId);
     let suspended = false;
     try {
-      await readContext('assert', () => options.context.assert(state.binding, current.version), deadline, () => {
+      const checked=await readContext('assert', () => options.context.assert(state.binding, observedVersion(current.generationId),admissions.get(current.generationId)), deadline, () => {
         if (!suspended) { suspended = true; block('replacing'); }
       });
+      recordVersion(current.generationId,checked.version);
       if (suspended) return restore(attached);
     }
     catch (error) {
@@ -529,6 +543,11 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
     if (!stillRelevant()) throw new LiveGenerationError('presentation_deferred');
     if (state.phase !== 'active') return beforeReuse(deadline);
     const attached = attachment(), original = admittedContexts.get(attached.generationId);
+    if (admissions.has(attached.generationId)) {
+      const current=await beforeReuse(deadline);
+      if(!stillRelevant()) throw new LiveGenerationError('presentation_deferred');
+      return current;
+    }
     if (!original) return beforeReuse(deadline);
     let suspended = false;
     const suspend = () => { if (!suspended) { suspended = true; block('replacing'); } };
@@ -619,11 +638,11 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
         let response: EligibleDeliveryResponse;
         const readDelivery = async () => {
           let suspended = false;
-          const value = await readContext('delivery', () => options.context.delivery(state.binding, requestId, { version: current.version, source }, laterCall), deadline, () => {
+          const value = await readContext('delivery', () => options.context.delivery(state.binding, requestId, { version: observedVersion(current.generationId), source, ...(admissions.has(current.generationId)?{admission:admissions.get(current.generationId)}:{}) }, laterCall), deadline, () => {
             if (!suspended) { suspended = true; block('replacing'); }
           });
           if (suspended) {
-            await readContext('assert', () => options.context.assert(state.binding, current.version), deadline);
+            await readContext('assert', () => options.context.assert(state.binding, observedVersion(current.generationId),admissions.get(current.generationId)), deadline);
             restore(currentAttachment);
           }
           return value;
@@ -636,13 +655,18 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
           try { response = await readDelivery(); }
           catch (retryError) { unavailable('eligible_delivery_unavailable'); await retire('context_unavailable'); throw retryError; }
         }
+        if(admissions.has(current.generationId)) {
+          if(!response.admission) throw new LiveGenerationError('delivery_generation_changed');
+          admissions.set(current.generationId,structuredClone(response.admission));
+          recordVersion(current.generationId,response.version);
+        }
         const stillCurrent = attachment();
-        if (stillCurrent.generationId !== currentAttachment.generationId || !sameHistoryVersion(response.version, current.version))
+        if (stillCurrent.generationId !== currentAttachment.generationId || !sameHistoryVersion(response.version, observedVersion(current.generationId)))
           throw new LiveGenerationError('delivery_generation_changed');
         const outcome: GenerationDeliveryOutcome = { requestId, attachment: currentAttachment, response };
         if (response.delivery.state === 'ready') {
           if (!stillRelevant()) return { ...outcome, publication: { eventId: '', status: 'stale', reason: 'caller_context_changed' } };
-          outcome.publication = await handle!.publish({ requestId, version: current.version, delivery: response.delivery,
+          outcome.publication = await handle!.publish({ requestId, version: response.version, delivery: response.delivery,
             ...('deliveryAssociation' in response ? { deliveryAssociation: response.deliveryAssociation } : {}) });
           if (state.deliveryAttachment?.generationId !== currentAttachment.generationId || state.phase !== 'active')
             outcome.publication = { eventId: outcome.publication.eventId, status: 'stale', reason: 'generation_changed' };

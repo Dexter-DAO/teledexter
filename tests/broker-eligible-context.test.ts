@@ -469,3 +469,17 @@ test('later delivery validates saved scope, question and exact retained alias be
   await assert.rejects(client.delivery(binding, requestId, assistantInput, unassociated), errorCode('identity_mismatch'));
   assert.equal(requests.length, 0);
 });
+
+test('admission accepts only same-epoch forward versions and exact additions for the requested result', async () => {
+  const admission={invalidationDigest:'c'.repeat(64),messages:[{messageId:foreignId,digest:'d'.repeat(64)}],memories:[]};
+  const current={...version,threadEventSequence:'9007199254740994',digest:'e'.repeat(64)};
+  assert.equal((await harness([json({bindingId,callSid,current:true,version:current,admission})]).client.assert(binding,version,admission)).version.digest,current.digest);
+  for(const changed of [{...current,contextEpoch:'8'},{...current,threadEventSequence:'1'}])
+    await assert.rejects(harness([json({bindingId,callSid,current:true,version:changed,admission})]).client.assert(binding,version,admission),errorCode('identity_mismatch'));
+  const result={...assistantDelivery(),version:current,admission:{...admission,messages:[...admission.messages,{messageId,digest:'f'.repeat(64)}]}};
+  assert.deepEqual(await harness([json(result)]).client.delivery(binding,requestId,{...assistantInput,admission}),result);
+  for(const changed of [undefined,admission,{...result.admission,messages:[...result.admission.messages,{messageId:foreignId,digest:"f".repeat(64)}]},{...admission,messages:[]},{...result.admission,messages:[{messageId,digest:'f'.repeat(64)}]},
+    {...result.admission,messages:[...result.admission.messages,{messageId:questionId,digest:'f'.repeat(64)}]},
+    {...result.admission,invalidationDigest:'e'.repeat(64)}])
+    await assert.rejects(harness([json({...result,admission:changed})]).client.delivery(binding,requestId,{...assistantInput,admission}),errorCode('identity_mismatch'));
+});

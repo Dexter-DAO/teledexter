@@ -45,8 +45,14 @@ export const eligiblePhoneMessageSchema = z.object({
 }).strict();
 export type EligiblePhoneMessage = z.infer<typeof eligiblePhoneMessageSchema>;
 
+// Bounds reuse the Live startup message budget and the existing local-memory limit.
+export const historyAdmissionSchema = z.object({ invalidationDigest: digest,
+  messages: z.array(z.object({messageId:uuid,digest}).strict()).max(128),
+  memories: z.array(z.object({memoryId:uuid,revision:z.number().int().positive(),digest}).strict()).max(40),
+}).strict();
+export type HistoryAdmission = z.infer<typeof historyAdmissionSchema>;
 export const phoneHistorySchema = z.object({
-  version: historyVersionSchema, pageDigest: digest, localContext: z.string(),
+  version: historyVersionSchema, admission:historyAdmissionSchema.optional(), pageDigest: digest, localContext: z.string(),
   nextBeforeSequence: historySequenceSchema.nullable(), hasMore: z.boolean(), omittedForBudget: z.boolean(),
 }).strict();
 export const eligiblePhoneContextSchema = z.object({
@@ -103,9 +109,9 @@ export const eligibleContextBindingSchema = z.object({
 /** The first authenticated eligible envelope can establish the owner; later reads pin it. */
 export type EligibleContextBinding = z.infer<typeof eligibleContextBindingSchema>;
 
-export const contextAssertionRequestSchema = z.object({ version: historyVersionSchema }).strict();
+export const contextAssertionRequestSchema = z.object({ version: historyVersionSchema, admission:historyAdmissionSchema.optional() }).strict();
 export const contextAssertionSchema = z.object({
-  bindingId: uuid, callSid, current: z.literal(true), version: historyVersionSchema,
+  bindingId: uuid, callSid, current: z.literal(true), version: historyVersionSchema, admission:historyAdmissionSchema.optional(),
 }).strict();
 export type ContextAssertion = z.infer<typeof contextAssertionSchema>;
 
@@ -129,7 +135,7 @@ export const eligibleDeliveryTargetSchema = z.discriminatedUnion('kind', [
 ]);
 export type EligibleDeliveryTarget = z.infer<typeof eligibleDeliveryTargetSchema>;
 export const eligibleDeliveryRequestSchema = z.object({
-  version: historyVersionSchema, source: eligibleDeliveryTargetSchema,
+  version: historyVersionSchema, admission:historyAdmissionSchema.optional(), source: eligibleDeliveryTargetSchema,
 }).strict();
 export type EligibleDeliveryRequest = z.infer<typeof eligibleDeliveryRequestSchema>;
 
@@ -149,7 +155,7 @@ const eligibleDeliverySchema = z.union([
   z.object({ state: z.literal('unavailable'), reason: z.enum(['not_ready', 'source_not_in_projection']) }).strict(),
 ]);
 const deliveryResponseBaseSchema = z.object({
-  bindingId: uuid, callSid, requestId: uuid, version: historyVersionSchema, delivery: eligibleDeliverySchema,
+  bindingId: uuid, callSid, requestId: uuid, version: historyVersionSchema, admission:historyAdmissionSchema.optional(), delivery: eligibleDeliverySchema,
 }).strict();
 function checkDeliveryScope(value: z.infer<typeof deliveryResponseBaseSchema>, ctx: z.RefinementCtx): void {
   if (value.delivery.state !== 'ready') return;
@@ -211,7 +217,7 @@ export function parseEligiblePhoneCall(value: unknown, expected: EligibleContext
 
 export interface EligibleContextClient {
   fetch(binding: EligibleContextBinding): Promise<EligiblePhoneCall>;
-  assert(binding: EligibleContextBinding, version: HistoryVersion): Promise<ContextAssertion>;
+  assert(binding: EligibleContextBinding, version: HistoryVersion, admission?:HistoryAdmission): Promise<ContextAssertion>;
   delivery(binding: EligibleContextBinding, requestId: string, input: EligibleDeliveryRequest,
     laterCall?: RequestDeliveryJournal): Promise<EligibleDeliveryResponse>;
 }
@@ -261,15 +267,17 @@ export function createEligibleContextClient(options: PrimaryApiOptions): Eligibl
       remember(observed, call.context.history.version);
       return call;
     },
-    async assert(expected, inputVersion) {
+    async assert(expected, inputVersion, admission) {
       const binding = checkedBinding(expected);
       const version = checkedVersion(binding, inputVersion);
-      const value = await request('POST', `/calls/${binding.bindingId}/context/assert`, { version }, headers(binding));
+      const value = await request('POST', `/calls/${binding.bindingId}/context/assert`, { version,...(admission?{admission:parse(historyAdmissionSchema,admission,'invalid_request')}:{}) }, headers(binding));
       const result = parse(contextAssertionSchema, value, 'invalid_response');
       same(result.bindingId, binding.bindingId);
       same(result.callSid, binding.callSid);
-      if (!sameHistoryVersion(result.version, version)) throw new PrimaryApiError('identity_mismatch');
-      remember(binding, version);
+      if (admission ? canonicalJson(result.admission)!==canonicalJson(admission) : !sameHistoryVersion(result.version,version)) throw new PrimaryApiError('identity_mismatch');
+      checkedVersion(binding,result.version);
+      if (result.version.contextEpoch !== version.contextEpoch || BigInt(result.version.threadEventSequence)<BigInt(version.threadEventSequence)) throw new PrimaryApiError('identity_mismatch');
+      remember(binding, result.version);
       return result;
     },
     async delivery(expected, inputRequestId, input, laterCall) {
@@ -306,7 +314,20 @@ export function createEligibleContextClient(options: PrimaryApiOptions): Eligibl
       same(result.bindingId, binding.bindingId);
       same(result.callSid, binding.callSid);
       same(result.requestId, requestId);
-      if (!sameHistoryVersion(result.version, body.version)) throw new PrimaryApiError('identity_mismatch');
+      if (!body.admission && !sameHistoryVersion(result.version, body.version)) throw new PrimaryApiError('identity_mismatch');
+      checkedVersion(binding,result.version);
+      if (result.version.contextEpoch !== body.version.contextEpoch || BigInt(result.version.threadEventSequence)<BigInt(body.version.threadEventSequence)) throw new PrimaryApiError('identity_mismatch');
+      if (body.admission) {
+        const next = result.admission;
+        if (!next || new Set(next.messages.map(item=>item.messageId)).size !== next.messages.length
+          || (result.delivery.state === 'ready' && !next.messages.map(item=>item.messageId).includes(result.delivery.source.messageId))
+          || next.invalidationDigest !== body.admission.invalidationDigest
+          || canonicalJson(next.memories) !== canonicalJson(body.admission.memories)
+          || body.admission.messages.some(prior => !next.messages.some(item => canonicalJson(item) === canonicalJson(prior)))
+          || next.messages.some(item => !body.admission!.messages.some(prior => prior.messageId === item.messageId)
+            && (result.delivery.state !== 'ready' || item.messageId !== result.delivery.source.messageId)))
+          throw new PrimaryApiError('identity_mismatch');
+      }
       if (result.delivery.state === 'ready') {
         same(result.delivery.source.kind, body.source.kind);
         if (body.source.kind === 'assistant') same(result.delivery.source.messageId, body.source.messageId);
@@ -316,7 +337,7 @@ export function createEligibleContextClient(options: PrimaryApiOptions): Eligibl
           same(result.delivery.question.revision, body.source.questionRevision);
         }
       }
-      remember(binding, body.version);
+      remember(binding, result.version);
       return result;
     },
   };

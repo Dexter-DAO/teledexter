@@ -115,3 +115,12 @@ test('digital silence keeps total accounting without holding audible playback; e
   assert.equal(receipts.sentBytes, 483); assert.equal(receipts.playedBytes, 163); assert.equal(receipts.clearedBytes, 320);
   assert.equal(receipts.audibleSentBytes, 480); assert.equal(receipts.audiblePlayedBytes, 160); assert.equal(receipts.audibleClearedBytes, 320);
 });
+
+
+test('known provider failures explain service availability without asserting a financial outcome',()=>{
+  const {entry}=fixture();
+  for(const code of ['provider_busy','provider_request_budget_exceeded','provider_credit_limit','provider_credits_unavailable','provider_rate_limited']) {
+    entry.primaryResult={state:'failed',error:{code,retryable:false}} as BrokerDelegationRecord['primaryResult'];
+    const text=failedRequestSpeech(entry);assert.match(text,/AI service/);assert.doesNotMatch(text,/trade failed|not submitted|nothing was sold|out of service credits/i);
+  }
+});

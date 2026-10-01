@@ -918,3 +918,55 @@ test('late result frontier is checked before I/O and again after eligible delive
     assert.equal(h.sessions[0].publications.length, 0);
   } finally { await h.controller.stop(); }
 });
+
+test('admitted additions refresh the boundary once without fetching or replacing the Live session', async () => {
+  const h=harness(), admitted={invalidationDigest:'a'.repeat(64),messages:[],memories:[]};
+  let current=versionFor(1), checks=0;
+  h.api.fetch=async()=>{h.operations.push({name:'fetch'});return {...contextFor(current),context:{...contextFor(current).context,
+    history:{...contextFor(current).context.history,admission:admitted}}};};
+  h.api.assert=async(_binding,_version,admission)=>{checks++;assert.deepEqual(admission,admitted);return {bindingId,callSid,current:true,version:current,admission};};
+  h.api.delivery=async(_binding,id,input)=>({bindingId,callSid,requestId:id,version:current,admission:input.admission,
+    delivery:{state:'ready',source:{kind:'assistant',messageId,eventSequence:current.threadEventSequence,
+      provenance:{messageCreatedAt:when,eventId,eventOccurredAt:when,runId}},text:'Your account total is $45.35.'}});
+  try {
+    await h.controller.start();current={...versionFor(2),contextEpoch:'1'};
+    await h.controller.withStatusAttachment(()=>true,async()=>undefined);
+    await h.controller.deliver(requestId,{kind:'assistant',messageId});
+    assert.equal(h.sessions.length,1);assert.equal(h.operations.filter(op=>op.name==='fetch').length,1);
+    assert.equal(h.sessions[0].closes.length,0);assert.equal(h.sessions[0].publications.length,1);
+    assert.equal(checks,3);assert.deepEqual(h.controller.snapshot().segments[0].version,versionFor(1),'startup source stays immutable');
+  } finally {await h.controller.stop();}
+});
+
+test('admitted removal still replaces the session and never sends old audio during replacement', async()=>{
+  const h=harness(), admitted={invalidationDigest:'a'.repeat(64),messages:[],memories:[]};
+  let removed=false;
+  h.api.fetch=async()=>{const context=contextFor(removed?versionFor(2):versionFor(1));context.context.history.admission=admitted;return context;};
+  h.api.assert=async(_binding,version,admission)=>{if(removed && version.contextEpoch==='1') throw changed();return{bindingId,callSid,current:true,version,admission};};
+  try {await h.controller.start();removed=true;await h.controller.beforeReuse();
+    assert.equal(h.sessions.length,2);assert.equal(h.sessions[0].closes.length,1);
+    h.sessions[0].input.callbacks.onAudio('removed');assert.deepEqual(h.audio,[]);
+  } finally {await h.controller.stop();}
+});
+
+test('cached startup retains its original page digest and version when admitted sources validate at a newer version', async () => {
+  const h = harness(), cache = createInboundStartupContexts(h.api), call = startupCall();
+  const page = contextFor(versionFor(1));
+  page.context.history.pageDigest = 'b'.repeat(64);
+  page.context.history.admission = { invalidationDigest: 'c'.repeat(64), messages: [], memories: [] };
+  cache.remember(call, page); h.options.context = cache.take(call);
+  let assertions = 0;
+  h.api.assert = async (_binding, requested, admission) => {
+    assertions++; assert.deepEqual(requested, page.context.history.version);
+    assert.deepEqual(admission, page.context.history.admission);
+    return { bindingId, callSid, current: true, version: {...versionFor(2),contextEpoch:'1'}, admission };
+  };
+  try {
+    await h.controller.start();
+    assert.equal(assertions, 2, 'pre-start and post-open assertions remain distinct');
+    assert.deepEqual(h.sessions[0].input.context, page);
+    assert.deepEqual(h.controller.snapshot().segments[0].version, versionFor(1));
+    assert.equal(h.sessions.length, 1);
+    assert.equal(h.operations.filter(value => value.name === 'fetch').length, 0);
+  } finally { await h.controller.stop(); }
+});

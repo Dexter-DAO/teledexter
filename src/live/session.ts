@@ -61,6 +61,7 @@ type Delegation = {
   offsetMs: number;
   controller: AbortController;
   updates: Map<string, { signature: string; delivery: Promise<LiveDelivery> }>;
+  publish?: LiveBackendChannel['publish'];
   responseId?: string;
   toolCalls?: Map<string, { itemId: string; signature: string }>;
 };
@@ -267,6 +268,7 @@ export function createBrokerLiveSession(options: BrokerLiveSessionOptions): Brok
       state.updates.set(update.id, { signature, delivery });
       return delivery;
     };
+    state.publish=publish;
     const channel: LiveBackendChannel = {
       getContext: () => clone(persistedTranscript),
       subscribeContext: listener => {
@@ -428,6 +430,8 @@ export function createBrokerLiveSession(options: BrokerLiveSessionOptions): Brok
       }
       return send({ type: 'session.input_audio.append', audio: base64 });
     },
+    publishDelegation: (delegationId,update) => delegations.get(delegationId)?.publish?.(update)
+      ?? Promise.resolve({eventId:'',status:'rejected',reason:'unknown_delegation'}),
     appendContext: text => append('thinking', text, null),
     appendInstructions: text => append('instructions', text, null),
     appendCommentary: text => append('commentary', text, null),

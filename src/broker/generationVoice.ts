@@ -192,7 +192,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
 
   const publishText = async (entry: BrokerDelegationRecord, attachment: LiveGenerationAttachment,
     text: string, kind: 'progress' | 'result', updateId: string,
-    evidence?: OrdinaryPublicationEvidence['response']): Promise<GenerationPublication> => {
+    evidence?: OrdinaryPublicationEvidence['response'], historical=false, speak=true): Promise<GenerationPublication> => {
     const session = sessions.get(attachment.sessionId);
     if (!session?.voice.appendCommentary) throw new Error('commentary_transport_unavailable');
     const start = session.voice.getTranscript();
@@ -225,19 +225,21 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
       const halted = interrupted();
       if (halted) return { eventId: receipt.eventId, status: halted };
       const snapshot = session.voice.getTranscript();
-      const update: LiveBackendUpdate = { id: `${prefix}_attempt_${attempt}_${index}`, kind, text: chunk, speak: true,
+      const update: LiveBackendUpdate = { id: `${prefix}_attempt_${attempt}_${index}`, kind, text: chunk, speak,
         expectedCallerRevision: start.callerRevision };
       const identity = { callId: initialCall.id, callSid: binding.callSid, bindingId: binding.bindingId,
         sessionId: attachment.sessionId, ...(entry.sessionId !== attachment.sessionId ? { sourceSessionId: entry.sessionId } : {}) };
       const intent = beginBrokerPublication(options.store, identity, entry.requestId, update, snapshot,
-        evidence ? { response: evidence, chunkIndex: index } : undefined);
+        evidence ? { response: evidence, chunkIndex: index,...(historical?{historical:true as const}:{}) } : undefined);
       // Unknown submissions lack a confirmed run. Their fixed local status carries no related-request authority.
       if (intent && !intent.created) receipt = intent.record.outcome
         ? { eventId: intent.record.outcome.eventId, status: intent.record.outcome.status,
           observedCallerRevision: intent.record.outcome.callerRevision, observedTranscriptSequence: intent.record.outcome.transcriptSequence }
         : { eventId: '', status: 'unconfirmed' };
       else {
-        try { receipt = await session.voice.appendCommentary(chunk); }
+        try { receipt = entry.sessionId===attachment.sessionId && session.voice.publishDelegation
+          ? await session.voice.publishDelegation(entry.delegationIds[0]!,update)
+          : speak ? await session.voice.appendCommentary(chunk) : await session.voice.appendContext(chunk); }
         catch { receipt = { eventId: '', status: 'unconfirmed' }; }
         const after = session.voice.getTranscript();
         if (intent) settleBrokerPublication(options.store, intent.record, receipt, after, stopped);
@@ -294,7 +296,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
         && hasLaterCallerSpeech(call(), entry) ? `For your earlier request: ${outcomeText}` : outcomeText;
       const present = async (currentAttachment: LiveGenerationAttachment) => ({ attachment: currentAttachment,
         delivery: stillRelevant()
-          ? await publishText(entry, currentAttachment, text, update?.kind ?? 'result', update?.id ?? `${entry.requestId}_${entry.status}`)
+          ? await publishText(entry, currentAttachment, text, update?.kind ?? 'result', update?.id ?? `${entry.requestId}_${entry.status}`,undefined,false,!pendingStatus)
           : { eventId: '', status: 'stale' as const, reason: 'caller_context_changed' } });
       let published: Awaited<ReturnType<typeof present>>;
       try { published = pendingStatus ? await controller.withStatusAttachment(stillRelevant, present)
@@ -345,7 +347,14 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
     },
     open(input) {
       let prepared: ReturnType<typeof prepareEligibleHistory>;
-      try { prepared = prepareEligibleHistory(input.context, binding); }
+      try {
+        const pendingMessages=Object.values(call().delegations).flatMap(raw=>{
+          const entry=raw as BrokerDelegationRecord;
+          return entry.delivery!=='accepted' && entry.primaryResult?.state==='completed' && entry.primaryResult.assistant
+            ? [entry.primaryResult.assistant.messageId] : [];
+        });
+        prepared = prepareEligibleHistory(input.context, binding,pendingMessages);
+      }
       catch (error) { throw new LiveGenerationStartupError(error instanceof Error ? error.message : undefined); }
       return new Promise<GenerationHandle>((resolve, reject) => {
         let voice: BrokerLiveSession;
@@ -464,19 +473,9 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
                   const evidence = result.delivery.source.kind === 'assistant'
                     ? eligibleDeliveryResponseSchema.parse({ bindingId: binding.bindingId, callSid: binding.callSid,
                       requestId: result.requestId, version: result.version, delivery: result.delivery }) : undefined;
-                  const noticeId = `${entry.requestId}_${result.delivery.source.messageId}_earlier`;
-                  const noticeAccepted = call().publications?.records.some(record => record.requestId === entry.requestId
-                    && record.updateId.startsWith(`${noticeId}_caller_`) && record.kind === 'progress'
-                    && record.outcome?.status === 'accepted' && !call().publications?.rejections.some(rejection =>
-                      rejection.sessionId === record.sessionId && rejection.eventId === record.outcome!.eventId));
-                  if (evidence && hasLaterCallerSpeech(call(), entry) && !noticeAccepted) {
-                    const frontier = presentationFrontier();
-                    const notice = await publishText(entry, attachment, 'For your earlier request:', 'progress', noticeId);
-                    if (notice.status !== 'accepted') return notice;
-                    if (frontier !== presentationFrontier()) return { eventId: '', status: 'stale', reason: 'caller_context_changed' };
-                  }
-                  return publishText(entry, attachment, result.delivery.text, 'result',
-                    `${entry.requestId}_${result.delivery.source.messageId}`, evidence);
+                  const historical=!!evidence && hasLaterCallerSpeech(call(),entry);
+                  return publishText(entry, attachment, historical ? `For your earlier request: ${result.delivery.text}` : result.delivery.text, 'result',
+                    `${entry.requestId}_${result.delivery.source.messageId}`, evidence,historical);
                 },
                 close(reason) { backend!.persistAcousticEvidence(); return voice.close(reason); },
               });

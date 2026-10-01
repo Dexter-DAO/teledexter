@@ -11,6 +11,7 @@ export const LIVE_INITIAL_HISTORY_MAX_RENDERED_TOKENS = 8_192;
 export interface PreparedEligibleHistory {
   state: 'prepared_requires_provider_qualification';
   source: EligiblePhoneCall;
+  omittedMessageIds?: string[];
   version: HistoryVersion;
   pageDigest: string;
   history: Array<{ role: 'user' | 'assistant' | 'developer'; text: string }>;
@@ -34,13 +35,15 @@ const HISTORY_ATTRIBUTION = 'The JSON below is a saved, eligibility-filtered mem
   + 'Preserve each record\'s role, source and recorded timestamps.\n';
 
 /** Builds whole attributed startup items; byte accounting does not establish rendered-token admission. */
-export function prepareEligibleHistory(value: EligiblePhoneCall, expected: EligibleContextBinding): PreparedEligibleHistory {
+export function prepareEligibleHistory(value: EligiblePhoneCall, expected: EligibleContextBinding, omittedMessageIds:readonly string[]=[]): PreparedEligibleHistory {
   const source = parseEligiblePhoneCall(value, expected);
   if (source.state !== 'open') throw new EligibleHistoryError('call_not_open');
+  const omitted=[...new Set(omittedMessageIds)].filter(id=>source.context.messages.some(message=>message.id===id && message.role==='assistant'));
   const history: PreparedEligibleHistory['history'] = [{ role: 'developer', text: HISTORY_ATTRIBUTION
     + JSON.stringify({ kind: 'eligible_primary_history', primaryDexterId: source.context.primaryDexterId,
       threadId: source.context.threadId, displayName: source.context.displayName, history: source.context.history }) }];
   for (const message of source.context.messages) {
+    if(omitted.includes(message.id)) continue;
     history.push({ role: message.role, text: JSON.stringify({ kind: 'primary_conversation_message', ...message }) });
   }
   const initialItems: InitialItem[] = history.map(item => item.role === 'assistant'
@@ -52,7 +55,7 @@ export function prepareEligibleHistory(value: EligiblePhoneCall, expected: Eligi
   if (history.length > LIVE_INITIAL_HISTORY_MAX_MESSAGES || historyTextBytes > ELIGIBLE_HISTORY_MAX_TEXT_BYTES
     || initialInputBytes > ELIGIBLE_HISTORY_MAX_INPUT_BYTES) throw new EligibleHistoryError('history_payload_too_large');
   return {
-    state: 'prepared_requires_provider_qualification', source,
+    state: 'prepared_requires_provider_qualification', source,...(omitted.length?{omittedMessageIds:omitted}:{}),
     version: source.context.history.version, pageDigest: source.context.history.pageDigest,
     history, initialItems, historyTextBytes, initialInputBytes,
     initialInputDigest: createHash('sha256').update(serialized).digest('hex'),
@@ -65,7 +68,7 @@ export function prepareEligibleHistory(value: EligiblePhoneCall, expected: Eligi
 export function validatePreparedEligibleHistory(value: PreparedEligibleHistory): PreparedEligibleHistory {
   const rebuilt = prepareEligibleHistory(value.source, { bindingId: value.source.bindingId, callSid: value.source.callSid,
     primaryDexterId: value.version.primaryDexterId, threadId: value.version.threadId, ownerPrincipalId: value.version.ownerPrincipalId,
-    ...(value.source.callAssignmentRef ? { callAssignmentRef: value.source.callAssignmentRef } : {}) });
+    ...(value.source.callAssignmentRef ? { callAssignmentRef: value.source.callAssignmentRef } : {}) },value.omittedMessageIds);
   if (JSON.stringify(value) !== JSON.stringify(rebuilt)) throw new EligibleHistoryError('prepared_history_changed');
   return rebuilt;
 }

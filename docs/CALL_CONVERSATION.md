@@ -70,3 +70,31 @@ An approved inbound call can open its initial voice-provider connection while th
 The initial connection belongs to that call. A failed connection is closed without an automatic replacement. Consume failure, revocation, admission expiry, media failure, hangup and shutdown close an unused connection. Terminal cleanup removes its saved in-memory slot. After adoption, the voice session owns cleanup, and an intentional later generation replacement uses the normal connection path.
 
 `broker_inbound_transport` logs connection start, socket open, adoption and discard with call ID and elapsed time. These logs can measure handshake overlap against the existing account-read spans. Local composition tests establish the authorization and cleanup behavior; customer opening latency still requires a subsequent call measurement.
+
+### Keep authorized conversation additions in the current voice session
+
+The October 1 account call exposed five unnecessary context replacements. A new
+account answer was first loaded as replacement history and then published again.
+The Broker now keeps the current Live session when the API confirms that its
+admitted sources remain eligible. Memory corrections, forgotten or removed
+content, changed authority and closed calls still stop reuse.
+
+Results use the original delegation channel while that session remains active.
+Progress updates use quiet thinking context. An answer to earlier work has one
+contextualized publication. A genuine replacement omits an unaccepted result
+from startup history until its authoritative publication; previously accepted
+answers remain eligible history. A replacement never addresses an old session's
+delegation ID.
+
+The admitted-source request is bounded to 128 message references and 40 memory
+references. Reaching the bound requires a fresh eligible generation. The API
+rechecks the existing context epoch and exact source witnesses under the current
+owner, call and memory locks. Ordinary additions require the same assertion
+round trips as a legacy assertion; combined admission and display-name reading
+removes one further round trip from each assertion.
+
+Deploy the compatible Broker before the API starts returning admission metadata.
+The new Broker reads old call journals and older API responses. Once a journal
+contains admission refresh evidence, retain this compatible Broker when rolling
+the API back. Automated and composed tests establish source behavior; an actual
+call remains necessary to verify what the caller hears.

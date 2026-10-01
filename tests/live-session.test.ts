@@ -419,3 +419,24 @@ test('audio suppressed during close invalidates heard-text proof while final tra
   assert.equal(result.finalized, true); assert.equal(result.outputAudioDiscarded, true);
   assert.equal(f.outputs.length, 0); assert.equal(f.transcripts.at(-1)!.fragments[0].text, 'This was never played.');
 });
+
+test('composed publisher uses original delegation for quiet progress and exactly one result', async()=>{
+  const f=fixture();f.transport.start();f.transcript('user','Check my account',0);f.delegate('original_task');await flush();
+  try {
+    const update={id:'progress_1',kind:'progress' as const,text:'The account request is still running.',speak:false};
+    const pending=f.session.publishDelegation!('original_task',update);
+    const thinking=f.transport.sent.at(-1)!;assert.equal(thinking.type,'session.thinking.append');
+    assert.equal('delegation_id' in thinking && thinking.delegation_id,'original_task');
+    f.transport.receive(appendAck('thinking',thinking.event_id));assert.equal((await pending).status,'accepted');
+    f.transcript('complaint','Does it always take over thirty seconds?',1500);
+    const result={id:'result_1',kind:'result' as const,text:'For your earlier request: Your account total is $45.35.',expectedCallerRevision:2};
+    const answer=f.session.publishDelegation!('original_task',result);
+    const commentary=f.transport.sent.at(-1)!;assert.equal(commentary.type,'session.commentary.append');
+    assert.equal('delegation_id' in commentary && commentary.delegation_id,'original_task');
+    f.transport.receive(appendAck('commentary',commentary.event_id));assert.equal((await answer).status,'accepted');
+    const count=f.transport.sent.length;assert.equal((await f.session.publishDelegation!('original_task',result)).status,'accepted');
+    assert.equal(f.transport.sent.length,count);
+    assert.equal((await f.session.publishDelegation!('previous_session_task',result)).reason,'unknown_delegation');
+    assert.equal(f.transport.sent.length,count);
+  } finally {await f.finish();}
+});
