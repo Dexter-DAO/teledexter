@@ -98,3 +98,30 @@ The new Broker reads old call journals and older API responses. Once a journal
 contains admission refresh evidence, retain this compatible Broker when rolling
 the API back. Automated and composed tests establish source behavior; an actual
 call remains necessary to verify what the caller hears.
+
+### Start admission during the first hold
+
+The ordinary inbound webhook returns its existing Say and Redirect before
+starting account admission. After the HTTP response finishes, one admission
+request runs on the existing per-call queue with the original signed identity
+and deadline. The saved `earlyAdmission` marker is written before that contact.
+An aborted response starts no admission work. Enrollment-only and undecided
+setup calls keep their existing path.
+
+The signed continuation still gates attachment recovery, context loading and
+voice transport. If the early request loses its reply or reaches the carrier
+while the call is ringing, continuation recovers the same attachment before the
+existing admission path resumes. Duplicate webhooks and maintenance never
+repeat the early contact. Hangup, shutdown and expiry retain normal cancellation
+and closure handling, including an admission request already in flight.
+
+Historical approved and bound journals without the marker keep their existing
+recovery behavior. The older e725 reader rejects the new marker. After any new
+marker is written, rollback must use a compatible reader that preserves this
+barrier; retain a reviewed recovery artifact before deployment.
+
+The measured earlier call spent about 992 ms in admission after a 1,872 ms
+initial hold interval. That is the gross overlap opportunity. Carrier refusal
+or a slow admission can require extra recovery work. The `hold_response` and
+`early_begin_admission` timing spans measure the new ordering; a real call is
+still required to establish the change in audible opening delay.

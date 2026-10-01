@@ -387,7 +387,10 @@ test('actual non-A incoming settles ordinary attachment before restricted conver
   async function post(route: string, body: Record<string, string>) { return fetch(origin + route, { method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-twilio-signature': Twilio.getExpectedTwilioSignature(config.twilioAuthToken, config.publicOrigin + route, body) },
     body: new URLSearchParams(body) }); }
-  const first = await post('/broker/incoming-call', params); assert.equal(first.status, 200); assert.equal(counts.begin, 0);
+  const first = await post('/broker/incoming-call', params); assert.equal(first.status, 200);
+  assert.match(await first.text(), /<Say>One moment\.<\/Say><Redirect/);
+  await until(() => counts.begin === 1, 'early ordinary admission reaches its current carrier refusal');
+  assert.equal(counts.private, 0); assert.equal(voice, undefined);
   const original = store.bySid(sid)!;
   const continuation = await post(`/broker/inbound/${original.id}/continue`, { ...params, CallStatus: 'in-progress' });
   const continuationBody = await continuation.text();

@@ -387,3 +387,22 @@ test('historical attempted and approved journal needs no invented continuation o
   assert.equal(recovered.inbound!.continuation, undefined); assert.equal(recovered.inbound!.remote?.state, 'approved');
   assert.equal(fs.readFileSync(f.file, 'utf8'), bytes);
 });
+
+test('early marker is durable and forbids approved consumption until original signed continuation', t => {
+  const f = fixture(t);
+  const started = f.send({ type: 'early_admission_started', observedAt: after(10) });
+  assert.deepEqual(f.restart(), started);
+  f.send({ type: 'outcome', outcome: f.approved, observedAt: after(1000) });
+  assert.throws(() => f.send({ type: 'consume_attempted', observedAt: after(2000) }), /continuation required/);
+  assert.throws(() => f.send({ type: 'outcome', outcome: f.bound, observedAt: after(11000) }), /requires continuation/);
+  assert.throws(() => f.send({ type: 'early_admission_started', observedAt: after(2000) }), /unavailable/);
+  f.continue(); f.send({ type: 'consume_attempted', observedAt: after(2000) });
+  assert.equal(f.send({ type: 'outcome', outcome: f.bound, observedAt: after(11000) }).inbound!.remote?.state, 'bound');
+});
+
+test('undecided and enrollment-only records reject early admission', t => {
+  const f = fixture(t); const otherProof = { ...proof, params: { ...proof.params, CallSid: `CA${'3'.repeat(32)}` } };
+  const other = f.store.reserveInbound({ ...input, requestId: inboundRequestId(otherProof.params.CallSid), providerProof: otherProof }, policy, start, true).call;
+  assert.equal(other.inbound!.mode?.kind, 'undecided');
+  assert.throws(() => f.store.transitionInbound(other.id, { type: 'early_admission_started', observedAt: after(1) }), /unavailable/);
+});

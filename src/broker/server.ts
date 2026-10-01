@@ -45,7 +45,7 @@ import type { deliverHarkBilling } from './harkBillingDelivery.js';
 import { rejectBrokerPublication } from './publications.js';
 import { createCallbackFlow } from './callback.js';
 import { createInboundFlow } from './inbound.js';
-import { logInboundTiming, observeInboundStreamResponse } from './inboundTiming.js';
+import { logInboundTiming, observeInboundStreamResponse, observeInboundHoldResponse } from './inboundTiming.js';
 import { type BrokerConfig, isPhoneNumber } from './config.js';
 import { BrokerStore, type BrokerCall, type CallStatus, terminalCallStatuses } from './store.js';
 import { brokerInstructions, brokerHistory, brokerOpening } from './instructions.js';
@@ -465,7 +465,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
     } catch (error) { store.update(call.id, { failure: safeFailure(error) }); }
   }
 
-  async function inboundResponse(call: BrokerCall, response: ServerResponse): Promise<void> {
+  async function inboundResponse(call: BrokerCall, response: ServerResponse, originalHold = false): Promise<void> {
     call = store.get(call.id)!;
     if (restricted) { const setup = await restricted.inboundResponse(call); if (setup !== undefined) return xml(response, setup); }
     if (!options.inboundAttachment || !accepting) inbound.stopLocal(call.id, 'service_unavailable');
@@ -489,6 +489,15 @@ export function createBrokerServer(options: BrokerServerOptions) {
         ...(remote && remote.state !== 'absent' ? { attachmentId: remote.attachmentId } : {}),
         ...(remote && 'expiresAt' in remote && remote.expiresAt ? { expiresAt: remote.expiresAt } : {}),
       });
+      if (originalHold && !call.inbound!.mode && !call.inbound!.continuation)
+        observeInboundHoldResponse(call.id, response, logInboundTiming, () => {
+          void inbound.beginEarly(call.id).catch(error => {
+            // This optional contact can reach a still-ringing leg. Its failure does
+            // not describe the eventual call; normal continuation owns that result.
+            try { console.error('[dexter-broker] Early inbound admission did not finish', { callId: call.id, code: safeFailure(error).code }); }
+            catch { /* Diagnostic output must not change recovery. */ }
+          });
+        });
       return xml(response, rendered);
     } catch (error) {
       store.update(call.id, { failure: safeFailure(error) });
@@ -778,7 +787,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
           store.update(reserved.id, { failure: safeFailure(error) }); call = store.get(reserved.id)!;
         }
         sessionCalls.add(call.id);
-        return inboundResponse(call, response);
+        return inboundResponse(call, response, true);
       }
       const requestId = createHash('sha256').update(`incoming:${params.CallSid}`).digest('hex');
       call = store.reserve({ requestId, direction: 'inbound', purpose: 'The person called Dexter.', number: params.From, callSid: params.CallSid }).call;

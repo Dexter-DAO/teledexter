@@ -22,6 +22,8 @@ export interface InboundJournal {
   continuation?: { observedAt: string; beginBodyDigest: string; providerProof: InboundBeginIdentity['providerProof'] };
   admissionRefusal?: { observedAt: string; beginBodyDigest: string; status: 403; retryable: false;
     code: 'inbound_carrier_attestation_required' | 'inbound_enrollment_required' };
+  /** One admission contact after the first hold response finishes; consumption still needs continuation. */
+  earlyAdmission?: { startedAt: string; beginBodyDigest: string };
   beginAttemptedAt?: string;
   consumeAttemptedAt?: string;
   remote?: RecoverInboundResult;
@@ -38,7 +40,7 @@ export type InboundJournalEvent =
   | { type: 'enrollment_observation'; result: EnrollmentCompletionRecovery; observedAt: string }
   | { type: 'enrollment_error'; error: EnrollmentTransportError; observedAt: string }
   | { type: 'enrollment_end_requested' | 'enrollment_end_acknowledged'; observedAt: string }
-  | { type: 'begin_attempted' | 'consume_attempted' | 'cancel_requested' | 'close_requested'; observedAt: string }
+  | { type: 'early_admission_started' | 'begin_attempted' | 'consume_attempted' | 'cancel_requested' | 'close_requested'; observedAt: string }
   | { type: 'continuation'; providerProof: InboundBeginIdentity['providerProof']; observedAt: string }
   | { type: 'admission_refused'; code: 'inbound_carrier_attestation_required' | 'inbound_enrollment_required'; observedAt: string }
   | { type: 'stop'; reason: string; observedAt: string }
@@ -59,6 +61,7 @@ const journalSchema = z.object({
   admissionRefusal: z.object({ observedAt: time, beginBodyDigest: z.string().regex(/^[0-9a-f]{64}$/),
     status: z.literal(403), retryable: z.literal(false),
     code: z.enum(['inbound_carrier_attestation_required', 'inbound_enrollment_required']) }).strict().optional(),
+  earlyAdmission: z.object({ startedAt: time, beginBodyDigest: z.string().regex(/^[0-9a-f]{64}$/) }).strict().optional(),
   beginAttemptedAt: time.optional(), consumeAttemptedAt: time.optional(),
   remote: recoverInboundResultSchema.optional(), issuedExpiresAt: time.optional(), approvalRef: inboundApprovalRefSchema.optional(),
   mediaStartBy: time.optional(), localStop: z.object({ observedAt: time, reason: z.string().min(1).max(100) }).strict().optional(),
@@ -142,7 +145,7 @@ export function validateInboundJournal(call: BrokerCall, previous?: BrokerCall):
     && (Date.parse(mode.selectedAt) < Date.parse(call.createdAt) || Date.parse(mode.selectedAt) >= Date.parse(journal.waitUntil)))
     throw new Error('Inbound mode selection outside original wait');
   if (mode && mode.kind !== 'ordinary') {
-    if (journal.continuation || journal.beginAttemptedAt || journal.consumeAttemptedAt || journal.remote
+    if (journal.continuation || journal.earlyAdmission || journal.beginAttemptedAt || journal.consumeAttemptedAt || journal.remote
       || journal.approvalRef || journal.issuedExpiresAt || journal.admissionRefusal || journal.cancelRequestedAt
       || journal.closureRequestedAt || journal.closure || journal.mediaStartBy || call.primary || call.primaryClosed
       || call.mediaStartedAt || call.liveSessionId || call.liveGenerations || call.transcript
@@ -175,6 +178,17 @@ export function validateInboundJournal(call: BrokerCall, previous?: BrokerCall):
       for (const field of ['endRequestedAt', 'endAcknowledgedAt'] as const)
         if (old[field] !== undefined && mode[field] !== old[field]) throw new Error('Enrollment end evidence cannot change');
     }
+  }
+  if (previous?.inbound?.earlyAdmission && !same(previous.inbound.earlyAdmission, journal.earlyAdmission))
+    throw new Error('Inbound early admission cannot change');
+  if (journal.earlyAdmission) {
+    if (journal.earlyAdmission.beginBodyDigest !== journal.beginBodyDigest
+      || journal.earlyAdmission.startedAt !== journal.beginAttemptedAt
+      || Date.parse(journal.earlyAdmission.startedAt) < Date.parse(call.createdAt)
+      || Date.parse(journal.earlyAdmission.startedAt) >= Date.parse(journal.waitUntil))
+      throw new Error('Inbound early admission identity mismatch');
+    if (!journal.continuation && (journal.consumeAttemptedAt || journal.remote?.state === 'bound' || call.primary || call.mediaStartedAt))
+      throw new Error('Inbound early admission requires continuation before consumption');
   }
   if (journal.continuation) {
     if (journal.continuation.beginBodyDigest !== journal.beginBodyDigest) throw new Error('Inbound continuation original proof changed');
@@ -280,6 +294,12 @@ export function reduceInboundJournal(call: BrokerCall, event: InboundJournalEven
     journal.admissionRefusal ??= { observedAt: at, beginBodyDigest: journal.beginBodyDigest, status: 403, retryable: false, code };
     journal.localStop ??= { observedAt: at, reason: code };
     journal.cancelRequestedAt ??= at;
+  } else if (event.type === 'early_admission_started') {
+    if (stopped() || next.endedAt || Date.parse(at) >= Date.parse(journal.waitUntil)) throw new Error('Inbound wait stopped');
+    if (journal.mode || journal.continuation || journal.beginAttemptedAt || journal.remote || journal.earlyAdmission)
+      throw new Error('Inbound early admission unavailable');
+    journal.earlyAdmission = { startedAt: at, beginBodyDigest: journal.beginBodyDigest };
+    journal.beginAttemptedAt = at;
   } else if (event.type === 'begin_attempted') {
     if (stopped() || next.endedAt || Date.parse(at) >= Date.parse(journal.waitUntil)) throw new Error('Inbound wait stopped');
     if (!journal.continuation) throw new Error('Inbound continuation required');
@@ -288,6 +308,7 @@ export function reduceInboundJournal(call: BrokerCall, event: InboundJournalEven
     if (stopped() || journal.remote?.state !== 'approved' || Date.parse(at) >= Date.parse(journal.waitUntil)
         || Date.parse(at) >= Date.parse(journal.remote.expiresAt)) throw new Error('Inbound consumption unavailable');
     if (!journal.beginAttemptedAt) throw new Error('Inbound begin not attempted');
+    if (journal.earlyAdmission && !journal.continuation) throw new Error('Inbound continuation required');
     journal.consumeAttemptedAt ??= at;
   } else if (event.type === 'stop') {
     z.string().min(1).max(100).parse(event.reason);

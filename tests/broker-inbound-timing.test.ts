@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
-import { createInboundAttemptTiming, observeInboundStreamResponse, type InboundTimingEvent } from '../src/broker/inboundTiming.js';
+import { createInboundAttemptTiming, observeInboundStreamResponse, observeInboundHoldResponse, type InboundTimingEvent } from '../src/broker/inboundTiming.js';
 import { PrimaryApiError } from '../src/broker/primaryApi.js';
 
 test('a failed stage retains elapsed time across wall-clock movement and never logs the error body', async () => {
@@ -51,4 +51,20 @@ test('stream timing distinguishes a dropped HTTP response from a completed strea
   t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
   await assert.rejects(fetch(`http://127.0.0.1:${(server.address() as { port: number }).port}`));
   assert.deepEqual(events.map(event => event.phase), ['started', 'aborted']);
+});
+
+for (const abort of [false, true]) test(`hold response ${abort ? 'abort' : 'finish'} controls admission callback`, async t => {
+  const events: InboundTimingEvent[] = []; let contacts = 0;
+  const server = createServer((_request, response) => {
+    observeInboundHoldResponse(randomUUID(), response, event => events.push(event), () => { contacts++; assert.ok(response.writableFinished); });
+    assert.equal(contacts, 0);
+    if (abort) response.destroy(); else response.end('<Response><Say>One moment.</Say><Redirect/></Response>');
+    assert.equal(contacts, 0);
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+  const request = fetch(`http://127.0.0.1:${(server.address() as { port: number }).port}`);
+  if (abort) await assert.rejects(request); else await (await request).text();
+  assert.equal(contacts, abort ? 0 : 1);
+  assert.deepEqual(events.map(event => event.phase), ['started', abort ? 'aborted' : 'completed']);
 });

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { ServerResponse } from 'node:http';
 import { PrimaryApiError } from './primaryApi.js';
 
-export type InboundTimingStage = 'recover_attachment' | 'poll_attachment' | 'begin_admission'
+export type InboundTimingStage = 'recover_attachment' | 'poll_attachment' | 'begin_admission' | 'early_begin_admission' | 'hold_response'
   | 'provider_identity' | 'open_context' | 'recover_binding' | 'refresh_context' | 'stream_response';
 export interface InboundTimingEvent {
   event: 'broker_inbound_timing'; version: 1; callId: string; attemptId: string; spanId: string;
@@ -51,3 +51,12 @@ export function observeInboundStreamResponse(callId: string, response: ServerRes
 }
 
 export const logInboundTiming: InboundTimingSink = event => console.info(JSON.stringify(event));
+
+/** The early contact follows a successfully flushed hold, never an aborted response. */
+export function observeInboundHoldResponse(callId: string, response: ServerResponse, sink: InboundTimingSink,
+  onFinished: () => void) {
+  const finish = createInboundAttemptTiming(callId, sink).start('hold_response');
+  let aborted = false;
+  response.once('finish', () => { if (!aborted) { finish('completed'); onFinished(); } });
+  response.once('close', () => { aborted = !response.writableFinished; finish(aborted ? 'aborted' : 'completed'); });
+}
