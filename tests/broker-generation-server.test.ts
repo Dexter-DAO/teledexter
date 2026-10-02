@@ -899,3 +899,71 @@ test('a genuine replacement keeps an accepted earlier answer and omits only the 
   assert.deepEqual(f.voices[1].native,[],'old-session task IDs are never addressed in a replacement session');
   assert.equal(f.posts.length,2);
 });
+
+test('failed result after a genuine replacement keeps its own ambiguous caller source and successful tool facts', async t => {
+  const original = ' What about the big one?';
+  const f = await host(t, false, false, false, { failed: true, failureCode: 'provider_busy', callerText: original });
+  const fetch = f.eligible.fetch;
+  f.eligible.fetch = async (...args) => {
+    const context = await fetch(...args), input = f.posts[0]?.input;
+    if (input) context.context.messages = [{ id: messageId, role: 'user', text: input.text, eventSequence: '1',
+      provenance: { messageCreatedAt: at, eventId, eventOccurredAt: at, runId },
+      canonicalSource: { sourceEventId: input.source.sourceEventId, revision: input.source.revision,
+        occurredAt: input.source.receivedAt, storedProjectionKind: 'derived' } }];
+    return context;
+  };
+  const result = f.primary.result;
+  const partialResult = { kind: 'prepared_action' as const, text: 'An unsigned Apple purchase was prepared. It has not executed.',
+    toolInvocationId: eventId, observedAt: at };
+  f.primary.result = async (...args) => {
+    const response = await result(...args);
+    return response.state === 'failed' ? { ...response, partialResult, failure: { kind: 'provider_error' as const } } : response;
+  };
+  const work = f.delegate(); await until(() => f.posts.length === 1);
+  f.release(); await work;
+  assert.equal(f.voices.length, 2);
+  const target = f.voices[1];
+  const contexts = target.quiet.filter(text => text.startsWith('{')).map(text => JSON.parse(text));
+  assert.deepEqual(contexts.map(value => value.requestId), [f.posts[0].requestId]);
+  assert.equal(contexts.map(value => value.requestText).join(''), original);
+  assert.ok(target.published.indexOf(JSON.stringify(contexts[0])) < target.published.indexOf(target.spoken[0]));
+  assert.match(target.spoken.join(''), /^An unsigned Apple purchase/);
+  assert.match(target.spoken.join(''), /AI response failed/);
+  assert.equal(f.posts.length, 1); assert.equal(f.posts[0].input.text, original);
+  assert.equal((f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord).status, 'failed');
+});
+
+test('confirmed facts are spoken during provider cooldown and final failure uses the same request after replacement', async t => {
+  const f = await host(t, false, false, false, { failed: true, failureCode: 'provider_request_budget_exceeded' });
+  const result = f.primary.result;
+  const partialResult = { kind: 'portfolio' as const, text: 'Your portfolio observation lists 8 SOL.', toolInvocationId: eventId, observedAt: at };
+  f.primary.result = async (...args) => {
+    const response = await result(...args);
+    return { ...response, partialResult, failure: response.state === 'running'
+      ? { kind: 'provider_cooldown' as const, retryAt: '2099-01-01T00:00:00.000Z', retryAfterSeconds: 60 }
+      : { kind: 'provider_request_budget' as const } };
+  };
+  const work = f.delegate();
+  await until(() => f.voices.flatMap(voice => voice.spoken).includes(partialResult.text));
+  await wait(850);
+  assert.equal(f.posts.length, 1); assert.equal(f.voices.length, 1);
+  assert.equal((f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord).status, 'running');
+  f.release(); await work;
+  const speech = f.voices.flatMap(voice => voice.spoken);
+  assert.equal(speech.filter(text => text === partialResult.text).length, 1);
+  assert.match(speech.at(-1)!, /processing limit/);
+  assert.equal(f.posts.length, 1); assert.equal(f.voices.length, 2);
+  assert.equal((f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord).partialDelivery?.status, 'accepted');
+});
+
+test('replacement cannot reinsert a caller source absent from its eligible history', async t => {
+  const original = 'My old private request must remain removed.';
+  const f = await host(t, false, false, false, { failed: true, failureCode: 'provider_busy', callerText: original });
+  const work = f.delegate(); await until(() => f.posts.length === 1);
+  f.release(); await work;
+  assert.equal(f.voices.length, 2);
+  const target = f.voices[1], contexts = target.quiet.filter(text => text.startsWith('{')).map(text => JSON.parse(text));
+  assert.deepEqual(contexts, [{ kind: 'task_result_context', requestId: f.posts[0].requestId, state: 'failed', sourceAvailable: false }]);
+  assert.ok(target.published.every(text => !text.includes(original)));
+  assert.equal(f.posts.length, 1); assert.match(target.spoken.join(''), /AI service is busy/);
+});

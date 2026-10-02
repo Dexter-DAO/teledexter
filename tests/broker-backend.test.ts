@@ -847,7 +847,10 @@ for (const interruption of ['abort', 'caller_revision', 'acoustic_speech', 'call
 test('stable transcript alone cannot establish a completed acoustic caller turn', async t => {
   const f = await fixture(t); f.add('Read my balance.');
   await f.backend.delegate(f.request(), f.channel);
-  assert.equal(f.posts.length, 0); assert.match(f.updates.at(-1)!.text, /finish your request/);
+  assert.equal(f.posts.length, 0); assert.equal(f.updates.at(-1)!.speak, false);
+  assert.equal(f.updates.at(-1)!.kind, 'progress');
+  f.speech(); await f.backend.delegate(f.request('completed'), f.channel);
+  assert.equal(f.posts.length, 1); assert.equal(f.posts[0].input.text, 'Read my balance.');
 });
 
 test('final capture uses canonical IDs once for ordinary caller and fully played assistant turns', async t => {
@@ -2012,4 +2015,46 @@ test('uncertain status append is not repeated without a new caller or observed s
   f.add('Sell four dollars of Apple.'); f.speech(); const work = f.backend.delegate(f.request(), f.channel);
   await awaitStatus(() => notices === 1); await wait(60); assert.equal(notices, 1);
   done = true; await work; assert.equal(f.posts.length, 1);
+});
+
+test('a saved tool observation is delivered once while the same request waits and resumes', async t => {
+  const f = await fixture(t, { maxPollMs: 100 });
+  const partialResult = { kind: 'portfolio' as const, text: 'The portfolio observation lists 8 SOL.',
+    toolInvocationId: '77777777-7777-4777-8777-777777777777', observedAt: '2026-10-02T21:00:00.000Z' };
+  let polls = 0;
+  f.behavior.result = async id => ++polls < 4 ? { bindingId, requestId: id, state: 'running', partialResult,
+    failure: { kind: 'provider_cooldown', retryAt: '2026-10-02T21:01:00.000Z', retryAfterSeconds: 60 - polls } }
+    : { bindingId, requestId: id, state: 'failed', partialResult, failure: { kind: 'provider_request_budget' },
+      error: { code: 'provider_request_budget_exceeded', retryable: false } };
+  f.add('Show my portfolio.'); f.speech();
+  await f.backend.delegate(f.request(), f.channel);
+  assert.equal(f.updates.filter(update => update.text === partialResult.text).length, 1);
+  assert.equal(f.saved()[0].partialDelivery?.status, 'accepted');
+  assert.equal(f.posts.length, 1); assert.equal(new Set(f.reads).size, 1);
+  assert.equal(f.saved()[0].status, 'failed'); assert.equal(f.saved()[0].primaryResult?.assistant, undefined);
+  assert.match(f.updates.at(-1)!.text, /processing limit/);
+  assert.doesNotMatch(f.updates.at(-1)!.text, /8 SOL/);
+  const backend = createPrimaryBackend(f.options);
+  await backend.delegate(f.request(), f.channel);
+  assert.equal(f.updates.filter(update => update.text === partialResult.text).length, 1);
+  assert.equal(f.posts.length, 1);
+});
+
+test('a lost partial append receipt cannot replay the observation or resubmit the request', async t => {
+  const f = await fixture(t);
+  const partialResult = { kind: 'portfolio' as const, text: 'The portfolio observation lists 8 SOL.',
+    toolInvocationId: '77777777-7777-4777-8777-777777777777', observedAt: '2026-10-02T21:00:00.000Z' };
+  f.behavior.result = async id => ({ bindingId, requestId: id, state: 'running', partialResult });
+  let appends = 0;
+  const publish = f.channel.publish;
+  f.channel.publish = async update => {
+    if (update.text === partialResult.text) { appends++; throw new Error('receipt lost'); }
+    return publish(update);
+  };
+  f.add('Show my portfolio.'); f.speech();
+  await f.backend.delegate(f.request(), f.channel);
+  const backend = createPrimaryBackend(f.options);
+  await backend.delegate(f.request(), f.channel);
+  assert.equal(appends, 1); assert.equal(f.posts.length, 1);
+  assert.equal(f.saved()[0].partialDelivery?.status, 'unconfirmed');
 });

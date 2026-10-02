@@ -1,9 +1,9 @@
 import { createPrimaryBackend, liveResultChunks, withCallerAdmission, type BrokerDelegationRecord, type PrimaryBackend } from './backend.js';
 import { createLiveGenerationController, LiveGenerationError, LiveGenerationStartupError, LIVE_GENERATION_STARTUP_MS, type GenerationHandle, type GenerationPublication, type LiveGenerationAttachment } from './liveGeneration.js';
-import { callerPresentationFrontier, failedRequestSpeech, hasLaterCallerSpeech, hasNewerCallerWork, isFixedPendingStatus, pendingRequestState } from './voicePresentation.js';
+import { callerPresentationFrontier, failedRequestSpeech, hasLaterCallerSpeech, hasNewerCallerWork, isFixedPendingStatus, isPartialResultUpdate, pendingRequestState, requestPresentationContext } from './voicePresentation.js';
 import { prepareEligibleHistory } from './eligibleHistory.js';
 import { eligibleAssociatedDeliveryResponseSchema, eligibleDeliveryResponseSchema,
-  type EligibleContextClient, type EligibleContextBinding } from './eligibleContext.js';
+  type EligibleContextClient, type EligibleContextBinding, type EligiblePhoneMessage } from './eligibleContext.js';
 import type { PrimaryApiClient } from './primaryApi.js';
 import { terminalCallStatuses, type BrokerCall, type BrokerStore } from './store.js';
 import { beginBrokerPublication, beginSelectedQuestionPublication, selectedQuestionPublicationReceiptsAccepted,
@@ -78,7 +78,8 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
     primaryDexterId: initialCall.primary.primaryDexterId, threadId: initialCall.primary.threadId,
     ...(initialCall.primary.callAssignmentRef ? { callAssignmentRef: initialCall.primary.callAssignmentRef } : {}) };
   const observer = new AbortController();
-  const sessions = new Map<string, { voice: BrokerLiveSession; backend: PrimaryBackend; firstSample?: number }>();
+  const sessions = new Map<string, { voice: BrokerLiveSession; backend: PrimaryBackend; firstSample?: number;
+    eligibleMessages: EligiblePhoneMessage[] }>();
   const admissions = new Map<string, Map<LiveDelegationRequest, { promise: Promise<void>; resolve(): void }>>();
   let stopped = false;
   let playbackPaused = false;
@@ -221,6 +222,17 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
       'progress', `${updateId}_format_notice`);
       return { ...notice, status: notice.status === 'accepted' ? 'unconfirmed' : notice.status, reason: 'result_format_unsupported' };
     }
+    // A successor has no provider delegation ID for this task. Its newly admitted
+    // history controls which source text can accompany the durable request identity.
+    if (entry.sessionId !== attachment.sessionId && speak) {
+      for (const context of requestPresentationContext(entry, session.eligibleMessages)) {
+        const halted = interrupted(); if (halted) return { ...receipt, status: halted };
+        try { receipt = await session.voice.appendContext(context); }
+        catch { return { eventId: '', status: 'unconfirmed', reason: 'task_context_unconfirmed' }; }
+        const status = interrupted() ?? receipt.status;
+        if (status !== 'accepted') return { ...receipt, status, reason: 'task_context_unconfirmed' };
+      }
+    }
     for (const [index, chunk] of chunks.entries()) {
       const halted = interrupted();
       if (halted) return { eventId: receipt.eventId, status: halted };
@@ -257,7 +269,8 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
   const publish = async (entry: BrokerDelegationRecord, update?: LiveBackendUpdate) => {
     if (stopped || observer.signal.aborted || call().endedAt) return { delivery: closedDelivery() };
     const pendingStatus = isFixedPendingStatus(entry, update);
-    const ordinaryResult = !update && ['completed', 'failed', 'cancelled', 'waiting_for_reply'].includes(entry.status);
+    const ordinaryResult = isPartialResultUpdate(entry, update)
+      || !update && ['completed', 'failed', 'cancelled', 'waiting_for_reply'].includes(entry.status);
     const deferred = () => ({ delivery: { eventId: '', status: 'stale' as const, reason: 'caller_presentation_deferred' } });
     if ((ordinaryResult || pendingStatus) && !await atSpeechBoundary(entry, pendingStatus)) return deferred();
     const statusCurrent = () => {
@@ -439,7 +452,8 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
                     .find(candidate => candidate.id === ref.id && candidate.digest === ref.digest)?.reference;
                 },
                 observation: { signal: observer.signal, publish } });
-              const record = { voice, backend, firstSample: undefined as number | undefined };
+              const record = { voice, backend, firstSample: undefined as number | undefined,
+                eligibleMessages: prepared.source.context.messages };
               sessions.set(sessionId, record);
               ready = true; clearTimeout(startTimer); input.signal.removeEventListener('abort', cancelStart);
               resolve({ sessionId,

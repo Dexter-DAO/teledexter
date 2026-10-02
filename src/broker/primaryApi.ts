@@ -127,12 +127,25 @@ export interface PrimaryQuestionResult {
   requestId: string; bindingId: string; state: PrimaryQuestion['runState']; question: PrimaryQuestion; replayed?: boolean;
 }
 
+export interface PrimaryPartialResult {
+  kind: 'portfolio' | 'prepared_action';
+  text: string;
+  toolInvocationId: string;
+  observedAt: string;
+}
+export interface PrimaryRequestFailure {
+  kind: 'provider_cooldown' | 'provider_request_budget' | 'provider_limit' | 'provider_error';
+  retryAt?: string;
+  retryAfterSeconds?: number;
+}
 export type PrimaryRequestResult = {
   resultSms?: PhoneResultSmsAdmissionReceipt;
   requestId: string;
   bindingId: string;
   replayed?: boolean;
   question?: PrimaryQuestion;
+  partialResult?: PrimaryPartialResult;
+  failure?: PrimaryRequestFailure;
 } & (
   | { state: 'queued' | 'running'; assistant?: never; error?: never }
   | { state: 'completed'; assistant: PrimaryAssistant; error?: never }
@@ -426,7 +439,13 @@ const questionSchema = z.object({
   }).refine(value => (value.answer === 'other') === (value.text !== null)).nullable(),
 }).refine(value => (value.state === 'answered') === (value.reply !== null));
 const requestBase = z.object({ requestId: uuid, bindingId: uuid, replayed: z.boolean().optional(), question: questionSchema.optional(),
-  resultSms:phoneResultSmsAdmissionReceiptSchema.optional() });
+  resultSms:phoneResultSmsAdmissionReceiptSchema.optional(),
+  partialResult: z.object({ kind: z.enum(['portfolio', 'prepared_action']), text: z.string().min(1)
+    .refine(value => value.trim().length > 0 && Buffer.byteLength(value) <= 8192 && !value.includes('\0')),
+    toolInvocationId: uuid, observedAt: timestamp }).strict().optional(),
+  failure: z.object({ kind: z.enum(['provider_cooldown', 'provider_request_budget', 'provider_limit', 'provider_error']),
+    retryAt: timestamp.optional(), retryAfterSeconds: z.number().finite().nonnegative().optional() }).strict().optional(),
+});
 export const requestSchema = z.discriminatedUnion('state', [
   requestBase.extend({ state: z.enum(['queued', 'running']), assistant: z.never().optional(), error: z.never().optional() }),
   requestBase.extend({ state: z.literal('completed'), error: z.never().optional(), assistant: z.object({

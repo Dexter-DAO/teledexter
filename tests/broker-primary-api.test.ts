@@ -587,3 +587,23 @@ test('registration replays echo the same original control UUID and immutable ret
   assert.equal(requests[0].init.body, requests[1].init.body);
   assert.equal(JSON.parse(String(requests[0].init.body)).callAssignment.assignmentId, originalId);
 });
+
+test('provider pause and failed response retain validated tool facts without manufacturing an assistant result', async () => {
+  const partialResult = { kind: 'prepared_action', text: 'An unsigned Apple purchase was prepared. It has not executed.',
+    toolInvocationId: eventId, observedAt: when };
+  const failure = { kind: 'provider_cooldown', retryAt: when, retryAfterSeconds: 30 };
+  for (const envelope of [{ bindingId, requestId, state: 'running', partialResult, failure },
+    { bindingId, requestId, state: 'failed', partialResult, failure: { kind: 'provider_request_budget' },
+      error: { code: 'provider_request_budget_exceeded', retryable: false } }]) {
+    const h = harness([json(envelope)]);
+    const result = await h.client.result(bindingId, requestId);
+    assert.deepEqual(result, envelope); assert.equal(result.assistant, undefined);
+    assert.equal(h.requests.length, 1);
+  }
+  for (const invalid of [{ ...partialResult, toolInvocationId: 'unknown' }, { ...partialResult, kind: 'trade_executed' },
+    { ...partialResult, observedAt: 'yesterday' }, { ...partialResult, raw: 'unvalidated tool output' },
+    { ...partialResult, text: ' ' }, { ...partialResult, text: 'x'.repeat(8193) }]) {
+    const h = harness([json({ bindingId, requestId, state: 'running', partialResult: invalid })]);
+    await assert.rejects(h.client.result(bindingId, requestId), code('invalid_response'));
+  }
+});

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { carrierPlaybackState, callerPresentationFrontier, hasLaterCallerSpeech, hasNewerCallerWork,
-  isFixedPendingStatus, failedRequestSpeech } from '../src/broker/voicePresentation.js';
+  isFixedPendingStatus, failedRequestSpeech, requestPresentationContext, pendingRequestState, pendingRequestSpeech } from '../src/broker/voicePresentation.js';
 import { hasAudiblePcmu, PlaybackReceipts } from '../src/broker/phone.js';
 import type { BrokerCall } from '../src/broker/store.js';
 import type { BrokerDelegationRecord } from '../src/broker/backend.js';
@@ -123,4 +123,46 @@ test('known provider failures explain service availability without asserting a f
     entry.primaryResult={state:'failed',error:{code,retryable:false}} as BrokerDelegationRecord['primaryResult'];
     const text=failedRequestSpeech(entry);assert.match(text,/AI service/);assert.doesNotMatch(text,/trade failed|not submitted|nothing was sold|out of service credits/i);
   }
+});
+
+test('partial facts survive model failure without implying trade execution or erasing uncertainty', () => {
+  const { entry } = fixture(); entry.status = 'failed';
+  entry.primaryResult = { state: 'failed', error: { code: 'primary_financial_result_unknown', retryable: false },
+    partialResult: { kind: 'prepared_action', text: 'An unsigned Apple purchase was prepared. It has not executed.',
+      toolInvocationId: '11111111-1111-4111-8111-111111111111', observedAt: '2026-10-02T21:00:00.000Z' } } as BrokerDelegationRecord['primaryResult'];
+  assert.match(failedRequestSpeech(entry), /^An unsigned Apple purchase/);
+  assert.match(failedRequestSpeech(entry), /couldn't confirm the trade request/);
+  entry.partialDelivery = { ...entry.primaryResult!.partialResult!, status: 'accepted' };
+  assert.equal(failedRequestSpeech(entry), "I couldn't confirm the trade request. We need to check that same request before continuing.");
+});
+
+test('replacement context carries the eligible source in bounded quoted fragments', () => {
+  const { entry } = fixture();
+  const text = ' Please review "that one" 🔍, with the earlier figures.\n'.repeat(50);
+  entry.submission = { text: 'An old local copy that must not replace eligible text.',
+    source: { sourceEventId: 'source', revision: 1 } } as BrokerDelegationRecord['submission'];
+  const messages = [{ role: 'user', text, canonicalSource: { sourceEventId: 'source', revision: 1 } }] as Parameters<typeof requestPresentationContext>[1];
+  const chunks = requestPresentationContext(entry, messages);
+  assert.ok(chunks.length > 1);
+  const parsed = chunks.map(chunk => { assert.ok(Buffer.byteLength(chunk) <= 500); return JSON.parse(chunk); });
+  assert.equal(parsed.map(value => value.requestText).join(''), text);
+  for (const [index, value] of parsed.entries()) {
+    assert.equal(value.kind, 'task_result_context'); assert.equal(value.requestId, entry.requestId);
+    assert.equal(value.state, 'running'); assert.equal(value.part, index + 1);
+  }
+  const absent = requestPresentationContext(entry, []);
+  assert.deepEqual(JSON.parse(absent[0]), { kind: 'task_result_context', requestId: entry.requestId, state: 'running', sourceAvailable: false });
+  const revised = structuredClone(messages); revised[0].canonicalSource!.revision = 2;
+  assert.deepEqual(requestPresentationContext(entry, revised), absent);
+});
+
+test('cooldown countdown does not create new progress notices or promise a completed task', () => {
+  const { entry } = fixture();
+  entry.primaryResult = { state: 'running', failure: { kind: 'provider_cooldown', retryAt: '2026-10-02T21:01:00.000Z',
+    retryAfterSeconds: 60 } } as BrokerDelegationRecord['primaryResult'];
+  const before = pendingRequestState(entry);
+  entry.primaryResult!.failure!.retryAfterSeconds = 59;
+  assert.equal(pendingRequestState(entry), before);
+  assert.match(pendingRequestSpeech(entry, false), /same request is scheduled to continue/);
+  assert.doesNotMatch(pendingRequestSpeech(entry, false), /completed|executed|failed/);
 });

@@ -1,0 +1,13 @@
+# Phone result continuity
+
+Primary may return a confirmed portfolio observation or an unsigned prepared action while the response model is unavailable. The optional `partialResult` contains `kind`, `text`, `toolInvocationId`, and `observedAt`. The API derives this text from validated tool output. A preparation describes the unsigned action; execution still requires its own confirmed result.
+
+The optional `failure` identifies `provider_cooldown`, `provider_request_budget`, `provider_limit`, or `provider_error`. A running request with a cooldown and `retryAt` remains the same saved request. Primary owns that continuation. Broker observes it by GET and presents the confirmed facts once, without resubmitting the request. Failed requests retain their failed state and error even when a tool observation is available.
+
+Broker records partial delivery intent before appending speech and saves the receipt. An unknown append outcome remains unconfirmed across observer recovery. A refused or deferred append may be attempted again only when the publication journal contains no accepted or unknown append. Final failure presentation includes confirmed facts that were not previously accepted, followed by the remaining failure. Financial outcome uncertainty takes precedence over a model error.
+
+When a voice connection is replaced, Broker supplies the request identity as internal task context before speaking its result. Source text comes from the replacement's admitted eligible history and must match the original canonical source and revision. If that source is absent, Broker supplies only the identity and status; the local journal cannot restore removed text. Each context block fits the provider's append limit. Result chunks retain their original text and publication evidence. Ordinary follow-ups continue to use the accepted publication's request identity.
+
+A delegation without a newly admitted caller turn supplies an internal observation and continues listening. It does not ask the caller to finish an already completed request. The `broker_delegation_unadmitted` event records whether the source session closed, caller context stayed unstable, or no unclaimed completed turn was found.
+
+The fixtures exercise provider pauses, partial facts followed by failure, lost append receipts, and replacement voice connections. They establish source behavior with synthetic account and voice transports. Audible pacing and comprehension require a controlled call after the API and Broker releases are integrated.

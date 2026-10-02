@@ -17,7 +17,7 @@ import { orderedAssociatedResultReference } from './associatedResult.js';
 import { callerIntentDecisionSchema, type CallerIntentDecision } from './callerIntentContract.js';
 import { resultSmsAcknowledgement, resultSmsResearchRefusal } from './resultSmsAcknowledgement.js';
 import { phoneResultSmsAdmissionReceiptSchema, type PhoneResultSmsAdmissionReceipt } from './resultSmsContract.js';
-import { failedRequestSpeech, pendingRequestSpeech, pendingRequestState } from './voicePresentation.js';
+import { failedRequestSpeech, pendingRequestSpeech, pendingRequestState, partialResultUpdate } from './voicePresentation.js';
 
 export interface CallerSourceAnchor {
   frozen: FrozenCallerTurn;
@@ -120,6 +120,8 @@ export interface BrokerDelegationRecord {
   laterCallerRevision?: number;
   correctionState?: 'recorded_not_applied';
   primaryResult?: PrimaryResult;
+  /** Confirmed tool facts may arrive before the final answer. Unknown appends must not replay. */
+  partialDelivery?: { toolInvocationId: string; text: string; status: LiveDelivery['status'] | 'dispatching' };
   /** Receipt-only recovery never supplies task content or resolves task dispatch uncertainty. */
   resultSmsAdmission?: PhoneResultSmsAdmissionReceipt;
   result?: string;
@@ -1087,6 +1089,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     catch { return save({ ...load(entry), questionNotice: 'reply_unknown' }); }
     return dispatchPreparedReply(entry, target.questionId, () => channel.signal.aborted || Boolean(options.observation?.signal.aborted));
   });
+  const unadmittedReasons = new WeakMap<LiveDelegationRequest, string>();
   const accept = async (request: LiveDelegationRequest, channel: LiveBackendChannel): Promise<BrokerDelegationRecord | undefined> => {
     if (request.callId !== options.callId) throw new Error('broker_call_identity_mismatch');
     const audioThroughMs = acousticSpans.at(-1)?.endMs;
@@ -1096,9 +1099,12 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     const replay = before.find(entry => entry.predecessorRequestId && matchesDelegation(entry)) ?? before.find(matchesDelegation);
     if (replay) return replay;
     const snapshot = await stableContext(channel);
-    if (!snapshot || channel.signal.aborted) return undefined;
+    if (!snapshot || channel.signal.aborted) {
+      unadmittedReasons.set(request, channel.signal.aborted ? 'source_session_closed' : 'caller_context_not_stable');
+      return undefined;
+    }
     return locked(async () => {
-      if (channel.signal.aborted) return undefined;
+      if (channel.signal.aborted) { unadmittedReasons.set(request, 'source_session_closed'); return undefined; }
       if (boundCall(request.sessionId).endedAt) throw new Error('broker_call_ended');
       const saved = entries(request.sessionId);
       const all = entries(request.sessionId, true);
@@ -1234,6 +1240,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       }
       if (!fragments?.length) {
         const latest = saved.sort((a, b) => b.lastSequence - a.lastSequence)[0];
+        if (!latest) unadmittedReasons.set(request, 'no_unclaimed_completed_caller_turn');
         return latest ? save({ ...latest, delegationIds: [...latest.delegationIds, request.delegationId] }) : undefined;
       }
       const text = fragments.map(fragment => fragment.text).join('');
@@ -1274,6 +1281,10 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     if (!['queued', 'running', 'waiting_for_reply', 'completed', 'failed', 'cancelled'].includes(result.state)
         || (result.state === 'completed' && !result.assistant?.text?.trim())) throw new Error('invalid_primary_result');
     let current = load(entry);
+    const priorPartial = current.primaryResult?.partialResult;
+    if (priorPartial && result.partialResult?.toolInvocationId === priorPartial.toolInvocationId
+      && (result.partialResult.text !== priorPartial.text || result.partialResult.kind !== priorPartial.kind
+        || result.partialResult.observedAt !== priorPartial.observedAt)) throw new Error('primary_partial_result_changed');
     if (terminal(current.status) && !terminal(result.state)) return current;
     const outcome = (value: PrimaryResult) => JSON.stringify([value.state, value.assistant ?? null, value.error ?? null]);
     if (terminal(current.status) && current.primaryResult && outcome(current.primaryResult) !== outcome(result))
@@ -1336,6 +1347,24 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       settleBrokerPublication(options.store, intent.record, delivery, channel.getContext(), channel.signal.aborted);
       return delivery;
     });
+  };
+  const deliverPartial = async (entry: BrokerDelegationRecord, channel: LiveBackendChannel) => {
+    const current = load(entry), update = partialResultUpdate(current), partial = current.primaryResult?.partialResult;
+    if (!update || !partial) return;
+    const previous = current.partialDelivery;
+    if (previous?.toolInvocationId === partial.toolInvocationId
+      && !['stale', 'rejected'].includes(previous.status)) return;
+    save({ ...current, partialDelivery: { toolInvocationId: partial.toolInvocationId, text: partial.text, status: 'dispatching' } });
+    // The publication journal also records individual append receipts. Saving intent
+    // first prevents a lost response or process exit from replaying the observation.
+    let status: LiveDelivery['status'] = 'unconfirmed';
+    try { status = (await publishRequest(current, channel, { ...update,
+      expectedCallerRevision: channel.getContext().callerRevision })).status; }
+    catch { /* A thrown append has an unknown acceptance outcome. */ }
+    if (status !== 'accepted' && options.store.get(options.callId)?.publications?.records.some(record =>
+      record.requestId === entry.requestId && record.updateId.startsWith(update.id)
+      && (!record.outcome || record.outcome.status === 'accepted'))) status = 'unconfirmed';
+    save({ ...load(entry), partialDelivery: { toolInvocationId: partial.toolInvocationId, text: partial.text, status } });
   };
   const deliverQuestion = async (entry: BrokerDelegationRecord, channel: LiveBackendChannel) => locked(async () => {
     let current = load(entry);
@@ -1594,8 +1623,11 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       const observationSignal = options.observation?.signal ?? channel.signal;
       if (observationSignal.aborted) return;
       if (!entry) {
-        await channel.publish({ id: `${request.requestId}_clarify`, kind: 'result',
-          text: 'Please finish your request, then give me a moment to check it.',
+        console.info(JSON.stringify({ event: 'broker_delegation_unadmitted', callId: options.callId,
+          sessionId: request.sessionId, delegationId: request.delegationId,
+          reason: unadmittedReasons.get(request) ?? 'no_qualified_caller_source' }));
+        await channel.publish({ id: `${request.requestId}_unadmitted`, kind: 'progress', speak: false,
+          text: 'No new completed caller turn was admitted by this delegation. Continue listening and preserve the existing task. This internal observation does not mean the caller must finish or repeat their request.',
           expectedCallerRevision: channel.getContext().callerRevision });
         return;
       }
@@ -1707,6 +1739,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
                 if (entry.sessionId === request.sessionId && !channel.signal.aborted) entry = await captureRevision(entry, channel);
                 if (observationSignal.aborted) return;
                 if (terminal(entry.status)) break;
+                await deliverPartial(entry, channel);
                 publishStatus(false);
                 // A terminal answer can wait across later work without replaying
                 // that work. Questions keep control of their own reply boundary.
