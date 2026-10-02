@@ -72,7 +72,8 @@ test('successor registration/context crosses actual HTTP with negotiated full me
 });
 
 async function host(t: test.TestContext, slowClose = false, questionMode = false, boundedCleanup = false,
-  settings: { admitted?: boolean; failed?: boolean; failureCode?: string; cancelled?: boolean; sameEpoch?: boolean; resultText?: string; callerText?: string } = {}) {
+  settings: { admitted?: boolean; failed?: boolean; failureCode?: string; cancelled?: boolean; sameEpoch?: boolean; resultText?: string; callerText?: string;
+    openingStatus?: 'accepted' | 'rejected' | 'unconfirmed' } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-generation-server-'));
   const config: BrokerConfig = { host: '127.0.0.1', port: 3213, publicOrigin: 'https://phone.example.test', stateDir: directory,
     controlToken: 'c'.repeat(40), apiKey: 'fixture-key', model: 'gpt-live-1', voice: 'marin',
@@ -81,7 +82,7 @@ async function host(t: test.TestContext, slowClose = false, questionMode = false
   const store = new BrokerStore(directory);
   const reserved = store.reserve({ requestId: randomUUID(), number: proof.params.To, direction: 'outbound', purpose: 'Discuss my portfolio', callSid: sid }).call;
   store.recordPrimaryBinding(reserved.id, context());
-  let generation = 1, released = false, providerEnds = 0, cursor = 280, fetches=0;
+  let generation = 1, released = false, providerEnds = 0, cursor = 280, fetches=0, assertions=0;
   const currentContext = () => { const value = context(generation);
     if(settings.admitted) value.context.history.version.contextEpoch='1';
     if(settings.admitted) value.context.history.admission={invalidationDigest:"a".repeat(64),messages:[],memories:[]};
@@ -116,6 +117,7 @@ async function host(t: test.TestContext, slowClose = false, questionMode = false
   const eligible: EligibleContextClient = {
     async fetch() { fetches++;return currentContext(); },
     async assert(_binding, requested, admission) {
+      assertions++;
       if(settings.admitted && admission) return {bindingId,callSid:sid,current:true,version:currentContext().context.history.version,admission};
       if (requested.digest !== currentContext().context.history.version.digest) throw new PrimaryApiError('http_error', 409, { code: 'context_changed', retryable: false });
       return { bindingId, callSid: sid, current: true, version: requested };
@@ -153,7 +155,7 @@ async function host(t: test.TestContext, slowClose = false, questionMode = false
           native.push({id,kind:update.kind,speak:update.speak??update.kind==='result'});
           return update.speak===false?voice.appendContext(update.text):voice.appendCommentary!(update.text);
         }}:{}),
-        async appendInstructions(text) { opening.push(text); return { eventId: `open_${opening.length}`, status: 'accepted' }; },
+        async appendInstructions(text) { opening.push(text); return { eventId: `open_${opening.length}`, status: settings.openingStatus ?? 'accepted' }; },
         async appendCommentary(text) { spoken.push(text);published.push(text);
           if (questionMode && spoken.join('') === eligibleText) await new Promise<void>(resolve => { finishQuestion = resolve; });
           return { eventId: `comment_${sessionId}_${spoken.length}`, status: 'accepted',
@@ -205,7 +207,7 @@ async function host(t: test.TestContext, slowClose = false, questionMode = false
   return { broker, store, primary, callId: reserved.id, ws, streamSid, voices, posts, opening, eligible, eligibleText, delegate,
     advanceWork: () => { cursor++; },
     release: (callback?: () => void) => { beforeResult = callback; released = true; }, providerEnds: () => providerEnds,
-    fetches:()=>fetches,finishSlow: () => finishSlowClose?.(), finishQuestion: () => finishQuestion?.(), questionId, audio };
+    fetches:()=>fetches,assertions:()=>assertions,finishSlow: () => finishSlowClose?.(), finishQuestion: () => finishQuestion?.(), questionId, audio };
 }
 
 test('actual server preserves accepted work through replacement and speaks only the complete eligible result', async t => {
@@ -966,4 +968,15 @@ test('replacement cannot reinsert a caller source absent from its eligible histo
   assert.deepEqual(contexts, [{ kind: 'task_result_context', requestId: f.posts[0].requestId, state: 'failed', sourceAvailable: false }]);
   assert.ok(target.published.every(text => !text.includes(original)));
   assert.equal(f.posts.length, 1); assert.match(target.spoken.join(''), /AI service is busy/);
+});
+
+for (const openingStatus of ['accepted', 'rejected', 'unconfirmed'] as const) test(`initial greeting records ${openingStatus} without another eligibility round trip or replacement replay`, async t => {
+  const f = await host(t, false, false, false, { failed: true, failureCode: 'provider_busy', openingStatus });
+  await until(() => f.store.get(f.callId)?.voiceOpening?.status === openingStatus);
+  assert.equal(f.fetches(), 1); assert.equal(f.assertions(), 1, 'fresh context still has its post-open assertion');
+  assert.equal(f.opening.length, 1);
+  const work = f.delegate(); await until(() => f.posts.length === 1); f.release(); await work;
+  assert.equal(f.voices.length, 2); assert.equal(f.opening.length, 1);
+  assert.equal(f.store.get(f.callId)!.voiceOpening!.status, openingStatus);
+  assert.ok(f.assertions() > 1, 'ordinary request publication still qualifies current context');
 });

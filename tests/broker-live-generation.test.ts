@@ -951,6 +951,8 @@ test('admitted removal still replaces the session and never sends old audio duri
 
 test('cached startup retains its original page digest and version when admitted sources validate at a newer version', async () => {
   const h = harness(), cache = createInboundStartupContexts(h.api), call = startupCall();
+  let openings = 0;
+  h.options.onInitialActivation = async () => { openings++; };
   const page = contextFor(versionFor(1));
   page.context.history.pageDigest = 'b'.repeat(64);
   page.context.history.admission = { invalidationDigest: 'c'.repeat(64), messages: [], memories: [] };
@@ -964,9 +966,58 @@ test('cached startup retains its original page digest and version when admitted 
   try {
     await h.controller.start();
     assert.equal(assertions, 2, 'pre-start and post-open assertions remain distinct');
+    assert.equal(openings, 1, 'the greeting shares activation without a third assertion');
     assert.deepEqual(h.sessions[0].input.context, page);
     assert.deepEqual(h.controller.snapshot().segments[0].version, versionFor(1));
     assert.equal(h.sessions.length, 1);
     assert.equal(h.operations.filter(value => value.name === 'fetch').length, 0);
   } finally { await h.controller.stop(); }
+});
+
+test('initial opening shares the validated activation before later publishers can enter', async () => {
+  const opening = pending<void>(), events: string[] = [];
+  const h = harness(undefined, { async onInitialActivation(attachment) {
+    events.push(`opening:${attachment.sessionId}`); await opening.promise;
+  } });
+  const starting = h.controller.start();
+  await until(() => events.length === 1);
+  assert.deepEqual(h.operations.map(value => value.name), ['fetch', 'assert']);
+  assert.equal(h.controller.appendAudio({ payload: 'AQI=', callInputStartSample: 0 }), 'sent');
+  const later = h.controller.withCurrentAttachment(async () => { events.push('later'); });
+  await Promise.resolve(); assert.deepEqual(events, ['opening:session_1']);
+  opening.resolve(); await starting; await later;
+  assert.deepEqual(events, ['opening:session_1', 'later']);
+  assert.deepEqual(h.operations.map(value => value.name), ['fetch', 'assert', 'assert']);
+  h.advanceVersion(); await h.controller.beforeReuse();
+  assert.equal(events.filter(event => event.startsWith('opening:')).length, 1);
+  await h.controller.stop();
+});
+
+test('a changed startup context suppresses the old greeting and opens only the admitted successor', async () => {
+  const opened: string[] = [];
+  const h = harness(undefined, { async onInitialActivation(attachment) { opened.push(attachment.sessionId); } });
+  const assertCurrent = h.api.assert; let checks = 0;
+  h.api.assert = async (...args) => {
+    if (++checks === 1) { h.advanceVersion(); throw changed(); }
+    return assertCurrent(...args);
+  };
+  await h.controller.start();
+  assert.equal(h.sessions.length, 2); assert.deepEqual(opened, ['session_2']);
+  assert.equal(h.controller.snapshot().segments[0].outputDiscarded, true);
+  await h.controller.stop();
+});
+
+test('stop before activation prevents an opening; stop during its receipt wait cannot repeat it', async () => {
+  for (const stopDuringOpening of [false, true]) {
+    const gate = pending<void>(); let openings = 0, checks = 0;
+    const h = harness(undefined, { async onInitialActivation() { openings++; if (stopDuringOpening) await gate.promise; } });
+    const assertCurrent = h.api.assert;
+    h.api.assert = async (...args) => { checks++; if (!stopDuringOpening) await gate.promise; return assertCurrent(...args); };
+    const starting = assert.rejects(h.controller.start(), (error: unknown) => error instanceof LiveGenerationError && error.code === 'call_stopped');
+    await until(() => stopDuringOpening ? openings === 1 : checks === 1);
+    const stopping = h.controller.stop(); gate.resolve(); await starting; await stopping;
+    assert.equal(openings, Number(stopDuringOpening));
+    await assert.rejects(h.controller.start());
+    assert.equal(openings, Number(stopDuringOpening));
+  }
 });

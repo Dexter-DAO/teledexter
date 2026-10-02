@@ -505,7 +505,7 @@ test('admitted eligible history reaches first voice startup without a duplicate 
     streamSid: 'MZ' + '4'.repeat(32), customParameters: { token: streamToken(f.config.controlToken, call.id, f.params.CallSid) },
     mediaFormat: { encoding: 'audio/x-mulaw', sampleRate: 8000, channels: 1 } } }));
   for (let count = 0; count < 100 && f.seen.opening === 0; count++) await new Promise(resolve => setTimeout(resolve, 10));
-  assert.equal(f.seen.opening, 1); assert.equal(f.seen.contextAssert, 3);
+  assert.equal(f.seen.opening, 1); assert.equal(f.seen.contextAssert, 2, 'pre-load and post-open checks also qualify the initial greeting');
   assert.equal(f.seen.startupFetch, 0); assert.equal(f.seen.context, 1);
   assert.deepEqual(f.startupPages, [f.eligiblePage]);
   ws.close(); await new Promise<void>(resolve => ws.once('close', () => resolve()));
@@ -728,7 +728,7 @@ test('approved inbound transport overlaps context I/O and stays command-free thr
   assert.deepEqual(transport.sent, []); assert.equal(f.seen.voice, 0);
   releaseAssert();
   await preconnectUntil(() => f.store.get(call.id)!.voiceOpening?.status === 'accepted');
-  assert.equal(f.transports.length, 1); assert.equal(f.seen.contextAssert, 3);
+  assert.equal(f.transports.length, 1); assert.equal(f.seen.contextAssert, 2, 'opening shares the validated activation');
   assert.equal(f.seen.startupFetch, 0); assert.equal(f.seen.context, 1);
   assert.equal(transport.sent.filter(event => event.type === 'session.start').length, 1);
   assert.deepEqual(f.startupPages, [f.eligiblePage]);

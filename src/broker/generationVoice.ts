@@ -18,7 +18,7 @@ import type { SelectedQuestionAssociationClient, SelectedQuestionSeed } from './
 import type { RequestDeliveryClient } from './requestDelivery.js';
 import { createSelectedQuestionVoiceAdapter, createSelectedQuestionRecovery, selectedQuestionSourceAnchors,
   type SelectedQuestionCloseout } from './selectedQuestionVoice.js';
-import { brokerInstructions } from './instructions.js';
+import { brokerInstructions, brokerOpening } from './instructions.js';
 import { inputSpeechEnergy, hasAudiblePcmu } from './phone.js';
 import type { BrokerLiveSession, BrokerLiveSessionOptions, LiveBackendUpdate, LiveDelivery,
   LiveDelegationRequest, LiveSessionClosed, LiveTranscriptSnapshot } from '../live/types.js';
@@ -331,6 +331,24 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
       ...(initialCall.inbound?.remote?.state === 'bound' ? { consumedAt: initialCall.inbound.remote.consumedAt,
         mediaStartBy: initialCall.inbound.mediaStartBy! } : {}) },
     initial: initialCall.liveGenerations, context: options.context,
+    async onInitialActivation(attachment) {
+      if (continuation || stopped || observer.signal.aborted || call().endedAt || call().voiceOpening) return;
+      const voice = sessions.get(attachment.sessionId)?.voice;
+      if (!voice) throw new LiveGenerationError('generation_source_not_ready');
+      if (!readyReported) { readyReported = true; options.onReady({ callId: initialCall.id, sessionId: attachment.sessionId }); }
+      if (stopped || observer.signal.aborted || call().endedAt) return;
+      // A saved intent prevents a restart or an unknown append receipt from
+      // issuing another opening. Acceptance describes injection, not playback.
+      options.store.update(initialCall.id, { voiceOpening: { status: 'pending' } });
+      let receipt: LiveDelivery;
+      try { receipt = await voice.appendInstructions(brokerOpening(initialCall.direction, Boolean(initialCall.callAssignment),
+        initialCall.callAssignment?.origin === 'authenticated_hark_delivery',
+        initialCall.callAssignment?.origin === 'authenticated_notification_delivery')); }
+      catch { receipt = { eventId: '', status: 'unconfirmed', reason: 'opening_delivery_failed' }; }
+      if (!stopped && !observer.signal.aborted && !call().endedAt
+        && controller.snapshot().deliveryAttachment?.generationId === attachment.generationId)
+        options.store.update(initialCall.id, { voiceOpening: receipt });
+    },
     persist(journal) {
       options.store.update(initialCall.id, { liveGenerations: journal,
         ...(journal.deliveryAttachment ? { liveSessionId: journal.deliveryAttachment.sessionId } : {}) });

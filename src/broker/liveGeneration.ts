@@ -127,6 +127,8 @@ export interface LiveGenerationOptions {
   /** Adapter startup/close/publication promises retain their bounded Live timeouts. */
   open(input: { generationId: string; ordinal: number; context: EligiblePhoneCall;
     allowOpening: boolean; signal: AbortSignal; callbacks: GenerationCallbacks }): Promise<GenerationHandle>;
+  /** One initial greeting, inside the post-open assertion operation. Must not call queued controller methods. */
+  onInitialActivation?(attachment: LiveGenerationAttachment): Promise<void>;
   /** Drain only source admissions already observed on this generation; the host deadline remains independent. */
   beforeRetire?(generationId: string): Promise<void>;
   onAudio(payload: string, attachment: LiveGenerationAttachment): void;
@@ -461,8 +463,9 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
         candidate = { generationId: current.generationId };
         const ownedCandidate = candidate;
         checkTransition();
+        const allowOpening = canOpenInitially && !activated;
         const opening = options.open({ generationId: current.generationId, ordinal: current.ordinal, context,
-          allowOpening: canOpenInitially && !activated, signal: abort.signal, callbacks: callbacks(current.generationId) });
+          allowOpening, signal: abort.signal, callbacks: callbacks(current.generationId) });
         // A late adapter result never gains an attachment after stop/timeout.
         const openingCleanup = opening.then(async opened => {
           ownedCandidate.handle = opened;
@@ -489,6 +492,10 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
         // No await between attachment and the complete replay. Publications
         // queued behind this operation observe the entire input frontier.
         flushInput(checkTransition);
+        // The assert, activation, input flush and initial append dispatch share one
+        // operation. Later publications still perform their own current-context check.
+        if (allowOpening && options.onInitialActivation)
+          await wait(() => options.onInitialActivation!(attachment()));
         return attachment();
       }
       throw new LiveGenerationError('context_unavailable');

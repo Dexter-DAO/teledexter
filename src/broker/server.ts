@@ -995,7 +995,8 @@ export function createBrokerServer(options: BrokerServerOptions) {
               // The selected host publishes the exact eligible saved question.
               // Its operator purpose must never become an automatic new task.
               if (call.continuation) return;
-              if (options.eligibleContext && store.get(call.id)!.voiceOpening) return;
+              // The generation controller owns its opening inside validated activation.
+              if (options.eligibleContext) return;
               store.update(call.id, { liveSessionId: sessionId, voiceOpening: { status: 'pending' } });
               // Live's documented speak-first command runs while phone audio
               // continues. Its receipt confirms context injection, not playback.
