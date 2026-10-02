@@ -1283,8 +1283,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     let current = load(entry);
     const priorPartial = current.primaryResult?.partialResult;
     if (priorPartial && result.partialResult?.toolInvocationId === priorPartial.toolInvocationId
-      && (result.partialResult.text !== priorPartial.text || result.partialResult.kind !== priorPartial.kind
-        || result.partialResult.observedAt !== priorPartial.observedAt)) throw new Error('primary_partial_result_changed');
+      && canonicalJson(result.partialResult) !== canonicalJson(priorPartial)) throw new Error('primary_partial_result_changed');
     if (terminal(current.status) && !terminal(result.state)) return current;
     const outcome = (value: PrimaryResult) => JSON.stringify([value.state, value.assistant ?? null, value.error ?? null]);
     if (terminal(current.status) && current.primaryResult && outcome(current.primaryResult) !== outcome(result))

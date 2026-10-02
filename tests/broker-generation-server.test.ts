@@ -798,12 +798,19 @@ test('continuous digital silence does not starve a saved result, while audible f
   t.after(() => clearInterval(silence));
   f.release(); await wait(1100);
   assert.deepEqual(f.voices.flatMap(v => v.spoken), [], 'audible mark is mandatory even with a transcript result');
+  // Admit caller audio before releasing the playback fence. A timer scheduled
+  // afterward leaves a real quiet boundary where delivery is permitted.
+  const inputCount = f.voices.reduce((count, voice) => count + voice.inputs.length, 0);
+  const callerSpeech = setInterval(() => f.audio(), 20);
+  t.after(() => clearInterval(callerSpeech));
+  f.audio();
+  await boundary('caller interruption admitted', () =>
+    f.voices.reduce((count, voice) => count + voice.inputs.length, 0) > inputCount, [work]);
   f.ws.send(JSON.stringify({ event: 'mark', streamSid: f.streamSid, mark: { name: audibleMark } }));
   source.captions.revision++; source.captions.callerRevision++;
   source.captions.fragments.push({ eventId: 'caller_interrupts_silence', role: 'user', text: 'Wait, what happened?',
     startMs: 1400, endMs: 1420, sequence: source.captions.revision });
   await source.options.onTranscript(source.captions);
-  const callerSpeech = setInterval(() => f.audio(), 20);
   try { await wait(500); assert.deepEqual(f.voices.flatMap(v => v.spoken), [], 'caller speech still owns the boundary'); }
   finally { clearInterval(callerSpeech); }
   await boundary('saved result delivered through continuous silence', work.settled, [work], 8000);
@@ -979,4 +986,23 @@ for (const openingStatus of ['accepted', 'rejected', 'unconfirmed'] as const) te
   assert.equal(f.voices.length, 2); assert.equal(f.opening.length, 1);
   assert.equal(f.store.get(f.callId)!.voiceOpening!.status, openingStatus);
   assert.ok(f.assertions() > 1, 'ordinary request publication still qualifies current context');
+});
+
+test('a confirmed financial receipt survives a later model failure and voice replacement', async t => {
+  const f = await host(t, false, false, false, { failed: true, failureCode: 'provider_busy', callerText: 'Did my Apple purchase finish?' });
+  const read = f.primary.result;
+  const partialResult = { kind: 'action_status' as const, intentId: messageId, actionState: 'confirmed' as const,
+    text: 'The saved Apple purchase is confirmed. The receipt reports 0.02 shares received.', toolInvocationId: eventId, observedAt: at };
+  f.primary.result = async (...args) => {
+    const result = await read(...args);
+    return result.state === 'failed' ? { ...result, partialResult, failure: { kind: 'provider_error' as const } } : result;
+  };
+  const work = f.delegate(); await until(() => f.posts.length === 1); f.release(); await work;
+  const speech = f.voices.flatMap(voice => voice.spoken).join('');
+  assert.ok(speech.startsWith(partialResult.text)); assert.match(speech, /AI response failed/);
+  assert.doesNotMatch(speech, /trade failed|couldn't confirm the trade|not executed|not submitted/);
+  assert.equal(f.voices.length, 2); assert.equal(f.posts.length, 1);
+  const saved = f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord;
+  assert.equal(saved.status, 'failed'); assert.deepEqual(saved.primaryResult?.partialResult, partialResult);
+  assert.equal(saved.primaryResult?.assistant, undefined);
 });

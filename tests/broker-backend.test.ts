@@ -578,7 +578,7 @@ test('untyped exceptions cannot put raw error details into the saved request or 
 });
 
 test('spoken progress continues during a blocked result read and is bounded across duplicate delegates', async t => {
-  const f = await fixture(t, { progressIntervalMs: 15, maxPollMs: 500 });
+  const f = await fixture(t, { progressIntervalMs: 15, maxPollMs: 5000 });
   f.add('Read my balance.'); f.speech();
   let entered!: () => void, release!: () => void;
   const began = new Promise<void>(resolve => { entered = resolve; });
@@ -587,7 +587,9 @@ test('spoken progress continues during a blocked result read and is bounded acro
   const work = Promise.all([f.backend.delegate(f.request(), f.channel), f.backend.delegate(f.request(), f.channel)]);
   try {
     await began;
-    await wait(110);
+    const end = Date.now() + 5000;
+    while (f.updates.filter(update => update.kind === 'progress').length < 4 && Date.now() < end) await wait(10);
+    await wait(60); // Keep the blocked read open after its fourth accepted notice.
     const progress = f.updates.filter(update => update.kind === 'progress');
     assert.equal(progress.length, 4);
     assert.equal(new Set(progress.map(update => update.id)).size, 4);
@@ -2018,7 +2020,7 @@ test('uncertain status append is not repeated without a new caller or observed s
 });
 
 test('a saved tool observation is delivered once while the same request waits and resumes', async t => {
-  const f = await fixture(t, { maxPollMs: 100 });
+  const f = await fixture(t, { maxPollMs: 5000 });
   const partialResult = { kind: 'portfolio' as const, text: 'The portfolio observation lists 8 SOL.',
     toolInvocationId: '77777777-7777-4777-8777-777777777777', observedAt: '2026-10-02T21:00:00.000Z' };
   let polls = 0;
@@ -2057,4 +2059,26 @@ test('a lost partial append receipt cannot replay the observation or resubmit th
   await backend.delegate(f.request(), f.channel);
   assert.equal(appends, 1); assert.equal(f.posts.length, 1);
   assert.equal(f.saved()[0].partialDelivery?.status, 'unconfirmed');
+});
+
+test('a saved action observation cannot silently change its financial intent on a later poll', async t => {
+  const f = await fixture(t, { maxPollMs: 5000 });
+  const partialResult = { kind: 'action_status' as const, text: 'The saved action is submitted and awaits its final outcome.',
+    toolInvocationId: '77777777-7777-4777-8777-777777777777', observedAt: '2026-10-02T21:00:00.000Z',
+    intentId: '88888888-8888-4888-8888-888888888888', actionState: 'submitted' as const };
+  let reads = 0;
+  f.behavior.result = async id => {
+    reads++;
+    if (reads === 3) assert.equal(f.saved()[0].resultReadUnavailable, true);
+    if (reads === 2) return { bindingId, requestId: id, state: 'failed',
+      partialResult: { ...partialResult, intentId: '99999999-9999-4999-8999-999999999999' },
+      error: { code: 'provider_busy', retryable: false } };
+    if (reads >= 3) return { bindingId, requestId: id, state: 'failed', partialResult,
+      error: { code: 'provider_busy', retryable: false } };
+    return { bindingId, requestId: id, state: 'running', partialResult };
+  };
+  f.add('Check my saved purchase.'); f.speech(); await f.backend.delegate(f.request(), f.channel);
+  assert.equal(reads, 3); assert.deepEqual(f.saved()[0].primaryResult?.partialResult, partialResult);
+  assert.equal(f.posts.length, 1);
+  assert.equal(f.updates.filter(update => update.text === partialResult.text).length, 1);
 });

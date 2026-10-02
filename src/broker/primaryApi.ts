@@ -127,12 +127,12 @@ export interface PrimaryQuestionResult {
   requestId: string; bindingId: string; state: PrimaryQuestion['runState']; question: PrimaryQuestion; replayed?: boolean;
 }
 
-export interface PrimaryPartialResult {
-  kind: 'portfolio' | 'prepared_action';
+export type PrimaryPartialResult = {
   text: string;
   toolInvocationId: string;
   observedAt: string;
-}
+} & ({ kind: 'portfolio' | 'prepared_action' }
+  | { kind: 'action_status'; intentId: string; actionState: 'submitted' | 'pending' | 'confirmed' | 'refused' | 'failed' | 'unknown' });
 export interface PrimaryRequestFailure {
   kind: 'provider_cooldown' | 'provider_request_budget' | 'provider_limit' | 'provider_error';
   retryAt?: string;
@@ -438,11 +438,16 @@ const questionSchema = z.object({
     text: questionText(2000).nullable(), interpretedAnswer: questionText(2000), receivedAt: timestamp,
   }).refine(value => (value.answer === 'other') === (value.text !== null)).nullable(),
 }).refine(value => (value.state === 'answered') === (value.reply !== null));
-const requestBase = z.object({ requestId: uuid, bindingId: uuid, replayed: z.boolean().optional(), question: questionSchema.optional(),
-  resultSms:phoneResultSmsAdmissionReceiptSchema.optional(),
-  partialResult: z.object({ kind: z.enum(['portfolio', 'prepared_action']), text: z.string().min(1)
+const partialResultBase = z.object({ text: z.string().min(1)
     .refine(value => value.trim().length > 0 && Buffer.byteLength(value) <= 8192 && !value.includes('\0')),
-    toolInvocationId: uuid, observedAt: timestamp }).strict().optional(),
+  toolInvocationId: uuid, observedAt: timestamp }).strict();
+const partialResultSchema = z.discriminatedUnion('kind', [
+  partialResultBase.extend({ kind: z.enum(['portfolio', 'prepared_action']) }),
+  partialResultBase.extend({ kind: z.literal('action_status'), intentId: uuid,
+    actionState: z.enum(['submitted', 'pending', 'confirmed', 'refused', 'failed', 'unknown']) }),
+]);
+const requestBase = z.object({ requestId: uuid, bindingId: uuid, replayed: z.boolean().optional(), question: questionSchema.optional(),
+  resultSms:phoneResultSmsAdmissionReceiptSchema.optional(), partialResult: partialResultSchema.optional(),
   failure: z.object({ kind: z.enum(['provider_cooldown', 'provider_request_budget', 'provider_limit', 'provider_error']),
     retryAt: timestamp.optional(), retryAfterSeconds: z.number().finite().nonnegative().optional() }).strict().optional(),
 });

@@ -607,3 +607,20 @@ test('provider pause and failed response retain validated tool facts without man
     await assert.rejects(h.client.result(bindingId, requestId), code('invalid_response'));
   }
 });
+
+test('canonical action observations require an exact intent and state without claiming whole-run success', async () => {
+  for (const actionState of ['submitted', 'pending', 'confirmed', 'refused', 'failed', 'unknown'] as const) {
+    const partialResult = { kind: 'action_status', text: `The saved action is ${actionState}.`, toolInvocationId: eventId,
+      observedAt: when, intentId: sourceEventId, actionState };
+    const envelope = { bindingId, requestId, state: 'failed', partialResult,
+      failure: { kind: 'provider_error' }, error: { code: 'provider_busy', retryable: false } };
+    const h = harness([json(envelope)]);
+    assert.deepEqual(await h.client.result(bindingId, requestId), envelope);
+    for (const invalid of [{ ...partialResult, intentId: undefined }, { ...partialResult, actionState: undefined },
+      { ...partialResult, actionState: 'success' }, { ...partialResult, intentId: 'any action' },
+      { ...partialResult, kind: 'prepared_action' }]) {
+      const wrong = harness([json({ ...envelope, partialResult: invalid })]);
+      await assert.rejects(wrong.client.result(bindingId, requestId), code('invalid_response'));
+    }
+  }
+});
