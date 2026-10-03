@@ -46,6 +46,39 @@ const json = (body: unknown, status = 200) => new Response(JSON.stringify(body),
   headers: { 'content-type': 'application/json' } });
 const code = (expected: string) => (error: unknown) => error instanceof PrimaryApiError && error.code === expected;
 
+test('successful negotiated context retains the exact outcome and original consumed time', async () => {
+  const billing = { version: 1, bindingId, callSid, termsDigest: 'a'.repeat(64) };
+  const outcome = { ...bound, billing };
+  const h = harness([json(approved), json({ ...call, billing, inboundOutcome: outcome }), json(outcome)]);
+  await h.client.beginInbound!(begin);
+  const result = await h.client.openInboundCall!(begin.providerProof, approvalRef);
+  assert.deepEqual(result.inboundOutcome, outcome);
+  assert.equal(new Headers(h.requests[1].init.headers).get('X-Dexter-Phone-Inbound-Outcome-Version'), 'bound-outcome-v1');
+  assert.deepEqual(await h.client.recoverInbound!(begin), outcome);
+});
+
+test('negotiated outcome rejects foreign identity, changed billing and incompatible call state', async () => {
+  const billing = { version: 1, bindingId, callSid, termsDigest: 'a'.repeat(64) };
+  for (const patch of [
+    { bindingId: foreignId }, { beginRef: { ...beginRef, brokerCallId: foreignId } },
+    { beginRef: { ...beginRef, digest: '0'.repeat(64) } },
+    { approvalRef: { ...approvalRef, digest: '0'.repeat(64) } },
+    { billing: { ...billing, termsDigest: '0'.repeat(64) } }, { billing: undefined }, { callState: 'closed' },
+  ]) {
+    const h = harness([json(approved), json({ ...call, billing, inboundOutcome: { ...bound, billing, ...patch } })]);
+    await h.client.beginInbound!(begin);
+    await assert.rejects(h.client.openInboundCall!(begin.providerProof, approvalRef), code('identity_mismatch'));
+  }
+  const h = harness([json({ ...call, inboundOutcome: approved })]);
+  await assert.rejects(h.client.openInboundCall!(begin.providerProof, approvalRef), code('invalid_response'));
+});
+
+test('a changed consumed timestamp cannot replace the negotiated retained outcome', async () => {
+  const h = harness([json({ ...call, inboundOutcome: bound }), json({ ...bound, consumedAt: closedAt })]);
+  await h.client.openInboundCall!(begin.providerProof, approvalRef);
+  await assert.rejects(h.client.recoverInbound!(begin), code('identity_mismatch'));
+});
+
 function harness(replies: (Response | Error)[], options: Partial<PrimaryApiOptions> = {}) {
   const requests: { url: string; init: RequestInit }[] = [];
   const fetcher: typeof fetch = async (url, init) => {

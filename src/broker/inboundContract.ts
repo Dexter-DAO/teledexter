@@ -33,12 +33,16 @@ export const inboundApprovalRefSchema = z.object({ attachmentId: uuid, approvalI
 export type InboundApprovalRef = z.infer<typeof inboundApprovalRefSchema>;
 
 const envelope = { attachmentId: uuid, beginRef: inboundBeginRefSchema };
+export const INBOUND_OUTCOME_HEADER = 'X-Dexter-Phone-Inbound-Outcome-Version';
+export const INBOUND_OUTCOME_VERSION = 'bound-outcome-v1';
+const boundOutcome = z.object({ ...envelope, state: z.literal('bound'), approvalRef: inboundApprovalRefSchema,
+  bindingId: uuid, consumedAt: timestamp, callState: z.enum(['open', 'closed']), billing: phoneInboundBillingRefSchema.optional() }).strict();
+export const inboundBoundOutcomeSchema = boundOutcome.refine(outcome => outcome.approvalRef.attachmentId === outcome.attachmentId);
 export const inboundOutcomeSchema = z.discriminatedUnion('state', [
   z.object({ ...envelope, state: z.literal('pending'), expiresAt: timestamp }).strict(),
   z.object({ ...envelope, state: z.literal('approved'), expiresAt: timestamp,
     approvalRef: inboundApprovalRefSchema }).strict(),
-  z.object({ ...envelope, state: z.literal('bound'), approvalRef: inboundApprovalRefSchema,
-    bindingId: uuid, consumedAt: timestamp, callState: z.enum(['open', 'closed']), billing: phoneInboundBillingRefSchema.optional() }).strict(),
+  boundOutcome,
   z.object({ ...envelope, state: z.literal('expired'), expiresAt: timestamp }).strict(),
   z.object({ ...envelope, state: z.literal('cancelled'), cancelledAt: timestamp,
     expiresAt: timestamp.nullable() }).strict(),

@@ -6,7 +6,7 @@ import { historyVersionSchema } from './eligibleContext.js';
 import { acknowledgedTurn, originalTurn } from './reconciliation.js';
 import { brokerPublicationReceiptsAccepted, selectedQuestionPublicationReceiptsAccepted,
   callerIntentResultPublicationCandidates, callerIntentResultPublicationInventory } from './publications.js';
-import { callerIntentOperationSchema, callerIntentInputSchema, callerIntentResultCoverageSchema, validateCallerIntentResponse,
+import { callerIntentOperationSchema, callerIntentTaskIdentitySchema, callerIntentInputSchema, callerIntentResultCoverageSchema, validateCallerIntentResponse,
   type CallerIntentOperation, type CallerIntentInput, type CallerIntentQuestion, type CallerIntentResponse } from './callerIntentContract.js';
 import type { BrokerCall } from './store.js';
 import type { BrokerDelegationRecord } from './backend.js';
@@ -50,7 +50,8 @@ export const callerResolutionInputSchema = z.object({ version: historyVersionSch
       ctx.addIssue({ code: 'custom', path: ['classificationRefusal'], message: 'Unverified inventory cannot carry result coverage' });
   });
 export const callerRouteDecisionSchema = z.discriminatedUnion('kind', [
-  z.object({ kind: z.literal('task'), contextReference: referenceSchema.optional() }).strict(),
+  z.object({ kind: z.literal('task'), contextReference: referenceSchema.optional(), delivery:z.object({kind:z.literal('sms_result')}).strict().optional() }).strict(),
+  z.object({kind:z.literal('deliver_result'),target:callerIntentTaskIdentitySchema,delivery:z.object({kind:z.literal('sms_result')}).strict()}).strict(),
   z.object({ kind: z.literal('answer'), target: callerQuestionTargetSchema }).strict(),
   z.object({ kind: z.literal('clarify'), reason: z.enum(['ambiguous_target', 'mixed_intent', 'incomplete',
     'unavailable', 'stale_context', 'invalid_resolution']) }).strict(),
@@ -100,7 +101,7 @@ function validateIntentRecord(record: CallerRouteRecord): void {
     || !same(input.version, record.resolutionInput.version)
     || !same(input.questions, record.resolutionInput.questions.map(callerIntentQuestionForTarget))) fail('caller_intent_input_changed');
   const coverage = record.resolutionInput.resultCoverage;
-  if (input.v === 'phone.caller-intent.v2') {
+  if (input.v !== 'phone.caller-intent.v1') {
     if (!coverage || !same(input.resultCoverage, coverage)
       || (coverage.state === 'complete' ? input.results.length !== record.resolutionInput.references.length : input.results.length !== 0))
       fail('caller_intent_input_changed');
@@ -112,13 +113,17 @@ function validateIntentRecord(record: CallerRouteRecord): void {
 /** An API receipt chooses the route; local clarification never authorizes work. */
 function validateActionReceipt(record: CallerRouteRecord): void {
   const decision = record.decision, response = record.intent?.response;
-  if (!decision || !['task', 'answer'].includes(decision.kind)) return;
+  if (!decision || !['task', 'answer', 'deliver_result'].includes(decision.kind)) return;
   if (response?.state !== 'resolved') fail('caller_route_intent_unresolved');
-  if (decision.kind === 'answer') {
+  if (decision.kind === 'deliver_result') {
+    if(response.v!=='phone.caller-intent.v3' || response.decision.kind!=='deliver_result' || !same(response.decision,decision)
+      || decision.target.bindingId!==record.scope.bindingId)fail('caller_route_intent_decision_changed');
+  } else if (decision.kind === 'answer') {
     if (response.decision.kind !== 'answer' || !same(response.decision.target, callerIntentQuestionForTarget(decision.target)))
       fail('caller_route_intent_decision_changed');
   } else if (decision.kind === 'task' && (response.decision.kind !== 'task'
-    || Boolean(response.decision.reference) !== Boolean(decision.contextReference))) fail('caller_route_intent_decision_changed');
+    || Boolean(response.decision.reference) !== Boolean(decision.contextReference)
+    || !same('delivery' in response.decision ? response.decision.delivery : undefined,decision.delivery))) fail('caller_route_intent_decision_changed');
 }
 
 function validateIntentCandidates(call: BrokerCall, record: CallerRouteRecord, historical: boolean): void {
@@ -127,7 +132,7 @@ function validateIntentCandidates(call: BrokerCall, record: CallerRouteRecord, h
   if (intent.input.callDeadlineAt !== call.liveGenerations?.clocks.callDeadlineAt) fail('caller_intent_deadline_changed');
   const candidates = callerIntentResultPublicationCandidates(call, record.frozen.sessionId, { historical });
   const coverage = record.resolutionInput.resultCoverage;
-  if (!historical && intent.input.v === 'phone.caller-intent.v2') {
+  if (!historical && intent.input.v !== 'phone.caller-intent.v1') {
     const inventory = callerIntentResultPublicationInventory(call, record.frozen.sessionId);
     if (!same(coverage, inventory.resultCoverage)
       || !same(record.resolutionInput.references, inventory.candidates.map(({ id, digest }) => ({ id, digest }))))
@@ -179,11 +184,11 @@ export function requireCallerRouteDispatch(call: BrokerCall, sourceEventId: stri
   if (!Number.isFinite(atMs)) fail('caller_route_invalid_dispatch_time');
   validateCallerRouting(call);
   const record = getCallerRouteBySource(call, sourceEventId), response = record?.intent?.response;
-  if (!record || !record.decision || !['task', 'answer'].includes(record.decision.kind) || response?.state !== 'resolved')
+  if (!record || !record.decision || !['task', 'answer', 'deliver_result'].includes(record.decision.kind) || response?.state !== 'resolved')
     fail('caller_route_intent_unresolved');
   // This function gates a first HTTP dispatch only. Saved admitted or unknown
   // work is recovered by its existing downstream identity before reaching it.
-  if (record.intent?.input.v !== 'phone.caller-intent.v2' || response.v !== 'phone.caller-intent.v2')
+  if (!record.intent || record.intent.input.v === 'phone.caller-intent.v1' || response.v === 'phone.caller-intent.v1')
     fail('caller_intent_legacy_dispatch_refused');
   validateActionReceipt(record);
   if (call.endedAt || call.finalized || call.primaryClosed || ['completed', 'busy', 'no-answer', 'canceled', 'failed'].includes(call.status)
@@ -220,7 +225,7 @@ export function parseCallerRoutingJournal(value: unknown): CallerRoutingJournal 
       operations.add(record.intent.operationId);
       validateIntentRecord(record);
     }
-    if (decision?.kind === 'task' || decision?.kind === 'answer') validateActionReceipt(record);
+    if (decision?.kind === 'task' || decision?.kind === 'answer' || decision?.kind === 'deliver_result') validateActionReceipt(record);
   }
   return result;
 }
@@ -286,11 +291,11 @@ export const getCallerRouteBySource = (call: BrokerCall, sourceEventId: string):
 export const callerRoutePendingCaptures = (call: BrokerCall): number => records(call).filter(r => !r.capture).length;
 
 export function requireCallerRoute(call: BrokerCall, request: LiveDelegationRequest, value: CallerRouteRef,
-  kind: 'task' | 'ordinary_answer' | 'selected_answer', mode: 'admit' | 'recover' = 'admit'): CallerRouteRecord {
+  kind: 'task' | 'ordinary_answer' | 'selected_answer' | 'deliver_result', mode: 'admit' | 'recover' = 'admit'): CallerRouteRecord {
   const ref = callerRouteRefSchema.parse(value), record = findCallerRoute(call, request);
   if (!record || !same(callerRouteRef(record), ref)) fail('caller_route_not_found');
   const decision = record.decision;
-  if (kind === 'task' ? decision?.kind !== 'task'
+  if (kind === 'deliver_result' ? decision?.kind !== 'deliver_result' : kind === 'task' ? decision?.kind !== 'task'
     : decision?.kind !== 'answer' || decision.target.kind !== (kind === 'ordinary_answer' ? 'ordinary' : 'selected'))
     fail('caller_route_decision_mismatch');
   if (mode === 'admit') {
@@ -305,15 +310,15 @@ export function requireCallerRoute(call: BrokerCall, request: LiveDelegationRequ
 }
 
 function owners(call: BrokerCall, sourceId: string): Array<{ kind: 'task' | 'ordinary' | 'selected'; requestId: string;
-  questionId?: string; turn: unknown; sessionId: string; associationId?: string }> {
+  questionId?: string; turn: unknown; sessionId: string; associationId?: string;resultSms?:BrokerDelegationRecord['submission']['resultSms'] }> {
   const found: ReturnType<typeof owners> = [];
   for (const raw of Object.values(call.delegations)) {
     const entry = raw as BrokerDelegationRecord;
     if (entry.submission?.source.sourceEventId === sourceId) found.push({ kind: 'task', requestId: entry.requestId,
-      turn: originalTurn(entry.submission), sessionId: entry.sessionId });
+      turn: originalTurn(entry.submission), sessionId: entry.sessionId,resultSms:entry.submission.resultSms });
     for (const deferred of entry.deferredTurns ?? []) if (deferred.sourceEventId === sourceId && deferred.queuedRequest)
       found.push({ kind: 'task', requestId: deferred.queuedRequest.requestId, turn: originalTurn(deferred.queuedRequest.submission),
-        sessionId: deferred.sourceSessionId ?? entry.sessionId });
+        sessionId: deferred.sourceSessionId ?? entry.sessionId,resultSms:deferred.queuedRequest.submission.resultSms });
     for (const q of Object.values(entry.questions ?? {})) for (const reply of [...(q.refusedReplies ?? []), ...(q.reply ? [q.reply] : [])])
       if (reply.input.source.sourceEventId === sourceId) found.push({ kind: 'ordinary', requestId: entry.requestId,
         questionId: q.question.id, sessionId: reply.sourceSessionId ?? entry.sessionId,
@@ -357,12 +362,12 @@ export function validateCallerRouting(call: BrokerCall, previous?: BrokerCall): 
     }
     if (previous && old && !old.intent && record.intent) {
       if (old.decision || record.intent.response) fail('caller_intent_input_not_durable');
-      if (record.intent.input.v !== 'phone.caller-intent.v2') fail('caller_intent_legacy_dispatch_refused');
+      if (record.intent.input.v === 'phone.caller-intent.v1') fail('caller_intent_legacy_dispatch_refused');
       currentSource(call, record);
       for (const target of record.resolutionInput.questions) currentTarget(call, target, frozen.sessionId);
       validateIntentCandidates(call, record, false);
     }
-    if (previous && old && !old.decision && record.decision && ['task', 'answer'].includes(record.decision.kind)) {
+    if (previous && old && !old.decision && record.decision && ['task', 'answer', 'deliver_result'].includes(record.decision.kind)) {
       if (old.intent?.response?.state !== 'resolved') fail('caller_intent_receipt_not_durable');
       currentSource(call, record);
       validateIntentCandidates(call, record, false);
@@ -376,6 +381,8 @@ export function validateCallerRouting(call: BrokerCall, previous?: BrokerCall): 
       if (use.kind === 'task') {
         if (record.decision?.kind !== 'task' || use.requestId !== identity('request', call.id, frozen.sessionId, record.delegation.delegationId))
           fail('caller_route_decision_mismatch');
+        if(record.decision.delivery ? !same(use.resultSms,{v:'phone.result-sms.v1',callerIntentOperationId:record.intent?.operationId,
+          requestId:use.requestId}) : use.resultSms!==undefined)fail('caller_route_delivery_changed');
       } else if (record.decision?.kind !== 'answer' || record.decision.target.kind !== use.kind
         || record.decision.target.requestId !== use.requestId || record.decision.target.questionId !== use.questionId
         || (record.decision.target.kind === 'selected' && record.decision.target.associationId !== use.associationId))

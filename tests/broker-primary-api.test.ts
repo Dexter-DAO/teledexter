@@ -32,6 +32,23 @@ const submission: PrimarySubmission = { source: {
   callSid, itemId: 'item_caller_1', sourceEventId, revision: 1, receivedAt: when, role: 'user',
 }, text: 'Tell me my current portfolio.' };
 
+test('combined delivery and standalone receipt recovery retain exact admission identity over HTTP',async()=>{
+  const resultSms={v:'phone.result-sms.v1' as const,callerIntentOperationId:eventId,requestId};
+  const receipt={v:'phone.result-sms.v1',intentId:messageId,intentDigest:'a'.repeat(64),state:'waiting_result',replayed:false};
+  const h=harness([json({bindingId,requestId,state:'queued',replayed:false,resultSms:receipt},202),json({...receipt,replayed:true},202)],{
+    contextProtocol:{version:'memory-eligible-v1',parse(){throw new Error('No context');}},
+  });
+  assert.deepEqual((await h.client.submit(bindingId,requestId,{...submission,resultSms})).resultSms,receipt);
+  assert.deepEqual(await h.client.admitResultSms!(bindingId,resultSms),{...receipt,replayed:true});
+  assert.deepEqual(JSON.parse(String(h.requests[0]!.init.body)).resultSms,resultSms);
+  assert.deepEqual(JSON.parse(String(h.requests[1]!.init.body)),resultSms);
+  assert.ok(String(h.requests[1]!.url).endsWith(`/calls/${bindingId}/result-sms`));
+  for(const item of h.requests)assert.equal(new Headers(item.init.headers).get('X-Dexter-Phone-Context-Version'),'memory-eligible-v1');
+  const wrong=harness([]);
+  await assert.rejects(wrong.client.submit(bindingId,requestId,{...submission,resultSms:{...resultSms,requestId:messageId}}),code('invalid_request'));
+  assert.equal(wrong.requests.length,0);
+});
+
 test('associated-result frozen wire preserves all eight literal digests and exact new submit/reconcile bodies', async () => {
   const fixtures = JSON.parse(fs.readFileSync(new URL('./fixtures/associated-result-digests.json', import.meta.url), 'utf8')) as Array<{
     name: string; bindingId: string; input: PrimarySubmission; rawDigest: string;
@@ -569,4 +586,41 @@ test('registration replays echo the same original control UUID and immutable ret
   assert.deepEqual(await client.openCall(proof, original), response);
   assert.equal(requests[0].init.body, requests[1].init.body);
   assert.equal(JSON.parse(String(requests[0].init.body)).callAssignment.assignmentId, originalId);
+});
+
+test('provider pause and failed response retain validated tool facts without manufacturing an assistant result', async () => {
+  const partialResult = { kind: 'prepared_action', text: 'An unsigned Apple purchase was prepared. It has not executed.',
+    toolInvocationId: eventId, observedAt: when };
+  const failure = { kind: 'provider_cooldown', retryAt: when, retryAfterSeconds: 30 };
+  for (const envelope of [{ bindingId, requestId, state: 'running', partialResult, failure },
+    { bindingId, requestId, state: 'failed', partialResult, failure: { kind: 'provider_request_budget' },
+      error: { code: 'provider_request_budget_exceeded', retryable: false } }]) {
+    const h = harness([json(envelope)]);
+    const result = await h.client.result(bindingId, requestId);
+    assert.deepEqual(result, envelope); assert.equal(result.assistant, undefined);
+    assert.equal(h.requests.length, 1);
+  }
+  for (const invalid of [{ ...partialResult, toolInvocationId: 'unknown' }, { ...partialResult, kind: 'trade_executed' },
+    { ...partialResult, observedAt: 'yesterday' }, { ...partialResult, raw: 'unvalidated tool output' },
+    { ...partialResult, text: ' ' }, { ...partialResult, text: 'x'.repeat(8193) }]) {
+    const h = harness([json({ bindingId, requestId, state: 'running', partialResult: invalid })]);
+    await assert.rejects(h.client.result(bindingId, requestId), code('invalid_response'));
+  }
+});
+
+test('canonical action observations require an exact intent and state without claiming whole-run success', async () => {
+  for (const actionState of ['submitted', 'pending', 'confirmed', 'refused', 'failed', 'unknown'] as const) {
+    const partialResult = { kind: 'action_status', text: `The saved action is ${actionState}.`, toolInvocationId: eventId,
+      observedAt: when, intentId: sourceEventId, actionState };
+    const envelope = { bindingId, requestId, state: 'failed', partialResult,
+      failure: { kind: 'provider_error' }, error: { code: 'provider_busy', retryable: false } };
+    const h = harness([json(envelope)]);
+    assert.deepEqual(await h.client.result(bindingId, requestId), envelope);
+    for (const invalid of [{ ...partialResult, intentId: undefined }, { ...partialResult, actionState: undefined },
+      { ...partialResult, actionState: 'success' }, { ...partialResult, intentId: 'any action' },
+      { ...partialResult, kind: 'prepared_action' }]) {
+      const wrong = harness([json({ ...envelope, partialResult: invalid })]);
+      await assert.rejects(wrong.client.result(bindingId, requestId), code('invalid_response'));
+    }
+  }
 });

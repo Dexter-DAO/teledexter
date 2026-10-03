@@ -107,6 +107,7 @@ function harness(initial?: LiveGenerationJournal, overrides: Partial<LiveGenerat
   const controller = createLiveGenerationController(options);
   return { controller, options, sessions, persisted, problems, contextReadFailures, audio, api, operations,
     get clears() { return clears; }, setTime: (value: number) => { time = value; },
+    setVersion: (value: HistoryVersion) => { version = structuredClone(value); },
     advanceVersion: () => { version = versionFor(Number(version.contextEpoch) + 1); } };
 }
 
@@ -809,4 +810,214 @@ test('replacement refuses a repeated provider session ID and restart refuses a d
   const saved = f.controller.snapshot();
   saved.segments.at(-1)!.sessionId = existing;
   assert.equal(liveGenerationJournalSchema.safeParse(saved).success, false);
+});
+
+// These are the observed work-event cursors from the Apple call. They carry no
+// new eligible message in this fixture; epoch and bound content remain exact.
+test('incident work cursors retain one voice for fixed pending status and never rewrite its source version', async () => {
+  const refreshes: unknown[] = [];
+  const h = harness(undefined, { onStatusContextRefresh: value => { refreshes.push(structuredClone(value)); } });
+  const initial = { ...versionFor(1), contextEpoch: '10', threadEventSequence: '280' };
+  h.setVersion(initial); await h.controller.start();
+  const original = h.controller.snapshot().segments[0], clears = h.clears;
+  try {
+    for (const sequence of ['281', '282', '283', '284', '285']) {
+      h.setVersion({ ...initial, threadEventSequence: sequence, digest: sequence.padStart(64, '0') });
+      const attached = await h.controller.withStatusAttachment(() => true, async value => value);
+      assert.equal(attached.sessionId, 'session_1');
+    }
+    assert.equal(h.sessions.length, 1); assert.equal(h.clears, clears);
+    assert.deepEqual(h.controller.snapshot().segments[0], original);
+    assert.equal(refreshes.length, 5); assert.equal(h.sessions[0].closes.length, 0);
+    // A result continues through the strict source/version guard, not the status exception.
+    const result = await h.controller.deliver(requestId, { kind: 'assistant', messageId });
+    assert.equal(result.attachment.sessionId, 'session_2');
+    assert.equal(h.sessions[1].publications.length, 1);
+    assert.deepEqual(h.controller.snapshot().segments[0].version, initial);
+  } finally { await h.controller.stop(); }
+});
+
+for (const change of ['epoch', 'forgotten-context', 'omission', 'name'] as const) {
+  test(`fixed status replaces the old voice when ${change} changes`, async () => {
+    const h = harness(); await h.controller.start();
+    if (change === 'epoch') h.advanceVersion();
+    else {
+      const fetch = h.api.fetch;
+      h.api.fetch = async scope => {
+        const value = await fetch(scope);
+        if (change === 'forgotten-context') value.context.history.localContext = 'An updated eligible context.';
+        if (change === 'omission') value.context.history.omittedForBudget = true;
+        if (change === 'name') value.context.displayName = 'Updated name';
+        return value;
+      };
+    }
+    try {
+      const result = await h.controller.withStatusAttachment(() => true, async value => value);
+      assert.equal(result.sessionId, 'session_2');
+      assert.equal(h.sessions[0].closes.length, 1);
+    } finally { await h.controller.stop(); }
+  });
+}
+
+for (const change of ['owner', 'binding', 'revocation'] as const) {
+  test(`fixed status refuses ${change} without publishing`, async () => {
+    const h = harness(); await h.controller.start(); let publishes = 0;
+    if (change === 'revocation') h.api.assert = async () => {
+      throw new PrimaryApiError('http_error', 403, { code: 'authority_unavailable', retryable: false });
+    };
+    else {
+      const fetch = h.api.fetch;
+      h.api.fetch = async scope => { const value = await fetch(scope);
+        if (change === 'owner') value.context.history.version.ownerPrincipalId = requestId;
+        else value.bindingId = requestId; return value; };
+    }
+    try {
+      await assert.rejects(h.controller.withStatusAttachment(() => true, async () => { publishes++; }));
+      assert.equal(publishes, 0);
+      h.sessions[0].input.callbacks.onAudio('denied audio'); assert.deepEqual(h.audio, []);
+    } finally { await h.controller.stop(); }
+  });
+}
+
+test('status transient retry silences unvalidated output and restores the exact same voice after validation', async () => {
+  const h = harness(); await h.controller.start();
+  const fetch = h.api.fetch, waiting = pending<void>(); let attempts = 0;
+  h.api.fetch = async scope => { if (++attempts === 1) throw temporarilyUnavailable(); await waiting.promise; return fetch(scope); };
+  const recovering = h.controller.withStatusAttachment(() => true, async value => value);
+  try {
+    await until(() => h.controller.snapshot().phase !== 'active');
+    h.sessions[0].input.callbacks.onAudio('unvalidated');
+    assert.equal(h.controller.appendAudio({ payload: 'AQI=', callInputStartSample: 0 }), 'buffered');
+    waiting.resolve();
+    assert.equal((await recovering).sessionId, 'session_1');
+    assert.equal(h.sessions.length, 1); assert.deepEqual(h.audio, []);
+    assert.equal(h.sessions[0].audio.length, 1);
+  } finally { waiting.resolve(); await recovering.catch(() => {}); await h.controller.stop(); }
+});
+
+test('status frontier changes during context fetch withhold publication without rewriting the voice', async () => {
+  const h = harness(); await h.controller.start(); let relevant = true, publishes = 0;
+  const fetch = h.api.fetch; h.api.fetch = async scope => { relevant = false; return fetch(scope); };
+  try {
+    await assert.rejects(h.controller.withStatusAttachment(() => relevant, async () => { publishes++; }),
+      (error: unknown) => error instanceof LiveGenerationError && error.code === 'presentation_deferred');
+    assert.equal(publishes, 0); assert.equal(h.sessions.length, 1);
+  } finally { await h.controller.stop(); }
+});
+
+test('late result frontier is checked before I/O and again after eligible delivery', async () => {
+  const h = harness(); await h.controller.start(); let relevant = false;
+  const before = h.operations.length;
+  try {
+    await assert.rejects(h.controller.deliver(requestId, { kind: 'assistant', messageId }, undefined, () => relevant));
+    assert.equal(h.operations.length, before);
+    relevant = true; const read = h.api.delivery;
+    h.api.delivery = async (...args) => { relevant = false; return read(...args); };
+    const result = await h.controller.deliver(requestId, { kind: 'assistant', messageId }, undefined, () => relevant);
+    assert.equal(result.publication?.status, 'stale');
+    assert.equal(h.sessions[0].publications.length, 0);
+  } finally { await h.controller.stop(); }
+});
+
+test('admitted additions refresh the boundary once without fetching or replacing the Live session', async () => {
+  const h=harness(), admitted={invalidationDigest:'a'.repeat(64),messages:[],memories:[]};
+  let current=versionFor(1), checks=0;
+  h.api.fetch=async()=>{h.operations.push({name:'fetch'});return {...contextFor(current),context:{...contextFor(current).context,
+    history:{...contextFor(current).context.history,admission:admitted}}};};
+  h.api.assert=async(_binding,_version,admission)=>{checks++;assert.deepEqual(admission,admitted);return {bindingId,callSid,current:true,version:current,admission};};
+  h.api.delivery=async(_binding,id,input)=>({bindingId,callSid,requestId:id,version:current,admission:input.admission,
+    delivery:{state:'ready',source:{kind:'assistant',messageId,eventSequence:current.threadEventSequence,
+      provenance:{messageCreatedAt:when,eventId,eventOccurredAt:when,runId}},text:'Your account total is $45.35.'}});
+  try {
+    await h.controller.start();current={...versionFor(2),contextEpoch:'1'};
+    await h.controller.withStatusAttachment(()=>true,async()=>undefined);
+    await h.controller.deliver(requestId,{kind:'assistant',messageId});
+    assert.equal(h.sessions.length,1);assert.equal(h.operations.filter(op=>op.name==='fetch').length,1);
+    assert.equal(h.sessions[0].closes.length,0);assert.equal(h.sessions[0].publications.length,1);
+    assert.equal(checks,3);assert.deepEqual(h.controller.snapshot().segments[0].version,versionFor(1),'startup source stays immutable');
+  } finally {await h.controller.stop();}
+});
+
+test('admitted removal still replaces the session and never sends old audio during replacement', async()=>{
+  const h=harness(), admitted={invalidationDigest:'a'.repeat(64),messages:[],memories:[]};
+  let removed=false;
+  h.api.fetch=async()=>{const context=contextFor(removed?versionFor(2):versionFor(1));context.context.history.admission=admitted;return context;};
+  h.api.assert=async(_binding,version,admission)=>{if(removed && version.contextEpoch==='1') throw changed();return{bindingId,callSid,current:true,version,admission};};
+  try {await h.controller.start();removed=true;await h.controller.beforeReuse();
+    assert.equal(h.sessions.length,2);assert.equal(h.sessions[0].closes.length,1);
+    h.sessions[0].input.callbacks.onAudio('removed');assert.deepEqual(h.audio,[]);
+  } finally {await h.controller.stop();}
+});
+
+test('cached startup retains its original page digest and version when admitted sources validate at a newer version', async () => {
+  const h = harness(), cache = createInboundStartupContexts(h.api), call = startupCall();
+  let openings = 0;
+  h.options.onInitialActivation = async () => { openings++; };
+  const page = contextFor(versionFor(1));
+  page.context.history.pageDigest = 'b'.repeat(64);
+  page.context.history.admission = { invalidationDigest: 'c'.repeat(64), messages: [], memories: [] };
+  cache.remember(call, page); h.options.context = cache.take(call);
+  let assertions = 0;
+  h.api.assert = async (_binding, requested, admission) => {
+    assertions++; assert.deepEqual(requested, page.context.history.version);
+    assert.deepEqual(admission, page.context.history.admission);
+    return { bindingId, callSid, current: true, version: {...versionFor(2),contextEpoch:'1'}, admission };
+  };
+  try {
+    await h.controller.start();
+    assert.equal(assertions, 2, 'pre-start and post-open assertions remain distinct');
+    assert.equal(openings, 1, 'the greeting shares activation without a third assertion');
+    assert.deepEqual(h.sessions[0].input.context, page);
+    assert.deepEqual(h.controller.snapshot().segments[0].version, versionFor(1));
+    assert.equal(h.sessions.length, 1);
+    assert.equal(h.operations.filter(value => value.name === 'fetch').length, 0);
+  } finally { await h.controller.stop(); }
+});
+
+test('initial opening shares the validated activation before later publishers can enter', async () => {
+  const opening = pending<void>(), events: string[] = [];
+  const h = harness(undefined, { async onInitialActivation(attachment) {
+    events.push(`opening:${attachment.sessionId}`); await opening.promise;
+  } });
+  const starting = h.controller.start();
+  await until(() => events.length === 1);
+  assert.deepEqual(h.operations.map(value => value.name), ['fetch', 'assert']);
+  assert.equal(h.controller.appendAudio({ payload: 'AQI=', callInputStartSample: 0 }), 'sent');
+  const later = h.controller.withCurrentAttachment(async () => { events.push('later'); });
+  await Promise.resolve(); assert.deepEqual(events, ['opening:session_1']);
+  opening.resolve(); await starting; await later;
+  assert.deepEqual(events, ['opening:session_1', 'later']);
+  assert.deepEqual(h.operations.map(value => value.name), ['fetch', 'assert', 'assert']);
+  h.advanceVersion(); await h.controller.beforeReuse();
+  assert.equal(events.filter(event => event.startsWith('opening:')).length, 1);
+  await h.controller.stop();
+});
+
+test('a changed startup context suppresses the old greeting and opens only the admitted successor', async () => {
+  const opened: string[] = [];
+  const h = harness(undefined, { async onInitialActivation(attachment) { opened.push(attachment.sessionId); } });
+  const assertCurrent = h.api.assert; let checks = 0;
+  h.api.assert = async (...args) => {
+    if (++checks === 1) { h.advanceVersion(); throw changed(); }
+    return assertCurrent(...args);
+  };
+  await h.controller.start();
+  assert.equal(h.sessions.length, 2); assert.deepEqual(opened, ['session_2']);
+  assert.equal(h.controller.snapshot().segments[0].outputDiscarded, true);
+  await h.controller.stop();
+});
+
+test('stop before activation prevents an opening; stop during its receipt wait cannot repeat it', async () => {
+  for (const stopDuringOpening of [false, true]) {
+    const gate = pending<void>(); let openings = 0, checks = 0;
+    const h = harness(undefined, { async onInitialActivation() { openings++; if (stopDuringOpening) await gate.promise; } });
+    const assertCurrent = h.api.assert;
+    h.api.assert = async (...args) => { checks++; if (!stopDuringOpening) await gate.promise; return assertCurrent(...args); };
+    const starting = assert.rejects(h.controller.start(), (error: unknown) => error instanceof LiveGenerationError && error.code === 'call_stopped');
+    await until(() => stopDuringOpening ? openings === 1 : checks === 1);
+    const stopping = h.controller.stop(); gate.resolve(); await starting; await stopping;
+    assert.equal(openings, Number(stopDuringOpening));
+    await assert.rejects(h.controller.start());
+    assert.equal(openings, Number(stopDuringOpening));
+  }
 });

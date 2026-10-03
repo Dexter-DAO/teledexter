@@ -8,6 +8,7 @@ import { PrimaryApiError, type PrimaryApiClient } from './primaryApi.js';
 import type { BrokerLiveSessionOptions } from '../live/types.js';
 import { createVerificationCallbackClient, type VerificationCallbackClient } from './verificationCallbackClient.js';
 import { createVerificationCallbackFlow, type VerificationCallbackProviderObservation } from './verificationCallbackFlow.js';
+import { validateVerificationCallbackCall } from './verificationCallbackJournal.js';
 import { createVerificationCallbackKickoff, VERIFICATION_CALLBACK_KICKOFF_PATH } from './verificationCallbackKickoff.js';
 import { type PhoneVerificationCallbackPermit } from './verificationCallbackContract.js';
 import { createRestrictedSetupVoice, type RestrictedSetupVoice, type RestrictedSetupScope } from './restrictedSetupVoice.js';
@@ -242,9 +243,21 @@ export function createRestrictedSetupServer(options: RestrictedSetupServerOption
       sendJson(response, 503, { error: { code: 'callback_unavailable', retryable: true } }); return true;
     }
   }
+  function enrollmentSettled(call: BrokerCall): boolean {
+    const journal = call.verificationCallback;
+    if (!journal || journal.permit.purpose !== 'enrollment' || journal.remote?.state !== 'completed'
+      || journal.completion?.observation?.state !== 'enrolled' || !journal.providerTerminal || !journal.endedTiming
+      || !call.endedAt || !terminal.has(call.status) || call.primary || call.primaryClosePending
+      || (journal.media && !journal.media.stoppedAt) || active.has(call.id) || claimed.has(call.id)
+      || !journal.receipts?.every(receipt => receipt.acknowledgedAt)
+      || !journal.receipts.some(receipt => receipt.kind === 'ended' && receipt.acknowledgedAt && receipt.receipt)) return false;
+    validateVerificationCallbackCall(call);
+    return true;
+  }
   async function stopSaved(call: BrokerCall, reason: string) {
     clearPrivateWaitDeadline(call.id);
     const saved = store.get(call.id); if (!saved) fail();
+    if (enrollmentSettled(saved)) return;
     const savedMedia = media(saved);
     // A fully stopped original leg has no callback or Primary work to recover.
     // Maintenance and shutdown may revisit it after its host has drained.
@@ -392,8 +405,11 @@ export function createRestrictedSetupServer(options: RestrictedSetupServerOption
       if (call.verificationCallback) await flushReceipts(call.id);
       await actors.get(call.id)?.recover(); return true;
     }
+    if (enrollmentSettled(store.get(call.id)!)) return true;
     if (call.primaryClosePending) await options.closePrimary(call);
     if (call.verificationCallback) await flushReceipts(call.id);
+    // The last receipt acknowledgement can finish the remaining work this pass.
+    if (enrollmentSettled(store.get(call.id)!)) return true;
     if (call.verificationCallback) {
       await flow.recover(call.verificationCallback.permit.request).catch(() => {});
       if (call.callSid && (!call.verificationCallback.providerTerminal || !call.verificationCallback.endedTiming)) {

@@ -128,3 +128,13 @@ test('an oversized escaped watch summary is omitted whole while its name and obs
   assert.deepEqual(JSON.parse(encoded), { source: 'saved_watch_event', watchName: watch.watch.name,
     observedAt: watch.event.observedAt, summaryOmitted: true, explanationFromPrimaryRequired: true });
 });
+
+
+test('trade language distinguishes preparing, confirmation and execution while pending work allows a topic change', () => {
+  const instructions = brokerInstructions({ direction: 'inbound', purpose: '' });
+  assert.match(instructions, /request to buy or sell starts by preparing an order for review/);
+  assert.match(instructions, /only when Primary reports that exact execution stage/);
+  assert.match(instructions, /Read the prepared quote and obtain the required confirmation before execution/);
+  assert.match(instructions, /Acknowledge a change of topic and answer the new question/);
+  assert.match(instructions, /leave internal debugging details in the saved record/);
+});

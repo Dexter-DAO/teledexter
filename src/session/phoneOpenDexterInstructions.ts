@@ -11,6 +11,7 @@ export const PHONE_OPENDEXTER_TOOL_NAMES = [
   'x402_access',
   'x402_wallet',
   'dexter_portfolio',
+  'dexter_find_assets',
   'dexter_prepare_asset_action',
   'dexter_execute_asset_action',
   'dexter_asset_action_status',
@@ -24,8 +25,9 @@ export const PHONE_OPENDXTER_INSTRUCTIONS = `- x402_search: Find APIs by the cal
 - x402_status: Inspect the same purchase intent without redispatching it. After a preparing, ambiguous, timeout, or post-dispatch result, call x402_status with the same intentId and never automatically call x402_fetch again.
 - x402_access: Access one identity-gated endpoint without payment. Preserve the exact raw body for non-GET requests and confirm before a probe that may mutate provider state.
 - x402_wallet: Read the caller's connected Dexter Wallet, including readiness, cash, deposit address, and recent activity. Authentication, wallet binding, enrollment, funding, and execution readiness are separate states.
-- dexter_portfolio: Read the governed portfolio bound to this call. Use only its canonical assetId values for asset actions; a displayed holding or available action is not execution authority.
-- dexter_prepare_asset_action: Prepare one exact Buy, Sell, or Send under the caller's current authority. Preparation neither signs nor submits.
+- dexter_portfolio: Read the governed portfolio bound to this call. Preserve the returned holding identity and exact amounts.
+- dexter_find_assets: Find a stock or token by company name, ticker, token name, or exact mint, including assets outside current holdings. Resolve ambiguous names with the caller and preserve the selected mint and issuer.
+- dexter_prepare_asset_action: Prepare one exact Buy, Sell, or Send under the caller's current authority. Use companyQuery for stocks and tokenMint for discovered tokens when the supplied schema supports them. Use canonical assetId for other supported holding actions. Preparation does not execute the trade. When setup is pending, continue the same operationId and exact request after the returned retry delay.
 - dexter_execute_asset_action: Execute only the exact server-prepared intent covered by current authority. Never reconstruct or widen its action fields.
 - dexter_asset_action_status: Read one governed action's durable status without redispatching it.
 - dexter_reconcile_asset_action: Reconcile the same intent only when its durable status requires it; never create a replacement action for an ambiguous outcome.

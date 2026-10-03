@@ -21,7 +21,8 @@ import type { PrimaryCall } from './primaryApi.js';
 import { primaryHarkReceiptBindingFromCall, reducePrimaryHarkReceiptOutbox, validatePrimaryHarkReceiptOutbox,
   type PrimaryHarkReceiptBinding, type PrimaryHarkReceiptCommand, type PrimaryHarkReceiptOutbox } from './harkPrimaryReceiptOutbox.js';
 import { validateBrokerAdmissionRefusals, type BrokerDelegationRecord } from './backend.js';
-import { liveGenerationJournalSchema, type LiveGenerationJournal, type ContextReadFailure } from './liveGeneration.js';
+import { liveGenerationJournalSchema, type LiveGenerationJournal, type ContextReadFailure, type StatusContextRefresh } from './liveGeneration.js';
+import { historyVersionSchema } from './eligibleContext.js';
 import { callContinuationPatch, assertCallContinuationReplay, requestDeliveryRequestForContinuation, validateCallContinuation, type CallContinuation } from './callContinuation.js';
 import { assertSelectedQuestionJournalUpdate, parseSelectedQuestionJournal, type SelectedQuestionJournal } from './selectedQuestion.js';
 
@@ -68,6 +69,7 @@ export interface BrokerCall {
   liveSessionId?: string; transcript?: unknown; transcriptRevision?: number;
   liveGenerations?: LiveGenerationJournal;
   contextReadFailures?: ContextReadFailure[];
+  statusContextRefreshes?: StatusContextRefresh[];
   sourceAcousticSpans?: Record<string, unknown>;
   mediaStartedAt?: string;
   harkJournal?: HarkJournal;
@@ -165,6 +167,7 @@ function assertPrimaryIdentityUnchanged(previous: BrokerCall, next: BrokerCall):
 
 function validateGenerations(call: BrokerCall, previous?: BrokerCall): void {
   if (call.liveGenerations === undefined) {
+    if (call.statusContextRefreshes !== undefined) throw new Error('Status context requires generation history');
     if (previous?.liveGenerations) throw new Error('Live generation journal cannot be removed');
     return;
   }
@@ -174,6 +177,21 @@ function validateGenerations(call: BrokerCall, previous?: BrokerCall): void {
     || next.binding.threadId !== call.primary.threadId || next.clocks.mediaStartedAt !== call.mediaStartedAt)
     throw new Error('Live generation call identity changed');
   const old = previous?.liveGenerations;
+  const refreshes = call.statusContextRefreshes ?? [];
+  if (!Array.isArray(refreshes) || refreshes.length > 1000) throw new Error('Invalid status context evidence');
+  for (const refresh of refreshes) {
+    const checked = z.object({ generationId: z.string().uuid(), observedAt: z.iso.datetime(),
+      version: historyVersionSchema, contentDigest: z.string().regex(/^[a-f0-9]{64}$/),
+      kind:z.literal('admitted_sources').optional() }).strict().parse(refresh);
+    const source = next.segments.find(segment => segment.generationId === checked.generationId);
+    if (!source || checked.version.ownerPrincipalId !== source.version.ownerPrincipalId
+      || checked.version.primaryDexterId !== source.version.primaryDexterId || checked.version.threadId !== source.version.threadId
+      || checked.version.contextEpoch !== source.version.contextEpoch
+      || BigInt(checked.version.threadEventSequence) < BigInt(source.version.threadEventSequence))
+      throw new Error('Status context source changed');
+  }
+  if ((previous?.statusContextRefreshes ?? []).some((value, index) => canonicalJson(value) !== canonicalJson(refreshes[index])))
+    throw new Error('Status context evidence changed');
   if (!old) return;
   const priorBinding = old.binding.ownerPrincipalId === undefined ? { ...old.binding, ownerPrincipalId: next.binding.ownerPrincipalId } : old.binding;
   if (canonicalJson(priorBinding) !== canonicalJson(next.binding) || canonicalJson(old.clocks) !== canonicalJson(next.clocks)

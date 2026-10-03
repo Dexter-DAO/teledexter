@@ -578,7 +578,7 @@ test('untyped exceptions cannot put raw error details into the saved request or 
 });
 
 test('spoken progress continues during a blocked result read and is bounded across duplicate delegates', async t => {
-  const f = await fixture(t, { progressIntervalMs: 15, maxPollMs: 500 });
+  const f = await fixture(t, { progressIntervalMs: 15, maxPollMs: 5000 });
   f.add('Read my balance.'); f.speech();
   let entered!: () => void, release!: () => void;
   const began = new Promise<void>(resolve => { entered = resolve; });
@@ -587,7 +587,9 @@ test('spoken progress continues during a blocked result read and is bounded acro
   const work = Promise.all([f.backend.delegate(f.request(), f.channel), f.backend.delegate(f.request(), f.channel)]);
   try {
     await began;
-    await wait(110);
+    const end = Date.now() + 5000;
+    while (f.updates.filter(update => update.kind === 'progress').length < 4 && Date.now() < end) await wait(10);
+    await wait(60); // Keep the blocked read open after its fourth accepted notice.
     const progress = f.updates.filter(update => update.kind === 'progress');
     assert.equal(progress.length, 4);
     assert.equal(new Set(progress.map(update => update.id)).size, 4);
@@ -600,15 +602,39 @@ test('spoken progress continues during a blocked result read and is bounded acro
 });
 
 test('pending status notices are periodic rather than emitted by every result poll', async t => {
-  const f = await fixture(t, { progressIntervalMs: 25, maxPollMs: 100, pollIntervalMs: 1 });
+  let clock: number | undefined;
+  const f = await fixture(t, { progressIntervalMs: 25, pollIntervalMs: 1, watchUntilCallEnds: true,
+    now: () => clock ?? Date.now() });
   f.add('Read my balance.'); f.speech();
+  // Let the existing quiet/admission gate finish, then freeze the clock before
+  // the observer starts. Poll count cannot consume the notice's time budget.
+  const submit = f.behavior.submit;
+  f.behavior.submit = async id => { clock = Date.now() + 10; return submit(id); };
   f.behavior.result = async id => ({ bindingId, requestId: id, state: 'running' });
-  await f.backend.delegate(f.request(), f.channel);
-  const progress = f.updates.filter(update => update.kind === 'progress');
-  assert.ok(progress.length >= 1 && progress.length <= 4);
-  assert.ok(f.reads.length > progress.length);
-  assert.ok(progress.every(update => update.speak === true));
-  assert.equal(f.posts.length, 1);
+  let failure: unknown;
+  const work = f.backend.delegate(f.request(), f.channel);
+  void work.catch(error => { failure = error; });
+  const progress = () => f.updates.filter(update => update.kind === 'progress');
+  const until = async (label: string, predicate: () => boolean) => {
+    const deadline = Date.now() + 6000;
+    while (!predicate()) {
+      if (failure) throw failure;
+      assert.ok(Date.now() < deadline, `timed out waiting for ${label}; reads=${f.reads.length}, progress=${progress().length}`);
+      await wait(5);
+    }
+  };
+  try {
+    await until('five initial polls', () => f.reads.length >= 5);
+    assert.equal(progress().length, 0, 'polls alone must not produce a periodic notice');
+    clock! += 25;
+    await until('one due notice', () => progress().length === 1);
+    const readsAtNotice = f.reads.length;
+    await until('five more polls', () => f.reads.length >= readsAtNotice + 5);
+    assert.equal(progress().length, 1, 'more polls at the same time must not repeat the notice');
+    assert.ok(progress().length <= 4, 'the notice budget remains bounded');
+    assert.ok(progress().every(update => update.speak === true), 'periodic notices must be spoken');
+    assert.equal(f.posts.length, 1);
+  } finally { f.controller.abort(); await work; }
 });
 
 for (const change of ['abort', 'call_ended'] as const)
@@ -823,7 +849,10 @@ for (const interruption of ['abort', 'caller_revision', 'acoustic_speech', 'call
 test('stable transcript alone cannot establish a completed acoustic caller turn', async t => {
   const f = await fixture(t); f.add('Read my balance.');
   await f.backend.delegate(f.request(), f.channel);
-  assert.equal(f.posts.length, 0); assert.match(f.updates.at(-1)!.text, /finish your request/);
+  assert.equal(f.posts.length, 0); assert.equal(f.updates.at(-1)!.speak, false);
+  assert.equal(f.updates.at(-1)!.kind, 'progress');
+  f.speech(); await f.backend.delegate(f.request('completed'), f.channel);
+  assert.equal(f.posts.length, 1); assert.equal(f.posts[0].input.text, 'Read my balance.');
 });
 
 test('final capture uses canonical IDs once for ordinary caller and fully played assistant turns', async t => {
@@ -1843,4 +1872,213 @@ test('a pre-admission-looking error during GET cannot turn an older unknown POST
   assert.deepEqual(await createPrimaryBackend(f.options).flushPendingCaptures(), { pending: 1, unsupported: ['reply_outcome_unknown'] });
   assert.equal(f.saved()[0].questions![firstQuestionId].reply!.status, 'unknown');
   assert.equal(f.replies.length, 1); assert.equal(f.posts.length, 1);
+});
+
+
+test('duplicate saved delegation cannot republish an already accepted completed answer', async t => {
+  const f = await fixture(t);
+  let publications = 0;
+  f.options.observation = { signal: f.controller.signal, async publish() {
+    publications++; return { delivery: { eventId: 'accepted_original', status: 'accepted' } };
+  } };
+  f.add('Read my balance.'); f.speech();
+  await f.backend.delegate(f.request(), f.channel);
+  assert.equal(f.saved()[0].delivery, 'accepted');
+  await f.backend.delegate(f.request('duplicate_completed_source'), f.channel);
+  assert.equal(publications, 1); assert.equal(f.posts.length, 1);
+});
+
+
+test('completed presentation survives more than three interruptions without another action', async t => {
+  const f = await fixture(t, { watchUntilCallEnds: true });
+  let publications = 0;
+  f.options.observation = { signal: f.controller.signal, async publish() {
+    publications++;
+    return { delivery: { eventId: publications < 8 ? '' : 'accepted_original',
+      status: publications < 8 ? 'stale' : 'accepted', reason: 'caller_context_changed' } };
+  } };
+  f.add('Read my balance.'); f.speech();
+  await f.backend.delegate(f.request(), f.channel);
+  assert.equal(publications, 8); assert.equal(f.posts.length, 1); assert.equal(f.reads.length, 1);
+  assert.equal(f.saved()[0].delivery, 'accepted');
+});
+
+test('hangup preserves an undelivered completed result without another action', async t => {
+  const f = await fixture(t, { watchUntilCallEnds: true });
+  let publications = 0;
+  f.options.observation = { signal: f.controller.signal, async publish() {
+    publications++;
+    if (publications === 3) f.controller.abort();
+    return { delivery: { eventId: '', status: 'stale' } };
+  } };
+  f.add('Read my balance.'); f.speech();
+  await f.backend.delegate(f.request(), f.channel);
+  assert.equal(publications, 3); assert.equal(f.posts.length, 1); assert.equal(f.reads.length, 1);
+  assert.equal(f.saved()[0].status, 'completed'); assert.equal(f.saved()[0].primaryResult?.state, 'completed');
+});
+
+test('a deferred completed answer yields to queued work and resumes during its running polls', async t => {
+  const f = await blockedQueueFixture(t);
+  f.options.watchUntilCallEnds = true;
+  const presented: string[] = [];
+  let attempts = 0;
+  f.options.observation = { signal: f.controller.signal, async publish(entry) {
+    if (entry.requestId === f.posts[0].requestId) {
+      attempts++;
+      if (attempts < 6) return { delivery: { eventId: '', status: 'stale' } };
+      assert.equal(f.posts.length, 2, 'the later request must not starve behind repeated interruptions');
+    }
+    presented.push(entry.requestId);
+    return { delivery: { eventId: `accepted_${entry.requestId}`, status: 'accepted' } };
+  } };
+  const result = f.behavior.result;
+  f.behavior.result = async id => {
+    if (id === f.posts[0].requestId) return result(id);
+    return presented.includes(f.posts[0].requestId) ? f.completed(id) : { bindingId, requestId: id, state: 'running' };
+  };
+  f.release(); await Promise.all([f.first, f.second]);
+  assert.equal(attempts, 6); assert.equal(f.posts.length, 2);
+  assert.deepEqual(presented, f.posts.map(post => post.requestId));
+  assert.equal(f.saved()[0].delivery, 'accepted');
+});
+
+async function awaitStatus(predicate: () => boolean) {
+  for (let i = 0; i < 300; i++) { if (predicate()) return; await wait(5); }
+  assert.ok(predicate(), 'expected bounded status observation');
+}
+
+test('recorded sale, progress questions, queued buy and check retain truthful status through 503 and hangup', async t => {
+  const f = await fixture(t, { watchUntilCallEnds: true, progressIntervalMs: 15 });
+  f.add('Um, I probably want to sell four dollars of the Apple stock that I just bought recently'); f.speech();
+  let unavailable = false;
+  f.behavior.result = async id => {
+    if (unavailable) throw new PrimaryApiError('http_error', 503, { code: 'temporarily_unavailable', retryable: true });
+    return { bindingId, requestId: id, state: 'running' };
+  };
+  const first = f.backend.delegate(f.request(), f.channel);
+  await awaitStatus(() => f.reads.length > 0);
+  f.add("Okay, it's been thirty seconds. How much longer is it going to be", 3000, 3500); f.speech(3000, 3500);
+  await awaitStatus(() => f.updates.some(u => u.text === 'I am still waiting for the result of your earlier request.'));
+  f.add('How about you buy a dollar worth', 6000, 6400); f.speech(6000, 6400);
+  const buy = f.backend.delegate(f.request('buy_later'), f.channel);
+  await awaitStatus(() => f.saved()[0].deferredTurns?.length === 1);
+  await awaitStatus(() => f.updates.some(u => u.text === 'Your later requests are queued behind the earlier request. They have not started.'));
+  assert.equal(f.posts.length, 1);
+  unavailable = true;
+  f.add('Check again', 9000, 9400); f.speech(9000, 9400);
+  const check = f.backend.delegate(f.request('check_later'), f.channel);
+  await awaitStatus(() => f.saved()[0].deferredTurns?.length === 2);
+  await awaitStatus(() => f.updates.some(u => u.text === 'I cannot get the latest status of the earlier request. Your later requests are queued and have not started.'));
+  assert.equal(f.saved()[0].lastResultReadError?.status, 503);
+  assert.equal(f.saved()[0].primaryResult?.state, 'running');
+  assert.equal(f.posts.length, 1);
+  assert.ok(f.updates.every(u => !/switch|cancelled|buying|selling|checking again/i.test(u.text)));
+  f.store.update(f.call.id, { endedAt: new Date().toISOString(), status: 'completed' }); f.controller.abort();
+  await Promise.all([first, buy, check]);
+  assert.equal(f.posts.length, 1);
+  assert.deepEqual(f.saved()[0].deferredTurns?.map(turn => turn.status), ['queued', 'queued']);
+});
+
+test('repeated deferred notices retain their budget and a recovered GET retains diagnostic without stale error speech', async t => {
+  const f = await fixture(t, { watchUntilCallEnds: true, progressIntervalMs: 5 });
+  let attempts = 0, recovered = false, done = false;
+  const accepted: string[] = [];
+  f.options.observation = { signal: f.controller.signal, async publish(_entry, update) {
+    if (!update) return { delivery: { eventId: 'terminal', status: 'accepted' } };
+    attempts++;
+    if (attempts < 8) return { delivery: { eventId: '', status: 'stale' } };
+    accepted.push(update.text); return { delivery: { eventId: `accepted_${attempts}`, status: 'accepted' } };
+  } };
+  f.behavior.result = async id => {
+    if (done) return f.completed(id);
+    if (!recovered) throw new PrimaryApiError('http_error', 503, { code: 'temporarily_unavailable', retryable: true });
+    return { bindingId, requestId: id, state: 'running' };
+  };
+  f.add('Sell four dollars of Apple.'); f.speech();
+  const work = f.backend.delegate(f.request(), f.channel);
+  await awaitStatus(() => accepted.length > 0);
+  assert.ok(attempts >= 8); assert.match(accepted[0], /cannot get the latest status/);
+  recovered = true;
+  await awaitStatus(() => accepted.some(text => text === 'Your request is still being handled. I am waiting for its result.'));
+  assert.equal(f.saved()[0].resultReadUnavailable, false);
+  assert.equal(f.saved()[0].lastResultReadError?.status, 503, 'keep original bounded failure evidence');
+  done = true; await work;
+  assert.equal(f.posts.length, 1); assert.equal(f.saved()[0].delivery, 'accepted');
+});
+
+test('uncertain status append is not repeated without a new caller or observed state', async t => {
+  const f = await fixture(t, { watchUntilCallEnds: true, progressIntervalMs: 5 });
+  let notices = 0, done = false;
+  f.options.observation = { signal: f.controller.signal, async publish(_entry, update) {
+    if (update) { notices++; return { delivery: { eventId: '', status: 'unconfirmed' } }; }
+    return { delivery: { eventId: 'result', status: 'accepted' } };
+  } };
+  f.behavior.result = async id => done ? f.completed(id) : { bindingId, requestId: id, state: 'running' };
+  f.add('Sell four dollars of Apple.'); f.speech(); const work = f.backend.delegate(f.request(), f.channel);
+  await awaitStatus(() => notices === 1); await wait(60); assert.equal(notices, 1);
+  done = true; await work; assert.equal(f.posts.length, 1);
+});
+
+test('a saved tool observation is delivered once while the same request waits and resumes', async t => {
+  const f = await fixture(t, { maxPollMs: 5000 });
+  const partialResult = { kind: 'portfolio' as const, text: 'The portfolio observation lists 8 SOL.',
+    toolInvocationId: '77777777-7777-4777-8777-777777777777', observedAt: '2026-10-02T21:00:00.000Z' };
+  let polls = 0;
+  f.behavior.result = async id => ++polls < 4 ? { bindingId, requestId: id, state: 'running', partialResult,
+    failure: { kind: 'provider_cooldown', retryAt: '2026-10-02T21:01:00.000Z', retryAfterSeconds: 60 - polls } }
+    : { bindingId, requestId: id, state: 'failed', partialResult, failure: { kind: 'provider_request_budget' },
+      error: { code: 'provider_request_budget_exceeded', retryable: false } };
+  f.add('Show my portfolio.'); f.speech();
+  await f.backend.delegate(f.request(), f.channel);
+  assert.equal(f.updates.filter(update => update.text === partialResult.text).length, 1);
+  assert.equal(f.saved()[0].partialDelivery?.status, 'accepted');
+  assert.equal(f.posts.length, 1); assert.equal(new Set(f.reads).size, 1);
+  assert.equal(f.saved()[0].status, 'failed'); assert.equal(f.saved()[0].primaryResult?.assistant, undefined);
+  assert.match(f.updates.at(-1)!.text, /processing limit/);
+  assert.doesNotMatch(f.updates.at(-1)!.text, /8 SOL/);
+  const backend = createPrimaryBackend(f.options);
+  await backend.delegate(f.request(), f.channel);
+  assert.equal(f.updates.filter(update => update.text === partialResult.text).length, 1);
+  assert.equal(f.posts.length, 1);
+});
+
+test('a lost partial append receipt cannot replay the observation or resubmit the request', async t => {
+  const f = await fixture(t);
+  const partialResult = { kind: 'portfolio' as const, text: 'The portfolio observation lists 8 SOL.',
+    toolInvocationId: '77777777-7777-4777-8777-777777777777', observedAt: '2026-10-02T21:00:00.000Z' };
+  f.behavior.result = async id => ({ bindingId, requestId: id, state: 'running', partialResult });
+  let appends = 0;
+  const publish = f.channel.publish;
+  f.channel.publish = async update => {
+    if (update.text === partialResult.text) { appends++; throw new Error('receipt lost'); }
+    return publish(update);
+  };
+  f.add('Show my portfolio.'); f.speech();
+  await f.backend.delegate(f.request(), f.channel);
+  const backend = createPrimaryBackend(f.options);
+  await backend.delegate(f.request(), f.channel);
+  assert.equal(appends, 1); assert.equal(f.posts.length, 1);
+  assert.equal(f.saved()[0].partialDelivery?.status, 'unconfirmed');
+});
+
+test('a saved action observation cannot silently change its financial intent on a later poll', async t => {
+  const f = await fixture(t, { maxPollMs: 5000 });
+  const partialResult = { kind: 'action_status' as const, text: 'The saved action is submitted and awaits its final outcome.',
+    toolInvocationId: '77777777-7777-4777-8777-777777777777', observedAt: '2026-10-02T21:00:00.000Z',
+    intentId: '88888888-8888-4888-8888-888888888888', actionState: 'submitted' as const };
+  let reads = 0;
+  f.behavior.result = async id => {
+    reads++;
+    if (reads === 3) assert.equal(f.saved()[0].resultReadUnavailable, true);
+    if (reads === 2) return { bindingId, requestId: id, state: 'failed',
+      partialResult: { ...partialResult, intentId: '99999999-9999-4999-8999-999999999999' },
+      error: { code: 'provider_busy', retryable: false } };
+    if (reads >= 3) return { bindingId, requestId: id, state: 'failed', partialResult,
+      error: { code: 'provider_busy', retryable: false } };
+    return { bindingId, requestId: id, state: 'running', partialResult };
+  };
+  f.add('Check my saved purchase.'); f.speech(); await f.backend.delegate(f.request(), f.channel);
+  assert.equal(reads, 3); assert.deepEqual(f.saved()[0].primaryResult?.partialResult, partialResult);
+  assert.equal(f.posts.length, 1);
+  assert.equal(f.updates.filter(update => update.text === partialResult.text).length, 1);
 });

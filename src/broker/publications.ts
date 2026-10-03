@@ -9,6 +9,7 @@ import { callerIntentResultSchema, type CallerIntentDecision, type CallerIntentR
 import { liveGenerationJournalSchema } from './liveGeneration.js';
 import type { BrokerDelegationRecord } from './backend.js';
 import type { LiveBackendUpdate, LiveDelivery, LiveTranscriptSnapshot } from '../live/types.js';
+import { hasLaterCallerSpeech } from './voicePresentation.js';
 import { terminalCallStatuses, type BrokerCall, type BrokerStore } from './store.js';
 
 export interface BrokerPublicationReference {
@@ -48,6 +49,7 @@ export interface SelectedQuestionPublication {
   chunkCount: number;
 }
 export interface OrdinaryPublicationEvidence {
+  historical?: true;
   response: z.infer<typeof eligibleDeliveryResponseSchema>;
   chunkIndex: number;
   chunkCount: number;
@@ -123,7 +125,7 @@ const equal = (a: unknown, b: unknown) => canonicalJson(a) === canonicalJson(b);
 const ordinaryPublicationSchema = selectedPublicationSchema.omit({ selectedDelivery: true }).extend({
   sourceSessionId: z.string().min(1).max(200).optional(),
   requestState: z.literal('completed'),
-  ordinaryDelivery: z.object({ response: eligibleDeliveryResponseSchema,
+  ordinaryDelivery: z.object({ response: eligibleDeliveryResponseSchema, historical:z.literal(true).optional(),
     chunkIndex: z.number().int().safe().nonnegative(), chunkCount: z.number().int().safe().positive() }).strict(),
 }).strict();
 
@@ -142,7 +144,8 @@ function ordinaryPublicationMatches(call: BrokerCall, input: BrokerPublicationRe
     || delivery.state !== 'ready' || delivery.source.kind !== 'assistant' || 'question' in delivery
     || delivery.source.messageId !== result.assistant.messageId
     || delivery.source.provenance.eventId !== result.assistant.eventId || delivery.source.eventSequence !== result.assistant.sequence
-    || !equal(response.version, segment.version)
+    || (!equal(response.version, segment.version) && !call.statusContextRefreshes?.some(refresh=>
+      refresh.kind==='admitted_sources' && refresh.generationId===segment.generationId && equal(refresh.version,response.version)))
     || response.version.ownerPrincipalId !== generations.binding.ownerPrincipalId
     || response.version.primaryDexterId !== generations.binding.primaryDexterId
     || response.version.threadId !== generations.binding.threadId
@@ -153,7 +156,7 @@ function ordinaryPublicationMatches(call: BrokerCall, input: BrokerPublicationRe
     || generations.deliveryAttachment.sessionId !== segment.sessionId
     || Date.now() >= Date.parse(generations.clocks.callDeadlineAt))) return false;
   let chunks: string[];
-  try { chunks = liveResultChunks(delivery.text); } catch { return false; }
+  try { chunks = liveResultChunks(saved.historical ? `For your earlier request: ${delivery.text}` : delivery.text); } catch { return false; }
   return saved.chunkCount === chunks.length && saved.chunkIndex < chunks.length
     && record.textDigest === createHash('sha256').update(chunks[saved.chunkIndex]!, 'utf8').digest('hex');
 }
@@ -179,7 +182,8 @@ function selectedPublicationMatches(call: BrokerCall, input: BrokerPublicationRe
     || record.requestId !== host.initial.request.originalRequestId || response.requestId !== record.requestId
     || response.deliveryAssociation.execution.requestId !== record.requestId
     || !equal(response.deliveryAssociation, slot.record.base.association)
-    || !equal(response.version, segment.version)
+    || (!equal(response.version, segment.version) && !call.statusContextRefreshes?.some(refresh=>
+      refresh.kind==='admitted_sources' && refresh.generationId===segment.generationId && equal(refresh.version,response.version)))
     || response.version.ownerPrincipalId !== host.initial.scope.ownerPrincipalId
     || response.version.primaryDexterId !== host.initial.scope.primaryDexterId
     || response.version.threadId !== host.initial.scope.threadId
@@ -493,7 +497,7 @@ export function selectedQuestionPublicationReceiptsAccepted(call: BrokerCall,
 /** The intent is durable before the caller of this function sends commentary. */
 export function beginBrokerPublication(store: Store, identity: BrokerPublicationIdentity, requestId: string,
   update: LiveBackendUpdate, snapshot: LiveTranscriptSnapshot,
-  ordinaryDelivery?: Pick<OrdinaryPublicationEvidence, 'response' | 'chunkIndex'>): { record: BrokerPublicationRecord; created: boolean } | undefined {
+  ordinaryDelivery?: Pick<OrdinaryPublicationEvidence, 'response' | 'chunkIndex' | 'historical'>): { record: BrokerPublicationRecord; created: boolean } | undefined {
   const call = store.get(identity.callId);
   if (!call || !active(call) || !sameCall(call, identity) || !requestMatches(call, identity, requestId)
       || update.speak !== true || !['progress', 'result'].includes(update.kind) || !commandId(update.id)
@@ -504,10 +508,11 @@ export function beginBrokerPublication(store: Store, identity: BrokerPublication
     const response = eligibleDeliveryResponseSchema.parse(ordinaryDelivery.response);
     if (response.delivery.state !== 'ready' || response.delivery.source.kind !== 'assistant'
       || 'question' in response.delivery || update.kind !== 'result') throw new Error('ordinary_publication_source_changed');
-    const chunks = liveResultChunks(response.delivery.text), index = ordinaryDelivery.chunkIndex;
+    if(ordinaryDelivery.historical && !hasLaterCallerSpeech(call,call.delegations[requestId] as BrokerDelegationRecord)) throw new Error('ordinary_publication_context_changed');
+    const chunks = liveResultChunks(ordinaryDelivery.historical ? `For your earlier request: ${response.delivery.text}` : response.delivery.text), index = ordinaryDelivery.chunkIndex;
     if (!Number.isSafeInteger(index) || index < 0 || index >= chunks.length || chunks[index] !== update.text)
       throw new Error('ordinary_publication_render_changed');
-    evidence = { response, chunkIndex: index, chunkCount: chunks.length };
+    evidence = { response, chunkIndex: index, chunkCount: chunks.length,...(ordinaryDelivery.historical?{historical:true}:{}) };
   }
   const intent = { ...identity, updateId: update.id, requestId, requestState: call.delegations[requestId].status,
     kind: update.kind, speak: true as const, textDigest: createHash('sha256').update(update.text, 'utf8').digest('hex'),

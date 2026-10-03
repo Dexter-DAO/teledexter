@@ -20,6 +20,7 @@ test('Phone teaches the hosted opaque-intent purchase sequence', () => {
     'x402_access',
     'x402_wallet',
     'dexter_portfolio',
+    'dexter_find_assets',
     'dexter_prepare_asset_action',
     'dexter_execute_asset_action',
     'dexter_asset_action_status',

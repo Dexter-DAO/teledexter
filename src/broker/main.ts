@@ -1,4 +1,5 @@
 import dotenv from 'dotenv';
+import { createBrokerSmsBridge, type BrokerSmsBridge } from './sms.js';
 import { BrokerStore } from './store.js';
 import { createInboundHoldAdapter } from './inboundHold.js';
 import { brokerConfig } from './config.js';
@@ -8,13 +9,17 @@ import { createSelectedQuestionAssociationClient } from './selectedQuestion.js';
 import { createRequestDeliveryClient } from './requestDelivery.js';
 import { createPrimaryCallerIntentClient } from './callerIntentClient.js';
 import { safeFailure } from './phone.js';
+import { createOpenAILiveConnection } from '../live/session.js';
 
 dotenv.config({ path: process.env.BROKER_ENV_FILE || '.env' });
+let sms: BrokerSmsBridge | undefined;
 try {
   const config = brokerConfig(process.env);
+  sms = await createBrokerSmsBridge(process.env, process.cwd());
   const setup = config.verificationSetup;
   const setupStore = setup ? new BrokerStore(config.stateDir) : undefined;
-  const broker = createBrokerServer({ config,
+  const broker = createBrokerServer({ config, sms,
+    inboundPreconnect: () => createOpenAILiveConnection(config.apiKey),
     ...(setup && setupStore ? { store: setupStore,
       inboundAttachment: createInboundHoldAdapter({ publicOrigin: config.publicOrigin, store: setupStore }),
       restrictedSetup: { model: setup.model, receiptTransport: { apiBaseUrl: setup.apiBaseUrl, signingSecret: setup.signingSecret } },
@@ -47,4 +52,4 @@ try {
   broker.server.listen(config.port, config.host, () => {
     console.log(JSON.stringify({ service: 'dexter-broker', model: config.model, voice: config.voice, port: config.port }));
   });
-} catch (error) { console.error(JSON.stringify(safeFailure(error))); process.exitCode = 1; }
+} catch (error) { await sms?.close().catch(() => {}); console.error(JSON.stringify(safeFailure(error))); process.exitCode = 1; }

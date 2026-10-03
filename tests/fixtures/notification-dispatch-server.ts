@@ -14,7 +14,7 @@ const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'notification-broker-jou
 const config: BrokerConfig = { host: '127.0.0.1', port: 0, publicOrigin: 'https://fixture.invalid',
   stateDir: directory, controlToken: 'fixture-control-'.repeat(4), apiKey: 'fixture-key', model: 'gpt-live-1', voice: 'marin',
   twilioAccountSid: `AC${'1'.repeat(32)}`, twilioAuthToken: 'fixture-secret', from: '+12025550100',
-  allowedTo: ['+12025550123'], apiBaseUrl: 'https://fixture.invalid', phoneServiceSecret: 's'.repeat(40), maxCallSeconds: 60,
+  allowedTo: ['+12025550123'], apiBaseUrl: process.env.NOTIFICATION_FIXTURE_API_ORIGIN!, phoneServiceSecret: 's'.repeat(40), maxCallSeconds: 60,
   harkInternalToken: 'fixture-hark-token', harkApiBaseUrl: process.env.NOTIFICATION_FIXTURE_API_ORIGIN };
 const dispatches: unknown[] = [];
 const provider = Object.assign((_sid: string) => ({ async fetch() { throw new Error('unexpected_provider_read'); },

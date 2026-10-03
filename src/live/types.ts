@@ -116,6 +116,7 @@ export interface BrokerLiveSessionOptions {
 export interface BrokerLiveSession {
   appendAudio(base64: string): boolean;
   appendContext(text: string): Promise<LiveDelivery>;
+  publishDelegation?(delegationId:string,update:LiveBackendUpdate):Promise<LiveDelivery>;
   appendInstructions(text: string): Promise<LiveDelivery>;
   /** Unaddressed spoken result publication; never resumes an earlier delegation. */
   appendCommentary?(text: string): Promise<LiveDelivery>;

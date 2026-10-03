@@ -1,0 +1,305 @@
+{
+  "v": "phone.caller-intent.v3.fixtures.v1",
+  "cases": [
+    {
+      "name": "empty",
+      "operationId": "00000011-0000-4000-8000-000000000000",
+      "bindingId": "00000001-0000-4000-8000-000000000000",
+      "input": {
+        "v": "phone.caller-intent.v3",
+        "source": {
+          "callSid": "CAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "sourceEventId": "00000012-0000-4000-8000-000000000000",
+          "itemId": "item_1",
+          "revision": 1,
+          "receivedAt": "2026-09-24T17:00:00.000Z",
+          "role": "user",
+          "text": "  Keep café and café separate.\nThen answer.  "
+        },
+        "generationId": "00000013-0000-4000-8000-000000000000",
+        "sourceSessionId": "session opaque 1",
+        "brokerInputDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "presentationDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "callDeadlineAt": "2026-09-24T17:00:30.000Z",
+        "version": {
+          "ownerPrincipalId": "00000014-0000-4000-8000-000000000000",
+          "primaryDexterId": "00000015-0000-4000-8000-000000000000",
+          "threadId": "00000016-0000-4000-8000-000000000000",
+          "contextEpoch": "4",
+          "threadEventSequence": "27",
+          "digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        },
+        "questions": [],
+        "results": [],
+        "resultCoverage": {
+          "state": "complete",
+          "count": 0
+        },
+        "tasks": [],
+        "taskCoverage": {
+          "state": "complete",
+          "count": 0,
+          "inventoryDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "sha256": "4d91786e895d9d85ebbdf74aef517e314a4d70f00f68595effdee0ed20e97376",
+      "response": {
+        "v": "phone.caller-intent.v3",
+        "operationId": "00000011-0000-4000-8000-000000000000",
+        "bindingId": "00000001-0000-4000-8000-000000000000",
+        "inputDigest": "4d91786e895d9d85ebbdf74aef517e314a4d70f00f68595effdee0ed20e97376",
+        "brokerInputDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "presentationDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "generationId": "00000013-0000-4000-8000-000000000000",
+        "sourceSessionId": "session opaque 1",
+        "callDeadlineAt": "2026-09-24T17:00:30.000Z",
+        "questions": [],
+        "results": [],
+        "resultCoverage": {
+          "state": "complete",
+          "count": 0
+        },
+        "resultContextCoverage": {
+          "state": "complete"
+        },
+        "reservedAt": "2026-09-24T17:00:01.000Z",
+        "validUntil": "2026-09-24T17:00:11.000Z",
+        "version": {
+          "ownerPrincipalId": "00000014-0000-4000-8000-000000000000",
+          "primaryDexterId": "00000015-0000-4000-8000-000000000000",
+          "threadId": "00000016-0000-4000-8000-000000000000",
+          "contextEpoch": "4",
+          "threadEventSequence": "27",
+          "digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        },
+        "state": "resolved",
+        "decision": {
+          "kind": "task",
+          "delivery": {
+            "kind": "sms_result"
+          }
+        },
+        "tasks": [],
+        "taskCoverage": {
+          "state": "complete",
+          "count": 0,
+          "inventoryDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    },
+    {
+      "name": "selected",
+      "operationId": "00000011-0000-4000-8000-000000000000",
+      "bindingId": "00000001-0000-4000-8000-000000000000",
+      "input": {
+        "v": "phone.caller-intent.v3",
+        "source": {
+          "callSid": "CAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "sourceEventId": "00000012-0000-4000-8000-000000000000",
+          "itemId": "item_1",
+          "revision": 1,
+          "receivedAt": "2026-09-24T17:00:00.000Z",
+          "role": "user",
+          "text": "  Keep café and café separate.\nThen answer.  "
+        },
+        "generationId": "00000013-0000-4000-8000-000000000000",
+        "sourceSessionId": "session opaque 1",
+        "brokerInputDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "presentationDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "callDeadlineAt": "2026-09-24T17:00:30.000Z",
+        "version": {
+          "ownerPrincipalId": "00000014-0000-4000-8000-000000000000",
+          "primaryDexterId": "00000015-0000-4000-8000-000000000000",
+          "threadId": "00000016-0000-4000-8000-000000000000",
+          "contextEpoch": "4",
+          "threadEventSequence": "27",
+          "digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        },
+        "questions": [],
+        "results": [],
+        "resultCoverage": {
+          "state": "complete",
+          "count": 0
+        },
+        "tasks": [
+          {
+            "execution": {
+              "bindingId": "00000001-0000-4000-8000-000000000000",
+              "requestId": "70000000-0000-4000-8000-000000000001",
+              "runId": "70000000-0000-4000-8000-000000000002"
+            }
+          }
+        ],
+        "taskCoverage": {
+          "state": "complete",
+          "count": 1,
+          "inventoryDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "sha256": "c671adb3fb81add7968a79003a0df3c4914bd452bb72d2af8225761974e401b1",
+      "response": {
+        "v": "phone.caller-intent.v3",
+        "operationId": "00000011-0000-4000-8000-000000000000",
+        "bindingId": "00000001-0000-4000-8000-000000000000",
+        "inputDigest": "c671adb3fb81add7968a79003a0df3c4914bd452bb72d2af8225761974e401b1",
+        "brokerInputDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "presentationDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "generationId": "00000013-0000-4000-8000-000000000000",
+        "sourceSessionId": "session opaque 1",
+        "callDeadlineAt": "2026-09-24T17:00:30.000Z",
+        "questions": [],
+        "results": [],
+        "resultCoverage": {
+          "state": "complete",
+          "count": 0
+        },
+        "resultContextCoverage": {
+          "state": "complete"
+        },
+        "reservedAt": "2026-09-24T17:00:01.000Z",
+        "validUntil": "2026-09-24T17:00:11.000Z",
+        "version": {
+          "ownerPrincipalId": "00000014-0000-4000-8000-000000000000",
+          "primaryDexterId": "00000015-0000-4000-8000-000000000000",
+          "threadId": "00000016-0000-4000-8000-000000000000",
+          "contextEpoch": "4",
+          "threadEventSequence": "27",
+          "digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        },
+        "state": "resolved",
+        "decision": {
+          "kind": "deliver_result",
+          "target": {
+            "bindingId": "00000001-0000-4000-8000-000000000000",
+            "requestId": "70000000-0000-4000-8000-000000000001",
+            "runId": "70000000-0000-4000-8000-000000000002"
+          },
+          "delivery": {
+            "kind": "sms_result"
+          }
+        },
+        "tasks": [
+          {
+            "execution": {
+              "bindingId": "00000001-0000-4000-8000-000000000000",
+              "requestId": "70000000-0000-4000-8000-000000000001",
+              "runId": "70000000-0000-4000-8000-000000000002"
+            }
+          }
+        ],
+        "taskCoverage": {
+          "state": "complete",
+          "count": 1,
+          "inventoryDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    },
+    {
+      "name": "partial",
+      "operationId": "00000011-0000-4000-8000-000000000000",
+      "bindingId": "00000001-0000-4000-8000-000000000000",
+      "input": {
+        "v": "phone.caller-intent.v3",
+        "source": {
+          "callSid": "CAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "sourceEventId": "00000012-0000-4000-8000-000000000000",
+          "itemId": "item_1",
+          "revision": 1,
+          "receivedAt": "2026-09-24T17:00:00.000Z",
+          "role": "user",
+          "text": "  Keep café and café separate.\nThen answer.  "
+        },
+        "generationId": "00000013-0000-4000-8000-000000000000",
+        "sourceSessionId": "session opaque 1",
+        "brokerInputDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "presentationDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "callDeadlineAt": "2026-09-24T17:00:30.000Z",
+        "version": {
+          "ownerPrincipalId": "00000014-0000-4000-8000-000000000000",
+          "primaryDexterId": "00000015-0000-4000-8000-000000000000",
+          "threadId": "00000016-0000-4000-8000-000000000000",
+          "contextEpoch": "4",
+          "threadEventSequence": "27",
+          "digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        },
+        "questions": [],
+        "results": [],
+        "resultCoverage": {
+          "state": "complete",
+          "count": 0
+        },
+        "tasks": [
+          {
+            "execution": {
+              "bindingId": "00000001-0000-4000-8000-000000000000",
+              "requestId": "70000000-0000-4000-8000-000000000001",
+              "runId": "70000000-0000-4000-8000-000000000002"
+            }
+          }
+        ],
+        "taskCoverage": {
+          "state": "partial",
+          "count": 21,
+          "inventoryDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "sha256": "0641a59efb551d0f380c0b0417e6dd362e195066dfdc738d8e5e40bd4eb54e60",
+      "response": {
+        "v": "phone.caller-intent.v3",
+        "operationId": "00000011-0000-4000-8000-000000000000",
+        "bindingId": "00000001-0000-4000-8000-000000000000",
+        "inputDigest": "0641a59efb551d0f380c0b0417e6dd362e195066dfdc738d8e5e40bd4eb54e60",
+        "brokerInputDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "presentationDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "generationId": "00000013-0000-4000-8000-000000000000",
+        "sourceSessionId": "session opaque 1",
+        "callDeadlineAt": "2026-09-24T17:00:30.000Z",
+        "questions": [],
+        "results": [],
+        "resultCoverage": {
+          "state": "complete",
+          "count": 0
+        },
+        "resultContextCoverage": {
+          "state": "complete"
+        },
+        "reservedAt": "2026-09-24T17:00:01.000Z",
+        "validUntil": "2026-09-24T17:00:11.000Z",
+        "version": {
+          "ownerPrincipalId": "00000014-0000-4000-8000-000000000000",
+          "primaryDexterId": "00000015-0000-4000-8000-000000000000",
+          "threadId": "00000016-0000-4000-8000-000000000000",
+          "contextEpoch": "4",
+          "threadEventSequence": "27",
+          "digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        },
+        "state": "resolved",
+        "decision": {
+          "kind": "deliver_result",
+          "target": {
+            "bindingId": "00000001-0000-4000-8000-000000000000",
+            "requestId": "70000000-0000-4000-8000-000000000001",
+            "runId": "70000000-0000-4000-8000-000000000002"
+          },
+          "delivery": {
+            "kind": "sms_result"
+          }
+        },
+        "tasks": [
+          {
+            "execution": {
+              "bindingId": "00000001-0000-4000-8000-000000000000",
+              "requestId": "70000000-0000-4000-8000-000000000001",
+              "runId": "70000000-0000-4000-8000-000000000002"
+            }
+          }
+        ],
+        "taskCoverage": {
+          "state": "partial",
+          "count": 21,
+          "inventoryDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    }
+  ]
+}

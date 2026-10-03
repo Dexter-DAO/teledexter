@@ -53,27 +53,41 @@ export function mediaStart(start: Record<string, unknown>, expected: { accountSi
 export class PlaybackReceipts {
   sentBytes = 0; playedBytes = 0; clearedBytes = 0;
   private next = 0;
-  private pending = new Map<string, { bytes: number; cleared: boolean }>();
-  sent(bytes: number): string {
+  audibleSentBytes = 0; audiblePlayedBytes = 0; audibleClearedBytes = 0;
+  private pending = new Map<string, { bytes: number; cleared: boolean; audible: boolean }>();
+  sent(bytes: number, audible = true): string {
     this.sentBytes += bytes;
+    if (audible) this.audibleSentBytes += bytes;
     const id = `broker-audio-${++this.next}`;
-    this.pending.set(id, { bytes, cleared: false });
+    this.pending.set(id, { bytes, cleared: false, audible });
     return id;
   }
   acknowledge(id: string) {
     const item = this.pending.get(id);
     if (!item) return;
-    if (!item.cleared) this.playedBytes += item.bytes;
+    if (!item.cleared) {
+      this.playedBytes += item.bytes;
+      if (item.audible) this.audiblePlayedBytes += item.bytes;
+    }
     this.pending.delete(id);
   }
   clear() {
     for (const item of this.pending.values()) {
-      if (!item.cleared) this.clearedBytes += item.bytes;
+      if (!item.cleared) {
+        this.clearedBytes += item.bytes;
+        if (item.audible) this.audibleClearedBytes += item.bytes;
+      }
       item.cleared = true;
     }
   }
   get backlogMs() { return (this.sentBytes - this.playedBytes - this.clearedBytes) / 8; }
   get pendingCount() { return this.pending.size; }
+}
+
+/** Only the two exact PCMU zero encodings are silence. Quiet speech still
+ * owns its playback mark; no energy threshold can discard it as inaudible. */
+export function hasAudiblePcmu(bytes: Buffer): boolean {
+  return bytes.length === 0 || bytes.some(byte => byte !== 0xff && byte !== 0x7f);
 }
 
 /** PCMU energy helps avoid submitting while the caller is still speaking. */

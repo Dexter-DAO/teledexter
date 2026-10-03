@@ -3,6 +3,7 @@ import test from 'node:test';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { createServer } from 'node:http';
 import Twilio from 'twilio';
 import { WebSocket } from 'ws';
 import { createBrokerServer } from '../src/broker/server.js';
@@ -18,6 +19,7 @@ import { createRequestDeliveryJournal, retainRequestDeliveryAssociation, PHONE_R
   type RequestDeliveryQuestionResult, type RequestDeliveryResult } from '../src/broker/requestDelivery.js';
 import type { BrokerConfig } from '../src/broker/config.js';
 import type { EligibleContextClient, EligiblePhoneCall } from '../src/broker/eligibleContext.js';
+import { createPrimaryApiClient } from '../src/broker/primaryApi.js';
 import type { PrimaryApiClient, PrimarySubmission, PrimaryTurn, PrimaryQuestionResult,
   PrimaryReplyInput, PrimaryResult } from '../src/broker/primaryApi.js';
 import type { BrokerLiveSession, BrokerLiveSessionOptions, LiveBackendChannel,
@@ -43,7 +45,8 @@ async function until(predicate: () => boolean, label: string) {
 }
 type IntentOutcome = 'task' | 'ordinary_answer' | 'selected_answer' | 'ambiguous' | 'lost';
 
-async function fixture(t: test.TestContext, options: { ordinaryQuestion?: boolean } = {}) {
+async function fixture(t: test.TestContext, options: { ordinaryQuestion?: boolean; phoneTrade?: 'buy'|'sell'; primaryHttp?: boolean; ordinaryOnly?: boolean } = {}) {
+  options={...options,ordinaryQuestion:options.ordinaryQuestion || !!options.phoneTrade};
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-mixed-server-'));
   const store = new BrokerStore(directory);
   let ws: WebSocket | undefined, closeHost: (() => Promise<void>) | undefined;
@@ -61,14 +64,15 @@ async function fixture(t: test.TestContext, options: { ordinaryQuestion?: boolea
     stateDir: directory, controlToken: 'c'.repeat(40), apiKey: 'fixture-key', model: 'gpt-live-1', voice: 'marin',
     twilioAccountSid: accountSid, twilioAuthToken: 'fixture-token', from: '+12025550100', allowedTo: ['+12025550123'],
     apiBaseUrl: 'https://api.example.test', phoneServiceSecret: 's'.repeat(40), maxCallSeconds: 60 };
-  const call = store.reserve({ requestId: id(10), number: config.allowedTo[0]!, direction: 'outbound', callSid,
-    purpose: 'Review the saved comparison.', continuation: { originalRequestId: originalRequest, questionId, questionRevision: 1 } },
-  'authenticated_broker_control').call;
+  const call = store.reserve({ requestId: id(10), number: config.allowedTo[0]!, direction: options.ordinaryOnly ? 'inbound' : 'outbound', callSid,
+    purpose: options.phoneTrade ? 'Help with the requested trade.' : 'Review the saved comparison.',
+    ...(options.ordinaryOnly ? {} : {continuation: { originalRequestId: originalRequest, questionId, questionRevision: 1 as const }}) },
+  options.ordinaryOnly ? undefined : 'authenticated_broker_control').call;
   const createdAt = new Date().toISOString(), expiresAt = new Date(Date.now() + 120_000).toISOString();
   const assignmentRef = { assignmentId: call.requestId, revision: 1 as const, digest: 'a'.repeat(64) };
   const version = { ownerPrincipalId: owner, primaryDexterId: primaryId, threadId,
     contextEpoch: '1', threadEventSequence: '10', digest: 'b'.repeat(64) };
-  const context = (): EligiblePhoneCall => ({ bindingId, callSid, state: 'open', callAssignmentRef: assignmentRef,
+  const context = (): EligiblePhoneCall => ({ bindingId, callSid, state: 'open', ...(options.ordinaryOnly ? {} : {callAssignmentRef: assignmentRef}),
     context: { primaryDexterId: primaryId, threadId, displayName: 'Dexter', messages: [], history: {
       version, pageDigest: 'c'.repeat(64), localContext: '', nextBeforeSequence: null, hasMore: false, omittedForBudget: false } } });
   store.recordPrimaryBinding(call.id, context());
@@ -105,19 +109,24 @@ async function fixture(t: test.TestContext, options: { ordinaryQuestion?: boolea
   const forbidden = async () => { throw new Error('Unexpected external API operation'); };
   const ordinaryQuestionId = id(25), ordinaryRunId = id(26);
   let ordinaryAnswer: PrimaryReplyInput | undefined;
+  const tradeQuestion=options.phoneTrade==='buy' ? 'Buy five dollars of tokenized NVIDIA shares using USDC?' : 'Sell five dollars of tokenized NVIDIA shares for USDC?';
+  const tradeYes=options.phoneTrade==='buy' ? 'Buy exactly five dollars of tokenized NVIDIA shares.' : 'Sell exactly five dollars of tokenized NVIDIA shares.';
   const ordinaryQuestion = (requestId: string): PrimaryQuestionResult => ({ bindingId, requestId,
     state: ordinaryAnswer ? 'running' : 'waiting_for_reply', question: {
       id: ordinaryQuestionId, revision: 1, runId: ordinaryRunId, threadId, agent: { id: primaryId, name: 'Dexter' },
       state: ordinaryAnswer ? 'answered' : 'pending', runState: ordinaryAnswer ? 'running' : 'waiting_for_reply',
-      question: 'Include the filing comparison?', context: 'Research only.', proposedAnswer: 'Compare the filings.',
-      yesMeaning: 'Compare the filings.', noMeaning: 'Leave out the filings.', createdAt, expiresAt,
-      reply: ordinaryAnswer ? { ...ordinaryAnswer.reply, interpretedAnswer: 'Compare the filings.',
+      question: options.phoneTrade ? tradeQuestion : 'Include the filing comparison?',
+      context: options.phoneTrade ? 'This is a simulated quote with a one percent slippage limit.' : 'Research only.',
+      proposedAnswer: options.phoneTrade ? tradeYes : 'Compare the filings.',
+      yesMeaning: options.phoneTrade ? tradeYes : 'Compare the filings.', noMeaning: options.phoneTrade ? 'Cancel this order.' : 'Leave out the filings.', createdAt, expiresAt,
+      reply: ordinaryAnswer ? { ...ordinaryAnswer.reply, interpretedAnswer: options.phoneTrade
+        ? (ordinaryAnswer.reply.answer === 'yes' ? tradeYes : 'Cancel this order.') : 'Compare the filings.',
         receivedAt: new Date().toISOString() } : null } });
   const completedTask = (requestId: string) => ({ bindingId, requestId, state: 'completed' as const,
-    assistant: { messageId: id(20), eventId: id(21), sequence: '2', text: 'The new research is saved.' } });
+    assistant: { messageId: id(20), eventId: id(21), sequence: '2', text: options.phoneTrade ? (ordinaryAnswer?.reply.answer==='yes' ? 'The simulated trade settled. Your updated holdings are saved with its receipt.' : 'The order was cancelled. No trade was submitted.') : 'The new research is saved.' } });
   const taskResult = (requestId: string): PrimaryResult => options.ordinaryQuestion && !ordinaryAnswer
     ? { ...ordinaryQuestion(requestId), state: 'waiting_for_reply' } : completedTask(requestId);
-  const primary: PrimaryApiClient = { readiness: forbidden, openCall: forbidden, getContext: forbidden,
+  const primaryPort: PrimaryApiClient = { readiness: forbidden, openCall: forbidden, getContext: forbidden,
     reconcile: forbidden,
     async question(receivedBinding, requestId, receivedQuestion) {
       assert.ok(options.ordinaryQuestion); assert.equal(receivedBinding, bindingId);
@@ -157,7 +166,7 @@ async function fixture(t: test.TestContext, options: { ordinaryQuestion?: boolea
       }
       assert.ok(taskPosts.some(post => post.requestId === requestId));
       if (options.ordinaryQuestion && input.source.kind === 'question') return { bindingId, callSid, requestId,
-        version: input.version, delivery: { state: 'ready', text: 'Include the filing comparison? Yes compares the filings. No leaves them out.',
+        version: input.version, delivery: { state: 'ready', text: options.phoneTrade ? `${tradeQuestion} Yes means ${tradeYes} No cancels the order.` : 'Include the filing comparison? Yes compares the filings. No leaves them out.',
           question: ordinaryQuestion(requestId).question, source: { kind: 'question', messageId: id(27), eventSequence: '2',
             provenance: { messageCreatedAt: createdAt, eventId: id(28), eventOccurredAt: createdAt, runId: ordinaryRunId } } } };
       assert.equal(input.source.kind, 'assistant');
@@ -168,8 +177,40 @@ async function fixture(t: test.TestContext, options: { ordinaryQuestion?: boolea
             runId: options.ordinaryQuestion ? ordinaryRunId : id(24) } } } };
     },
   };
+  const httpRequests:Array<{method:string;path:string;body:unknown}>=[];
+  let primary=primaryPort;
+  if(options.primaryHttp) {
+    const apiServer=createServer(async(req,res)=>{
+      try {
+        assert.equal(req.headers['x-dexter-binding-id'],bindingId);
+        assert.match(String(req.headers.authorization),/^Bearer [a-f0-9]{64}$/);
+        const chunks:Buffer[]=[];for await(const part of req)chunks.push(Buffer.from(part));
+        const body=chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : undefined;
+        const route=new URL(req.url!,'http://127.0.0.1').pathname.replace('/internal/primary-dexter/channels/phone','');
+        httpRequests.push({method:req.method!,path:route,body});
+        const requestMatch=route.match(/^\/requests\/([^/]+)(?:\/questions\/([^/]+)(\/reply)?)?$/);
+        let result:unknown,status=200;
+        if(route==='/requests' && req.method==='POST') {
+          status=202;result={...await primaryPort.submit(bindingId,String(req.headers['idempotency-key']),
+            {source:{...body.source,role:body.role},text:body.text,...(body.callAssignmentRef?{callAssignmentRef:body.callAssignmentRef}:{})}),replayed:false};
+        } else if(requestMatch && req.method==='GET') result=requestMatch[2]
+          ? await primaryPort.question(bindingId,requestMatch[1]!,requestMatch[2]!) : await primaryPort.result(bindingId,requestMatch[1]!);
+        else if(requestMatch?.[3] && req.method==='POST')result=await primaryPort.reply(bindingId,requestMatch[1]!,requestMatch[2]!,body);
+        else if(route===`/calls/${bindingId}/turns`)result=await primaryPort.captureTurn(bindingId,body);
+        else if(route===`/calls/${bindingId}/close`)result=await primaryPort.close(bindingId);
+        else throw new Error('Unexpected fixture API route '+route);
+        res.writeHead(status,{'Content-Type':'application/json'});res.end(JSON.stringify(result));
+      } catch {res.writeHead(500,{'Content-Type':'application/json'});res.end(JSON.stringify({error:{code:'fixture_contract_error',retryable:false}}));}
+    });
+    await new Promise<void>(resolve=>apiServer.listen(0,'127.0.0.1',resolve));
+    t.after(()=>new Promise<void>((resolve,reject)=>apiServer.close(error=>error?reject(error):resolve())));
+    primary=createPrimaryApiClient({apiBaseUrl:`http://127.0.0.1:${(apiServer.address() as {port:number}).port}`,
+      phoneServiceSecret:config.phoneServiceSecret});
+  }
   const client = createPrimaryCallerIntentClient({ apiBaseUrl: config.apiBaseUrl, phoneServiceSecret: config.phoneServiceSecret,
     fetch: async (url, init) => {
+      // This suite exercises compatibility with an API that supports caller intent v2.
+      if (String(url).endsWith('/caller-intents/candidates')) return Response.json({ error: 'not_found' }, { status: 404 });
       const headers = new Headers(init?.headers), operationId = headers.get('Idempotency-Key');
       assert.equal(String(url), config.apiBaseUrl + `/internal/primary-dexter/channels/phone/calls/${bindingId}/caller-intents`);
       assert.equal(init?.method, 'POST'); assert.ok(operationId);
@@ -249,7 +290,8 @@ async function fixture(t: test.TestContext, options: { ordinaryQuestion?: boolea
     customParameters: { token: streamToken(config.controlToken, call.id, callSid) },
     mediaFormat: { encoding: 'audio/x-mulaw', sampleRate: 8000, channels: 1 } } }));
   const currentCall = () => store.get(call.id)!;
-  await until(() => currentCall().selectedQuestionVoice?.presentations.length === 1, 'selected question presentation');
+  if(options.ordinaryOnly)await until(()=>voices.length===1 && currentCall().liveGenerations?.phase==='active','ordinary voice ready');
+  else await until(() => currentCall().selectedQuestionVoice?.presentations.length === 1, 'selected question presentation');
   const audio = (silent: boolean) => ws!.send(JSON.stringify({ event: 'media', streamSid,
     media: { track: 'inbound', payload: Buffer.alloc(160, silent ? 255 : 0).toString('base64') } }));
   const mediaOnly = async (silent: boolean) => {
@@ -284,7 +326,7 @@ async function fixture(t: test.TestContext, options: { ordinaryQuestion?: boolea
     return { request, delegate, start };
   };
   return { call, currentCall, say, voices, taskPosts, replyPosts, captures, intentPosts, suppliedOutcomes,
-    ordinaryReplyPosts, ordinaryQuestionId, holdNextIntent, mediaOnly, providerEnds: () => providerEnds };
+    ordinaryReplyPosts, ordinaryQuestionId, holdNextIntent, mediaOnly, httpRequests, providerEnds: () => providerEnds };
 }
 
 test('actual selected server routes a new task and then an exact answer without consuming the pending question as task consent', { timeout: 15_000 }, async t => {
@@ -319,6 +361,33 @@ test('actual selected server routes a new task and then an exact answer without 
 });
 
 function associationExecution() { return { bindingId: executionBinding, requestId: originalRequest, runId }; }
+
+for(const side of ['buy','sell'] as const)for(const answer of ['Yes.','No.']) {
+  test(`phone ${side} reaches the exact confirmation and preserves ${answer} through the actual Primary HTTP client`,{timeout:15_000},async t=>{
+    const f=await fixture(t,{phoneTrade:side,primaryHttp:true,ordinaryOnly:true});
+    const text=side==='buy' ? 'Buy five dollars of NVIDIA stock.' : 'Sell five dollars of my NVIDIA stock.';
+    const task=await f.say(text,'task');const pending=task.start();
+    await until(()=>Object.values(f.currentCall().delegations).some(raw=>{
+      const entry=raw as BrokerDelegationRecord;
+      return entry.status==='waiting_for_reply' && !!entry.questions?.[f.ordinaryQuestionId]?.presentation;
+    }),'trade question publication');
+    assert.equal(f.taskPosts.length,1);assert.equal(f.ordinaryReplyPosts.length,0);
+    assert.equal(f.taskPosts[0]!.input.text,text);
+    assert.ok(f.voices[0]!.comments.join(' ').includes('five dollars of tokenized NVIDIA shares'));
+    const source=await f.say(answer,'ordinary_answer',1400);await source.delegate();await source.delegate();await pending;
+    assert.equal(f.taskPosts.length,1,'confirmation cannot become a second trade request');
+    assert.equal(f.ordinaryReplyPosts.length,1,'exact replay cannot confirm a second time');
+    assert.equal(f.ordinaryReplyPosts[0]!.input.text,answer);
+    assert.equal(f.ordinaryReplyPosts[0]!.input.reply.answer,answer==='Yes.'?'yes':'no');
+    assert.equal(f.ordinaryReplyPosts[0]!.requestId,f.taskPosts[0]!.requestId);
+    const entry=f.currentCall().delegations[f.taskPosts[0]!.requestId] as BrokerDelegationRecord;
+    assert.equal(entry.status,'completed');
+    assert.ok(f.voices[0]!.comments.join(' ').includes(answer==='Yes.'?'simulated trade settled':'No trade was submitted'));
+    assert.equal(f.httpRequests.filter(r=>r.path==='/requests' && r.method==='POST').length,1);
+    assert.equal(f.httpRequests.filter(r=>r.path.endsWith('/reply') && r.method==='POST').length,1);
+    assert.equal(f.providerEnds(),0);
+  });
+}
 
 for (const outcome of ['ambiguous', 'lost'] as const) {
   test(`actual selected server preserves raw speech and dispatches neither task nor answer after ${outcome} intent`, { timeout: 15_000 }, async t => {

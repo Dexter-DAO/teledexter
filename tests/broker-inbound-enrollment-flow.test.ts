@@ -241,3 +241,14 @@ test('failure to persist the dispatch fence prevents provider completion contact
   // The fixture reopens only the unchanged durable reservation; no dispatch was attempted.
   await f.restart(); assert.deepEqual(f.store.get(call.id)?.inbound?.mode, { kind: 'undecided' });
 });
+
+
+test('after-response early admission stays excluded from undecided and enrollment-only legs', async t => {
+  const f = fixture(t), call = await f.reserve();
+  await f.flow.beginEarly(call.id); noOrdinary(f.counts);
+  assert.equal(f.store.get(call.id)!.inbound!.earlyAdmission, undefined);
+  await f.flow.completeEnrollment(call.id, f.digit());
+  assert.equal(f.store.get(call.id)!.inbound!.mode?.kind, 'enrollment-only');
+  await f.flow.beginEarly(call.id); noOrdinary(f.counts);
+  assert.equal(f.store.get(call.id)!.inbound!.earlyAdmission, undefined);
+});

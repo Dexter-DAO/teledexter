@@ -251,6 +251,32 @@ export class SmsService {
     // Twilio Advanced Opt Out owns keyword replies. Plain messages await agent integration.
     return '';
   }
+  /** Read-only admission check; does not consume a rate slot or send an enrollment text. */
+  requestedEligibility(phoneValue: string) {
+    const parsed = phoneSchema.safeParse(phoneValue);
+    if (!parsed.success) throw new SmsError('sms_unsupported_number', 400);
+    if (!this.deliveryActive()) throw new SmsError('sms_delivery_pending', 503);
+    const consent = this.state.consents.find(value => value.phone === parsed.data);
+    if (consent?.carrierOptedOut) throw new SmsError('carrier_opted_out', 409);
+    if (!consent?.enrolled || consent.disclosureVersion !== SMS_DISCLOSURE_VERSION)
+      throw new SmsError('sms_consent_required', 403);
+    return { ok: true as const };
+  }
+  /** Immutable receipt lookup remains available after STOP or provider disablement. */
+  requestedReceipt(phoneValue: string, callSid: string, message: string, messageId: string) {
+    const phone = this.phone(phoneValue);
+    if (!/^CA[0-9a-f]{32}$/i.test(callSid) || !message.trim() || message.length > 1000)
+      throw new SmsError('invalid_request');
+    const bodyHash = hash(`Dexter: ${message.trim()}\nReply STOP to opt out. HELP for help.`);
+    const id = hash(`${callSid}:${phone}:${bodyHash}`);
+    if (id !== messageId) throw new SmsError('invalid_request');
+    const existing = this.state.messages.find(value => value.id === id && value.phone === phone
+      && value.callSid === callSid && value.bodyHash === bodyHash);
+    if (existing) return { ok: true as const, messageId: id, status: existing.status, duplicate: true };
+    // A failed durable write can make absence in memory inconclusive.
+    if (this.poisoned) throw new SmsError('sms_unavailable', 503);
+    return null;
+  }
   async sendRequested(phoneValue: string, callSid: string, message: string) {
     if (!this.deliveryActive()) throw new SmsError('sms_delivery_pending', 503);
     const phone = this.phone(phoneValue);

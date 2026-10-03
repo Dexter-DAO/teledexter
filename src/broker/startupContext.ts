@@ -44,7 +44,10 @@ export function createInboundStartupContexts(client: EligibleContextClient) {
               // Admission may precede media by several seconds. Recheck eligibility
               // before loading retained text into Live, as well as the controller's
               // existing post-open assertion before caller audio is enabled.
-              try { await client.assert(binding, checked.context.history.version); return checked; }
+              try {
+                await client.assert(binding,checked.context.history.version,checked.context.history.admission);
+                return checked; // Keep the original page/version together; the controller records the newer validation.
+              }
               catch (error) {
                 if (!(error instanceof PrimaryApiError && error.status === 409 && error.remoteCode === 'context_changed')) throw error;
               }
@@ -52,7 +55,7 @@ export function createInboundStartupContexts(client: EligibleContextClient) {
           }
           return client.fetch(binding);
         },
-        assert: (binding, version) => client.assert(binding, version),
+        assert: (binding, version, admission) => client.assert(binding, version, admission),
         delivery: (binding, requestId, input, laterCall) => client.delivery(binding, requestId, input, laterCall),
       };
     },

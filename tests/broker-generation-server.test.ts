@@ -3,7 +3,7 @@ import test from 'node:test';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
 import Twilio from 'twilio';
 import { WebSocket } from 'ws';
@@ -71,7 +71,9 @@ test('successor registration/context crosses actual HTTP with negotiated full me
   assert.throws(() => createPrimaryApiClient({ ...options, contextProtocol: { version: 'unknown', parse: value => value } } as never));
 });
 
-async function host(t: test.TestContext, slowClose = false, questionMode = false, boundedCleanup = false) {
+async function host(t: test.TestContext, slowClose = false, questionMode = false, boundedCleanup = false,
+  settings: { admitted?: boolean; failed?: boolean; failureCode?: string; cancelled?: boolean; sameEpoch?: boolean; resultText?: string; callerText?: string;
+    openingStatus?: 'accepted' | 'rejected' | 'unconfirmed' } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-generation-server-'));
   const config: BrokerConfig = { host: '127.0.0.1', port: 3213, publicOrigin: 'https://phone.example.test', stateDir: directory,
     controlToken: 'c'.repeat(40), apiKey: 'fixture-key', model: 'gpt-live-1', voice: 'marin',
@@ -80,7 +82,13 @@ async function host(t: test.TestContext, slowClose = false, questionMode = false
   const store = new BrokerStore(directory);
   const reserved = store.reserve({ requestId: randomUUID(), number: proof.params.To, direction: 'outbound', purpose: 'Discuss my portfolio', callSid: sid }).call;
   store.recordPrimaryBinding(reserved.id, context());
-  let generation = 1, released = false, providerEnds = 0;
+  let generation = 1, released = false, providerEnds = 0, cursor = 280, fetches=0, assertions=0;
+  const currentContext = () => { const value = context(generation);
+    if(settings.admitted) value.context.history.version.contextEpoch='1';
+    if(settings.admitted) value.context.history.admission={invalidationDigest:"a".repeat(64),messages:[],memories:[]};
+    if (settings.sameEpoch) value.context.history.version = { ...value.context.history.version,
+      threadEventSequence: String(cursor), digest: createHash('sha256').update(String(cursor)).digest('hex') };
+    return value; };
   let beforeResult: (() => void) | undefined;
   const posts: Array<{ requestId: string; input: PrimarySubmission }> = [];
   const questionId = '88888888-8888-4888-8888-888888888888';
@@ -90,7 +98,7 @@ async function host(t: test.TestContext, slowClose = false, questionMode = false
     context: 'This request concerns research only. '.repeat(20), proposedAnswer: 'Research the stock.',
     yesMeaning: 'Research the stock and explain the findings.', noMeaning: 'Leave this request waiting.' };
   const questionText = [question.question, question.context, question.proposedAnswer, question.yesMeaning, question.noMeaning].join('\n');
-  const eligibleText = questionMode ? questionText : 'Your account result includes the complete position and its observation time. '.repeat(16);
+  const eligibleText = questionMode ? questionText : settings.resultText ?? 'Your account result includes the complete position and its observation time. '.repeat(16);
   const completed = (requestId: string) => ({ bindingId, requestId, state: 'completed' as const,
     assistant: { messageId, eventId, sequence: '2', text: 'RAW RESULT MUST NOT BE SENT DIRECTLY' } });
   const primary = {
@@ -98,7 +106,7 @@ async function host(t: test.TestContext, slowClose = false, questionMode = false
       posts.push({ requestId, input: structuredClone(input) }); return { bindingId, requestId, state: 'queued', replayed: false };
     },
     async result(_binding: string, requestId: string) {
-      if (released) { const callback = beforeResult; beforeResult = undefined; callback?.(); generation = 2; return questionMode ? { bindingId, requestId, state: 'waiting_for_reply', question } : completed(requestId); }
+      if (released) { const callback = beforeResult; beforeResult = undefined; callback?.(); generation = 2; if (settings.cancelled) return { bindingId, requestId, state: 'cancelled', error: { code: 'cancelled', retryable: false } }; if (settings.failed) return { bindingId, requestId, state: 'failed', error: { code: settings.failureCode ?? 'primary_financial_result_unknown', retryable: false } }; return questionMode ? { bindingId, requestId, state: 'waiting_for_reply', question } : completed(requestId); }
       return { bindingId, requestId, state: 'running' };
     },
     async close() { return { bindingId, callSid: sid, state: 'closed' }; },
@@ -107,23 +115,25 @@ async function host(t: test.TestContext, slowClose = false, questionMode = false
     },
   } as unknown as PrimaryApiClient;
   const eligible: EligibleContextClient = {
-    async fetch() { return context(generation); },
-    async assert(_binding, requested) {
-      if (requested.digest !== version(generation).digest) throw new PrimaryApiError('http_error', 409, { code: 'context_changed', retryable: false });
+    async fetch() { fetches++;return currentContext(); },
+    async assert(_binding, requested, admission) {
+      assertions++;
+      if(settings.admitted && admission) return {bindingId,callSid:sid,current:true,version:currentContext().context.history.version,admission};
+      if (requested.digest !== currentContext().context.history.version.digest) throw new PrimaryApiError('http_error', 409, { code: 'context_changed', retryable: false });
       return { bindingId, callSid: sid, current: true, version: requested };
     },
     async delivery(_binding, requestId, input) {
       assert.equal(input.source.kind, questionMode ? 'question' : 'assistant');
-      if (questionMode) return { bindingId, callSid: sid, requestId, version: input.version, delivery: { state: 'ready',
+      if (questionMode) return { bindingId, callSid: sid, requestId, version: input.version,...(input.admission?{admission:input.admission}:{}), delivery: { state: 'ready',
         source: { kind: 'question', messageId, eventSequence: '2', provenance: { messageCreatedAt: at, eventId, eventOccurredAt: at, runId } },
         text: eligibleText, question } };
-      return { bindingId, callSid: sid, requestId, version: input.version, delivery: { state: 'ready',
+      return { bindingId, callSid: sid, requestId, version: input.version,...(input.admission?{admission:input.admission}:{}), delivery: { state: 'ready',
         source: { kind: 'assistant', messageId, eventSequence: '2', provenance: {
           messageCreatedAt: at, eventId, eventOccurredAt: at, runId } }, text: eligibleText } };
     },
   };
   const voices: Array<{ options: BrokerLiveSessionOptions; voice: BrokerLiveSession; captions: LiveTranscriptSnapshot;
-    channel: LiveBackendChannel; abort: AbortController; spoken: string[]; inputs: string[]; closed: string[] }> = [];
+    channel: LiveBackendChannel; abort: AbortController; spoken: string[]; quiet: string[]; published:string[]; native:Array<{id:string;kind:string;speak:boolean}>; inputs: string[]; closed: string[] }> = [];
   const opening: string[] = [];
   let finishSlowClose: (() => void) | undefined;
   let finishQuestion: (() => void) | undefined;
@@ -133,16 +143,20 @@ async function host(t: test.TestContext, slowClose = false, questionMode = false
       const sessionId = `generation_${voices.length + 1}`;
       const abort = new AbortController();
       const captions: LiveTranscriptSnapshot = { revision: 0, callerRevision: 0, fragments: [] };
-      const spoken: string[] = [], inputs: string[] = [], closed: string[] = [];
+      const spoken: string[] = [], quiet:string[]=[],published:string[]=[],native:Array<{id:string;kind:string;speak:boolean}>=[], inputs: string[] = [], closed: string[] = [];
       const listeners = new Set<(value: LiveTranscriptSnapshot) => void>();
       const channel: LiveBackendChannel = { signal: abort.signal, getContext: () => structuredClone(captions),
         subscribeContext(listener) { listeners.add(listener); return () => listeners.delete(listener); },
         async publish() { throw new Error('Raw source channel publication must not be used'); } };
       const voice: BrokerLiveSession = {
         appendAudio(payload) { inputs.push(payload); return true; },
-        async appendContext() { throw new Error('Flattened context must not be used'); },
-        async appendInstructions(text) { opening.push(text); return { eventId: `open_${opening.length}`, status: 'accepted' }; },
-        async appendCommentary(text) { spoken.push(text);
+        async appendContext(text) {quiet.push(text);published.push(text);return {eventId:`quiet_${sessionId}_${quiet.length}`,status:'accepted'};},
+        ...(settings.admitted?{async publishDelegation(id:string,update:import('../src/live/types.js').LiveBackendUpdate) {
+          native.push({id,kind:update.kind,speak:update.speak??update.kind==='result'});
+          return update.speak===false?voice.appendContext(update.text):voice.appendCommentary!(update.text);
+        }}:{}),
+        async appendInstructions(text) { opening.push(text); return { eventId: `open_${opening.length}`, status: settings.openingStatus ?? 'accepted' }; },
+        async appendCommentary(text) { spoken.push(text);published.push(text);
           if (questionMode && spoken.join('') === eligibleText) await new Promise<void>(resolve => { finishQuestion = resolve; });
           return { eventId: `comment_${sessionId}_${spoken.length}`, status: 'accepted',
           observedCallerRevision: captions.callerRevision, observedTranscriptSequence: captions.revision }; },
@@ -155,7 +169,7 @@ async function host(t: test.TestContext, slowClose = false, questionMode = false
           options.onClosed(result); return result;
         },
       };
-      voices.push({ options, voice, captions, channel, abort, spoken, inputs, closed });
+      voices.push({ options, voice, captions, channel, abort, spoken, quiet, published, native, inputs, closed });
       queueMicrotask(() => options.onReady({ callId: options.callId, sessionId }));
       return voice;
     },
@@ -185,14 +199,15 @@ async function host(t: test.TestContext, slowClose = false, questionMode = false
     audio(); await until(() => voices[index]!.inputs.length > 0);
     const voice = voices[index]!;
     voice.captions.revision = 1; voice.captions.callerRevision = 1;
-    voice.captions.fragments = [{ eventId: 'caller_original', role: 'user', text: ' Read my portfolio.', startMs: 1, endMs: 20, sequence: 1 }];
+    voice.captions.fragments = [{ eventId: 'caller_original', role: 'user', text: settings.callerText ?? ' Read my portfolio.', startMs: 1, endMs: 20, sequence: 1 }];
     await voice.options.onTranscript(voice.captions);
     return voice.options.backend.delegate({ callId: reserved.id, sessionId: `generation_${index + 1}`,
       delegationId: 'explicit_request', requestId: 'provider_delegate', offsetMs: 20, transcript: structuredClone(voice.captions) }, voice.channel);
   };
-  return { broker, store, callId: reserved.id, ws, voices, posts, opening, eligible, eligibleText, delegate,
+  return { broker, store, primary, callId: reserved.id, ws, streamSid, voices, posts, opening, eligible, eligibleText, delegate,
+    advanceWork: () => { cursor++; },
     release: (callback?: () => void) => { beforeResult = callback; released = true; }, providerEnds: () => providerEnds,
-    finishSlow: () => finishSlowClose?.(), finishQuestion: () => finishQuestion?.(), questionId, audio };
+    fetches:()=>fetches,assertions:()=>assertions,finishSlow: () => finishSlowClose?.(), finishQuestion: () => finishQuestion?.(), questionId, audio };
 }
 
 test('actual server preserves accepted work through replacement and speaks only the complete eligible result', async t => {
@@ -335,12 +350,13 @@ async function boundary(label: string, predicate: () => boolean, work: ReturnTyp
   }
 }
 
-async function preparedFollowup(f: Awaited<ReturnType<typeof host>>, work: ReturnType<typeof observedWork>[]) {
+async function preparedFollowup(f: Awaited<ReturnType<typeof host>>, work: ReturnType<typeof observedWork>[],
+  text = ' Then compare Apple.') {
   const first = f.voices[0]!;
   for (let index = 0; index < 69; index++) f.audio(true);
   f.audio(); await boundary('follow-up audio', () => first.inputs.length === 71, work);
   first.captions.revision = 2; first.captions.callerRevision = 2;
-  first.captions.fragments.push({ eventId: 'explicit_followup', role: 'user', text: ' Then compare Apple.', startMs: 1400, endMs: 1420, sequence: 2 });
+  first.captions.fragments.push({ eventId: 'explicit_followup', role: 'user', text, startMs: 1400, endMs: 1420, sequence: 2 });
   first.options.onTranscript(first.captions);
   const snapshot = structuredClone(first.captions);
   const listeners = new Set<(snapshot: LiveTranscriptSnapshot) => void>();
@@ -466,4 +482,527 @@ test('late question-chunk rejection crosses actual host callbacks and forces a d
   const attempts = call.publications!.records.filter(record => record.kind === 'result').map(record => record.updateId);
   assert.ok(attempts.some(id => id.includes('_attempt_1_'))); assert.ok(attempts.some(id => id.includes('_attempt_2_')));
   assert.equal(f.posts.length, 1); f.ws.close(); await work;
+});
+
+
+test('actual server waits for carrier playback acknowledgement before rotating and presenting the result', async t => {
+  const f = await host(t); const work = f.delegate();
+  await until(() => f.posts.length === 1);
+  const messages: Array<{ event: string; mark?: { name: string } }> = [];
+  f.ws.on('message', value => { messages.push(JSON.parse(String(value))); });
+  f.voices[0].options.onAudio(Buffer.alloc(160, 0).toString('base64'), { deliveryId: 'synthetic_active_playback' });
+  await until(() => messages.some(message => message.event === 'mark'));
+  f.release(); await wait(1000);
+  assert.equal(f.voices.length, 1); assert.deepEqual(f.voices[0].spoken, []);
+  const mark = messages.find(message => message.event === 'mark')!.mark!;
+  f.ws.send(JSON.stringify({ event: 'mark', streamSid: f.streamSid, mark }));
+  await until(() => f.voices[1]?.spoken.join('') === f.eligibleText); await work;
+  assert.equal(f.posts.length, 1); assert.equal(f.providerEnds(), 0);
+});
+
+test('actual cleared carrier playback releases a queued result without waiting for a cleared mark', async t => {
+  const f = await host(t); const work = f.delegate();
+  await until(() => f.posts.length === 1);
+  f.voices[0].options.onAudio(Buffer.alloc(160, 0).toString('base64'), { deliveryId: 'cleared_playback' });
+  f.release(); await wait(1000); assert.equal(f.voices.length, 1);
+  f.voices[0].options.onPlaybackClear?.('application_interrupt');
+  await until(() => f.voices[1]?.spoken.join('') === f.eligibleText); await work;
+  assert.equal(f.posts.length, 1);
+});
+
+test('carrier disconnect cancels waiting result presentation and retains the result without another voice', async t => {
+  const f = await host(t); const work = f.delegate();
+  await until(() => f.posts.length === 1);
+  f.voices[0].options.onAudio(Buffer.alloc(160, 0).toString('base64'), { deliveryId: 'disconnect_playback' });
+  f.release(); await wait(1000); f.ws.close();
+  await until(() => Boolean(f.store.get(f.callId)!.endedAt)); await work;
+  assert.equal(f.voices.length, 1); assert.deepEqual(f.voices[0].spoken, []);
+  assert.equal((f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord).status, 'completed');
+});
+
+test('a caller turn during context replacement defers then presents the saved result at a fresh quiet boundary', async t => {
+  const f = await host(t); const work = f.delegate();
+  await until(() => f.posts.length === 1);
+  const fetch = f.eligible.fetch;
+  f.eligible.fetch = async scope => {
+    const source = f.voices[0];
+    source.captions.revision++; source.captions.callerRevision++;
+    source.captions.fragments.push({ eventId: 'new_topic', role: 'user', text: 'What are your suggestions?',
+      startMs: 21, endMs: 40, sequence: source.captions.revision });
+    source.options.onTranscript(source.captions);
+    return fetch(scope);
+  };
+  f.release(); await work;
+  assert.equal(f.voices.length, 2, 'a genuine eligibility change still requires strict replacement');
+  assert.equal(f.voices.flatMap(value => value.spoken).join(''), 'For your earlier request: ' + f.eligibleText);
+  const saved = f.store.get(f.callId)!;
+  assert.equal((saved.delegations[f.posts[0].requestId] as BrokerDelegationRecord).delivery, 'accepted');
+  assert.equal(f.posts.length, 1, 'presentation recovery cannot resubmit the original work');
+  assert.equal((saved.delegations[f.posts[0].requestId] as BrokerDelegationRecord).primaryResult?.state, 'completed');
+  assert.equal(saved.liveGenerations!.segments[0].transcript.fragments.at(-1)!.text, 'What are your suggestions?');
+});
+
+test('actual generation retains the failed financial request and speaks bounded uncertainty without a new submit', async t => {
+  const f = await host(t, false, false, false, { failed: true }); const work = f.delegate();
+  await until(() => f.posts.length === 1); f.release(); await work;
+  assert.deepEqual(f.voices.flatMap(value => value.spoken), [
+    "I couldn't confirm the trade request. We need to check that same request before continuing.",
+  ]);
+  const saved = f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord;
+  assert.equal(saved.status, 'failed'); assert.equal(saved.primaryResult?.state, 'failed');
+  assert.equal(saved.primaryResult?.error?.code, 'primary_financial_result_unknown');
+  assert.equal(f.posts.length, 1); assert.equal(saved.primaryResult?.assistant, undefined);
+});
+
+test('actual default backend work progress keeps its existing voice and persists a separate immutable-source audit', async t => {
+  const f = await host(t, false, false, false, { sameEpoch: true }); const work = f.delegate();
+  await until(() => f.posts.length === 1);
+  const original = structuredClone(f.store.get(f.callId)!.liveGenerations!.segments[0].version);
+  f.advanceWork();
+  await until(() => Boolean(f.store.get(f.callId)!.statusContextRefreshes?.length), 21000);
+  assert.equal(f.voices.length, 1); assert.equal(f.voices[0].closed.length, 0);
+  assert.deepEqual(f.voices[0].quiet, ['Your request is still being handled. I am waiting for its result.']);
+  assert.deepEqual(f.voices[0].spoken, []);
+  assert.deepEqual(f.store.get(f.callId)!.liveGenerations!.segments[0].version, original);
+  assert.equal(f.store.get(f.callId)!.statusContextRefreshes![0].version.threadEventSequence, '281');
+  assert.equal(f.posts.length, 1);
+  const source = f.voices[0];
+  source.captions.revision++; source.captions.callerRevision++;
+  source.captions.fragments.push({ eventId: 'suggestion_topic', role: 'user', text: 'What are your suggestions?',
+    startMs: 21, endMs: 40, sequence: source.captions.revision });
+  source.options.onTranscript(source.captions); f.advanceWork();
+  await wait(18500);
+  assert.equal(f.voices.length, 1, 'later conversation cannot be reset by old waiting notices');
+  assert.ok(f.store.get(f.callId)!.statusContextRefreshes!.length >= 2, 'the later quiet boundary permits current status');
+  assert.ok(source.quiet.slice(1).every(text => text === 'I am still waiting for the result of your earlier request.'));
+  assert.ok(source.quiet.length <= 5, 'unchanged status has a bounded accepted notice budget');
+  f.ws.close(); await work;
+});
+
+
+const incidentBuy = " Alright, let's buy five dollars worth of Apple";
+const incidentResult = 'Bought $5 of Apple stock, confirmed on-chain.';
+for (const followup of [' Can you give me something, please', ' What are your suggestions?', ' Cancel that order.']) {
+  test(`completed original request reaches voice before queued later speech: ${followup.trim()}`, async t => {
+    const f = await host(t, false, false, false, { callerText: incidentBuy, resultText: incidentResult });
+    const originalWork = observedWork(f.delegate());
+    await boundary('original buy submission', () => f.posts.length === 1, [originalWork]);
+    const original = structuredClone(f.posts[0]);
+    const first = f.voices[0];
+    for (let i = 0; i < 69; i++) f.audio(true);
+    f.audio(); await boundary('later caller audio', () => first.inputs.length === 71, [originalWork]);
+    first.captions.revision++; first.captions.callerRevision++;
+    first.captions.fragments.push({ eventId: 'incident_followup', role: 'user', text: followup,
+      startMs: 1400, endMs: 1420, sequence: first.captions.revision });
+    first.options.onTranscript(first.captions);
+    const request = { callId: f.callId, sessionId: 'generation_1', delegationId: 'incident_followup',
+      requestId: 'provider_followup', offsetMs: 1420, transcript: structuredClone(first.captions) };
+    const laterWork = observedWork(first.options.backend.delegate(request, first.channel));
+    await boundary('saved queued follow-up', () => (f.store.get(f.callId)!.delegations[original.requestId] as BrokerDelegationRecord)
+      .deferredTurns?.some(turn => turn.status === 'queued') === true, [originalWork, laterWork]);
+    const submit = f.primary.submit;
+    f.primary.submit = async (...args) => {
+      assert.equal((f.store.get(f.callId)!.delegations[original.requestId] as BrokerDelegationRecord).delivery, 'accepted');
+      assert.equal(f.voices.flatMap(v => v.spoken).join(''), 'For your earlier request: ' + incidentResult);
+      return submit(...args);
+    };
+    // Follow-up handling is distinct work. It cannot alter the completed result
+    // or replay the original purchase, even when the caller asked to cancel it.
+    const result = f.primary.result;
+    f.primary.result = async (binding, requestId) => requestId === original.requestId ? result(binding, requestId)
+      : { bindingId, requestId, state: 'cancelled', error: { code: 'fixture_followup_closed', retryable: false } };
+    f.release();
+    await boundary('both workers settled', () => originalWork.settled() && laterWork.settled(), [originalWork, laterWork]);
+    assert.equal(f.posts.length, 2); assert.deepEqual(f.posts[0], original);
+    assert.equal(f.posts[1].input.text, followup); assert.notEqual(f.posts[1].requestId, original.requestId);
+    assert.equal(f.voices.flatMap(v => v.spoken).filter(text => text === 'For your earlier request: ' + incidentResult).length, 1);
+    assert.equal((f.store.get(f.callId)!.delegations[original.requestId] as BrokerDelegationRecord).delivery, 'accepted');
+    assert.ok(f.store.get(f.callId)!.publications!.records.some(record => record.ordinaryDelivery
+      && record.requestId === original.requestId && record.outcome?.status === 'accepted'));
+    assert.equal(f.providerEnds(), 0);
+  });
+}
+
+test('carrier playback beyond the first wait defers a completed answer without losing it', async t => {
+  const f = await host(t, false, false, false, { resultText: incidentResult });
+  const work = observedWork(f.delegate());
+  await boundary('original submission', () => f.posts.length === 1, [work]);
+  f.voices[0].options.onAudio(Buffer.alloc(160, 0).toString('base64'), { deliveryId: 'long_existing_playback' });
+  f.release();
+  await boundary('first completed presentation deferred', () => (f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord).delivery === 'stale', [work], 8000);
+  assert.deepEqual(f.voices.flatMap(v => v.spoken), []);
+  f.voices[0].options.onPlaybackClear?.('application_interrupt');
+  await boundary('same result presented after playback clears', () => work.settled(), [work]);
+  assert.deepEqual(f.voices.flatMap(v => v.spoken), [incidentResult]);
+  assert.equal(f.posts.length, 1);
+});
+
+test('canonical cancellation is announced without attempting a completed-result delivery', async t => {
+  const f = await host(t, false, false, false, { cancelled: true });
+  let resultDeliveries = 0;
+  const delivery = f.eligible.delivery;
+  f.eligible.delivery = async (...args) => { resultDeliveries++; return delivery(...args); };
+  const work = f.delegate(); await until(() => f.posts.length === 1); f.release(); await work;
+  assert.deepEqual(f.voices.flatMap(v => v.spoken), ['The request was cancelled.']);
+  assert.equal(resultDeliveries, 0); assert.equal(f.posts.length, 1);
+  assert.equal((f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord).status, 'cancelled');
+});
+
+test('a pending question still yields to queued new work and hangup creates no reply', async t => {
+  const f = await host(t, false, true);
+  const work = observedWork(f.delegate());
+  await boundary('original request', () => f.posts.length === 1, [work]);
+  const later = await preparedFollowup(f, [work]);
+  const followup = observedWork(later.start());
+  await boundary('follow-up capture starts', later.entered, [work, followup]); later.release();
+  await boundary('new work queued', () => Object.values(f.store.get(f.callId)!.delegations)
+    .some(value => (value as BrokerDelegationRecord).deferredTurns?.some(turn => turn.status === 'queued')), [work, followup]);
+  f.release();
+  await boundary('question saved', () => (f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord).status === 'waiting_for_reply', [work, followup]);
+  await wait(1000);
+  assert.deepEqual(f.voices.flatMap(v => v.spoken), []);
+  const question = (f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord).questions![f.questionId];
+  assert.equal(question.presentation, undefined); assert.equal(question.reply, undefined);
+  f.ws.close(); await boundary('call workers closed', () => work.settled() && followup.settled(), [work, followup]);
+  assert.equal(f.posts.length, 1);
+});
+
+
+test('one contextualized result waits for actual playback and survives caller interruption without a separate prefix', async t => {
+  const f = await host(t, false, false, false, { admitted: true, resultText: incidentResult });
+  const work = observedWork(f.delegate());
+  await boundary('original request', () => f.posts.length === 1, [work]);
+  const voice = f.voices[0];
+  voice.options.onAudio(Buffer.alloc(160, 0).toString('base64'), { deliveryId: 'prior_speech' });
+  voice.captions.revision++; voice.captions.callerRevision++;
+  voice.captions.fragments.push({ eventId: 'later_topic', role: 'user', text: 'What else can you do?',
+    startMs: 1400, endMs: 1420, sequence: voice.captions.revision });
+  voice.options.onTranscript(voice.captions);
+  f.release(); await wait(1000);
+  assert.deepEqual(voice.spoken, [], 'actual speech remains blocked before playback clears');
+  voice.captions.revision++; voice.captions.callerRevision++;
+  voice.captions.fragments.push({ eventId: 'interruption', role: 'user', text: 'Yes?',
+    startMs: 1420, endMs: 1440, sequence: voice.captions.revision });
+  voice.options.onTranscript(voice.captions);
+  voice.options.onPlaybackClear?.('application_interrupt');
+  await boundary('completed result after interruption', work.settled, [work], 10000);
+  assert.deepEqual(voice.spoken, ['For your earlier request: ' + incidentResult]);
+  assert.equal(voice.native.filter(value => value.kind === 'result').length, 1);
+  assert.equal(f.posts.length, 1);
+  assert.equal(f.voices.length, 1);
+  const saved = f.store.get(f.callId)!;
+  assert.equal((saved.delegations[f.posts[0].requestId] as BrokerDelegationRecord).delivery, 'accepted');
+  assert.equal(saved.publications!.records.filter(record => record.kind === 'progress' && record.updateId.includes('_earlier_')).length, 0);
+});
+
+test('a forgotten completed source is not spoken or retried from the raw saved answer', async t => {
+  const f = await host(t, false, false, false, { resultText: incidentResult });
+  let reads = 0;
+  f.eligible.delivery = async (_binding, requestId, input) => {
+    reads++;
+    return { bindingId, callSid: sid, requestId, version: input.version,
+      delivery: { state: 'unavailable', reason: 'source_not_in_projection' } };
+  };
+  const work = f.delegate(); await until(() => f.posts.length === 1); f.release(); await work;
+  assert.equal(reads, 1); assert.equal(f.posts.length, 1);
+  assert.deepEqual(f.voices.flatMap(value => value.spoken), []);
+  assert.equal((f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord).delivery, 'unconfirmed');
+});
+
+
+for (const outcome of ['cancelled', 'failed', 'financial_unknown'] as const) {
+  test(`saved ${outcome} outcome remains reportable after a queued progress question`, async t => {
+    const f = await host(t, false, false, false, {
+      callerText: incidentBuy, cancelled: outcome === 'cancelled', failed: outcome !== 'cancelled',
+      failureCode: outcome === 'financial_unknown' ? 'primary_financial_result_unknown' : 'fixture_request_failed',
+    });
+    const work = observedWork(f.delegate());
+    await boundary('original request submitted', () => f.posts.length === 1, [work]);
+    const later = await preparedFollowup(f, [work]);
+    const followup = observedWork(later.start());
+    await boundary('later capture started', later.entered, [work, followup]); later.release();
+    await boundary('later request queued', () => (f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord)
+      .deferredTurns?.some(turn => turn.status === 'queued') === true, [work, followup]);
+    const queued = 'Your later requests are queued behind the earlier request. They have not started.';
+    await boundary('truthful queued notice', () => f.voices.flatMap(voice => voice.published).includes(queued), [work, followup]);
+    const expected = 'For your earlier request: ' + (outcome === 'cancelled' ? 'The request was cancelled.'
+      : outcome === 'financial_unknown' ? "I couldn't confirm the trade request. We need to check that same request before continuing."
+      : 'I could not get an answer to that request.');
+    const submit = f.primary.submit;
+    let beforeSecondSubmit: { speech: string[]; delivery: string | undefined } | undefined;
+    f.primary.submit = async (...args) => {
+      // Capture the boundary; assertions inside this transport would fabricate
+      // a dispatch-unknown response if legitimate progress had also been spoken.
+      beforeSecondSubmit = { speech: f.voices.flatMap(voice => voice.published),
+        delivery: (f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord).delivery };
+      return submit(...args);
+    };
+    f.release();
+    await boundary('terminal answer and later request completed', () => work.settled() && followup.settled(), [work, followup]);
+    assert.equal(f.posts.length, 2);
+    assert.ok(beforeSecondSubmit, 'second submission must be observed');
+    assert.equal(beforeSecondSubmit.delivery, 'accepted');
+    assert.equal(beforeSecondSubmit.speech.filter(text => text === expected).length, 1);
+    assert.ok(beforeSecondSubmit.speech.indexOf(queued) < beforeSecondSubmit.speech.indexOf(expected),
+      'the queued notice precedes the once-delivered terminal result');
+    assert.equal(beforeSecondSubmit.speech.at(-1), expected);
+    assert.notDeepEqual(beforeSecondSubmit.speech, [expected], 'legitimate earlier progress is preserved');
+    assert.equal((f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord).delivery, 'accepted');
+    assert.equal(f.voices.flatMap(voice => voice.spoken).filter(text => text === expected).length, 1);
+    assert.ok(!f.voices.flatMap(voice => voice.spoken).some(text => text.includes('Bought')));
+  });
+}
+
+
+test('recorded pending sale and queued buy deliver truthful status through the actual voice path', async t => {
+  const f = await host(t, false, false, false, { sameEpoch: true,
+    callerText: 'Um, I probably want to sell four dollars of the Apple stock that I just bought recently' });
+  const work = observedWork(f.delegate());
+  await boundary('sale submitted', () => f.posts.length === 1, [work]);
+  const later = await preparedFollowup(f, [work], 'How about you buy a dollar worth');
+  const next = observedWork(later.start());
+  await boundary('buy admission started', later.entered, [work, next]); later.release();
+  await boundary('queued notice accepted', () => f.voices.flatMap(v => v.published).includes(
+    'Your later requests are queued behind the earlier request. They have not started.'), [work, next]);
+  assert.equal(f.posts.length, 1, 'a spoken queue receipt does not submit the buy');
+  f.primary.result = async () => { throw new PrimaryApiError('http_error', 503,
+    { code: 'temporarily_unavailable', retryable: true }); };
+  await boundary('status error spoken', () => f.voices.flatMap(v => v.published).includes(
+    'I cannot get the latest status of the earlier request. Your later requests are queued and have not started.'), [work, next]);
+  const call = f.store.get(f.callId)!;
+  assert.deepEqual(f.voices.flatMap(v => v.spoken), [], 'pending status is quiet context, not an unsolicited spoken claim');
+  assert.ok(f.voices.flatMap(v => v.quiet).includes('I cannot get the latest status of the earlier request. Your later requests are queued and have not started.'));
+  assert.equal((call.delegations[f.posts[0].requestId] as BrokerDelegationRecord).resultReadUnavailable, true);
+  assert.equal(call.liveGenerations!.segments.length, 1);
+  assert.equal((call.delegations[f.posts[0].requestId] as BrokerDelegationRecord).primaryResult?.state, 'running');
+  f.ws.close(); await boundary('hangup closes both observers', () => work.settled() && next.settled(), [work, next]);
+  assert.equal(f.posts.length, 1);
+});
+
+test('continuous digital silence does not starve a saved result, while audible frames and late marks still block it', async t => {
+  const f = await host(t, false, false, false, { resultText: incidentResult });
+  const work = observedWork(f.delegate());
+  await boundary('request submitted', () => f.posts.length === 1, [work]);
+  const source = f.voices[0];
+  const marks: string[] = [];
+  f.ws.on('message', data => { const event = JSON.parse(data.toString()); if (event.event === 'mark') marks.push(event.mark.name); });
+  source.options.onAudio(Buffer.alloc(160, 0xfe).toString('base64'), { deliveryId: 'audible' });
+  await boundary('audible mark received', () => marks.length === 1, [work]);
+  const audibleMark = marks[0];
+  const silence = setInterval(() => {
+    source.options.onAudio(Buffer.alloc(160, 255).toString('base64'), { deliveryId: 'digital_silence' });
+    // Keep only digital silence acknowledged late; actual speech remains outstanding.
+    for (const name of marks.splice(0).filter(name => name !== audibleMark))
+      f.ws.send(JSON.stringify({ event: 'mark', streamSid: f.streamSid, mark: { name } }));
+  }, 20);
+  t.after(() => clearInterval(silence));
+  f.release(); await wait(1100);
+  assert.deepEqual(f.voices.flatMap(v => v.spoken), [], 'audible mark is mandatory even with a transcript result');
+  // Admit caller audio before releasing the playback fence. A timer scheduled
+  // afterward leaves a real quiet boundary where delivery is permitted.
+  const inputCount = f.voices.reduce((count, voice) => count + voice.inputs.length, 0);
+  const callerSpeech = setInterval(() => f.audio(), 20);
+  t.after(() => clearInterval(callerSpeech));
+  f.audio();
+  await boundary('caller interruption admitted', () =>
+    f.voices.reduce((count, voice) => count + voice.inputs.length, 0) > inputCount, [work]);
+  f.ws.send(JSON.stringify({ event: 'mark', streamSid: f.streamSid, mark: { name: audibleMark } }));
+  source.captions.revision++; source.captions.callerRevision++;
+  source.captions.fragments.push({ eventId: 'caller_interrupts_silence', role: 'user', text: 'Wait, what happened?',
+    startMs: 1400, endMs: 1420, sequence: source.captions.revision });
+  await source.options.onTranscript(source.captions);
+  try { await wait(500); assert.deepEqual(f.voices.flatMap(v => v.spoken), [], 'caller speech still owns the boundary'); }
+  finally { clearInterval(callerSpeech); }
+  await boundary('saved result delivered through continuous silence', work.settled, [work], 8000);
+  clearInterval(silence);
+  assert.deepEqual(f.voices.flatMap(v => v.spoken), ['For your earlier request: '+incidentResult]);
+  assert.equal(f.posts.length, 1);
+});
+
+
+for (const change of ['queued', 'recovered'] as const) {
+  test(`pending error speech is discarded when ${change} facts change during eligible-context I/O`, async t => {
+    const f = await host(t, false, false, false, { sameEpoch: true, callerText: 'Sell four dollars of Apple.' });
+    f.primary.result = async () => { throw new PrimaryApiError('http_error', 503,
+      { code: 'temporarily_unavailable', retryable: true }); };
+    const fetch = f.eligible.fetch;
+    let entered = false, gateOpen = false, release!: () => void;
+    const gate = new Promise<void>(resolve => { release = () => { gateOpen = true; resolve(); }; });
+    f.eligible.fetch = async (...args) => { entered = true; if (!gateOpen) await gate; return fetch(...args); };
+    const work = observedWork(f.delegate());
+    const workers = [work];
+    try {
+      await boundary('status context read begins', () => entered, workers);
+      assert.deepEqual(f.voices.flatMap(v => v.spoken), []);
+      if (change === 'queued') {
+        const later = await preparedFollowup(f, workers, 'How about you buy a dollar worth');
+        const next = observedWork(later.start()); workers.push(next);
+        await boundary('later admission begins', later.entered, workers); later.release();
+        await boundary('queue saved during context read', () => (f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord)
+          .deferredTurns?.some(turn => turn.status === 'queued') === true, workers);
+      } else {
+        f.primary.result = async (_binding, requestId) => ({ bindingId, requestId, state: 'running' });
+        await boundary('GET recovery saved during context read', () =>
+          (f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord).resultReadUnavailable === false, workers);
+      }
+      release();
+      if (change === 'queued') await boundary('current queue error is published quietly', () => f.voices.flatMap(v => v.quiet).includes(
+        'I cannot get the latest status of the earlier request. Your later requests are queued and have not started.'), workers);
+      else await wait(1000);
+      assert.ok(!f.voices.flatMap(v => v.published).includes('I cannot get the latest status of your request. Its outcome is still unconfirmed.'),
+        'the obsolete error facts must not be published after context returns');
+      assert.equal(f.posts.length, 1);
+    } finally {
+      release(); f.ws.close();
+      await boundary('observers close after test', () => workers.every(w => w.settled()), workers);
+    }
+  });
+}
+
+
+test('latest account dialogue keeps one generation and publishes one contextualized answer on its original delegation',async t=>{
+  const f=await host(t,false,false,false,{admitted:true,resultText:'Your account total is $45.35.',callerText:"Let's check my account."});
+  const work=observedWork(f.delegate());await boundary('account submitted',()=>f.posts.length===1,[work]);
+  const voice=f.voices[0];
+  voice.captions.revision++;voice.captions.callerRevision++;
+  voice.captions.fragments.push({eventId:'latency_complaint',role:'user',text:'Does it always take over thirty seconds to check my account?',
+    startMs:21,endMs:40,sequence:voice.captions.revision});
+  voice.options.onTranscript(voice.captions);
+  f.release();await boundary('original answer delivered',work.settled,[work]);
+  assert.equal(f.voices.length,1);assert.equal(f.fetches(),1);assert.equal(f.posts.length,1);
+  assert.deepEqual(voice.spoken,['For your earlier request: Your account total is $45.35.']);
+  assert.deepEqual(voice.native.filter(update=>update.kind==='result'),[{id:'explicit_request',kind:'result',speak:true}]);
+  const saved=f.store.get(f.callId)!;
+  assert.equal((saved.delegations[f.posts[0].requestId] as BrokerDelegationRecord).delivery,'accepted');
+  assert.ok(saved.statusContextRefreshes?.some(refresh=>refresh.kind==='admitted_sources'));
+  assert.equal(saved.liveGenerations!.segments.length,1);
+  assert.ok(!JSON.stringify(voice.options.eligibleHistory?.initialItems).includes('Your account total is $45.35.'));
+});
+
+test('a genuine replacement keeps an accepted earlier answer and omits only the pending answer',async t=>{
+  const f=await host(t,false,false,false,{admitted:true,resultText:'Your account total is $45.35.'});
+  const first=observedWork(f.delegate());await boundary('first submitted',()=>f.posts.length===1,[first]);
+  f.release();await boundary('first accepted',first.settled,[first]);
+  const nextMessageId='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  f.primary.result=async(_binding,requestId)=>({bindingId,requestId,state:'completed',assistant:{messageId:nextMessageId,eventId,sequence:'3',text:'Your next answer.'}});
+  f.eligible.assert=async(_binding,version,admission)=>{
+    if(version.contextEpoch==='1')throw new PrimaryApiError('http_error',409,{code:'context_changed',retryable:false});
+    return {bindingId,callSid:sid,current:true,version,admission};
+  };
+  f.eligible.fetch=async()=>{
+    const value=context(2);value.context.history.admission={invalidationDigest:'b'.repeat(64),messages:[],memories:[]};
+    value.context.history.version.threadEventSequence='3';
+    value.context.messages=[{id:messageId,role:'assistant',text:'Your account total is $45.35.',eventSequence:'2',provenance:{messageCreatedAt:at,eventId,eventOccurredAt:at,runId}},
+      {id:nextMessageId,role:'assistant',text:'Your next answer.',eventSequence:'3',provenance:{messageCreatedAt:at,eventId,eventOccurredAt:at,runId}}];
+    return value;
+  };
+  f.eligible.delivery=async(_binding,requestId,input)=>({bindingId,callSid:sid,requestId,version:input.version,admission:input.admission,
+    delivery:{state:'ready',source:{kind:'assistant',messageId:nextMessageId,eventSequence:'3',provenance:{messageCreatedAt:at,eventId,eventOccurredAt:at,runId}},text:'Your next answer.'}});
+  const later=await preparedFollowup(f,[],'Check my next account question.');const second=observedWork(later.start());
+  await boundary('second capture',later.entered,[second]);later.release();await boundary('second accepted',second.settled,[second]);
+  assert.equal(f.voices.length,2);
+  const seeded=JSON.stringify(f.voices[1].options.eligibleHistory!.initialItems);
+  assert.ok(seeded.includes('Your account total is $45.35.'));
+  assert.ok(!seeded.includes('Your next answer.'));
+  assert.deepEqual(f.voices[1].spoken,['Your next answer.']);
+  assert.deepEqual(f.voices[1].native,[],'old-session task IDs are never addressed in a replacement session');
+  assert.equal(f.posts.length,2);
+});
+
+test('failed result after a genuine replacement keeps its own ambiguous caller source and successful tool facts', async t => {
+  const original = ' What about the big one?';
+  const f = await host(t, false, false, false, { failed: true, failureCode: 'provider_busy', callerText: original });
+  const fetch = f.eligible.fetch;
+  f.eligible.fetch = async (...args) => {
+    const context = await fetch(...args), input = f.posts[0]?.input;
+    if (input) context.context.messages = [{ id: messageId, role: 'user', text: input.text, eventSequence: '1',
+      provenance: { messageCreatedAt: at, eventId, eventOccurredAt: at, runId },
+      canonicalSource: { sourceEventId: input.source.sourceEventId, revision: input.source.revision,
+        occurredAt: input.source.receivedAt, storedProjectionKind: 'derived' } }];
+    return context;
+  };
+  const result = f.primary.result;
+  const partialResult = { kind: 'prepared_action' as const, text: 'An unsigned Apple purchase was prepared. It has not executed.',
+    toolInvocationId: eventId, observedAt: at };
+  f.primary.result = async (...args) => {
+    const response = await result(...args);
+    return response.state === 'failed' ? { ...response, partialResult, failure: { kind: 'provider_error' as const } } : response;
+  };
+  const work = f.delegate(); await until(() => f.posts.length === 1);
+  f.release(); await work;
+  assert.equal(f.voices.length, 2);
+  const target = f.voices[1];
+  const contexts = target.quiet.filter(text => text.startsWith('{')).map(text => JSON.parse(text));
+  assert.deepEqual(contexts.map(value => value.requestId), [f.posts[0].requestId]);
+  assert.equal(contexts.map(value => value.requestText).join(''), original);
+  assert.ok(target.published.indexOf(JSON.stringify(contexts[0])) < target.published.indexOf(target.spoken[0]));
+  assert.match(target.spoken.join(''), /^An unsigned Apple purchase/);
+  assert.match(target.spoken.join(''), /AI response failed/);
+  assert.equal(f.posts.length, 1); assert.equal(f.posts[0].input.text, original);
+  assert.equal((f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord).status, 'failed');
+});
+
+test('confirmed facts are spoken during provider cooldown and final failure uses the same request after replacement', async t => {
+  const f = await host(t, false, false, false, { failed: true, failureCode: 'provider_request_budget_exceeded' });
+  const result = f.primary.result;
+  const partialResult = { kind: 'portfolio' as const, text: 'Your portfolio observation lists 8 SOL.', toolInvocationId: eventId, observedAt: at };
+  f.primary.result = async (...args) => {
+    const response = await result(...args);
+    return { ...response, partialResult, failure: response.state === 'running'
+      ? { kind: 'provider_cooldown' as const, retryAt: '2099-01-01T00:00:00.000Z', retryAfterSeconds: 60 }
+      : { kind: 'provider_request_budget' as const } };
+  };
+  const work = f.delegate();
+  await until(() => f.voices.flatMap(voice => voice.spoken).includes(partialResult.text));
+  await wait(850);
+  assert.equal(f.posts.length, 1); assert.equal(f.voices.length, 1);
+  assert.equal((f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord).status, 'running');
+  f.release(); await work;
+  const speech = f.voices.flatMap(voice => voice.spoken);
+  assert.equal(speech.filter(text => text === partialResult.text).length, 1);
+  assert.match(speech.at(-1)!, /processing limit/);
+  assert.equal(f.posts.length, 1); assert.equal(f.voices.length, 2);
+  assert.equal((f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord).partialDelivery?.status, 'accepted');
+});
+
+test('replacement cannot reinsert a caller source absent from its eligible history', async t => {
+  const original = 'My old private request must remain removed.';
+  const f = await host(t, false, false, false, { failed: true, failureCode: 'provider_busy', callerText: original });
+  const work = f.delegate(); await until(() => f.posts.length === 1);
+  f.release(); await work;
+  assert.equal(f.voices.length, 2);
+  const target = f.voices[1], contexts = target.quiet.filter(text => text.startsWith('{')).map(text => JSON.parse(text));
+  assert.deepEqual(contexts, [{ kind: 'task_result_context', requestId: f.posts[0].requestId, state: 'failed', sourceAvailable: false }]);
+  assert.ok(target.published.every(text => !text.includes(original)));
+  assert.equal(f.posts.length, 1); assert.match(target.spoken.join(''), /AI service is busy/);
+});
+
+for (const openingStatus of ['accepted', 'rejected', 'unconfirmed'] as const) test(`initial greeting records ${openingStatus} without another eligibility round trip or replacement replay`, async t => {
+  const f = await host(t, false, false, false, { failed: true, failureCode: 'provider_busy', openingStatus });
+  await until(() => f.store.get(f.callId)?.voiceOpening?.status === openingStatus);
+  assert.equal(f.fetches(), 1); assert.equal(f.assertions(), 1, 'fresh context still has its post-open assertion');
+  assert.equal(f.opening.length, 1);
+  const work = f.delegate(); await until(() => f.posts.length === 1); f.release(); await work;
+  assert.equal(f.voices.length, 2); assert.equal(f.opening.length, 1);
+  assert.equal(f.store.get(f.callId)!.voiceOpening!.status, openingStatus);
+  assert.ok(f.assertions() > 1, 'ordinary request publication still qualifies current context');
+});
+
+test('a confirmed financial receipt survives a later model failure and voice replacement', async t => {
+  const f = await host(t, false, false, false, { failed: true, failureCode: 'provider_busy', callerText: 'Did my Apple purchase finish?' });
+  const read = f.primary.result;
+  const partialResult = { kind: 'action_status' as const, intentId: messageId, actionState: 'confirmed' as const,
+    text: 'The saved Apple purchase is confirmed. The receipt reports 0.02 shares received.', toolInvocationId: eventId, observedAt: at };
+  f.primary.result = async (...args) => {
+    const result = await read(...args);
+    return result.state === 'failed' ? { ...result, partialResult, failure: { kind: 'provider_error' as const } } : result;
+  };
+  const work = f.delegate(); await until(() => f.posts.length === 1); f.release(); await work;
+  const speech = f.voices.flatMap(voice => voice.spoken).join('');
+  assert.ok(speech.startsWith(partialResult.text)); assert.match(speech, /AI response failed/);
+  assert.doesNotMatch(speech, /trade failed|couldn't confirm the trade|not executed|not submitted/);
+  assert.equal(f.voices.length, 2); assert.equal(f.posts.length, 1);
+  const saved = f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord;
+  assert.equal(saved.status, 'failed'); assert.deepEqual(saved.primaryResult?.partialResult, partialResult);
+  assert.equal(saved.primaryResult?.assistant, undefined);
 });

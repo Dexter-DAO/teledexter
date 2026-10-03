@@ -358,3 +358,35 @@ for (const historical of previouslyAcceptedAssignments) {
     }
   });
 }
+
+
+test('status context observations append independently without changing historical generation versions', t => {
+  const { store, directory } = fixture(t);
+  const call = store.reserve({ ...input(), callSid: `CA${'1'.repeat(32)}` }).call;
+  const response = returnedBinding(call.callSid!); store.recordPrimaryBinding(call.id, response);
+  const at = new Date().toISOString(), generationId = randomUUID();
+  const version = { ownerPrincipalId: randomUUID(), primaryDexterId: response.context.primaryDexterId,
+    threadId: response.context.threadId, contextEpoch: '10', threadEventSequence: '280', digest: 'a'.repeat(64) };
+  store.update(call.id, { mediaStartedAt: at, liveSessionId: 'status_source', liveGenerations: {
+    version: 1, callId: call.id, binding: { bindingId: response.bindingId, callSid: call.callSid!,
+      ownerPrincipalId: version.ownerPrincipalId, primaryDexterId: version.primaryDexterId, threadId: version.threadId },
+    clocks: { mediaStartedAt: at, callDeadlineAt: new Date(Date.now() + 60_000).toISOString() },
+    phase: 'active', inputNextSample: 0, deliveryAttachment: { generationId, sessionId: 'status_source' },
+    segments: [{ generationId, ordinal: 1, createdAt: at, readyAt: at, state: 'active', sessionId: 'status_source',
+      version, pageDigest: 'b'.repeat(64), outputDiscarded: false, transcript: { revision: 0, callerRevision: 0, fragments: [] } }],
+  } });
+  const refresh = { generationId, observedAt: at, version: { ...version, threadEventSequence: '281', digest: 'c'.repeat(64) },
+    contentDigest: 'd'.repeat(64) };
+  const saved = store.update(call.id, { statusContextRefreshes: [refresh] });
+  assert.deepEqual(saved.liveGenerations!.segments[0].version, version);
+  const file = path.join(directory, 'calls.json'), bytes = fs.readFileSync(file);
+  assert.throws(() => store.update(call.id, { statusContextRefreshes: [] }), /evidence changed/);
+  assert.throws(() => store.update(call.id, { statusContextRefreshes: [{ ...refresh, contentDigest: 'e'.repeat(64) }] }), /evidence changed/);
+  for (const wrong of [{ ...refresh, version: { ...refresh.version, ownerPrincipalId: randomUUID() } },
+    { ...refresh, version: { ...refresh.version, contextEpoch: '11' } },
+    { ...refresh, version: { ...refresh.version, threadEventSequence: '279' } }])
+    assert.throws(() => store.update(call.id, { statusContextRefreshes: [refresh, wrong] }), /source changed/);
+  assert.deepEqual(fs.readFileSync(file), bytes);
+  store.close(); const resumed = new BrokerStore(directory); t.after(() => resumed.close());
+  assert.deepEqual(resumed.get(call.id), saved); assert.deepEqual(fs.readFileSync(file), bytes);
+});

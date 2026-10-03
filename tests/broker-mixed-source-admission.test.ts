@@ -7,7 +7,7 @@ import { BrokerStore } from '../src/broker/store.js';
 import { brokerIdentity, createPrimaryBackend, validateBrokerAdmissionRefusals, type BrokerDelegationRecord, type PrimaryBackendOptions } from '../src/broker/backend.js';
 import { callerRouteRef, callerRoutingSourceAnchors, getCallerRouteBySource, callerRoutePresentationDigest,
   callerIntentQuestionForTarget, type CallerRouteRef, type CallerRouteRecord, type CallerQuestionTarget, type CallerRouteDecision } from '../src/broker/callerRouting.js';
-import { callerIntentInputDigest, type CallerIntentInput, type CallerIntentDecision, type CallerIntentResponse } from '../src/broker/callerIntentContract.js';
+import { callerIntentInputDigest, callerIntentInputSchema, callerIntentResponseSchema, type CallerIntentInput, type CallerIntentDecision, type CallerIntentResponse } from '../src/broker/callerIntentContract.js';
 import type { FrozenCallerTurn } from '../src/broker/callerTurn.js';
 import { beginBrokerPublication, beginSelectedQuestionPublication, settleBrokerPublication, rejectBrokerPublication,
   callerIntentResultPublicationCandidates, callerIntentResultPublicationInventory } from '../src/broker/publications.js';
@@ -78,9 +78,11 @@ async function fixture(t: TestContext, selectedResult = false) {
   const resultCandidate = selectedResult ? callerIntentResultPublicationCandidates(store.get(initial.id)!, sessionId)[0] : undefined;
   if (selectedResult) assert.ok(resultCandidate);
   const posts: PrimarySubmission[] = [], replies: PrimaryReplyInput[] = [], reads: string[] = [];
-  const captures: PrimaryTurn[] = [], commentary: string[] = [];
+  const captures: PrimaryTurn[] = [], commentary: string[] = [], acknowledgements: string[] = [];
+  const smsAdmissions: Array<{v:'phone.result-sms.v1';callerIntentOperationId:string;requestId:string}> = [];
+  const smsReceipt = {v:'phone.result-sms.v1' as const,intentId:id(80),intentDigest:'a'.repeat(64),state:'waiting_result' as const,replayed:false};
   const results = new Map<string, PrimaryResult>();
-  const hooks: { submitError?: Error; readError?: Error; captureFailures?: number } = {};
+  const hooks: { submitError?: Error; readError?: Error; captureFailures?: number; smsError?: Error; queuedSms?: boolean; onSmsAdmission?: () => void } = {};
   let submitQuestion = false, loseReply = false;
   const question = (): PrimaryQuestion => ({ id: id(6), revision: 1, runId: id(7), threadId: id(4),
     agent: { id: id(3), name: 'Dexter' }, question: 'Continue the comparison?', context: 'Research only.',
@@ -88,7 +90,7 @@ async function fixture(t: TestContext, selectedResult = false) {
     state: 'pending', runState: 'waiting_for_reply', createdAt: initial.createdAt,
     expiresAt: new Date(Date.now() + 120_000).toISOString(), reply: null });
   const channel: LiveBackendChannel = { signal: abort.signal, getContext: () => structuredClone(snapshot),
-    subscribeContext: () => () => {}, async publish(update) { return { status: 'accepted', eventId: update.id }; } };
+    subscribeContext: () => () => {}, async publish(update) { acknowledgements.push(update.text); return { status: 'accepted', eventId: update.id }; } };
   const options: PrimaryBackendOptions = { callId: initial.id, callSid, bindingId, store, sourceSessionId: sessionId,
     selectedQuestionSources: () => [], callerRouteSources: () => callerRoutingSourceAnchors(store.get(initial.id)!),
     callerRouteCaptureAccepted(sourceEventId, receipt) {
@@ -100,8 +102,9 @@ async function fixture(t: TestContext, selectedResult = false) {
       async submit(_binding, requestId, input) {
         posts.push(structuredClone(input));
         if (hooks.submitError) throw hooks.submitError;
-        const result: PrimaryResult = submitQuestion ? { requestId, bindingId, state: 'waiting_for_reply', question: question() }
+        const result: PrimaryResult = input.resultSms && hooks.queuedSms ? {requestId,bindingId,state:'queued'} : submitQuestion ? { requestId, bindingId, state: 'waiting_for_reply', question: question() }
           : { requestId, bindingId, state: 'completed', assistant: { messageId: id(8), eventId: id(9), sequence: '1', text: 'Research saved.' } };
+        if(input.resultSms) { result.resultSms=smsReceipt; hooks.onSmsAdmission?.(); }
         results.set(requestId, result); return structuredClone(result);
       },
       async result(_binding, requestId) {
@@ -122,6 +125,12 @@ async function fixture(t: TestContext, selectedResult = false) {
           ...before.question!, state: 'answered' as const, runState: 'running' as const,
           reply: { ...input.reply, interpretedAnswer: 'Compare both.', receivedAt: new Date(clock).toISOString() } } };
         results.set(requestId, result); return result;
+      },
+      async admitResultSms(_binding,input) {
+        assert.equal(_binding,bindingId);
+        assert.ok(posts.some(post=>JSON.stringify(post.resultSms)===JSON.stringify(input)) || captures.some(turn=>store.get(initial.id)!.callerRouting!.records.some(route=>route.intent?.operationId===input.callerIntentOperationId && route.capture && route.frozen.turn.sourceEventId===turn.sourceEventId)));
+        smsAdmissions.push(structuredClone(input));if(hooks.smsError)throw hooks.smsError;hooks.onSmsAdmission?.();
+        return {...smsReceipt,replayed:smsAdmissions.length>1};
       },
       async captureTurn(_binding, turn) {
         captures.push(structuredClone(turn));
@@ -174,28 +183,34 @@ async function fixture(t: TestContext, selectedResult = false) {
       const value = offered.find(value => value.id === reference.id && value.digest === reference.digest);
       assert.ok(value); return value;
     });
-    const input: CallerIntentInput = { v: 'phone.caller-intent.v2', source: { callSid,
+    const delivery = decision.kind==='deliver_result' || (decision.kind==='task' && decision.delivery);
+    const tasks=decision.kind==='deliver_result' ? [{execution:decision.target}] : [];
+    const input = callerIntentInputSchema.parse({ v: delivery ? 'phone.caller-intent.v3' : 'phone.caller-intent.v2',
+      ...(delivery ? {tasks,taskCoverage:{state:'complete',count:tasks.length,inventoryDigest:'a'.repeat(64)}} : {}), source: { callSid,
       sourceEventId: record.frozen.turn.sourceEventId, itemId: record.frozen.turn.itemId, revision: 1,
       receivedAt: record.frozen.turn.occurredAt, role: 'user', text: record.frozen.turn.text },
       generationId: record.scope.generationId, sourceSessionId: sessionId, brokerInputDigest: record.inputDigest,
       presentationDigest: callerRoutePresentationDigest(record.resolutionInput), callDeadlineAt: current.liveGenerations!.clocks.callDeadlineAt,
       version: record.resolutionInput.version, questions: record.resolutionInput.questions.map(callerIntentQuestionForTarget),
       resultCoverage: record.resolutionInput.resultCoverage!,
-      results: record.resolutionInput.resultCoverage!.state === 'overflow' ? [] : selected.map(value => value.candidate) };
+      results: record.resolutionInput.resultCoverage!.state === 'overflow' ? [] : selected.map(value => value.candidate) });
     const operationId = brokerIdentity('test-caller-intent', initial.id, ref.sourceEventId);
     store.prepareCallerIntent(initial.id, ref, { operationId, input });
     const resolved: CallerIntentDecision = decision.kind === 'answer' ? { kind: 'answer', target: callerIntentQuestionForTarget(decision.target) }
       : decision.kind === 'task' ? { kind: 'task', ...(decision.contextReference ? {
-        reference: selected.find(value => value.id === decision.contextReference!.id)!.reference } : {}) }
+        reference: selected.find(value => value.id === decision.contextReference!.id)!.reference } : {}), ...(decision.delivery ? {delivery:decision.delivery} : {}) }
+      : decision.kind==='deliver_result' ? decision
       : decision.kind === 'conversation' ? { kind: 'conversation' } : { kind: 'clarify', reason: 'invalid_output' };
-    const response: CallerIntentResponse = { v: 'phone.caller-intent.v2', operationId, bindingId,
+    assert.ok(input.v !== 'phone.caller-intent.v1');
+    const response = callerIntentResponseSchema.parse({ v: input.v, operationId, bindingId,
+      ...(input.v==='phone.caller-intent.v3' ? {tasks:input.tasks,taskCoverage:input.taskCoverage} : {}),
       inputDigest: callerIntentInputDigest(operationId, bindingId, input), brokerInputDigest: record.inputDigest,
       presentationDigest: input.presentationDigest, generationId: input.generationId, sourceSessionId: sessionId,
       callDeadlineAt: input.callDeadlineAt, questions: input.questions, results: input.results, version: input.version,
       resultCoverage: input.resultCoverage, resultContextCoverage: input.resultCoverage.state === 'overflow'
         ? { state: 'unavailable', reason: 'inventory_overflow' } : { state: 'complete' },
       reservedAt: new Date(clock).toISOString(), validUntil: new Date(Math.min(clock + 10_000, Date.parse(input.callDeadlineAt))).toISOString(),
-      state: 'resolved', decision: resolved };
+      state: 'resolved', decision: resolved });
     store.recordCallerIntentResponse(initial.id, ref, response);
     store.decideCallerRoute(initial.id, ref, { inputDigest: ref.inputDigest, decision });
   };
@@ -228,7 +243,7 @@ async function fixture(t: TestContext, selectedResult = false) {
     return { request, ref, frozen };
   };
   return { store, directory, callId: initial.id, sessionId, bindingId, options, backend, channel, route, posts, replies, reads, snapshot,
-    hooks, captures, commentary, results, resolve,
+    hooks, captures, commentary, results, resolve, smsAdmissions, acknowledgements, abort,
     reference: resultCandidate && { id: resultCandidate.id, digest: resultCandidate.digest },
     pendingQuestion() { submitQuestion = true; }, completedSubmits() { submitQuestion = false; },
     advance(ms: number) { clock += ms; }, now: () => clock, loseReply() { loseReply = true; },
@@ -277,6 +292,131 @@ test('an exact ordinary answer retains its question and source, and lost reply r
   assert.equal(h.posts.length, 1); assert.equal(h.replies.length, 1);
   assert.equal(h.replies[0].text, answer.frozen.turn.text); assert.equal(h.replies[0].reply.answer, 'yes');
   assert.equal(h.entries()[0].questions![id(6)].reply!.status, 'unknown');
+});
+
+test('a text instruction is durably admitted while the original question stays pending', async t => {
+  const h=await fixture(t);h.pendingQuestion();
+  const first=h.route('Compare Apple earnings.',{kind:'task'});
+  await h.backend.delegateFrozenTask(first.request,first.ref,h.channel);
+  const before=h.backend.questionTargets(h.sessionId);assert.equal(before.length,1);
+  const target={bindingId:h.bindingId,requestId:h.entries()[0]!.requestId,runId:id(7)};
+  const next=h.route('Text me that answer when it is ready.',{kind:'deliver_result',target,delivery:{kind:'sms_result'}},before);
+  h.hooks.onSmsAdmission=()=>assert.equal(h.acknowledgements.length,0,'acknowledgement follows durable admission');
+  await h.backend.deliverFrozenResult(next.request,next.ref,h.channel);
+  delete h.hooks.onSmsAdmission;
+  await h.backend.deliverFrozenResult(next.request,next.ref,h.channel);
+  assert.equal(h.posts.length,1);assert.equal(h.replies.length,0);assert.equal(h.captures.length,1);
+  assert.deepEqual(h.smsAdmissions[0],h.smsAdmissions[1]);
+  assert.deepEqual(h.backend.questionTargets(h.sessionId),before);
+  assert.match(h.acknowledgements[0]!,/request is saved/);
+  assert.equal(h.entries()[0]!.deferredTurns,undefined);
+});
+
+test('combined research and text admission bypasses the local queue without replacing the active question',async t=>{
+  const h=await fixture(t);h.pendingQuestion();
+  const first=h.route('Compare Apple earnings.',{kind:'task'});
+  await h.backend.delegateFrozenTask(first.request,first.ref,h.channel);
+  const before=h.backend.questionTargets(h.sessionId);
+  h.hooks.queuedSms=true;h.hooks.onSmsAdmission=()=>assert.equal(h.acknowledgements.length,0);
+  const next=h.route('Research Nvidia earnings and text me the answer.',{kind:'task',delivery:{kind:'sms_result'}},before);
+  await h.backend.delegateFrozenTask(next.request,next.ref,h.channel);
+  await h.backend.delegateFrozenTask(next.request,next.ref,h.channel);
+  assert.equal(h.posts.length,2);assert.equal(h.replies.length,0);
+  assert.equal(h.posts[1]!.resultSms?.requestId,h.entries()[1]!.requestId);
+  assert.equal(h.posts[1]!.source.sourceEventId,next.frozen.turn.sourceEventId);
+  assert.equal(h.entries()[0]!.deferredTurns,undefined);
+  assert.equal(h.entries()[1]!.status,'queued');
+  assert.deepEqual(h.backend.questionTargets(h.sessionId),before);
+  assert.match(h.acknowledgements[0]!,/request is saved/);
+});
+
+test('hangup after durable text admission preserves the request without a late voice acknowledgement',async t=>{
+  const h=await fixture(t),target={bindingId:h.bindingId,requestId:id(71),runId:id(72)};
+  const next=h.route('Text me the Apple answer.',{kind:'deliver_result',target,delivery:{kind:'sms_result'}});
+  h.hooks.onSmsAdmission=()=>h.abort.abort();
+  await h.backend.deliverFrozenResult(next.request,next.ref,h.channel);
+  assert.equal(h.smsAdmissions.length,1);assert.equal(h.acknowledgements.length,0);
+  assert.equal(h.posts.length,0);
+});
+
+test('failed delivery admission never claims the text request was saved',async t=>{
+  const h=await fixture(t),target={bindingId:h.bindingId,requestId:id(71),runId:id(72)};
+  const next=h.route('Text me the Apple answer.',{kind:'deliver_result',target,delivery:{kind:'sms_result'}});
+  h.hooks.smsError=new PrimaryApiError('http_error',409,{code:'primary_run_failed',retryable:false});
+  await h.backend.deliverFrozenResult(next.request,next.ref,h.channel);
+  assert.deepEqual(h.acknowledgements,['That task ended without an answer to send.']);
+  assert.equal(h.posts.length,0);assert.equal(h.replies.length,0);
+});
+
+test('definite combined SMS refusal preserves source and lets a later ordinary request proceed',async t=>{
+  const h=await fixture(t);
+  h.hooks.submitError=new PrimaryApiError('http_error',503,{code:'sms_delivery_pending',retryable:true});
+  const first=h.route('Research Apple and text me the answer.',{kind:'task',delivery:{kind:'sms_result'}});
+  await h.backend.delegateFrozenTask(first.request,first.ref,h.channel);
+  const refused=h.entries()[0]!;assert.equal(refused.status,'admission_refused');
+  assert.equal(refused.admissionRefusal?.code,'sms_delivery_pending');assert.equal(refused.originalCapture?.state,'accepted');
+  assert.match(h.acknowledgements[0]!,/Research has not started/);
+  assert.match(h.acknowledgements[0]!,/without a text/);
+  delete h.hooks.submitError;
+  const next=h.route('Research Apple now.',{kind:'task'});
+  await h.backend.delegateFrozenTask(next.request,next.ref,h.channel);
+  assert.equal(h.posts.length,2);assert.equal(h.posts[1]!.resultSms,undefined);
+  assert.equal(h.entries()[1]!.status,'completed');assert.equal(h.entries()[0]!.deferredTurns,undefined);
+  const changed=structuredClone(h.store.get(h.callId)!);
+  (changed.delegations[refused.requestId] as BrokerDelegationRecord).submission.resultSms!.requestId=id(99);
+  assert.throws(()=>validateBrokerAdmissionRefusals(changed),/invalid_saved_admission_refusal/);
+});
+
+test('lost combined submission remains uncertain even when later read returns an eligibility error',async t=>{
+  const h=await fixture(t);h.hooks.submitError=new Error('transport lost');
+  h.hooks.smsError=new PrimaryApiError('http_error',404,{code:'request_not_found',retryable:false});
+  const first=h.route('Research Apple and text me the answer.',{kind:'task',delivery:{kind:'sms_result'}});
+  await h.backend.delegateFrozenTask(first.request,first.ref,h.channel);
+  assert.equal(h.entries()[0]!.status,'dispatch_unknown');assert.equal(h.entries()[0]!.admissionRefusal,undefined);
+  h.hooks.readError=new PrimaryApiError('http_error',503,{code:'sms_delivery_pending',retryable:true});
+  await h.backend.delegateFrozenTask(first.request,first.ref,h.channel);
+  assert.equal(h.posts.length,1);assert.equal(h.entries()[0]!.status,'dispatch_unknown');
+  assert.ok(h.acknowledgements.every(text=>!text.includes('request is saved')));
+});
+
+test('lost combined acknowledgement recovers only its original SMS receipt after task content becomes unavailable',async t=>{
+  const h=await fixture(t);h.hooks.submitError=new Error('combined response lost after commit');
+  h.hooks.smsError=new Error('receipt response lost');
+  const first=h.route('Research Apple and text me the answer.',{kind:'task',delivery:{kind:'sms_result'}});
+  await h.backend.delegateFrozenTask(first.request,first.ref,h.channel);
+  assert.equal(h.entries()[0]!.status,'dispatch_unknown');assert.equal(h.entries()[0]!.resultSmsAdmission,undefined);
+  h.hooks.readError=new PrimaryApiError('http_error',403,{code:'binding_unauthorized',retryable:false});
+  delete h.hooks.smsError;
+  await h.backend.delegateFrozenTask(first.request,first.ref,h.channel);
+  assert.equal(h.posts.length,1);assert.deepEqual(h.smsAdmissions,[h.posts[0]!.resultSms,h.posts[0]!.resultSms]);
+  assert.equal(h.entries()[0]!.status,'dispatch_unknown');assert.equal(h.entries()[0]!.primaryResult,undefined);
+  assert.equal(h.entries()[0]!.resultSmsAdmission?.state,'waiting_result');
+  assert.match(h.acknowledgements.at(-1)!,/text request is saved/);
+  await h.backend.delegateFrozenTask(first.request,first.ref,h.channel);
+  assert.equal(h.smsAdmissions.length,2);assert.equal(h.posts.length,1);
+});
+
+test('crash-recovered dispatching task can recover its exact text receipt without another task POST',async t=>{
+  const h=await fixture(t);h.hooks.submitError=new Error('lost response');h.hooks.smsError=new Error('receipt transport lost');
+  const first=h.route('Research Apple and text me the answer.',{kind:'task',delivery:{kind:'sms_result'}});
+  await h.backend.delegateFrozenTask(first.request,first.ref,h.channel);
+  const entry=h.entries()[0]!;
+  h.store.update(h.callId,{delegations:{[entry.requestId]:{...entry,status:'dispatching'}}});
+  await h.store.close();const reopened=new BrokerStore(h.directory);t.after(()=>reopened.close());
+  delete h.hooks.smsError;
+  const recovered=createPrimaryBackend({...h.options,store:reopened});
+  await recovered.delegateFrozenTask(first.request,first.ref,h.channel);
+  assert.equal(h.posts.length,1);assert.deepEqual(h.smsAdmissions[1],entry.submission.resultSms);
+  const saved=reopened.get(h.callId)!;const retained=saved.delegations[entry.requestId] as BrokerDelegationRecord;
+  assert.equal(retained.status,'dispatching');assert.equal(retained.primaryResult,undefined);assert.ok(retained.resultSmsAdmission);
+  const missing=structuredClone(saved);delete (missing.delegations[entry.requestId] as BrokerDelegationRecord).resultSmsAdmission;
+  assert.throws(()=>validateBrokerAdmissionRefusals(missing,saved),/saved_sms_admission_recovery_removed/);
+  const removed=structuredClone(saved);delete removed.delegations[entry.requestId];
+  assert.throws(()=>validateBrokerAdmissionRefusals(removed,saved),/admission_refusal_removed/);
+  const before=structuredClone(saved),after=structuredClone(saved);
+  const previous=before.delegations[entry.requestId] as BrokerDelegationRecord;
+  delete previous.resultSmsAdmission;previous.status='prepared';
+  assert.throws(()=>validateBrokerAdmissionRefusals(after,before),/sms_admission_recovery_requires_attempted_dispatch/);
 });
 
 test('a late question publication rejection removes the candidate and prevents fresh routed reply', async t => {

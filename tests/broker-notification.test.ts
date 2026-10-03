@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createServer } from 'node:http';
+import { spawnSync } from 'node:child_process';
 import { BrokerStore } from '../src/broker/store.js';
 import { phoneCallAssignmentSchema } from '../src/broker/assignment.js';
 import { phoneNotificationSourceDigest, resolvedNotificationAssignmentSchema } from '../src/broker/notificationAssignment.js';
@@ -56,6 +57,47 @@ test('publication and owner-test sources retain their original event identity in
     const { sourceDigest: _changed, ...wrong } = value; value.sourceDigest = phoneNotificationSourceDigest(wrong);
     assert.equal(resolvedNotificationAssignmentSchema.safeParse(resolved).success, false);
   }
+});
+
+test('watcher source binds its producer and original event without claiming a Hark watch', () => {
+  const resolved = makeResolvedNotificationAssignment(), value = resolved.callAssignment.notification;
+  value.source = { kind: 'watcher_event_v1', producer: 'market_pulse', eventId: 'market-pulse:solcat:100:10:20' };
+  value.eventId = value.source.eventId;
+  const { sourceDigest: _old, ...source } = value; value.sourceDigest = phoneNotificationSourceDigest(source);
+  assert.deepEqual(resolvedNotificationAssignmentSchema.parse(resolved), resolved);
+  value.source.eventId = 'market-pulse:another';
+  const { sourceDigest: _changed, ...wrong } = value; value.sourceDigest = phoneNotificationSourceDigest(wrong);
+  assert.equal(resolvedNotificationAssignmentSchema.safeParse(resolved).success, false);
+});
+
+test('CATE keeps its crossing identity through completed journal restart and rejects another producer prefix', t => {
+  const f = fixture(t), resolved = makeResolvedNotificationAssignment(), value = resolved.callAssignment.notification;
+  value.source = { kind: 'watcher_event_v1', producer: 'cate_market_cap', eventId: 'cate-pumpswap-market-cap-v1-7-down-6030000' };
+  value.eventId = value.source.eventId;
+  const { sourceDigest: _old, ...source } = value; value.sourceDigest = phoneNotificationSourceDigest(source);
+  assert.deepEqual(resolvedNotificationAssignmentSchema.parse(resolved), resolved);
+  const call = f.store.reserveNotification(resolved, digest).call;
+  f.store.beginHarkDispatch(call.id, started); f.store.acceptHarkDispatch(call.id, sid, started);
+  f.store.observeHarkProvider(call.id, 'completed', ended, { startedAt: started, endedAt: ended, durationSeconds: 60 });
+  f.restart();
+  assert.deepEqual(f.store.get(call.id)?.callAssignment?.value, resolved.callAssignment);
+  assert.equal(f.store.get(call.id)?.status, 'completed');
+  assert.equal(f.store.reserveNotification(resolved, digest).existing, true);
+  if (process.env.CATE_PREVIOUS_BROKER_ROOT) {
+    const older = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-cate-old-reader-'));
+    t.after(() => fs.rmSync(older, { recursive: true, force: true }));
+    fs.copyFileSync(path.join(f.directory, 'calls.json'), path.join(older, 'calls.json'));
+    const script = `import {pathToFileURL} from 'node:url'; const {BrokerStore}=await import(pathToFileURL(process.argv[1]+'/dist/broker/store.js'));
+try {const store=new BrokerStore(process.argv[2]);store.close();process.stdout.write('accepted');}
+catch {process.stdout.write('rejected');}`;
+    const old = spawnSync(process.execPath, ['--input-type=module','-e',script,process.env.CATE_PREVIOUS_BROKER_ROOT,older], {encoding:'utf8',timeout:10000});
+    assert.equal(old.status, 0, old.stderr); assert.equal(old.stdout, 'rejected');
+  }
+  const changed = structuredClone(resolved), wrong = changed.callAssignment.notification;
+  wrong.source = { kind: 'watcher_event_v1', producer: 'cate_market_cap', eventId: 'market-pulse:solcat:100:10:20' };
+  wrong.eventId = wrong.source.eventId;
+  const { sourceDigest: _changed, ...wrongSource } = wrong; wrong.sourceDigest = phoneNotificationSourceDigest(wrongSource);
+  assert.equal(resolvedNotificationAssignmentSchema.safeParse(changed).success, false);
 });
 
 test('frozen notification reservation, dispatch ambiguity and accepted identity survive restart without redial authorization', t => {
@@ -150,4 +192,29 @@ test('resolver reflects authenticated original wire and refuses altered identity
   status = 200; reply = 'x'.repeat(65537);
   await assert.rejects(resolve(notification, 'fixture-token'), NotificationAssignmentError);
   assert.equal(requests.length, 7);
+});
+
+test('completed watcher records remain readable on restart and keep their original provenance', t => {
+  const f = fixture(t), resolved = makeResolvedNotificationAssignment(), value = resolved.callAssignment.notification;
+  value.source = { kind: 'watcher_event_v1', producer: 'market_pulse', eventId: 'market-pulse:solcat:100:10:20' };
+  value.eventId = value.source.eventId;
+  const { sourceDigest: _old, ...source } = value; value.sourceDigest = phoneNotificationSourceDigest(source);
+  const call = f.store.reserveNotification(resolved, digest).call;
+  f.store.beginHarkDispatch(call.id, started); f.store.acceptHarkDispatch(call.id, sid, started);
+  f.store.observeHarkProvider(call.id, 'completed', ended, { startedAt: started, endedAt: ended, durationSeconds: 60 });
+  f.restart();
+  assert.deepEqual(f.store.get(call.id)?.callAssignment?.value, resolved.callAssignment);
+  assert.equal(f.store.byNotification(call.id, digest)?.harkDispatch?.state, 'provider_accepted');
+  assert.equal(f.store.get(call.id)?.status, 'completed');
+  assert.equal(f.store.reserveNotification(resolved, digest).existing, true);
+  if (process.env.WATCHER_LEGACY_BROKER_ROOT) {
+    const older = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-watcher-old-reader-'));
+    t.after(() => fs.rmSync(older, { recursive: true, force: true }));
+    fs.copyFileSync(path.join(f.directory, 'calls.json'), path.join(older, 'calls.json'));
+    const script = `import {pathToFileURL} from 'node:url'; const {BrokerStore}=await import(pathToFileURL(process.argv[1]+'/dist/broker/store.js'));
+try {const store=new BrokerStore(process.argv[2]);store.close();process.stdout.write('accepted');}
+catch {process.stdout.write('rejected');}`;
+    const old = spawnSync(process.execPath, ['--input-type=module','-e',script,process.env.WATCHER_LEGACY_BROKER_ROOT,older], {encoding:'utf8',timeout:10000});
+    assert.equal(old.status, 0, old.stderr); assert.equal(old.stdout, 'rejected');
+  }
 });

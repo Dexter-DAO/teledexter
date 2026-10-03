@@ -1,3 +1,6 @@
+import type { BrokerSmsBridge } from './sms.js';
+import { createResultSmsClient, type ResultSmsClient } from './resultSmsClient.js';
+import { dispatchResultSms, resultSmsFailure } from './resultSmsDispatch.js';
 import { createInboundBillingLifecycle } from './inboundBillingLifecycle.js';
 import { inboundBillingSummary } from './inboundBilling.js';
 import { createRestrictedSetupServer, type RestrictedSetupServerOptions } from './restrictedSetupServer.js';
@@ -8,10 +11,12 @@ import Twilio from 'twilio';
 import { createBrokerLiveSession, type BrokerLiveSession, type BrokerLiveSessionOptions } from '../live/session.js';
 import type { LiveTranscriptSnapshot } from '../live/session.js';
 import { createPrimaryApiClient, type PrimaryApiClient } from './primaryApi.js';
-import { createPrimaryBackend } from './backend.js';
+import { createPrimaryBackend, type BrokerDelegationRecord } from './backend.js';
 import { eligiblePhoneCallSchema, type EligibleContextClient } from './eligibleContext.js';
 import { createGenerationVoice, type GenerationVoiceOptions, type GenerationVoiceSession } from './generationVoice.js';
+import { carrierPlaybackState } from './voicePresentation.js';
 import { createInboundStartupContexts } from './startupContext.js';
+import { createInboundPreconnect } from './inboundPreconnect.js';
 import { createNotificationAssignmentResolver, NotificationAssignmentError, type NotificationAssignmentResolver } from './notificationResolver.js';
 import { createBrokerDependencyHealth, type BrokerDependencyHealth } from './dependencyHealth.js';
 import { createSelectedQuestionRecovery, selectedQuestionSourceAnchors } from './selectedQuestionVoice.js';
@@ -40,11 +45,12 @@ import type { deliverHarkBilling } from './harkBillingDelivery.js';
 import { rejectBrokerPublication } from './publications.js';
 import { createCallbackFlow } from './callback.js';
 import { createInboundFlow } from './inbound.js';
+import { logInboundTiming, observeInboundStreamResponse, observeInboundHoldResponse } from './inboundTiming.js';
 import { type BrokerConfig, isPhoneNumber } from './config.js';
 import { BrokerStore, type BrokerCall, type CallStatus, terminalCallStatuses } from './store.js';
 import { brokerInstructions, brokerHistory, brokerOpening } from './instructions.js';
 import { probeLive } from './preflight.js';
-import { authorizedControl, callTwiml, fallbackTwiml, inputSpeechEnergy, mediaStart, PlaybackReceipts, safeFailure, streamToken, verifyTwilio, type ProviderCallProof } from './phone.js';
+import { authorizedControl, callTwiml, fallbackTwiml, inputSpeechEnergy, mediaStart, PlaybackReceipts, hasAudiblePcmu, safeFailure, streamToken, verifyTwilio, type ProviderCallProof } from './phone.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const CALL_SID = /^CA[0-9a-f]{32}$/i;
@@ -96,6 +102,10 @@ const publicCall = (call: BrokerCall) => ({
 });
 
 export interface BrokerServerOptions {
+  /** Ordinary inbound transport only; production supplies the same Live connector as the session adapter. */
+  inboundPreconnect?: () => import('../live/types.js').BrokerLiveConnection;
+  sms?: BrokerSmsBridge;
+  resultSms?: ResultSmsClient;
   config: BrokerConfig;
   store?: BrokerStore;
   primary?: PrimaryApiClient;
@@ -129,12 +139,16 @@ export function createBrokerServer(options: BrokerServerOptions) {
   const primary = options.primary ?? createPrimaryApiClient({ apiBaseUrl: config.apiBaseUrl, phoneServiceSecret: config.phoneServiceSecret,
     ...(options.eligibleContext ? { contextProtocol: { version: 'memory-eligible-v1' as const,
       parse: (value: unknown) => eligiblePhoneCallSchema.parse(value) } } : {}) });
+  const resultSms = options.resultSms ?? createResultSmsClient({ apiBaseUrl: config.apiBaseUrl,
+    phoneServiceSecret: config.phoneServiceSecret });
   const provider = options.provider ?? Twilio(config.twilioAccountSid, config.twilioAuthToken, { autoRetry: false, timeout: 15_000 });
   const voiceFactory = options.voiceFactory ?? createBrokerLiveSession;
   const probe = options.probe ?? probeLive;
   const dependencyHealth = options.dependencyHealth ?? createBrokerDependencyHealth({
     apiBaseUrl: config.apiBaseUrl, harkApiBaseUrl: config.harkApiBaseUrl,
   });
+  const preconnect = options.eligibleContext && options.inboundPreconnect ? createInboundPreconnect(options.inboundPreconnect,
+    event => console.info(JSON.stringify(event))) : undefined;
   const startupContexts = options.eligibleContext ? createInboundStartupContexts(options.eligibleContext) : undefined;
   const resolveHarkAssignment = options.resolveHarkAssignment ?? (config.harkApiBaseUrl
     ? createHarkAssignmentResolver({ apiBaseUrl: config.harkApiBaseUrl }) : undefined);
@@ -227,6 +241,9 @@ export function createBrokerServer(options: BrokerServerOptions) {
   });
 
   const inbound = createInboundFlow({ config, store, primary,
+    onTiming: logInboundTiming,
+    onApprovedTransport: call => preconnect?.begin(call),
+    onTransportDiscard: (id, terminal) => terminal ? preconnect?.forget(id) : preconnect?.discard(id),
     onContext: (call, context) => startupContexts?.remember(call, context),
     fetchCall: sid => provider.calls(sid).fetch(), closeBound: async call => {
       // Media may have started while a provider/account read was in flight.
@@ -241,6 +258,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
 
   function closePrimary(call: BrokerCall): Promise<void> {
     startupContexts?.discard(call.id);
+    preconnect?.forget(call.id);
     const inboundBound = call.inbound?.remote?.state === 'bound' ? call.inbound.remote : undefined;
     const bindingId = call.primary?.bindingId ?? inboundBound?.bindingId;
     if (!bindingId) return Promise.resolve();
@@ -447,7 +465,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
     } catch (error) { store.update(call.id, { failure: safeFailure(error) }); }
   }
 
-  async function inboundResponse(call: BrokerCall, response: ServerResponse): Promise<void> {
+  async function inboundResponse(call: BrokerCall, response: ServerResponse, originalHold = false): Promise<void> {
     call = store.get(call.id)!;
     if (restricted) { const setup = await restricted.inboundResponse(call); if (setup !== undefined) return xml(response, setup); }
     if (!options.inboundAttachment || !accepting) inbound.stopLocal(call.id, 'service_unavailable');
@@ -460,8 +478,10 @@ export function createBrokerServer(options: BrokerServerOptions) {
       return;
     }
     if (call.mediaStartedAt || active.has(call.id) || claimed.has(call.id)) return json(response, 409, { error: 'media_already_started' });
-    if (inbound.mediaAllowed(call)) return xml(response,
-      callTwiml(config.publicOrigin, call.id, streamToken(config.controlToken, call.id, call.callSid!)));
+    if (inbound.mediaAllowed(call)) {
+      observeInboundStreamResponse(call.id, response, logInboundTiming);
+      return xml(response, callTwiml(config.publicOrigin, call.id, streamToken(config.controlToken, call.id, call.callSid!)));
+    }
     const remote = call.inbound!.remote;
     try {
       const rendered = options.inboundAttachment!.waitingResponse({ callId: call.id,
@@ -469,6 +489,15 @@ export function createBrokerServer(options: BrokerServerOptions) {
         ...(remote && remote.state !== 'absent' ? { attachmentId: remote.attachmentId } : {}),
         ...(remote && 'expiresAt' in remote && remote.expiresAt ? { expiresAt: remote.expiresAt } : {}),
       });
+      if (originalHold && !call.inbound!.mode && !call.inbound!.continuation)
+        observeInboundHoldResponse(call.id, response, logInboundTiming, () => {
+          void inbound.beginEarly(call.id).catch(error => {
+            // This optional contact can reach a still-ringing leg. Its failure does
+            // not describe the eventual call; normal continuation owns that result.
+            try { console.error('[dexter-broker] Early inbound admission did not finish', { callId: call.id, code: safeFailure(error).code }); }
+            catch { /* Diagnostic output must not change recovery. */ }
+          });
+        });
       return xml(response, rendered);
     } catch (error) {
       store.update(call.id, { failure: safeFailure(error) });
@@ -479,12 +508,15 @@ export function createBrokerServer(options: BrokerServerOptions) {
 
   async function handle(request: IncomingMessage, response: ServerResponse) {
     const route = request.url || '/';
+    if (options.sms && await options.sms.handle(request, response)) return;
     if (restricted && await restricted.handle(request, response)) return;
     if (request.method === 'GET' && route === '/broker/health') {
       const dependencies = await dependencyHealth();
       const ok = accepting && dependencies.ok;
       return json(response, ok ? 200 : 503, { ok, service: 'dexter-broker', model: config.model,
-        revision: process.env.BROKER_REVISION || 'development', activeCalls: active.size, dependencies });
+        revision: process.env.BROKER_REVISION || 'development', activeCalls: active.size, dependencies,
+        notificationSourceKinds: ['publication_v1', 'owner_destination_test_v1', 'portfolio_watch_event_v1', 'watcher_event_v1'],
+        notificationWatcherProducers: ['market_pulse', 'founder_portfolio_pulse', 'cate_market_cap'] });
     }
     if (route === '/internal/outbound-alerts' && request.method === 'POST') {
       if (!accepting || !config.harkInternalToken) return json(response, 503, { ok: false, error: 'hark_broker_not_configured' });
@@ -548,9 +580,92 @@ export function createBrokerServer(options: BrokerServerOptions) {
         }
       }
       if (!authorizedControl(request.headers.authorization, config.controlToken)) return json(response, 401, { error: 'unauthorized' });
+      if (request.method === 'POST' && route === '/internal/broker/result-sms') {
+        let input: unknown;
+        try { input = JSON.parse(await body(request, 2_048)); }
+        catch { return json(response, 400, { ok: false, error: 'invalid_request' }); }
+        const result = await dispatchResultSms(input, { client: resultSms, sms: options.sms, accepting: () => accepting });
+        return json(response, !result.ok && result.error === 'invalid_request' ? 400 : 200, result);
+      }
+      if (request.method === 'POST' && route === '/internal/broker/result-sms/eligibility') {
+        let input: Record<string, unknown>;
+        try {
+          input = JSON.parse(await body(request, 2_048));
+          const keys = ['bindingId', 'callSid', 'primaryDexterId', 'threadId'];
+          if (!input || Array.isArray(input) || Object.keys(input).length !== keys.length
+            || Object.keys(input).some(key => !keys.includes(key))
+            || !['bindingId', 'primaryDexterId', 'threadId'].every(key => typeof input[key] === 'string' && UUID.test(input[key] as string))
+            || typeof input.callSid !== 'string' || !CALL_SID.test(input.callSid)) throw new Error('invalid_request');
+        } catch { return json(response, 400, { ok: false, error: 'invalid_request' }); }
+        const admittedCall = () => {
+          if (!accepting) return undefined;
+          const calls = store.list().filter(call => call.callSid === input.callSid && call.primary?.bindingId === input.bindingId);
+          if (calls.length !== 1) return undefined;
+          const call = calls[0];
+          if (call.status !== 'in-progress' || !call.mediaStartedAt || call.endedAt || call.finalized
+            || call.primaryClosed || call.primaryClosePending || call.restrictedSetup
+            || !call.primary || call.primary.primaryDexterId !== input.primaryDexterId || call.primary.threadId !== input.threadId)
+            return undefined;
+          return call;
+        };
+        if (!admittedCall()) return json(response, 409, { ok: false, error: 'sms_call_unavailable' });
+        try {
+          const current = await primary.getContext(input.bindingId as string);
+          if (current.state !== 'open' || current.bindingId !== input.bindingId || current.callSid !== input.callSid
+            || current.context.primaryDexterId !== input.primaryDexterId || current.context.threadId !== input.threadId)
+            return json(response, 409, { ok: false, error: 'sms_call_unavailable' });
+        } catch { return json(response, 409, { ok: false, error: 'sms_call_unavailable' }); }
+        const call = admittedCall();
+        if (!call) return json(response, 409, { ok: false, error: 'sms_call_unavailable' });
+        if (!options.sms) return json(response, 503, { ok: false, error: 'sms_delivery_pending' });
+        try { return json(response, 200, options.sms.requestedEligibility(call.number)); }
+        catch (error) {
+          const failure = resultSmsFailure(error);
+          return json(response, ['sms_delivery_pending', 'sms_unavailable'].includes(failure.error) ? 503 : 409, failure);
+        }
+      }
       if (request.method === 'GET' && route === '/internal/broker/calls') return json(response, 200, { calls: store.list().slice(0, 50).map(publicCall) });
       if (request.method !== 'POST' || !accepting) return json(response, 405, { error: 'unavailable' });
       const input = JSON.parse(await body(request, 8_000) || '{}') as Record<string, unknown>;
+      if (route === '/internal/broker/sms') {
+        const keys = ['bindingId', 'requestId', 'callSid', 'primaryDexterId', 'threadId', 'sourceEventId', 'sourceItemId', 'sourceRevision', 'message'];
+        if (!input || Array.isArray(input) || Object.keys(input).some(key => !keys.includes(key))
+          || !['bindingId', 'requestId', 'primaryDexterId', 'threadId', 'sourceEventId'].every(key => typeof input[key] === 'string' && UUID.test(input[key] as string))
+          || typeof input.callSid !== 'string' || !CALL_SID.test(input.callSid)
+          || typeof input.sourceItemId !== 'string' || !input.sourceItemId || input.sourceItemId.length > 200
+          || input.sourceRevision !== 1 || typeof input.message !== 'string' || !input.message.trim()
+          || input.message.length > 1000 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(input.message))
+          return json(response, 400, { ok: false, error: 'invalid_request' });
+        const admittedCall = () => {
+          const call = store.bySid(input.callSid as string);
+          if (!call || call.status !== 'in-progress' || !call.mediaStartedAt || call.endedAt || call.finalized
+            || call.primaryClosed || call.primaryClosePending || call.restrictedSetup
+            || !call.primary || call.primary.bindingId !== input.bindingId || call.primary.primaryDexterId !== input.primaryDexterId
+            || call.primary.threadId !== input.threadId) return undefined;
+          const matching = (Object.values(call.delegations) as BrokerDelegationRecord[]).filter(entry =>
+            entry.version === 1 && entry.callId === call.id && entry.callSid === call.callSid && entry.bindingId === input.bindingId
+            && (entry.requestId === input.requestId || (entry.reconciliation?.outcome === 'admitted'
+              && entry.reconciliation.canonicalRequestId === input.requestId && entry.reconciliation.bindingId === input.bindingId))
+            && ['dispatching', 'dispatch_unknown', 'queued', 'running'].includes(entry.status)
+            && entry.submission?.source.role === 'user' && entry.submission.source.callSid === call.callSid
+            && entry.submission.source.sourceEventId === input.sourceEventId && entry.submission.source.itemId === input.sourceItemId
+            && entry.submission.source.revision === input.sourceRevision);
+          return matching.length === 1 ? call : undefined;
+        };
+        if (!admittedCall()) return json(response, 409, { ok: false, error: 'sms_call_unavailable' });
+        // Reuse the binding read's current owner, caller verification and Primary checks.
+        // Its context stays private; it supplies no instructions or text to this action.
+        try {
+          const current = await primary.getContext(input.bindingId as string);
+          if (current.state !== 'open' || current.bindingId !== input.bindingId || current.callSid !== input.callSid
+            || current.context.primaryDexterId !== input.primaryDexterId || current.context.threadId !== input.threadId)
+            return json(response, 409, { ok: false, error: 'sms_call_unavailable' });
+        } catch { return json(response, 409, { ok: false, error: 'sms_call_unavailable' }); }
+        const call = admittedCall();
+        if (!call || !accepting) return json(response, 409, { ok: false, error: 'sms_call_unavailable' });
+        if (!options.sms) return json(response, 200, { ok: false, error: 'sms_delivery_pending', enrollmentUrl: 'https://dexter.cash/sms' });
+        return json(response, 200, await options.sms.sendRequested(call.number, call.callSid!, input.message));
+      }
       if (route === '/internal/broker/preflight') return json(response, 200, await probe({ apiKey: config.apiKey, model: config.model, voice: config.voice }));
       if (route === '/internal/broker/calls') {
         if (typeof input.requestId !== 'string' || !UUID.test(input.requestId)
@@ -672,7 +787,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
           store.update(reserved.id, { failure: safeFailure(error) }); call = store.get(reserved.id)!;
         }
         sessionCalls.add(call.id);
-        return inboundResponse(call, response);
+        return inboundResponse(call, response, true);
       }
       const requestId = createHash('sha256').update(`incoming:${params.CallSid}`).digest('hex');
       call = store.reserve({ requestId, direction: 'inbound', purpose: 'The person called Dexter.', number: params.From, callSid: params.CallSid }).call;
@@ -772,6 +887,11 @@ export function createBrokerServer(options: BrokerServerOptions) {
     const receipts = new PlaybackReceipts();
     let audioSentRecorded = Boolean(call.journey?.firstAudioSentAt);
     let playbackRecorded = Boolean(call.journey?.firstPlaybackConfirmedAt);
+    let audibleSentRecorded = false, audiblePlaybackRecorded = false;
+    const recordAudibleTiming = (stage: 'firstAudibleAudioSentAt' | 'firstAudiblePlaybackAcknowledgedAt') => {
+      try { console.info(JSON.stringify({ event: 'broker_audio_timing', version: 1, callId: call.id,
+        stage, observedAt: new Date().toISOString() })); } catch { /* Timing cannot interrupt audio or playback. */ }
+    };
     const metrics = () => ({ receivedAudioBytes: inputBytes, sentAudioBytes: receipts.sentBytes, playedAudioBytes: receipts.playedBytes, clearedAudioBytes: receipts.clearedBytes });
     const startTimer = setTimeout(() => { void stop('media_start_timeout'); }, 8_000);
     const callDeadlineAt = call.liveGenerations?.clocks.callDeadlineAt ?? call.verificationCallback?.media?.deadlineAt ?? new Date(Date.now() + config.maxCallSeconds * 1000).toISOString();
@@ -780,6 +900,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
     function stop(reason: string): Promise<void> {
       if (stopPromise) return stopPromise;
       stopping = true;
+      preconnect?.discard(call.id);
       clearTimeout(startTimer); clearTimeout(durationTimer);
       const previous = store.get(call.id)!;
       if (previous.inbound) inbound.stopLocal(call.id, reason);
@@ -855,7 +976,12 @@ export function createBrokerServer(options: BrokerServerOptions) {
                 store.update(call.id, { journey: { ...saved.journey, firstAudioSentAt: new Date().toISOString() } });
                 audioSentRecorded = true;
               }
-              const name = receipts.sent(Buffer.from(payload, 'base64').length);
+              const bytes = Buffer.from(payload, 'base64');
+              const audible = hasAudiblePcmu(bytes);
+              if (bytes.length > 0 && audible && !audibleSentRecorded) {
+                audibleSentRecorded = true; recordAudibleTiming('firstAudibleAudioSentAt');
+              }
+              const name = receipts.sent(bytes.length, audible);
               ws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name } }));
             },
             onTranscript(snapshot) {
@@ -869,7 +995,8 @@ export function createBrokerServer(options: BrokerServerOptions) {
               // The selected host publishes the exact eligible saved question.
               // Its operator purpose must never become an automatic new task.
               if (call.continuation) return;
-              if (options.eligibleContext && store.get(call.id)!.voiceOpening) return;
+              // The generation controller owns its opening inside validated activation.
+              if (options.eligibleContext) return;
               store.update(call.id, { liveSessionId: sessionId, voiceOpening: { status: 'pending' } });
               // Live's documented speak-first command runs while phone audio
               // continues. Its receipt confirms context injection, not playback.
@@ -894,7 +1021,13 @@ export function createBrokerServer(options: BrokerServerOptions) {
           };
           live = options.eligibleContext ? createGenerationVoice({ call: store.get(call.id)!, callDeadlineAt,
             apiKey: config.apiKey, voice: config.voice, store, primary,
-            context: startupContexts!.take(store.get(call.id)!), voiceFactory,
+            playbackState: () => carrierPlaybackState(!stopping && ws.readyState === WebSocket.OPEN,
+              receipts.audibleSentBytes, receipts.audiblePlayedBytes, receipts.audibleClearedBytes),
+            context: startupContexts!.take(store.get(call.id)!),
+            voiceFactory(settings) {
+              const connectionFactory = preconnect?.factory(store.get(call.id)!);
+              return voiceFactory(connectionFactory ? { ...settings, connectionFactory } : settings);
+            },
             ...(options.selectedQuestion ? { selectedQuestion: options.selectedQuestion } : {}),
             ...(call.continuation && options.callerIntent ? { callerIntent: createCallerIntentResolver({
               callId: call.id, store, client: options.callerIntent.client, timeoutMs: options.callerIntent.timeoutMs,
@@ -918,8 +1051,11 @@ export function createBrokerServer(options: BrokerServerOptions) {
           if (inputSpeechEnergy(bytes) > 0.012) { lastSpeechAt = Date.now(); backend?.noteCallerSpeech(lastSpeechAt, inputBytes / 8); }
           if (live?.appendAudio(frame.media.payload) === false) void stop('input_audio_refused');
         } else if (frame.event === 'mark' && frame.streamSid === streamSid && typeof frame.mark?.name === 'string') {
-          const previouslyPlayed = receipts.playedBytes;
+          const previouslyPlayed = receipts.playedBytes, previouslyAudiblePlayed = receipts.audiblePlayedBytes;
           receipts.acknowledge(frame.mark.name);
+          if (audibleSentRecorded && !audiblePlaybackRecorded && receipts.audiblePlayedBytes > previouslyAudiblePlayed) {
+            audiblePlaybackRecorded = true; recordAudibleTiming('firstAudiblePlaybackAcknowledgedAt');
+          }
           if (receipts.playedBytes > previouslyPlayed && !playbackRecorded) {
             const saved = store.get(call.id)!;
             store.update(call.id, { journey: { ...saved.journey, firstPlaybackConfirmedAt: new Date().toISOString() } });
@@ -1005,12 +1141,15 @@ export function createBrokerServer(options: BrokerServerOptions) {
 
   async function close() {
     accepting = false;
+    options.sms?.stop();
     startupContexts?.clear();
+    preconnect?.close();
     // Freeze every saved wait before awaiting any in-flight begin/consume operation.
     for (const call of store.list()) if (call.inbound && !call.inbound.closure) inbound.stopLocal(call.id, 'service_shutdown');
     clearInterval(maintenanceTimer);
     server.close();
     await Promise.allSettled([...pendingRequests]);
+    await options.sms?.close();
     await maintenance;
     await Promise.allSettled([...active.values()].map(call => call.stop('service_shutdown')));
     for (const call of store.list()) if (call.verificationCallback || call.restrictedSetup) {

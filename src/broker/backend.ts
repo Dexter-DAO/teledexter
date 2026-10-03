@@ -15,6 +15,9 @@ import { requireCallerRoute, requireCallerRouteDispatch, CallerRouteExpiredError
 import { canonicalJson } from '../outbound/canonical.js';
 import { orderedAssociatedResultReference } from './associatedResult.js';
 import { callerIntentDecisionSchema, type CallerIntentDecision } from './callerIntentContract.js';
+import { resultSmsAcknowledgement, resultSmsResearchRefusal } from './resultSmsAcknowledgement.js';
+import { phoneResultSmsAdmissionReceiptSchema, type PhoneResultSmsAdmissionReceipt } from './resultSmsContract.js';
+import { failedRequestSpeech, pendingRequestSpeech, pendingRequestState, partialResultUpdate } from './voicePresentation.js';
 
 export interface CallerSourceAnchor {
   frozen: FrozenCallerTurn;
@@ -29,7 +32,7 @@ export interface PrimaryBackendOptions {
   callId: string;
   callSid: string;
   bindingId: string;
-  api: Pick<PrimaryApiClient, 'submit' | 'result' | 'captureTurn' | 'question' | 'reply'> & Partial<Pick<PrimaryApiClient, 'reconcile'>>;
+  api: Pick<PrimaryApiClient, 'submit' | 'result' | 'captureTurn' | 'question' | 'reply'> & Partial<Pick<PrimaryApiClient, 'reconcile'|'admitResultSms'>>;
   store: Pick<BrokerStore, 'get' | 'update'>;
   stabilityMs?: number;
   maxWaitMs?: number;
@@ -64,6 +67,7 @@ export interface PrimaryBackendOptions {
 }
 
 export interface PrimaryBackend extends BrokerLiveBackend {
+  deliverFrozenResult(request: LiveDelegationRequest, route: CallerRouteRef, channel: LiveBackendChannel): Promise<void>;
   delegateFrozenTask(request: LiveDelegationRequest, route: CallerRouteRef, channel: LiveBackendChannel): Promise<void>;
   answerFrozenQuestion(request: LiveDelegationRequest, route: CallerRouteRef, channel: LiveBackendChannel): Promise<void>;
   questionTargets(sessionId: string): CallerQuestionTarget[];
@@ -116,13 +120,19 @@ export interface BrokerDelegationRecord {
   laterCallerRevision?: number;
   correctionState?: 'recorded_not_applied';
   primaryResult?: PrimaryResult;
+  /** Confirmed tool facts may arrive before the final answer. Unknown appends must not replay. */
+  partialDelivery?: { toolInvocationId: string; text: string; status: LiveDelivery['status'] | 'dispatching' };
+  /** Receipt-only recovery never supplies task content or resolves task dispatch uncertainty. */
+  resultSmsAdmission?: PhoneResultSmsAdmissionReceipt;
   result?: string;
   delivery?: string;
   submitError?: PrimaryApiDiagnostic;
-  admissionRefusal?: { origin: 'api_non_admission'; status: 409;
-    code: 'delivery_association_mismatch' | 'associated_result_unavailable'; submissionDigest: string };
+  admissionRefusal?: { origin: 'api_non_admission'; status: 409 | 503;
+    code: 'delivery_association_mismatch' | 'associated_result_unavailable' | SmsAdmissionRefusalCode; submissionDigest: string };
   admissionExpiry?: { origin: 'caller_intent_expiry'; validUntil: string; inputDigest: string };
   lastResultReadError?: PrimaryApiDiagnostic;
+  /** Presentation only; keep the last diagnostic even after a successful read. */
+  resultReadUnavailable?: boolean;
   originalCapture?: { turn: PrimaryTurn; state: 'dispatching' | 'unknown' | 'accepted'; receipt?: AcknowledgedTurnReceipt };
   reconciliation?: PrimaryReconciliation;
   reconciliationError?: PrimaryApiDiagnostic;
@@ -189,12 +199,32 @@ export interface BrokerQuestionReplyRecord {
   refusal?: { origin: 'local_validation' | 'api_non_admission'; code: string; status?: number };
 }
 
+const smsAdmissionRefusalCodes = ['sms_unsupported_number','carrier_opted_out','sms_consent_required',
+  'sms_delivery_pending','sms_call_unavailable','sms_authority_revoked','sms_number_changed'] as const;
+type SmsAdmissionRefusalCode = typeof smsAdmissionRefusalCodes[number];
+const isSmsAdmissionRefusal = (status: number, code: string): code is SmsAdmissionRefusalCode =>
+  (smsAdmissionRefusalCodes as readonly string[]).includes(code) && status === (code==='sms_delivery_pending' ? 503 : 409);
+const taskAdmissionRefusalText = (entry: BrokerDelegationRecord) => entry.submission.resultSms
+  ? resultSmsResearchRefusal(entry.admissionRefusal?.code)
+  : 'I could not start that request from the saved result. Please tell me what you want me to check or do.';
 const terminal = (state: string) => ['completed', 'failed', 'cancelled', 'not_admitted', 'admission_refused', 'admission_expired'].includes(state);
 /** Store startup and every write enforce this independently of routed admission. */
 export function validateBrokerAdmissionRefusals(call: BrokerCall, previous?: BrokerCall): void {
   for (const [requestId, raw] of Object.entries(call.delegations)) {
     if (!raw || typeof raw !== 'object') continue;
     const entry = raw as BrokerDelegationRecord, old = previous?.delegations[requestId] as BrokerDelegationRecord | undefined;
+    if (entry.resultSmsAdmission) {
+      phoneResultSmsAdmissionReceiptSchema.parse(entry.resultSmsAdmission);
+      if (!entry.submission.resultSms || entry.submission.resultSms.requestId!==entry.requestId
+        || ['prepared','admission_refused','admission_expired'].includes(entry.status) || !entry.timing?.firstDispatchAt)
+        throw new Error('invalid_saved_sms_admission_recovery');
+      if (previous && !old?.resultSmsAdmission && (!old || !['dispatching','dispatch_unknown'].includes(old.status) || !['dispatching','dispatch_unknown'].includes(entry.status)))
+        throw new Error('sms_admission_recovery_requires_attempted_dispatch');
+      if (old?.resultSmsAdmission && (old.resultSmsAdmission.intentId!==entry.resultSmsAdmission.intentId
+        || old.resultSmsAdmission.intentDigest!==entry.resultSmsAdmission.intentDigest))
+        throw new Error('saved_sms_admission_recovery_changed');
+    }
+    if (old?.resultSmsAdmission && !entry.resultSmsAdmission) throw new Error('saved_sms_admission_recovery_removed');
     if (old?.admissionExpiry && (entry.status !== 'admission_expired'
       || canonicalJson(entry.admissionExpiry) !== canonicalJson(old.admissionExpiry)
       || canonicalJson(entry.submission) !== canonicalJson(old.submission))) throw new Error('admission_expiry_changed');
@@ -225,19 +255,23 @@ export function validateBrokerAdmissionRefusals(call: BrokerCall, previous?: Bro
       || old.submitError !== undefined || old.lastResultReadError !== undefined || old.primaryResult !== undefined
       || old.reconciliation !== undefined || canonicalJson(old.submission) !== canonicalJson(entry.submission)))
       throw new Error('admission_refusal_requires_first_dispatch');
-    if (entry.status !== 'admission_refused' || !entry.submission.associatedResultReference || !refusal
-      || refusal.origin !== 'api_non_admission' || refusal.status !== 409
-      || !['delivery_association_mismatch', 'associated_result_unavailable'].includes(refusal.code)
+    const associatedRefusal=!!entry.submission.associatedResultReference && refusal?.status===409
+      && ['delivery_association_mismatch','associated_result_unavailable'].includes(refusal.code);
+    const smsRefusal=!!entry.submission.resultSms && entry.submission.resultSms.requestId===entry.requestId
+      && !!refusal && isSmsAdmissionRefusal(refusal.status,refusal.code);
+    if (entry.status !== 'admission_refused' || !refusal || (!associatedRefusal && !smsRefusal)
+      || refusal.origin !== 'api_non_admission'
       || Object.keys(refusal).sort().join(',') !== 'code,origin,status,submissionDigest'
       || refusal.submissionDigest !== rawSubmissionDigest(entry.bindingId, entry.submission)
-      || entry.submission.relatedPrimaryRequestId !== undefined || entry.submission.referenceOrigin !== undefined
+      || (associatedRefusal && (entry.submission.relatedPrimaryRequestId !== undefined || entry.submission.referenceOrigin !== undefined))
       || entry.primaryResult !== undefined || entry.result !== undefined || entry.submitError !== undefined
       || entry.lastResultReadError !== undefined || entry.reconciliation !== undefined || Object.keys(entry.questions ?? {}).length)
       throw new Error('invalid_saved_admission_refusal');
-    orderedAssociatedResultReference(entry.submission.associatedResultReference);
+    if(associatedRefusal) orderedAssociatedResultReference(entry.submission.associatedResultReference!);
   }
   for (const [id, raw] of Object.entries(previous?.delegations ?? {}))
-    if (((raw as BrokerDelegationRecord | null)?.admissionRefusal || (raw as BrokerDelegationRecord | null)?.admissionExpiry) && !call.delegations[id])
+    if (((raw as BrokerDelegationRecord | null)?.admissionRefusal || (raw as BrokerDelegationRecord | null)?.admissionExpiry
+      || (raw as BrokerDelegationRecord | null)?.resultSmsAdmission) && !call.delegations[id])
       throw new Error('admission_refusal_removed');
 }
 const admissionUnknown = (state: string) => ['prepared', 'dispatching', 'dispatch_unknown'].includes(state);
@@ -310,6 +344,7 @@ const storeWorkers = new WeakMap<object, Map<string, Promise<void>>>();
 // reservations without changing its admission or transcript journal.
 const storeNotices = new WeakMap<object, Map<string, {
   submitAnnounced: boolean; progressCount: number; lastAt: number; inFlight: boolean;
+  stateKey?: string; attempt?: number; deferred?: boolean; uncertainKey?: string; wake?: () => void;
 }>>();
 
 /** Timestamp grouping is application presentation state, not a provider turn-complete event. */
@@ -542,11 +577,15 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
   /** Called only by the catch for an initial POST, including queue promotion. */
   const firstSubmitFailure = async (entry: BrokerDelegationRecord, error: unknown): Promise<BrokerDelegationRecord> => {
     const current = load(entry);
-    if (current.status === 'dispatching' && current.submission.associatedResultReference && !current.submitError && !current.lastResultReadError
-      && error instanceof PrimaryApiError && error.code === 'http_error' && error.status === 409
-      && (error.remoteCode === 'delivery_association_mismatch' || error.remoteCode === 'associated_result_unavailable')) {
+    if (current.status === 'dispatching' && !current.submitError && !current.lastResultReadError
+      && error instanceof PrimaryApiError && error.code === 'http_error' && error.remoteCode
+      && ((current.submission.associatedResultReference && error.status===409
+        && (error.remoteCode==='delivery_association_mismatch' || error.remoteCode==='associated_result_unavailable'))
+        || (current.submission.resultSms && current.submission.resultSms.requestId===current.requestId
+          && isSmsAdmissionRefusal(error.status ?? 0,error.remoteCode)))) {
       const refused = save({ ...current, status: 'admission_refused', admissionRefusal: {
-        origin: 'api_non_admission', status: 409, code: error.remoteCode,
+        origin: 'api_non_admission', status: error.status as 409|503,
+        code: error.remoteCode as NonNullable<BrokerDelegationRecord['admissionRefusal']>['code'],
         submissionDigest: rawSubmissionDigest(options.bindingId, current.submission) } });
       return captureUnadmittedSubmission(refused);
     }
@@ -579,7 +618,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       ...(error.retryable === undefined ? {} : { retryable: error.retryable }), observedAt: new Date(now()).toISOString() }
     : undefined;
   const recordReadError = (entry: BrokerDelegationRecord, error: unknown) =>
-    save(load(entry), { lastResultReadError: diagnostic(error) });
+    save({ ...load(entry), resultReadUnavailable: true }, { lastResultReadError: diagnostic(error) });
   const knownReply = (sessionId: string, sourceEventId: string) => {
     for (const entry of entries(sessionId, true)) for (const [questionId, record] of Object.entries(entry.questions ?? {})) {
       const reply = replyAttempts(record).find(attempt => attempt.input.source.sourceEventId === sourceEventId);
@@ -957,6 +996,11 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     const route = requireCallerRoute(boundCall(request.sessionId), request, ref, 'task');
     if (route.decision?.kind !== 'task') throw new Error('caller_route_kind_mismatch');
     const submission = frozenSubmission(frozen);
+    if(route.decision.delivery) {
+      if(route.intent?.response?.v!=='phone.caller-intent.v3')throw new Error('caller_route_intent_decision_changed');
+      submission.resultSms={v:'phone.result-sms.v1',callerIntentOperationId:route.intent.operationId,
+        requestId:brokerIdentity('request',options.callId,request.sessionId,request.delegationId)};
+    }
     if (route.decision.contextReference !== undefined) {
       if (!options.resolveCallerTaskReference) throw new Error('caller_route_context_reference_unsupported');
       const reference = await options.resolveCallerTaskReference(structuredClone(route));
@@ -979,7 +1023,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     }
     const active = all.find(entry => !terminal(entry.status))
       ?? all.find(entry => entry.deferredTurns?.some(turn => turn.status === 'queued'));
-    if (active) {
+    if (active && !submission.resultSms) {
       const queuedTurns = all.flatMap(entry => (entry.deferredTurns ?? []).map(turn => ({ turn, session: turn.sourceSessionId ?? entry.sessionId })))
         .filter(value => value.turn.status === 'queued').sort((a, b) => sessionOrder(a.session) - sessionOrder(b.session)
           || a.turn.firstSequence - b.turn.firstSequence).map(value => value.turn);
@@ -1045,6 +1089,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     catch { return save({ ...load(entry), questionNotice: 'reply_unknown' }); }
     return dispatchPreparedReply(entry, target.questionId, () => channel.signal.aborted || Boolean(options.observation?.signal.aborted));
   });
+  const unadmittedReasons = new WeakMap<LiveDelegationRequest, string>();
   const accept = async (request: LiveDelegationRequest, channel: LiveBackendChannel): Promise<BrokerDelegationRecord | undefined> => {
     if (request.callId !== options.callId) throw new Error('broker_call_identity_mismatch');
     const audioThroughMs = acousticSpans.at(-1)?.endMs;
@@ -1054,9 +1099,12 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     const replay = before.find(entry => entry.predecessorRequestId && matchesDelegation(entry)) ?? before.find(matchesDelegation);
     if (replay) return replay;
     const snapshot = await stableContext(channel);
-    if (!snapshot || channel.signal.aborted) return undefined;
+    if (!snapshot || channel.signal.aborted) {
+      unadmittedReasons.set(request, channel.signal.aborted ? 'source_session_closed' : 'caller_context_not_stable');
+      return undefined;
+    }
     return locked(async () => {
-      if (channel.signal.aborted) return undefined;
+      if (channel.signal.aborted) { unadmittedReasons.set(request, 'source_session_closed'); return undefined; }
       if (boundCall(request.sessionId).endedAt) throw new Error('broker_call_ended');
       const saved = entries(request.sessionId);
       const all = entries(request.sessionId, true);
@@ -1192,6 +1240,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       }
       if (!fragments?.length) {
         const latest = saved.sort((a, b) => b.lastSequence - a.lastSequence)[0];
+        if (!latest) unadmittedReasons.set(request, 'no_unclaimed_completed_caller_turn');
         return latest ? save({ ...latest, delegationIds: [...latest.delegationIds, request.delegationId] }) : undefined;
       }
       const text = fragments.map(fragment => fragment.text).join('');
@@ -1232,13 +1281,16 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     if (!['queued', 'running', 'waiting_for_reply', 'completed', 'failed', 'cancelled'].includes(result.state)
         || (result.state === 'completed' && !result.assistant?.text?.trim())) throw new Error('invalid_primary_result');
     let current = load(entry);
+    const priorPartial = current.primaryResult?.partialResult;
+    if (priorPartial && result.partialResult?.toolInvocationId === priorPartial.toolInvocationId
+      && canonicalJson(result.partialResult) !== canonicalJson(priorPartial)) throw new Error('primary_partial_result_changed');
     if (terminal(current.status) && !terminal(result.state)) return current;
     const outcome = (value: PrimaryResult) => JSON.stringify([value.state, value.assistant ?? null, value.error ?? null]);
     if (terminal(current.status) && current.primaryResult && outcome(current.primaryResult) !== outcome(result))
       throw new Error('primary_terminal_result_changed');
     if (result.question) current = observeQuestion(current, result.question);
     if (result.state === 'waiting_for_reply' && !result.question) throw new Error('invalid_primary_result');
-    return save({ ...current, status: result.state, primaryResult: structuredClone(result),
+    return save({ ...current, status: result.state, primaryResult: structuredClone(result), resultReadUnavailable: false,
       ...(reconciliation ? { reconciliation: structuredClone(reconciliation) } : {}),
       ...(result.question ? { currentQuestionId: result.question.id } : {}),
       ...(result.assistant ? { result: result.assistant.text } : {}) });
@@ -1294,6 +1346,24 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       settleBrokerPublication(options.store, intent.record, delivery, channel.getContext(), channel.signal.aborted);
       return delivery;
     });
+  };
+  const deliverPartial = async (entry: BrokerDelegationRecord, channel: LiveBackendChannel) => {
+    const current = load(entry), update = partialResultUpdate(current), partial = current.primaryResult?.partialResult;
+    if (!update || !partial) return;
+    const previous = current.partialDelivery;
+    if (previous?.toolInvocationId === partial.toolInvocationId
+      && !['stale', 'rejected'].includes(previous.status)) return;
+    save({ ...current, partialDelivery: { toolInvocationId: partial.toolInvocationId, text: partial.text, status: 'dispatching' } });
+    // The publication journal also records individual append receipts. Saving intent
+    // first prevents a lost response or process exit from replaying the observation.
+    let status: LiveDelivery['status'] = 'unconfirmed';
+    try { status = (await publishRequest(current, channel, { ...update,
+      expectedCallerRevision: channel.getContext().callerRevision })).status; }
+    catch { /* A thrown append has an unknown acceptance outcome. */ }
+    if (status !== 'accepted' && options.store.get(options.callId)?.publications?.records.some(record =>
+      record.requestId === entry.requestId && record.updateId.startsWith(update.id)
+      && (!record.outcome || record.outcome.status === 'accepted'))) status = 'unconfirmed';
+    save({ ...load(entry), partialDelivery: { toolInvocationId: partial.toolInvocationId, text: partial.text, status } });
   };
   const deliverQuestion = async (entry: BrokerDelegationRecord, channel: LiveBackendChannel) => locked(async () => {
     let current = load(entry);
@@ -1366,7 +1436,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
         return result.delivery.status;
       };
       if (state.status === 'admission_refused') {
-        await tell('I could not start that request from the saved result. Please tell me what you want me to check or do.', 'admission_refused');
+        await tell(taskAdmissionRefusalText(state), 'admission_refused');
         return;
       }
       if (state.status === 'admission_expired') {
@@ -1435,9 +1505,9 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     const changed = current.callerRevision !== reviewedRevision;
     let text: string;
     if (entry.status === 'completed') text = entry.primaryResult!.assistant!.text;
-    else if (entry.status === 'admission_refused') text = 'I could not start that request from the saved result. Please tell me what you want me to check or do.';
+    else if (entry.status === 'admission_refused') text = taskAdmissionRefusalText(entry);
     else if (entry.status === 'admission_expired') text = 'The request took too long to confirm. Please tell me what you want me to do now.';
-    else if (entry.status === 'failed') text = 'I could not get an answer to that request.';
+    else if (entry.status === 'failed') text = failedRequestSpeech(entry);
     else if (entry.status === 'cancelled') text = 'The request was cancelled.';
     else if (['dispatching', 'dispatch_unknown', 'prepared'].includes(entry.status))
       text = 'I could not confirm the outcome. Please check the request status before trying again.';
@@ -1552,11 +1622,17 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       const observationSignal = options.observation?.signal ?? channel.signal;
       if (observationSignal.aborted) return;
       if (!entry) {
-        await channel.publish({ id: `${request.requestId}_clarify`, kind: 'result',
-          text: 'Please finish your request, then give me a moment to check it.',
+        console.info(JSON.stringify({ event: 'broker_delegation_unadmitted', callId: options.callId,
+          sessionId: request.sessionId, delegationId: request.delegationId,
+          reason: unadmittedReasons.get(request) ?? 'no_qualified_caller_source' }));
+        await channel.publish({ id: `${request.requestId}_unadmitted`, kind: 'progress', speak: false,
+          text: 'No new completed caller turn was admitted by this delegation. Continue listening and preserve the existing task. This internal observation does not mean the caller must finish or repeat their request.',
           expectedCallerRevision: channel.getContext().callerRevision });
         return;
       }
+      // The active observer owns status speech; queue admission can wake it
+      // without waiting for the earlier result GET or starting the queued task.
+      notices!.get(`${options.callId}:${entry.requestId}`)?.wake?.();
       const workerKey = options.observation ? options.callId : `${options.callId}:${request.sessionId}`;
       while (workers!.has(workerKey)) {
         await workers!.get(workerKey);
@@ -1567,10 +1643,22 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
             && !saved.some(value => value.deferredTurns?.some(turn => turn.status === 'queued'))) return;
       }
       const run = async () => {
+        let lastDeferredResult: string | undefined;
+        const deferredResult = (exceptRequestId?: string) => {
+          if (!options.observation || !options.watchUntilCallEnds || observationSignal.aborted
+              || boundCall(request.sessionId).endedAt) return;
+          const pending = entries(request.sessionId, true).filter(value => value.requestId !== exceptRequestId
+            && ['completed', 'failed', 'cancelled'].includes(value.status)
+            && value.primaryResult?.state === value.status && value.delivery === 'stale');
+          if (!pending.length) return;
+          const last = pending.findIndex(value => value.requestId === lastDeferredResult);
+          const next = pending[(last + 1) % pending.length];
+          if (next) lastDeferredResult = next.requestId;
+          return next;
+        };
         while (!observationSignal.aborted) {
           entry = load(entry!);
-          const alreadyDelivered = terminal(entry.status) && entry.delivery === 'accepted'
-            && entries(entry.sessionId, Boolean(options.observation)).some(value => value.deferredTurns?.some(turn => turn.status === 'queued'));
+          const alreadyDelivered = terminal(entry.status) && entry.delivery === 'accepted';
           if (!alreadyDelivered) {
             const deadline = now() + maxPollMs;
             const noticeKey = `${options.callId}:${entry.requestId}`;
@@ -1589,32 +1677,38 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
               const revision = channel.getContext().callerRevision;
               const lastSpeech = speechTime();
               if (lastSpeech !== undefined && now() - lastSpeech < stabilityMs) return;
+              const stateKey = JSON.stringify([pendingRequestState(current), revision]);
+              const changed = notice!.stateKey !== undefined && notice!.stateKey !== stateKey;
+              const queued = current.deferredTurns?.some(turn => turn.status === 'queued') === true;
+              const urgent = (changed || notice!.stateKey === undefined) && (queued || current.resultReadUnavailable
+                || revision !== reviewedRevision);
               const announceSubmit = immediate && current.status === 'dispatch_unknown' && !notice!.submitAnnounced;
-              if (!announceSubmit && (immediate || notice!.progressCount >= 4 || now() - notice!.lastAt < progressIntervalMs
-                  || now() >= deadline)) return;
-              const text = announceSubmit
-                ? current.submitError?.code === 'http_error'
-                  ? 'My connection to your account tools returned an error. I am checking whether your request was saved.'
-                  : 'I have not confirmed whether your request was saved. I am checking the original request.'
-                : ['prepared', 'dispatching', 'dispatch_unknown'].includes(current.status)
-                  ? revision !== reviewedRevision
-                    ? 'I am still checking whether your earlier request was saved.'
-                    : 'I am still checking whether your request was saved.'
-                  : revision !== reviewedRevision
-                    ? 'I am still waiting for the result of your earlier request.'
-                    : 'Your request is still being handled. I am waiting for its result.';
-              if (announceSubmit) notice!.submitAnnounced = true;
-              else notice!.progressCount++;
+              const retryAfter = notice!.deferred ? Math.min(progressIntervalMs, 1000) : progressIntervalMs;
+              if (notice!.uncertainKey === stateKey) return; // An unknown append is not authority to speak it again.
+              if (!announceSubmit && !urgent && (immediate || now() - notice!.lastAt < retryAfter)) return;
+              if (!options.watchUntilCallEnds && now() >= deadline) return;
+              if (changed) { notice!.progressCount = 0; notice!.deferred = false; }
+              if (notice!.progressCount >= 4) return;
+              notice!.stateKey = stateKey;
+              const text = pendingRequestSpeech(current, revision !== reviewedRevision);
               notice!.lastAt = now();
               notice!.inFlight = true;
-              // Audio acceptance must not delay the result GET. This continuation only
-              // releases the notice reservation; its publication receipt settles before Live closes.
-              try {
-                void publishRequest(current, channel, { id: `${current.requestId}_${revision}_${announceSubmit ? 'submit_unknown' : `pending_${notice!.progressCount}`}`,
-                  kind: 'progress', speak: true, text, expectedCallerRevision: revision })
-                  .catch(() => undefined).finally(() => { notice!.inFlight = false; });
-              } catch { notice!.inFlight = false; }
+              const attempt = notice!.attempt = (notice!.attempt ?? 0) + 1;
+              // Receipt acceptance consumes the budget. Deferred speech remains
+              // eligible at a later quiet boundary, without blocking result reads.
+              void Promise.resolve().then(() => publishRequest(current, channel, { id: `${current.requestId}_${revision}_${announceSubmit ? 'submit_unknown' : `pending_${attempt}`}`,
+                kind: 'progress', speak: true, text, expectedCallerRevision: revision }))
+                .then(delivery => {
+                  if (delivery.status === 'accepted') {
+                    if (announceSubmit) notice!.submitAnnounced = true;
+                    else notice!.progressCount++;
+                    notice!.deferred = false;
+                  } else if (delivery.status === 'unconfirmed') notice!.uncertainKey = stateKey;
+                  else notice!.deferred = delivery.status === 'stale' || delivery.status === 'rejected';
+                }, () => { notice!.uncertainKey = stateKey; })
+                .finally(() => { notice!.inFlight = false; });
             };
+            notice.wake = () => publishStatus(false);
             publishStatus(true);
             const progressTimer = setInterval(() => publishStatus(false), progressIntervalMs);
             progressTimer.unref();
@@ -1644,6 +1738,14 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
                 if (entry.sessionId === request.sessionId && !channel.signal.aborted) entry = await captureRevision(entry, channel);
                 if (observationSignal.aborted) return;
                 if (terminal(entry.status)) break;
+                await deliverPartial(entry, channel);
+                publishStatus(false);
+                // A terminal answer can wait across later work without replaying
+                // that work. Questions keep control of their own reply boundary.
+                if (entry.status !== 'waiting_for_reply') {
+                  const deferred = deferredResult(entry.requestId);
+                  if (deferred) await deliver(deferred, channel);
+                }
                 if (entry.status === 'waiting_for_reply') {
                   if (!options.watchUntilCallEnds) break;
                   const questionRecord = entry.currentQuestionId ? entry.questions?.[entry.currentQuestionId] : undefined;
@@ -1657,11 +1759,13 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
                 if (!(await delay(pollIntervalMs, observationSignal))) return;
               }
               await deliver(load(entry), channel);
-            } finally { clearInterval(progressTimer); unsubscribe(); }
+            } finally { notice.wake = undefined; clearInterval(progressTimer); unsubscribe(); }
           }
           const next = await promoteDeferred(entry.sessionId, { ...channel, signal: observationSignal });
-          if (!next || next.requestId === entry.requestId) return;
-          entry = next;
+          if (next && next.requestId !== entry.requestId) { entry = next; continue; }
+          const deferred = deferredResult();
+          if (!deferred || !await delay(pollIntervalMs, observationSignal)) return;
+          entry = deferred;
         }
       };
       const work = run();
@@ -1874,7 +1978,59 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       if (options.callerRouteSources) return Promise.reject(new Error('explicit_caller_route_required'));
       return observeDelegation(request, channel, () => accept(request, channel));
     },
-    delegateFrozenTask(request, route, channel) {
+    async deliverFrozenResult(request,ref,channel) {
+      let receipt:PhoneResultSmsAdmissionReceipt|undefined,error:string|undefined;
+      try {
+        receipt=await locked(async()=>{
+          if(!options.api.admitResultSms)throw new Error('sms_delivery_pending');
+          const route=requireCallerRoute(boundCall(request.sessionId),request,ref,'deliver_result');
+          if(route.decision?.kind!=='deliver_result' || route.intent?.response?.v!=='phone.caller-intent.v3')
+            throw new Error('caller_route_intent_decision_changed');
+          assertFrozenSpeech(route.frozen);
+          if(channel.signal.aborted || options.observation?.signal.aborted)return;
+          if(!route.capture) {
+            const captured=await options.api.captureTurn(options.bindingId,structuredClone(route.frozen.turn));
+            acknowledgedTurn(options.bindingId,route.frozen.turn,captured);
+            options.callerRouteCaptureAccepted?.(route.frozen.turn.sourceEventId,captured);
+          }
+          requireCallerRoute(boundCall(request.sessionId),request,ref,'deliver_result');
+          assertFrozenSpeech(route.frozen);
+          return options.api.admitResultSms(options.bindingId,{v:'phone.result-sms.v1',
+            callerIntentOperationId:route.intent.operationId,requestId:route.decision.target.requestId});
+        });
+      } catch(cause) { error=cause instanceof PrimaryApiError ? cause.remoteCode : undefined; }
+      finally { settleAdmission(request); }
+      if(!channel.signal.aborted && !boundCall(request.sessionId).endedAt)
+        await channel.publish({id:`${request.requestId}_sms_admission`,kind:'result',
+          text:resultSmsAcknowledgement(receipt,error),expectedCallerRevision:channel.getContext().callerRevision});
+    },
+    async delegateFrozenTask(request, route, channel) {
+      const record=requireCallerRoute(boundCall(request.sessionId),request,route,'task','recover');
+      if(record.decision?.kind==='task' && record.decision.delivery) {
+        let entry:BrokerDelegationRecord|undefined;
+        try { entry=await acceptFrozenTask(request,route,channel); }
+        finally { settleAdmission(request); }
+        if (entry && ['dispatching','dispatch_unknown'].includes(entry.status) && entry.submission.resultSms && entry.timing?.firstDispatchAt
+          && !entry.resultSmsAdmission && options.api.admitResultSms) {
+          const exact=entry;
+          try {
+            const receipt=await options.api.admitResultSms(options.bindingId,structuredClone(entry.submission.resultSms));
+            entry=await locked(async()=>{
+              const current=load(exact);
+              if(!['dispatching','dispatch_unknown'].includes(current.status) || !current.timing?.firstDispatchAt) return current;
+              return save({...current,resultSmsAdmission:phoneResultSmsAdmissionReceiptSchema.parse(receipt)});
+            });
+          } catch { /* The original task and SMS receipt remain uncertain; never submit new identities. */ }
+        }
+        // API's durable queue owns this explicit deferred-result request. It
+        // must be admitted before hangup; an existing voice observer continues
+        // on its original request and is never replaced by this acknowledgement.
+        if(!channel.signal.aborted && !boundCall(request.sessionId).endedAt)
+          await channel.publish({id:`${request.requestId}_sms_admission`,kind:'result',
+            text:entry?.admissionRefusal ? taskAdmissionRefusalText(entry) : resultSmsAcknowledgement(entry?.primaryResult?.resultSms ?? entry?.resultSmsAdmission,entry?.submitError?.remoteCode),
+            expectedCallerRevision:channel.getContext().callerRevision});
+        return;
+      }
       return observeDelegation(request, channel, () => acceptFrozenTask(request, route, channel));
     },
     answerFrozenQuestion(request, route, channel) {
