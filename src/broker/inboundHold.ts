@@ -22,7 +22,11 @@ export function createInboundHoldAdapter(options: { publicOrigin: string; store:
       // greeting clip exists. With a clip, the redirect alone answers and the clip
       // is the first thing the caller hears (call 2d141fec spoke "One moment." first).
       // Only later pending holds need a pause to pace repeated redirects.
-      if (!call.inbound.continuation) { if (!options.greetingClipAvailable) response.say('One moment.'); }
+      // Twilio does not pick up while the first verb is a pause or redirect, so the clip
+      // path answers with a silent half-second play instead of a spoken hold.
+      if (!call.inbound.continuation) {
+        if (options.greetingClipAvailable) response.play({ digits: 'w' }); else response.say('One moment.');
+      }
       else response.pause({ length: 1 });
       response.redirect({ method: 'POST' }, input.continuationUrl);
       return response.toString();

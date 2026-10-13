@@ -38,7 +38,7 @@ test('a result appended to the provider counts as presented even when journaled 
   assert.equal(resultAlreadyPresented(callWith([record('accepted', 'broker_7')]), { ...entry, status: 'failed' } as BrokerDelegationRecord), false);
 });
 
-test('inbound hold omits "One moment." when a greeting clip opens the call', () => {
+test('inbound hold answers silently instead of saying "One moment." when a greeting clip opens the call', () => {
   const origin = 'https://broker.example';
   const callId = '2d141fec-4a9d-4967-82f0-815492d7b334';
   const call = { id: callId, direction: 'inbound', inbound: { begin: { providerProof: { url: `${origin}/broker/incoming-call` } } } };
@@ -46,7 +46,8 @@ test('inbound hold omits "One moment." when a greeting clip opens the call', () 
   const input = { callId, continuationUrl: `${origin}/broker/inbound/${callId}/continue` };
   const withClip = createInboundHoldAdapter({ publicOrigin: origin, store, greetingClipAvailable: true }).waitingResponse(input);
   assert.doesNotMatch(withClip, /<Say>/); assert.doesNotMatch(withClip, /<Pause/);
-  assert.match(withClip, /<Redirect method="POST">/);
+  // The first verb must answer the call: a silent play, never a bare pause or redirect.
+  assert.match(withClip, /^<\?xml[^>]*><Response><Play digits="w"\/><Redirect method="POST">/);
   assert.match(createInboundHoldAdapter({ publicOrigin: origin, store }).waitingResponse(input), /<Say>One moment\.<\/Say><Redirect/);
   (call.inbound as Record<string, unknown>).continuation = {};
   assert.match(createInboundHoldAdapter({ publicOrigin: origin, store, greetingClipAvailable: true }).waitingResponse(input), /<Pause length="1"\/><Redirect/);
