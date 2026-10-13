@@ -2,7 +2,9 @@ import Twilio from 'twilio';
 import type { BrokerStore } from './store.js';
 
 /** Inbound hold responses for the same-call attachment flow; startup selects this when BROKER_VERIFICATION_SETUP_MODEL is set. */
-export function createInboundHoldAdapter(options: { publicOrigin: string; store: Pick<BrokerStore, 'get'> }) {
+export function createInboundHoldAdapter(options: { publicOrigin: string; store: Pick<BrokerStore, 'get'>;
+  /** A recorded greeting clip opens the call; a spoken hold before it only delays the greeting. */
+  greetingClipAvailable?: boolean }) {
   const origin = new URL(options.publicOrigin);
   if (origin.protocol !== 'https:' || origin.username || origin.password || origin.search || origin.hash
     || origin.pathname !== '/' || origin.origin !== options.publicOrigin) throw new Error('Invalid inbound hold origin');
@@ -16,9 +18,11 @@ export function createInboundHoldAdapter(options: { publicOrigin: string; store:
         || call.inbound.begin.providerProof.url !== `${origin.origin}/broker/incoming-call`)
         throw new Error('Inbound hold call unavailable');
       const response = new Twilio.twiml.VoiceResponse();
-      // Say answers the first leg before its authenticated continuation.
+      // Say answers the first leg before its authenticated continuation when no
+      // greeting clip exists. With a clip, the redirect alone answers and the clip
+      // is the first thing the caller hears (call 2d141fec spoke "One moment." first).
       // Only later pending holds need a pause to pace repeated redirects.
-      if (!call.inbound.continuation) response.say('One moment.');
+      if (!call.inbound.continuation) { if (!options.greetingClipAvailable) response.say('One moment.'); }
       else response.pause({ length: 1 });
       response.redirect({ method: 'POST' }, input.continuationUrl);
       return response.toString();

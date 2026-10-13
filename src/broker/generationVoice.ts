@@ -103,8 +103,9 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
   };
   const closedDelivery = (): LiveDelivery => ({ eventId: '', status: 'closed' });
   const presentationFrontier = () => `${speechRevision}:${callerPresentationFrontier(call())}`;
+  // 500 ms of caller and Dexter silence is a turn boundary; a ready answer goes out then.
   const quiet = () => (options.playbackState?.() ?? 'idle') === 'idle'
-    && Date.now() - Math.max(lastSpeechAt, lastOutputAt) >= 800;
+    && Date.now() - Math.max(lastSpeechAt, lastOutputAt) >= 500;
   const blocksEarlierPresentation = (entry: BrokerDelegationRecord) =>
     !(['completed', 'failed', 'cancelled'].includes(entry.status) && entry.primaryResult?.state === entry.status)
       && hasNewerCallerWork(call(), entry);
