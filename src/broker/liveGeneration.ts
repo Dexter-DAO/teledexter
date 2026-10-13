@@ -138,7 +138,7 @@ export interface LiveGenerationOptions {
   onStatusContextRefresh?(refresh: StatusContextRefresh): void;
   maxBufferedAudioBytes?: number;
   /** Backlog replay speed relative to real time (8 kHz PCMU: 8 bytes per ms). Live
-   * refuses input faster than real time, so the default never exceeds 1.0x. */
+   * rejected unpaced backlog bursts with input_audio_rate_limit_exceeded; the default is 1.0x. */
   inputPaceRate?: number;
   /** May tighten the shared fetch/start/assert budget, never extend it. */
   transitionTimeoutMs?: number;

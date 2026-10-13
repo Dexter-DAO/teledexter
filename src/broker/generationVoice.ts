@@ -326,7 +326,9 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
         : (segment.inputLastSampleExclusive! - segment.inputFirstSample) / 8 };
   };
 
-  const controller = createLiveGenerationController({ callId: initialCall.id, binding,
+  // Drain a startup or delivery backlog at 1.5x real time so the caller is heard
+  // without a lasting lag; unpaced bursts tripped input_audio_rate_limit_exceeded.
+  const controller = createLiveGenerationController({ callId: initialCall.id, binding, inputPaceRate: 1.5,
     clocks: initialCall.liveGenerations?.clocks ?? { callDeadlineAt: options.callDeadlineAt, mediaStartedAt: initialCall.mediaStartedAt,
       ...(initialCall.inbound?.remote?.state === 'bound' ? { consumedAt: initialCall.inbound.remote.consumedAt,
         mediaStartBy: initialCall.inbound.mediaStartBy! } : {}) },
