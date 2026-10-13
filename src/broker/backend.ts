@@ -208,6 +208,46 @@ const taskAdmissionRefusalText = (entry: BrokerDelegationRecord) => entry.submis
   ? resultSmsResearchRefusal(entry.admissionRefusal?.code)
   : 'I could not start that request from the saved result. Please tell me what you want me to check or do.';
 const terminal = (state: string) => ['completed', 'failed', 'cancelled', 'not_admitted', 'admission_refused', 'admission_expired'].includes(state);
+
+const ACK_HARD = "(?:thanks|thank you|great|nice|awesome|excellent|no worries|no problem|i'?m good|got it|ah|oh|wow|hmm|uh|um)";
+// These double as confirmations, so they count only alongside an explicit waiting statement.
+const ACK_SOFT = "(?:ok|okay|cool|alright|all right|sure|yeah|yep|perfect|sounds good|that'?s fine|fine|good|right)";
+const ACK_WAIT = "(?:(?:i'?ll|i will|i can|i'?m gonna|let me)\\s+)?(?:just\\s+)?(?:wait(?:\\s+(?:for|till|til|until)(?:\\s+(?:the|it|its|it's|that|this|my|your|order|buy|sale|trade|purchase|result|to|go|goes|through|finish|finishes|complete|completes|be|done|confirm|confirmed))+)?|hold on|take your time|no rush)";
+const ackPattern = new RegExp(`^(?:${ACK_HARD}|${ACK_SOFT}|${ACK_WAIT})(?:\\s+(?:${ACK_HARD}|${ACK_SOFT}|${ACK_WAIT}))*$`);
+const waitPattern = new RegExp(`(?:^|\\s)${ACK_WAIT}(?:\\s|$)`);
+const softPattern = new RegExp(`(?:^|\\s)${ACK_SOFT}(?:\\s|$)`);
+/** Pure acknowledgements and waiting statements ("I'm good. I'll just wait till the buy to go
+ * through", call 2d141fec) are conversation, never another request for Primary. */
+export function isConversationalAcknowledgement(text: string): boolean {
+  const normalized = text.toLowerCase().replace(/[‘’]/g, "'").replace(/[^a-z' ]+/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!normalized || normalized.length > 120 || !ackPattern.test(normalized)) return false;
+  return waitPattern.test(normalized) || !softPattern.test(normalized);
+}
+
+/** Every chunk of this exact result was appended to the voice provider (it holds a provider event
+ * id), so the caller heard it, even when caller speech advanced the transcript during the append
+ * and the journal marked it stale (call 2d141fec: "Bought..." spoken at 05:56:58, journaled stale,
+ * then spoken again at 05:57:31). */
+export function resultAlreadyPresented(call: BrokerCall | undefined, entry: BrokerDelegationRecord): boolean {
+  const messageId = entry.primaryResult?.assistant?.messageId;
+  if (!call || entry.status !== 'completed' || !messageId) return false;
+  const stem = `${entry.requestId}_${messageId}_caller_`;
+  const rejected = new Set((call.publications?.rejections ?? []).map(value => `${value.sessionId}:${value.eventId}`));
+  const attempts = new Map<string, { count?: number; chunks: Set<number> }>();
+  for (const record of call.publications?.records ?? []) {
+    const outcome = record.outcome;
+    if (record.requestId !== entry.requestId || record.kind !== 'result' || !record.updateId.startsWith(stem)
+      || !outcome?.eventId || !['accepted', 'stale'].includes(outcome.status)
+      || rejected.has(`${record.sessionId}:${outcome.eventId}`)) continue;
+    const match = record.updateId.match(/^(.*_attempt_\d+)_(\d+)$/);
+    if (!match) continue;
+    const attempt = attempts.get(match[1]!) ?? { chunks: new Set<number>() };
+    attempt.chunks.add(Number(match[2]));
+    attempt.count = record.ordinaryDelivery?.chunkCount ?? attempt.count;
+    attempts.set(match[1]!, attempt);
+  }
+  return [...attempts.values()].some(value => value.count !== undefined && value.chunks.size >= value.count);
+}
 /** Store startup and every write enforce this independently of routed admission. */
 export function validateBrokerAdmissionRefusals(call: BrokerCall, previous?: BrokerCall): void {
   for (const [requestId, raw] of Object.entries(call.delegations)) {
@@ -1023,6 +1063,17 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     }
     const active = all.find(entry => !terminal(entry.status))
       ?? all.find(entry => entry.deferredTurns?.some(turn => turn.status === 'queued'));
+    if (active && !submission.resultSms && active.status !== 'waiting_for_reply'
+      && isConversationalAcknowledgement(frozen.turn.text)) {
+      // Recorded for the transcript only; it starts no request and needs no result.
+      persistSpans();
+      const entry = save({ ...active, deferredTurns: [...active.deferredTurns ?? [], { delegationId: request.delegationId,
+        sourceEventId: frozen.turn.sourceEventId, text: frozen.turn.text, firstSequence: frozen.firstSequence,
+        callerRevision: frozen.callerRevision, status: 'recorded_not_submitted',
+        ...(active.sessionId !== request.sessionId ? { sourceSessionId: request.sessionId } : {}) }] });
+      settleAdmission(request);
+      return entry;
+    }
     if (active && !submission.resultSms) {
       const queuedTurns = all.flatMap(entry => (entry.deferredTurns ?? []).map(turn => ({ turn, session: turn.sourceSessionId ?? entry.sessionId })))
         .filter(value => value.turn.status === 'queued').sort((a, b) => sessionOrder(a.session) - sessionOrder(b.session)
@@ -1461,6 +1512,14 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
           ? 'I could not accept that answer. Please say it again.'
           : 'That answer was not accepted. The request is still waiting for a reply.', 'reply_refused') !== 'accepted') return;
       }
+      // An answer the caller already heard is never spoken again: neither the final message
+      // after its accepted partial (the unprompted portfolio recap), nor a result whose
+      // append landed but was journaled stale (the repeated buy confirmation).
+      if (state.status === 'completed' && state.primaryResult?.state === 'completed'
+        && (state.partialDelivery?.status === 'accepted' || resultAlreadyPresented(boundCall(entry.sessionId), state))) {
+        save({ ...state, delivery: 'accepted' });
+        return;
+      }
       const receipt = await options.observation.publish(load(entry));
       let current = load(entry);
       if (options.observation.signal.aborted || boundCall(entry.sessionId).endedAt) return;
@@ -1672,6 +1731,11 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
               const current = load(entry!);
               if (terminal(current.status) || current.status === 'waiting_for_reply'
                   || Object.values(current.questions ?? {}).some(record => unresolvedReply(record.reply))) return;
+              // A result the caller can hear outranks a waiting line: never say "Still working on it"
+              // once this request has a partial result or any request on the call has an unspoken answer.
+              if (current.primaryResult?.partialResult || entries(request.sessionId, true).some(value =>
+                ['completed', 'failed', 'cancelled'].includes(value.status) && value.primaryResult?.state === value.status
+                && value.delivery !== 'accepted')) return;
               const reviewedRevision = Math.max(current.frozenCallerRevision, ...Object.values(current.questions ?? {})
                 .filter(record => record.reply?.status === 'accepted').map(record => record.reply!.callerRevision));
               const revision = channel.getContext().callerRevision;

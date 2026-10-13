@@ -40,7 +40,7 @@ async function billingReceiver(t: test.TestContext, loseFirstReceipt = false) {
   return { bodies, encodedBodies, receipt, url: `http://127.0.0.1:${(server.address() as { port: number }).port}` };
 }
 
-async function connectIncomingMedia(f: Awaited<ReturnType<typeof fixture>>) {
+async function connectIncomingMedia(f: Awaited<ReturnType<typeof fixture>>, onMessage?: (raw: unknown) => void) {
   await (await f.webhook('/broker/incoming-call')).text();
   const call = f.store.list()[0]; await f.waitForAdmission(); f.approve();
   assert.match(await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text(), /<Stream/);
@@ -49,6 +49,7 @@ async function connectIncomingMedia(f: Awaited<ReturnType<typeof fixture>>) {
     'x-twilio-signature': Twilio.getExpectedTwilioSignature(f.config.twilioAuthToken, f.config.publicOrigin + route, {}),
   } });
   await new Promise<void>((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
+  if (onMessage) ws.on('message', onMessage);
   ws.send(JSON.stringify({ event: 'start', start: { accountSid: f.config.twilioAccountSid, callSid: f.params.CallSid,
     streamSid: 'MZ' + '4'.repeat(32), customParameters: { token: streamToken(f.config.controlToken, call.id, f.params.CallSid) },
     mediaFormat: { encoding: 'audio/x-mulaw', sampleRate: 8000, channels: 1 } } }));
@@ -322,6 +323,101 @@ test('a short pre-speech backlog is ordinary jitter and is not cleared', async t
   assert.equal(clears.length, 0);
 });
 
+// The pre-rendered "Hey, it's Dexter." plays at media start, before Live is ready.
+const greetingFixtureClip = Buffer.alloc(2_400, 0x20); // 300 ms of speech-energy PCMU
+async function greetingCall(t: test.TestContext, options: { eligible?: boolean } = {}) {
+  const timing: Array<{ stage: string; heldLiveMs?: number; incomplete?: number }> = [];
+  t.mock.method(console, 'info', (value: string) => { const event = JSON.parse(value); if (event.event === 'broker_audio_timing') timing.push(event); });
+  const f = await fixture(t, { greetingClip: greetingFixtureClip, ...options });
+  const frames: Array<{ event: string; payload?: string; name?: string }> = [];
+  const { call, ws } = await connectIncomingMedia(f, raw => { const frame = JSON.parse(String(raw));
+    frames.push({ event: frame.event, ...(frame.media ? { payload: frame.media.payload } : {}), ...(frame.mark ? { name: frame.mark.name } : {}) }); });
+  t.after(() => ws.close());
+  const waitFor = async (predicate: () => boolean, ms = 2_000) => { for (let i = 0; i < ms / 5 && !predicate(); i++) await new Promise(resolve => setTimeout(resolve, 5)); };
+  const ack = (name: string) => ws.send(JSON.stringify({ event: 'mark', streamSid: 'MZ' + '4'.repeat(32), mark: { name } }));
+  const clipMedia = () => frames.filter(frame => frame.event === 'media' && Buffer.from(frame.payload!, 'base64').every(byte => byte === 0x20));
+  return { f, call, ws, frames, timing, waitFor, ack, clipMedia };
+}
+
+for (const eligible of [false, true]) test(`greeting clip plays first at media start; Live waits behind it and opens without re-greeting (${eligible ? 'generation' : 'legacy'} path)`, async t => {
+  const g = await greetingCall(t, { eligible });
+  await g.waitFor(() => g.f.seen.opening === 1);
+  assert.equal(g.f.openings.length, 1, 'exactly one opening');
+  assert.equal(g.f.openings[0], 'The caller already heard you say "Hey, it\'s Dexter. What can I do for you?" Do not greet or ask again. Wait for the caller and respond to what they say.');
+  // Live audio that arrives during the clip is held, never interleaved.
+  const live = [Buffer.alloc(800, 0xf0), spoken(1_600)];
+  for (const chunk of live) g.f.emitAudio(chunk);
+  await g.waitFor(() => g.clipMedia().length === 15);
+  assert.equal(g.clipMedia().length, 15, '300 ms clip as fifteen 20 ms frames');
+  assert.deepEqual(Buffer.concat(g.clipMedia().map(frame => Buffer.from(frame.payload!, 'base64'))), greetingFixtureClip);
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(g.frames.filter(frame => frame.event === 'media').length, 15, 'no Live audio while the clip is unplayed');
+  const journey = g.f.store.get(g.call.id)!.journey!;
+  assert.ok(journey.greetingClipStartedAt && journey.firstAudioSentAt);
+  assert.equal(journey.greetingClipPlayedAt, undefined);
+  // Acknowledge all but the last clip mark: Live is still held.
+  const clipMarks = g.frames.filter(frame => frame.event === 'mark').map(frame => frame.name!);
+  for (const name of clipMarks.slice(0, -1)) g.ack(name);
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(g.frames.filter(frame => frame.event === 'media').length, 15);
+  g.ack(clipMarks.at(-1)!);
+  await g.waitFor(() => g.frames.filter(frame => frame.event === 'media').length >= 17);
+  const after = g.frames.slice(30);
+  assert.ok(!g.frames.some(frame => frame.event === 'clear'), 'the clip is never cleared');
+  assert.deepEqual(after.filter(frame => frame.event === 'media').map(frame => frame.payload), live.map(chunk => chunk.toString('base64')), 'held Live audio follows the clip in order');
+  assert.ok(g.f.store.get(g.call.id)!.journey!.greetingClipPlayedAt);
+  const stages = g.timing.map(event => event.stage);
+  assert.deepEqual(stages.filter(stage => stage.startsWith('greetingClip')), ['greetingClipStartedAt', 'greetingClipFirstPlaybackAcknowledgedAt', 'greetingClipPlayedAt']);
+  assert.equal(g.timing.find(event => event.stage === 'greetingClipPlayedAt')!.heldLiveMs, 300);
+  assert.ok(stages.indexOf('firstSpeechAudioSentAt') > stages.indexOf('greetingClipPlayedAt'), 'first-speech timing still measures Live');
+  assert.equal(stages.filter(stage => stage === 'firstSpeechAudioSentAt').length, 1);
+  assert.ok(!stages.includes('firstSpeechPlaybackAcknowledgedAt'), 'clip acknowledgements never time Live speech playback');
+  for (const frame of after) if (frame.event === 'mark') g.ack(frame.name!);
+  await g.waitFor(() => g.timing.some(event => event.stage === 'firstSpeechPlaybackAcknowledgedAt'));
+  assert.ok(g.timing.some(event => event.stage === 'firstSpeechPlaybackAcknowledgedAt'));
+});
+
+test('a Live playback clear during the clip drops held Live audio and leaves the clip playing', async t => {
+  const g = await greetingCall(t);
+  const stale = spoken(800), fresh = spoken(1_200);
+  g.f.emitAudio(stale); g.f.clearAudio(); g.f.emitAudio(fresh);
+  await g.waitFor(() => g.clipMedia().length === 15);
+  for (const frame of g.frames.filter(frame => frame.event === 'mark')) g.ack(frame.name!);
+  await g.waitFor(() => g.frames.filter(frame => frame.event === 'media').length >= 16);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.ok(!g.frames.some(frame => frame.event === 'clear'));
+  assert.deepEqual(g.frames.slice(30).filter(frame => frame.event === 'media').map(frame => frame.payload), [fresh.toString('base64')]);
+});
+
+test('Live audio is released after the clip duration plus grace even when the carrier never acknowledges marks', async t => {
+  const g = await greetingCall(t);
+  g.f.emitAudio(spoken(800));
+  await g.waitFor(() => g.frames.filter(frame => frame.event === 'media').length >= 16, 3_000);
+  assert.equal(g.frames.filter(frame => frame.event === 'media').length, 16);
+  const played = g.timing.find(event => event.stage === 'greetingClipPlayedAt')!;
+  assert.equal(played.incomplete, 1);
+  assert.equal(g.f.store.get(g.call.id)!.journey!.greetingClipPlayedAt, undefined, 'unacknowledged playback is not recorded as heard');
+});
+
+test('an inbound call never plays the outbound-only clip; Live speaks the whole inbound greeting', async t => {
+  const f = await fixture(t, { outboundClipOnly: Buffer.alloc(2_400, 0x20) });
+  const media: string[] = [];
+  const { call, ws } = await connectIncomingMedia(f, raw => { if (JSON.parse(String(raw)).event === 'media') media.push('media'); }); t.after(() => ws.close());
+  for (let i = 0; i < 100 && f.seen.opening === 0; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(media.length, 0);
+  assert.equal(f.openings[0], 'Immediately say in English: "Hey, it\'s Dexter. What can I do for you?" Then pause to listen.');
+  assert.equal(f.store.get(call.id)!.journey?.greetingClipStartedAt, undefined);
+});
+
+test('without a clip the Live opening still speaks the whole greeting', async t => {
+  const f = await fixture(t);
+  const { call, ws } = await connectIncomingMedia(f); t.after(() => ws.close());
+  for (let i = 0; i < 100 && f.seen.opening === 0; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(f.openings[0], 'Immediately say in English: "Hey, it\'s Dexter. What can I do for you?" Then pause to listen.');
+  assert.equal(f.store.get(call.id)!.journey?.greetingClipStartedAt, undefined);
+});
+
 test('audible timing logger failure cannot interrupt sent audio or carrier playback', async t => {
   let failures = 0;
   t.mock.method(console, 'info', (value: string) => { if (JSON.parse(value).event === 'broker_audio_timing') { failures++; throw new Error('sink_unavailable'); } });
@@ -360,7 +456,7 @@ test('incoming legacy admission without frozen billing reference never posts a n
       callSid: call.callSid!, termsDigest: 'a'.repeat(64) } } as InboundOutcome }), /binding changed/);
 });
 
-async function fixture(t: test.TestContext, options: { selected?: boolean; retained?: BrokerCall; initialRemote?: InboundOutcome; eligible?: boolean; billing?: boolean; billingUrl?: string; duration?: string; preconnect?: boolean; replaceFirstGeneration?: boolean } = {}) {
+async function fixture(t: test.TestContext, options: { selected?: boolean; retained?: BrokerCall; initialRemote?: InboundOutcome; eligible?: boolean; billing?: boolean; billingUrl?: string; duration?: string; preconnect?: boolean; replaceFirstGeneration?: boolean; greetingClip?: Buffer; outboundClipOnly?: Buffer } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-inbound-http-'));
   if (options.retained) fs.writeFileSync(path.join(dir, 'calls.json'), JSON.stringify({ version: 1, calls: { [options.retained.id]: options.retained } }));
   const store = new BrokerStore(dir);
@@ -401,6 +497,7 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
   let statusGate: Promise<void> | undefined; let releaseStatus: (() => void) | undefined;
   const seen = { dial: 0, end: 0, voice: 0, begin: 0, consume: 0, context: 0, cancel: 0, close: 0, legacyClose: 0,
     startupFetch: 0, contextAssert: 0, opening: 0 };
+  const openings: string[] = [];
   const context = () => {
     seen.context++;
     if (!authority) throw new Error('authority_unavailable');
@@ -457,6 +554,8 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
     async update() { seen.end++; return { sid, status: 'completed' }; },
   }), { async create() { seen.dial++; throw new Error('inbound_must_not_dial'); } });
   const broker = createBrokerServer({ config, store, primary, provider: { calls: provider } as unknown as ReturnType<typeof Twilio>,
+    ...(options.greetingClip ? { inboundGreetingClip: options.greetingClip } : {}),
+    ...(options.outboundClipOnly ? { greetingClip: options.outboundClipOnly } : {}),
     ...(options.selected === false ? {} : { inboundAttachment: createInboundHoldAdapter({ publicOrigin: config.publicOrigin, store }) }),
     ...(options.preconnect ? { inboundPreconnect: () => {
       const connection = new PreconnectTransport(`preconnect_${transports.length + 1}`); transports.push(connection); return connection;
@@ -486,7 +585,7 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
       });
       queueMicrotask(() => settings.onReady({ callId: settings.callId, sessionId: 'inbound-fixture' }));
       return { appendAudio() { return true; }, async appendContext() { return { eventId: 'c', status: 'accepted' }; },
-        async appendInstructions() { seen.opening++; return { eventId: 'i', status: 'accepted' }; }, async interruptPlayback() { return { eventId: 'p', status: 'accepted' }; },
+        async appendInstructions(text) { seen.opening++; openings.push(text); return { eventId: 'i', status: 'accepted' }; }, async interruptPlayback() { return { eventId: 'p', status: 'accepted' }; },
         resumePlayback() {}, getTranscript() { return { revision: 0, callerRevision: 0, fragments: [] }; },
         async close(reason) { lifecycle.push('live-close'); return { callId: settings.callId, sessionId: 'inbound-fixture', finalized: true,
           transcriptPersisted: true, outputAudioDiscarded: false, reason: reason ?? 'closed' }; } };
@@ -502,7 +601,7 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
   let closed = false;
   const close = async () => { if (!closed) { closed = true; await broker.close(); } };
   t.after(async () => { releaseBegin?.(); await close(); fs.rmSync(dir, { recursive: true, force: true }); });
-  return { broker, store, base, config, params, seen, lifecycle, webhook, close, provider, billing, transports,
+  return { broker, store, base, config, params, seen, openings, lifecycle, webhook, close, provider, billing, transports,
     gateBegin() { beginGate = new Promise<void>(resolve => { releaseBegin = resolve; }); return () => releaseBegin!(); },
     gateConsume() { consumeGate = new Promise<void>(resolve => { releaseConsume = resolve; }); return () => releaseConsume!(); },
     gateAssert() { assertGate = new Promise<void>(resolve => { releaseAssert = resolve; }); return () => releaseAssert!(); },

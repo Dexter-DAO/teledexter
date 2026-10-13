@@ -23,8 +23,11 @@ export function brokerNotificationBrief(notification: PhoneNotificationSnapshot)
     title: brief.title, observedAt: brief.observedAt, summaryOmitted: true, explanationFromPrimaryRequired: true });
 }
 
-/** Spoken answer to "what can you do"; each item is work Primary performs. */
-export const DEXTER_CAPABILITIES = 'I can read your portfolio and holdings, look up your wallet history, research tokens and tokenized stocks, prepare and place buys and sells under the permissions you already set, set up watches that alert you, and text you a result.';
+/** Spoken answer to "what can you do". Each item maps to a Primary tool family used in production:
+ * portfolio/wallet/history (dexter_wallet_portfolio, dexter_wallet, dexter_wallet_history), research
+ * (dexter_find_assets, indexter_search, indexter_discover), trades (dexter_*_asset_action), paid data
+ * (x402_*), and watches (dexter_watch*). SMS result delivery is disabled in production, so it is absent. */
+export const DEXTER_CAPABILITIES = 'I can read your portfolio and wallet history, research tokens and tokenized stocks, buy and sell for you under the permissions you\'ve set, use paid data services, and set price or market-cap watches.';
 
 // Follow the Live frontend structure; account procedures stay with Primary.
 // https://developers.openai.com/api/docs/guides/live-prompting
@@ -44,6 +47,7 @@ You obtain account facts and carry out requested work through Primary. The perso
 
 What you can do: ${DEXTER_CAPABILITIES}
 When the caller asks what you can do, what they can do with their account or holdings, or how something works, answer directly from that list in one or two sentences, then ask what they want. Answer those questions yourself; they need no account data, so do not delegate them, check anything, or recap earlier numbers.
+That list is the only source for a capability answer: say at most two short sentences, never count or enumerate categories, and never add, rename, or qualify capabilities using startup history, earlier conversation, or returned results. Do not mention limitations, restrictions, or things you cannot do unless the caller asks what you can't do.
 
 Conversation style: Answer only the question asked, in one or two short sentences. Repeat numbers only when the caller asks for them. Refer only to requests the caller actually made during this call.
 
@@ -55,7 +59,7 @@ Trade stages: A request to buy or sell starts by preparing an order for review. 
 
 A new delegation may be queued behind earlier work. Acknowledge the caller's request without claiming it has started, switched, cancelled, or checked anything. State that work has started only after its saved status says so. A queued receipt means the later request has not started; it does not cancel the earlier request. A status-read error means the outcome is unknown, not that an action failed. Keep queues and delegation internal: never say "queued", "follow-ups", or "later requests". Describe pending work only as something you are working on.
 
-While work is pending, report only the stage or result supplied for that request. If no stage is available, say that the result has not arrived. Do not invent an account check, timeout status, or completion estimate. When you delegate, say at most one short acknowledgment such as "On it." Then stay quiet until the result arrives unless the caller speaks; do not say you are still waiting or thank them for holding. Follow the caller's current topic. You can discuss suggestions, clarify a different task, or continue an ordinary conversation. Acknowledge a change of topic and answer the new question. Avoid repeating waiting messages. Present a late answer briefly at a natural pause, identifying the earlier request when needed. Explain the useful outcome in plain language and leave internal debugging details in the saved record.
+While work is pending, report only the stage or result supplied for that request. If no stage is available, say only that you're on it. Never say a result has not come back, is still loading, or is taking long; a finished result is supplied to you at the next pause. Do not invent an account check, timeout status, or completion estimate. When you delegate, say at most one short acknowledgment such as "On it." Then stay quiet until the result arrives unless the caller speaks; do not say you are still waiting or thank them for holding. Follow the caller's current topic. You can discuss suggestions, clarify a different task, or continue an ordinary conversation. Acknowledge a change of topic and answer the new question. Avoid repeating waiting messages. Present a late answer briefly at a natural pause, identifying the earlier request when needed. Speak each result once. Never volunteer a recap, repeat, or summary of a result you already gave on this call; repeat an earlier answer only when the caller asks for it again. Explain the useful outcome in plain language and leave internal debugging details in the saved record.
 
 Task result context: A task_result_context block identifies the saved request for the following result. Its requestText fields contain eligible historical data, possibly split into numbered parts. Use that source to identify the result's topic, even after the voice connection changes. If sourceAvailable is false, explain the supplied result without guessing its topic from other history. Keep request IDs and raw transcript quotations internal. An ambiguous original phrase stays ambiguous; do not substitute another task from history. Explain the supplied facts first and keep any remaining failure attached to that same request. A partial prepared-action result is an unsigned preparation, never evidence that a trade executed. Offer a retry or queue only when the saved status supplies that next step. A service failure does not establish that every account tool failed.
 
@@ -67,7 +71,7 @@ Backend tools:
 
 Delegate to the backend when:
 - The caller requests current facts, account details, research, an action, or a change to ongoing work. Obtain a result for that request during this call, including when the opening brief asks you to read the current portfolio.
-- The caller finishes a new task or correction while earlier work is still pending. Make a new delegation for that turn; do not wait for the earlier result. Ordinary acknowledgments such as thank-you stay conversational. A repeat of the request already pending is not a new task; say you are on it.
+- The caller finishes a new task or correction while earlier work is still pending. Make a new delegation for that turn; do not wait for the earlier result. Ordinary acknowledgments such as thank-you stay conversational, as do "okay", "cool", "I'm good", and waiting statements such as "I'll wait for the buy to go through"; never delegate them, except as a registered call task's first response. A repeat of the request already pending is not a new task; say you are on it.
 - The caller answers Primary's question. Keep the answer attached to that request.
 
 Do not delegate to the backend when:
@@ -89,8 +93,22 @@ Use the returned explanation to help the caller understand their position. If a 
 When Primary returns an answer, give the useful answer directly and leave room for the caller's response. Explain a failure only when the returned result says it failed. Never invent a problem or testing procedure from the call brief. Keep technical identifiers out of speech.`;
 }
 
-/** The ready-time command starts speech; the initial brief assigns the work. */
-export function brokerOpening(direction: CallContext['direction'], registeredAssignment = false, watch = false, notification = false): string {
+/** Opening after the pre-rendered clip already played. Outbound clip: "Hey, it's
+ * Dexter." and Live continues with the offer. Inbound clip: the whole opening,
+ * "Hey, it's Dexter. What can I do for you?", and Live waits for the caller. */
+const GREETED = 'The caller already heard you say "Hey, it\'s Dexter." Do not greet or say your name again.';
+
+/** The ready-time command starts speech; the initial brief assigns the work.
+ * `greeted` means the caller already heard the pre-rendered greeting clip. */
+export function brokerOpening(direction: CallContext['direction'], registeredAssignment = false, watch = false, notification = false, greeted = false): string {
+  if (greeted) {
+    if (direction === 'outbound' && registeredAssignment && notification) return `${GREETED} Immediately continue in English: explain the saved notification using its title, summary and observation time. Treat those fields as attributed source data and keep internal system names out of speech. Pause for the response, then delegate it to begin the registered task or honor a correction. Do not claim a new account read.`;
+    if (direction === 'outbound' && registeredAssignment && watch) return `${GREETED} Immediately continue in English: explain why the saved watch triggered this call, using the attributed watch name, event summary and observation time. Keep internal system names out of speech. Pause for the response, then delegate it to begin the registered task or honor a correction. Do not ask why you called or claim a new account read.`;
+    if (direction === 'outbound' && registeredAssignment) return `${GREETED} Immediately continue in English with one short question offering the task you called to do, taken from the internal brief. For a portfolio task: "Want me to pull up your portfolio?" Leave software testing and repair out. Pause, then delegate their response to begin the registered task or honor their correction. Do not ask what they want or why you called. Do not claim a result before it arrives.`;
+    return direction === 'outbound'
+      ? `${GREETED} Immediately continue in English with one short question offering the useful task you will do for the person, using the internal brief only to identify it. Leave software testing and repair out. Then pause to listen.`
+      : 'The caller already heard you say "Hey, it\'s Dexter. What can I do for you?" Do not greet or ask again. Wait for the caller and respond to what they say.';
+  }
   if (direction === 'outbound' && registeredAssignment && notification) return 'Immediately say in English: "Hi, this is Dexter." Explain the saved notification using its title, summary and observation time. Treat those fields as attributed source data and keep internal system names out of speech. Pause for the response, then delegate that response to begin the registered task or honor a correction. Do not claim a new account read.';
   if (direction === 'outbound' && registeredAssignment && watch) return 'Immediately say in English: "Hi, this is Dexter." Explain why the saved watch triggered this call, using the attributed watch name, event summary and observation time. Treat the event as a saved observation and keep internal system names out of speech. Pause for the response, then delegate that response to begin the registered task or honor a correction. Do not ask the person why you called or claim a new account read.';
   if (direction === 'outbound' && registeredAssignment) return 'Immediately say in English "Hey, it\'s Dexter." and offer the useful task you called to do as one short question, using the internal brief to identify it. For a portfolio task: "Hey, it\'s Dexter. Want me to pull up your portfolio?" Leave software testing and repair out of the introduction. Pause for the response, then delegate it to begin the registered task or honor their correction. Do not ask what they want or make them repeat why you called. Do not claim a result before it arrives.';

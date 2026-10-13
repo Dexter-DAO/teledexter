@@ -96,7 +96,9 @@ export interface BrokerCall {
     pending: number;
     unsupported: string[];
   };
-  journey?: { liveReadyAt?: string; firstAudioSentAt?: string; firstPlaybackConfirmedAt?: string };
+  /** greetingClip*: the pre-rendered "Hey, it's Dexter." clip, played before Live speaks. */
+  journey?: { liveReadyAt?: string; firstAudioSentAt?: string; firstPlaybackConfirmedAt?: string;
+    greetingClipStartedAt?: string; greetingClipPlayedAt?: string };
   metrics?: { receivedAudioBytes: number; sentAudioBytes: number; playedAudioBytes: number; clearedAudioBytes: number };
   delegations: Record<string, { requestId: string; status: string; updatedAt: string; result?: string }>;
 }
@@ -384,14 +386,16 @@ function assertHarkReceiptUpdate(previous: BrokerCall, next: BrokerCall): void {
 interface State { version: 1; calls: Record<string, BrokerCall> }
 
 const journeySchema = z.object({ liveReadyAt: z.iso.datetime({ offset: true }).optional(),
-  firstAudioSentAt: z.iso.datetime({ offset: true }).optional(), firstPlaybackConfirmedAt: z.iso.datetime({ offset: true }).optional() }).strict();
+  firstAudioSentAt: z.iso.datetime({ offset: true }).optional(), firstPlaybackConfirmedAt: z.iso.datetime({ offset: true }).optional(),
+  greetingClipStartedAt: z.iso.datetime({ offset: true }).optional(), greetingClipPlayedAt: z.iso.datetime({ offset: true }).optional() }).strict();
 function validateCallJourney(call: BrokerCall, previous?: BrokerCall): void {
   if (call.journey) {
     journeySchema.parse(call.journey);
-    if (!call.mediaStartedAt || (call.journey.firstPlaybackConfirmedAt && !call.journey.firstAudioSentAt))
+    if (!call.mediaStartedAt || (call.journey.firstPlaybackConfirmedAt && !call.journey.firstAudioSentAt)
+      || (call.journey.greetingClipPlayedAt && !call.journey.greetingClipStartedAt))
       throw new Error('Call journey lacks media evidence');
   }
-  for (const key of ['liveReadyAt', 'firstAudioSentAt', 'firstPlaybackConfirmedAt'] as const)
+  for (const key of ['liveReadyAt', 'firstAudioSentAt', 'firstPlaybackConfirmedAt', 'greetingClipStartedAt', 'greetingClipPlayedAt'] as const)
     if (previous?.journey?.[key] && previous.journey[key] !== call.journey?.[key]) throw new Error('Call journey observation changed');
 }
 
@@ -428,6 +432,7 @@ export class BrokerStore {
   private readonly parent: DurableParentBinding;
   private closed = false;
   private persistenceUncertain = false;
+  private pendingWrite: { body: string; next: State } | undefined;
 
   constructor(readonly directory: string) {
     fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -458,9 +463,26 @@ export class BrokerStore {
     finally { fs.closeSync(fd); }
   }
 
+  /** Settles an uncertain write from the journal on disk: either the attempted write landed or the
+   * previous state is intact. Any other content keeps the store uncertain. */
+  private reconcileFromDisk(): boolean {
+    try {
+      const disk = fs.readFileSync(this.file, 'utf8');
+      if (this.pendingWrite && disk === this.pendingWrite.body) this.state = this.pendingWrite.next;
+      else if (disk !== JSON.stringify(this.state)) return false;
+      this.persistenceUncertain = false;
+      this.pendingWrite = undefined;
+      return true;
+    } catch (error) {
+      console.error(JSON.stringify({ event: 'broker_journal_reconcile_failed', message: (error as Error).message,
+        code: (error as NodeJS.ErrnoException).code ?? null }));
+      return false;
+    }
+  }
+
   private persist(next: State) {
     if (this.closed) throw new Error('Broker store is closed');
-    if (this.persistenceUncertain) throw new Error('Broker journal write outcome is uncertain');
+    if (this.persistenceUncertain && !this.reconcileFromDisk()) throw new Error('Broker journal write outcome is uncertain');
     // All write paths share this guard, including selected replies and ordinary queue updates.
     for (const [id, call] of Object.entries(next.calls)) {
       validateCallerRouting(call, this.state?.calls[id]);
@@ -473,20 +495,32 @@ export class BrokerStore {
       validateRestrictedSetupCall(call, this.state?.calls[id]);
     }
     validateOutboundRetries(next.calls, this.state?.calls);
-    try { durablyReplaceJsonFile(this.file, JSON.stringify(next), fs, this.parent); }
-    catch (error) {
-      // A post-rename failure can leave next on disk and the old state in memory.
-      // Further writes must not overwrite that reservation from the stale cache.
-      this.persistenceUncertain = true;
-      throw error;
+    const body = JSON.stringify(next);
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      try {
+        durablyReplaceJsonFile(this.file, body, fs, this.parent);
+        this.state = next;
+        return;
+      } catch (error) {
+        lastError = error;
+        console.error(JSON.stringify({ event: 'broker_journal_write_failed', attempt, message: (error as Error).message,
+          code: (error as NodeJS.ErrnoException).code ?? null }));
+        // A post-rename failure can leave next on disk and the old state in memory. Settle it from
+        // disk before any further write; unknown content stays uncertain so a stale cache never overwrites it.
+        this.persistenceUncertain = true;
+        this.pendingWrite = { body, next };
+        if (!this.reconcileFromDisk()) throw error;
+        if (this.state === next) return;
+      }
     }
-    this.state = next;
+    throw lastError;
   }
 
   /** Full existing journal, with the same record validation used at startup. */
   readCallRequestJournal(): CallRequestJournalAvailability {
     if (this.closed) return { state: 'unavailable' };
-    if (this.persistenceUncertain) return { state: 'uncertain' };
+    if (this.persistenceUncertain && !this.reconcileFromDisk()) return { state: 'uncertain' };
     const owned = () => {
       if (!durableFileParentIsCurrent(this.parent)) return false;
       const lock = JSON.parse(fs.readFileSync(this.lock, 'utf8')) as { pid?: unknown; id?: unknown };

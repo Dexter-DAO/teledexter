@@ -16,7 +16,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-111111" alt="MIT license"></a>
 </p>
 
-Teledexter is a phone line to your own Dexter, an AI agent attached to your account. You call Dexter from your verified number, or Dexter calls that number when a saved watch fires or a call is arranged. On the call it can read your portfolio, research, and buy or sell Solana tokens and tokenized stocks under the standing permissions you set in advance. This repository is the voice broker that runs those calls. Teledexter succeeds an earlier product, Dexter Phone; the service and its process are still named `dexter-broker`.
+Teledexter is a phone line to your own Dexter, the AI agent attached to your self-custodial Dexter account. You call Dexter from your verified number, or Dexter calls you for an arranged call. On the call it reads your portfolio, researches assets, and buys or sells tokenized stocks under the standing permission you set in advance with your passkey. Calls triggered by saved watches are implemented but not yet proven in production. This repository is the voice broker that runs those calls. Teledexter succeeds an earlier product, Dexter Phone; the service and its process are still named `dexter-broker`.
 
 ## Live on mainnet
 
