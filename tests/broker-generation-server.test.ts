@@ -73,7 +73,7 @@ test('successor registration/context crosses actual HTTP with negotiated full me
 
 async function host(t: test.TestContext, slowClose = false, questionMode = false, boundedCleanup = false,
   settings: { admitted?: boolean; failed?: boolean; failureCode?: string; cancelled?: boolean; sameEpoch?: boolean; resultText?: string; callerText?: string;
-    openingStatus?: 'accepted' | 'rejected' | 'unconfirmed' } = {}) {
+    openingStatus?: 'accepted' | 'rejected' | 'unconfirmed'; greetingClip?: Buffer } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-generation-server-'));
   const config: BrokerConfig = { host: '127.0.0.1', port: 3213, publicOrigin: 'https://phone.example.test', stateDir: directory,
     controlToken: 'c'.repeat(40), apiKey: 'fixture-key', model: 'gpt-live-1', voice: 'marin',
@@ -138,6 +138,7 @@ async function host(t: test.TestContext, slowClose = false, questionMode = false
   let finishSlowClose: (() => void) | undefined;
   let finishQuestion: (() => void) | undefined;
   const broker = createBrokerServer({ config, store, primary, eligibleContext: eligible,
+    ...(settings.greetingClip ? { greetingClip: settings.greetingClip } : {}),
     provider: { calls: () => ({ async update() { providerEnds++; return { status: 'completed' }; } }) } as unknown as ReturnType<typeof Twilio>,
     voiceFactory(options) {
       const sessionId = `generation_${voices.length + 1}`;
@@ -990,6 +991,14 @@ for (const openingStatus of ['accepted', 'rejected', 'unconfirmed'] as const) te
   assert.equal(f.voices.length, 2); assert.equal(f.opening.length, 1);
   assert.equal(f.store.get(f.callId)!.voiceOpening!.status, openingStatus);
   assert.ok(f.assertions() > 1, 'ordinary request publication still qualifies current context');
+});
+
+test('an outbound call with the greeting clip opens once, continuing after "Hey, it\'s Dexter."', async t => {
+  const f = await host(t, false, false, false, { greetingClip: Buffer.alloc(2_400, 0x20) });
+  await until(() => f.store.get(f.callId)?.voiceOpening?.status === 'accepted');
+  assert.equal(f.opening.length, 1);
+  assert.match(f.opening[0], /^The caller already heard you say "Hey, it's Dexter\." Do not greet or say your name again\. Immediately continue in English with one short question/);
+  assert.ok(f.store.get(f.callId)!.journey?.greetingClipStartedAt);
 });
 
 test('a confirmed financial receipt survives a later model failure and voice replacement', async t => {

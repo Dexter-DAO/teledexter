@@ -89,8 +89,21 @@ Use the returned explanation to help the caller understand their position. If a 
 When Primary returns an answer, give the useful answer directly and leave room for the caller's response. Explain a failure only when the returned result says it failed. Never invent a problem or testing procedure from the call brief. Keep technical identifiers out of speech.`;
 }
 
-/** The ready-time command starts speech; the initial brief assigns the work. */
-export function brokerOpening(direction: CallContext['direction'], registeredAssignment = false, watch = false, notification = false): string {
+/** Opening after the pre-rendered "Hey, it's Dexter." clip already played:
+ * Live continues from those words without greeting or naming itself again. */
+const GREETED = 'The caller already heard you say "Hey, it\'s Dexter." Do not greet or say your name again.';
+
+/** The ready-time command starts speech; the initial brief assigns the work.
+ * `greeted` means the caller already heard the pre-rendered greeting clip. */
+export function brokerOpening(direction: CallContext['direction'], registeredAssignment = false, watch = false, notification = false, greeted = false): string {
+  if (greeted) {
+    if (direction === 'outbound' && registeredAssignment && notification) return `${GREETED} Immediately continue in English: explain the saved notification using its title, summary and observation time. Treat those fields as attributed source data and keep internal system names out of speech. Pause for the response, then delegate it to begin the registered task or honor a correction. Do not claim a new account read.`;
+    if (direction === 'outbound' && registeredAssignment && watch) return `${GREETED} Immediately continue in English: explain why the saved watch triggered this call, using the attributed watch name, event summary and observation time. Keep internal system names out of speech. Pause for the response, then delegate it to begin the registered task or honor a correction. Do not ask why you called or claim a new account read.`;
+    if (direction === 'outbound' && registeredAssignment) return `${GREETED} Immediately continue in English with one short question offering the task you called to do, taken from the internal brief. For a portfolio task: "Want me to pull up your portfolio?" Leave software testing and repair out. Pause, then delegate their response to begin the registered task or honor their correction. Do not ask what they want or why you called. Do not claim a result before it arrives.`;
+    return direction === 'outbound'
+      ? `${GREETED} Immediately continue in English with one short question offering the useful task you will do for the person, using the internal brief only to identify it. Leave software testing and repair out. Then pause to listen.`
+      : `${GREETED} Immediately say in English: "What can I do for you?" Then pause to listen.`;
+  }
   if (direction === 'outbound' && registeredAssignment && notification) return 'Immediately say in English: "Hi, this is Dexter." Explain the saved notification using its title, summary and observation time. Treat those fields as attributed source data and keep internal system names out of speech. Pause for the response, then delegate that response to begin the registered task or honor a correction. Do not claim a new account read.';
   if (direction === 'outbound' && registeredAssignment && watch) return 'Immediately say in English: "Hi, this is Dexter." Explain why the saved watch triggered this call, using the attributed watch name, event summary and observation time. Treat the event as a saved observation and keep internal system names out of speech. Pause for the response, then delegate that response to begin the registered task or honor a correction. Do not ask the person why you called or claim a new account read.';
   if (direction === 'outbound' && registeredAssignment) return 'Immediately say in English "Hey, it\'s Dexter." and offer the useful task you called to do as one short question, using the internal brief to identify it. For a portfolio task: "Hey, it\'s Dexter. Want me to pull up your portfolio?" Leave software testing and repair out of the introduction. Pause for the response, then delegate it to begin the registered task or honor their correction. Do not ask what they want or make them repeat why you called. Do not claim a result before it arrives.';

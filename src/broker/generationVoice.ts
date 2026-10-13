@@ -345,7 +345,8 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
       let receipt: LiveDelivery;
       try { receipt = await voice.appendInstructions(brokerOpening(initialCall.direction, Boolean(initialCall.callAssignment),
         initialCall.callAssignment?.origin === 'authenticated_hark_delivery',
-        initialCall.callAssignment?.origin === 'authenticated_notification_delivery')); }
+        initialCall.callAssignment?.origin === 'authenticated_notification_delivery',
+        Boolean(call().journey?.greetingClipStartedAt))); }
       catch { receipt = { eventId: '', status: 'unconfirmed', reason: 'opening_delivery_failed' }; }
       if (!stopped && !observer.signal.aborted && !call().endedAt
         && controller.snapshot().deliveryAttachment?.generationId === attachment.generationId)
