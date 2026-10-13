@@ -6,7 +6,8 @@
 
 <p align="center">
   <strong>A phone line to your own AI financial agent on Solana.</strong><br>
-  Call <strong>+1 (561) 940-2402</strong> from your verified number.
+  Call <strong>+1 (561) 940-2402</strong> from your verified number.<br>
+  <a href="https://www.loom.com/share/db201aec86bf4108a203e63542ab5e1d">Live demo</a> · <a href="https://www.loom.com/share/4b55495806da4c1c8e9089618d2ddcb0">Pitch</a>
 </p>
 
 <p align="center">
@@ -21,11 +22,16 @@ Teledexter is a phone line to your own Dexter, an AI agent attached to your acco
 
 Each of these trades was requested by voice on a phone call to Dexter and settled on Solana mainnet. Primary Dexter carried out each one under the account's standing permissions; the broker relayed the conversation and holds no wallet keys.
 
-| Date | Trade | Transaction |
+| Time (UTC) | Trade | Transaction |
 | --- | --- | --- |
-| 2026-09-30 | Bought 0.01467362 AAPLx for 5 USDC | [`2ePLu4tj…R1AE4b`](https://solscan.io/tx/2ePLu4tj4BS3ckMsJrCe62jmEhUnU3hziSymuEyzChQoQnJLLcWBx1JHq7U5XRvpMA3KDKMDhvmBGAsQ55R1AE4b) |
-| 2026-10-13 | Sold 0.00875977 AAPLx for 2.977647 USDC | [`5XtuXQwS…efvtDP`](https://solscan.io/tx/5XtuXQwSLvtTKvdy6VzHSz9yPNPgaCK3Yxm1qifjaBikcCnPP7zuJyHLGhxQgKf2Lqcmp2FqrMb3w2onWxefvtDP) |
-| 2026-10-13 | Bought 0.00289208 AAPLx for 1 USDC | [`2TcC3Tn7…6J2bmr`](https://solscan.io/tx/2TcC3Tn7KBTLdZyfBzTzuQwJ6NdeXmzRkHpXufJHPoLkqugz2P1Bp5pyeNqboJtKmpz83Q3HS4gY5o4afp6J2bmr) |
+| 2026-09-30 16:21 | Bought 0.01467362 AAPLx for 5 USDC | [`2ePLu4tj…R1AE4b`](https://solscan.io/tx/2ePLu4tj4BS3ckMsJrCe62jmEhUnU3hziSymuEyzChQoQnJLLcWBx1JHq7U5XRvpMA3KDKMDhvmBGAsQ55R1AE4b) |
+| 2026-10-13 04:11 | Sold 0.00875977 AAPLx for 2.977647 USDC | [`5XtuXQwS…efvtDP`](https://solscan.io/tx/5XtuXQwSLvtTKvdy6VzHSz9yPNPgaCK3Yxm1qifjaBikcCnPP7zuJyHLGhxQgKf2Lqcmp2FqrMb3w2onWxefvtDP) |
+| 2026-10-13 04:13 | Bought 0.00289208 AAPLx for 1 USDC | [`2TcC3Tn7…6J2bmr`](https://solscan.io/tx/2TcC3Tn7KBTLdZyfBzTzuQwJ6NdeXmzRkHpXufJHPoLkqugz2P1Bp5pyeNqboJtKmpz83Q3HS4gY5o4afp6J2bmr) |
+| 2026-10-13 05:49 | Sold 0.00292246 AAPLx for 0.993421 USDC | [`5QzyX2Ui…H16v4T`](https://solscan.io/tx/5QzyX2UixL1jSNrAbVw71fXEKUtoLugyatPgPho3y9ybo7siL7fzMGDdrUbf68qsBg1zuwfg6NRG8NSWhmH16v4T) |
+| 2026-10-13 05:56 | Bought 0.00289197 AAPLx for 1 USDC | [`3ooYTJWw…UXFWst`](https://solscan.io/tx/3ooYTJWwYR5uSKLyKZV9mV1EjKV8DggiWoHfh6VevUvKRJQwciiuftvUFhNwTMtSwZCvA6HfBog6bXyzdPUXFWst) |
+| 2026-10-13 06:26 | Bought 0.00289167 AAPLx for 1 USDC on the [demo call](https://www.loom.com/share/db201aec86bf4108a203e63542ab5e1d) | [`3669NH69…VWmcz5`](https://solscan.io/tx/3669NH69yj9MzQRSW9hCYnsV9uHA62QwQzmDBTgq3i9ynMhV9dJKve1j2y52jDpom7SFxwFpbjkFHc8S1qVWmcz5) |
+
+The limits each trade ran under are enforced on-chain by the Dexter Vault program, [`Hg3wRayd…pncj2fhc`](https://solscan.io/account/Hg3wRaydFtJhYrdvYrKECacpJYDsC9Px7yKmpncj2fhc), which is not part of this repository.
 
 ## How it works
 
