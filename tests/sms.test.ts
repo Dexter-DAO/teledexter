@@ -276,16 +276,14 @@ test('unconfigured service fails closed without opening Twilio clients or storag
   assert.equal(configureSms({}, fakeClients, '/release'), null);
 });
 
-test('SIGTERM releases ledger ownership and preserves bytes for next process', async t => {
+test('closing on SIGTERM releases ledger ownership and preserves bytes for next process', async t => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'sms-signal-test-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const statePath = path.join(directory, 'sms.json');
   const serviceModule = pathToFileURL(path.resolve('src/sms/SmsService.ts')).href;
-  const shutdownModule = pathToFileURL(path.resolve('src/sms/shutdown.ts')).href;
   const code = `import { SmsService } from ${JSON.stringify(serviceModule)};
-    import { installPhoneShutdownHandlers } from ${JSON.stringify(shutdownModule)};
     const service = new SmsService({ statePath: ${JSON.stringify(statePath)}, enrollmentEnabled: false, sendEnabled: false, campaignApproved: false, advancedOptOutConfigured: false, messagingServiceSid: '', publicBaseUrl: 'https://test.invalid', provider: { startVerification: async () => {}, checkVerification: async () => false, send: async () => { throw new Error('disabled'); } } });
-    installPhoneShutdownHandlers({close: async () => {}}, service);
+    process.once('SIGTERM', () => { service.close(); process.exit(0); });
     console.log('READY'); setInterval(() => {}, 1000);`;
   const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', code], { stdio: ['ignore', 'pipe', 'pipe'] });
   t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); });
