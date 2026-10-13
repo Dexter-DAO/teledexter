@@ -14,7 +14,9 @@ const SECRET = 'internal-test-secret-'.repeat(4), TOKEN = 'fixture-sms-webhook';
 const ACCOUNT = 'AC' + '1'.repeat(32), BASE = 'https://phone.example.test', MESSAGE = 'SM' + '2'.repeat(32);
 function settings(t: test.TestContext) {
   // The real durable-state validator rejects temporary roots and release-contained state.
-  const dir = fs.mkdtempSync(path.join(os.homedir(), '.local/state/broker-sms-test-'));
+  const stateHome = path.join(os.homedir(), '.local/state');
+  fs.mkdirSync(stateHome, { recursive: true });
+  const dir = fs.mkdtempSync(path.join(stateHome, 'broker-sms-test-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const env: NodeJS.ProcessEnv = {
     DEXTER_SMS_STATE_PATH: path.join(dir, 'sms.json'), DEXTER_SMS_INTERNAL_SECRET: SECRET,

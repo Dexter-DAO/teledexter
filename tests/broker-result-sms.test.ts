@@ -35,7 +35,10 @@ const ref = (v: PhoneResultSmsResolved) => ({ v: v.identity.v, intentId: v.ident
 function deferred<T>() { let resolve!: (v: T) => void; const promise = new Promise<T>(r => { resolve = r; }); return { promise, resolve }; }
 
 async function fixture(t: test.TestContext, resolved = value()) {
-  const dir = fs.mkdtempSync(path.join(os.homedir(), '.local/state/broker-result-sms-test-'));
+  // The durable-state validator rejects temporary roots, so use a directory under the user's state home.
+  const stateHome = path.join(os.homedir(), '.local/state');
+  fs.mkdirSync(stateHome, { recursive: true });
+  const dir = fs.mkdtempSync(path.join(stateHome, 'broker-result-sms-test-'));
   const statePath = path.join(dir, 'sms.json');
   const old = new SmsService({ statePath, enrollmentEnabled: true, sendEnabled: false, campaignApproved: true,
     advancedOptOutConfigured: true, messagingServiceSid: SERVICE, publicBaseUrl: BASE,
