@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { brokerInstructions, brokerHistory, brokerOpening, brokerWatchBrief } from '../src/broker/instructions.js';
+import { DEXTER_CAPABILITIES, brokerInstructions, brokerHistory, brokerOpening, brokerWatchBrief } from '../src/broker/instructions.js';
 import { makeHarkSnapshot } from './fixtures/broker-hark.js';
 import { factFreshnessScenarios, historicalAccountMessages } from './fixtures/broker-fact-freshness.js';
 
@@ -27,7 +27,8 @@ test('the observed repair brief stays assigned to Dexter and is absent from the 
   assert.equal(instructions.split(purpose).length - 1, 1);
   assert.doesNotMatch(opening, /verify|portfolio|Primary|Branch/);
   assert.match(opening, /task you will do for the person/);
-  assert.match(opening, /Invite their question or response.*pause to listen/);
+  assert.match(opening, /"Hey, it's Dexter\." and offer the useful task .* as one short question/);
+  assert.match(opening, /pause to listen/);
 });
 
 test('an inbound opening follows the person even when an outbound work brief was supplied', () => {
@@ -37,7 +38,7 @@ test('an inbound opening follows the person even when an outbound work brief was
   assert.match(instructions, /The person called you/);
   assert.ok(!instructions.includes(purpose));
   assert.doesNotMatch(instructions, /Call brief for Dexter|You called the person/);
-  assert.match(opening, /Immediately say in English: "Hi, this is Dexter\. What would you like to do\?"/);
+  assert.match(opening, /Immediately say in English: "Hey, it's Dexter\. What can I do for you\?"/);
   assert.doesNotMatch(opening, /assignment|call brief/);
 });
 
@@ -100,8 +101,9 @@ test('registered call opening starts its assigned work from the real first respo
   assert.match(instructions, /first response, including an ordinary greeting or acknowledgment, delegate it/);
   assert.match(instructions, /Preserve what they actually say/);
   assert.match(instructions, /greetings and acknowledgments do not restart the task/);
-  assert.match(opening, /State the useful task you called to do in one sentence/);
-  assert.doesNotMatch(opening, /Invite their question|What would you like/);
+  assert.match(opening, /"Hey, it's Dexter\." and offer the useful task you called to do as one short question/);
+  assert.match(opening, /"Hey, it's Dexter\. Want me to pull up your portfolio\?"/);
+  assert.doesNotMatch(opening, /Invite their question|What would you like|What can I do for you/);
   assert.match(instructions, /finishes a new task or correction while earlier work is still pending/);
   assert.match(instructions, /Ordinary acknowledgments such as thank-you stay conversational/);
   assert.doesNotMatch(brokerInstructions({ ...call, registeredAssignment: false }), /task is registered with Primary/);
@@ -137,4 +139,27 @@ test('trade language distinguishes preparing, confirmation and execution while p
   assert.match(instructions, /Read the prepared quote and obtain the required confirmation before execution/);
   assert.match(instructions, /Acknowledge a change of topic and answer the new question/);
   assert.match(instructions, /leave internal debugging details in the saved record/);
+});
+
+test('capability and conversational questions are answered by voice without delegation or recaps', () => {
+  for (const direction of ['inbound', 'outbound'] as const) {
+    const instructions = brokerInstructions({ direction, purpose: 'Read the current portfolio.', registeredAssignment: direction === 'outbound' });
+    assert.ok(instructions.includes(`What you can do: ${DEXTER_CAPABILITIES}`));
+    assert.match(instructions, /what they can do with their account or holdings.*answer directly from that list in one or two sentences/);
+    assert.match(instructions, /Answer those questions yourself; they need no account data, so do not delegate them/);
+    assert.match(instructions, /Do not delegate to the backend when:[\s\S]*The caller asks what you can do, what they can do/);
+    assert.match(instructions, /Repeat numbers only when the caller asks for them/);
+    assert.match(instructions, /Refer only to requests the caller actually made during this call/);
+    assert.match(instructions, /A repeat of the request already pending is not a new task/);
+  }
+  for (const capability of ['portfolio', 'wallet history', 'tokenized stocks', 'buys and sells under the permissions you already set', 'watches', 'text you'])
+    assert.ok(DEXTER_CAPABILITIES.includes(capability), capability);
+});
+
+test('pending work gets one short acknowledgment and no spoken queue mechanics', () => {
+  const instructions = brokerInstructions({ direction: 'inbound', purpose: '' });
+  assert.match(instructions, /never say "queued", "follow-ups", or "later requests"/);
+  assert.match(instructions, /at most one short acknowledgment such as "On it\."/);
+  assert.match(instructions, /stay quiet until the result arrives unless the caller speaks; do not say you are still waiting/);
+  assert.match(instructions, /A queued receipt means the later request has not started/);
 });

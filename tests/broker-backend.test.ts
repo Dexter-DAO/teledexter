@@ -577,7 +577,7 @@ test('untyped exceptions cannot put raw error details into the saved request or 
   assert.equal(f.updates.at(-1)!.text, 'Your balance is $10.25 USDC.');
 });
 
-test('spoken progress continues during a blocked result read and is bounded across duplicate delegates', async t => {
+test('spoken progress is given once during a blocked result read and is bounded across duplicate delegates', async t => {
   const f = await fixture(t, { progressIntervalMs: 15, maxPollMs: 5000 });
   f.add('Read my balance.'); f.speech();
   let entered!: () => void, release!: () => void;
@@ -588,11 +588,11 @@ test('spoken progress continues during a blocked result read and is bounded acro
   try {
     await began;
     const end = Date.now() + 5000;
-    while (f.updates.filter(update => update.kind === 'progress').length < 4 && Date.now() < end) await wait(10);
-    await wait(60); // Keep the blocked read open after its fourth accepted notice.
+    while (f.updates.filter(update => update.kind === 'progress').length < 1 && Date.now() < end) await wait(10);
+    await wait(90); // Keep the blocked read open for several more progress intervals.
     const progress = f.updates.filter(update => update.kind === 'progress');
-    assert.equal(progress.length, 4);
-    assert.equal(new Set(progress.map(update => update.id)).size, 4);
+    assert.equal(progress.length, 1, 'one waiting line; repeats only interrupt the caller');
+    assert.equal(progress[0].text, 'Still working on it.');
     assert.ok(progress.every(update => update.speak === true && update.expectedCallerRevision === 1));
     assert.equal(f.saved()[0].status, 'queued');
   } finally { release(); await work; }
@@ -656,28 +656,25 @@ for (const change of ['abort', 'call_ended'] as const)
     assert.equal(f.posts.length, 1);
   });
 
-test('an active request continues to report progress after a caller interjection', async t => {
+test('a caller interjection does not repeat the spoken pending status', async t => {
   const f = await fixture(t, { progressIntervalMs: 10, maxPollMs: 500 });
   f.add('Read my portfolio.'); f.speech();
-  let entered!: () => void, release!: () => void, noticed!: () => void;
+  let entered!: () => void, release!: () => void;
   const began = new Promise<void>(resolve => { entered = resolve; });
   const gate = new Promise<void>(resolve => { release = resolve; });
-  const notice = new Promise<void>(resolve => { noticed = resolve; });
-  const originalPublish = f.channel.publish;
-  f.channel.publish = async update => {
-    const result = await originalPublish(update);
-    if (update.kind === 'progress' && update.expectedCallerRevision === 2) noticed();
-    return result;
-  };
   f.behavior.result = async id => { entered(); await gate; return f.completed(id); };
   const work = f.backend.delegate(f.request(), f.channel);
+  const progress = () => f.updates.filter(value => value.kind === 'progress');
   try {
     await began;
+    const end = Date.now() + 2000;
+    while (!progress().length && Date.now() < end) await wait(5);
+    assert.equal(progress().length, 1, 'the pending request gets one spoken status');
     f.add('Okay, do you need anything else?', 3000, 3200); f.speech(3000, 3200);
-    await Promise.race([notice, wait(250).then(() => { throw new Error('No progress after interjection'); })]);
-    const update = f.updates.find(value => value.kind === 'progress' && value.expectedCallerRevision === 2)!;
-    assert.equal(update.text, 'I am still waiting for the result of your earlier request.');
-    assert.equal(update.speak, true);
+    await wait(150); // Many progress intervals after the interjection.
+    assert.equal(progress().length, 1, 'caller speech alone must not trigger another waiting line');
+    assert.equal(progress()[0].text, 'Still working on it.');
+    assert.equal(progress()[0].speak, true);
     assert.equal(f.saved()[0].status, 'queued');
     assert.equal(f.posts.length, 1);
   } finally { release(); await work; }
@@ -1958,21 +1955,22 @@ test('recorded sale, progress questions, queued buy and check retain truthful st
   const first = f.backend.delegate(f.request(), f.channel);
   await awaitStatus(() => f.reads.length > 0);
   f.add("Okay, it's been thirty seconds. How much longer is it going to be", 3000, 3500); f.speech(3000, 3500);
-  await awaitStatus(() => f.updates.some(u => u.text === 'I am still waiting for the result of your earlier request.'));
+  await awaitStatus(() => f.updates.some(u => u.text === 'Still working on it.'));
   f.add('How about you buy a dollar worth', 6000, 6400); f.speech(6000, 6400);
   const buy = f.backend.delegate(f.request('buy_later'), f.channel);
   await awaitStatus(() => f.saved()[0].deferredTurns?.length === 1);
-  await awaitStatus(() => f.updates.some(u => u.text === 'Your later requests are queued behind the earlier request. They have not started.'));
+  await wait(60); // Several progress intervals: a queued turn is not spoken news.
+  assert.equal(f.updates.filter(u => u.kind === 'progress').length, 1);
   assert.equal(f.posts.length, 1);
   unavailable = true;
   f.add('Check again', 9000, 9400); f.speech(9000, 9400);
   const check = f.backend.delegate(f.request('check_later'), f.channel);
   await awaitStatus(() => f.saved()[0].deferredTurns?.length === 2);
-  await awaitStatus(() => f.updates.some(u => u.text === 'I cannot get the latest status of the earlier request. Your later requests are queued and have not started.'));
+  await awaitStatus(() => f.updates.some(u => u.text === "I can't confirm how that's going yet, so I don't know the outcome."));
   assert.equal(f.saved()[0].lastResultReadError?.status, 503);
   assert.equal(f.saved()[0].primaryResult?.state, 'running');
   assert.equal(f.posts.length, 1);
-  assert.ok(f.updates.every(u => !/switch|cancelled|buying|selling|checking again/i.test(u.text)));
+  assert.ok(f.updates.every(u => !/switch|cancelled|buying|selling|checking again|queued|later request|not started/i.test(u.text)));
   f.store.update(f.call.id, { endedAt: new Date().toISOString(), status: 'completed' }); f.controller.abort();
   await Promise.all([first, buy, check]);
   assert.equal(f.posts.length, 1);
@@ -1997,9 +1995,9 @@ test('repeated deferred notices retain their budget and a recovered GET retains 
   f.add('Sell four dollars of Apple.'); f.speech();
   const work = f.backend.delegate(f.request(), f.channel);
   await awaitStatus(() => accepted.length > 0);
-  assert.ok(attempts >= 8); assert.match(accepted[0], /cannot get the latest status/);
+  assert.ok(attempts >= 8); assert.match(accepted[0], /can't confirm how that's going/);
   recovered = true;
-  await awaitStatus(() => accepted.some(text => text === 'Your request is still being handled. I am waiting for its result.'));
+  await awaitStatus(() => accepted.some(text => text === 'Still working on it.'));
   assert.equal(f.saved()[0].resultReadUnavailable, false);
   assert.equal(f.saved()[0].lastResultReadError?.status, 503, 'keep original bounded failure evidence');
   done = true; await work;

@@ -561,7 +561,7 @@ test('actual default backend work progress keeps its existing voice and persists
   f.advanceWork();
   await until(() => Boolean(f.store.get(f.callId)!.statusContextRefreshes?.length), 21000);
   assert.equal(f.voices.length, 1); assert.equal(f.voices[0].closed.length, 0);
-  assert.deepEqual(f.voices[0].quiet, ['Your request is still being handled. I am waiting for its result.']);
+  assert.deepEqual(f.voices[0].quiet, ['Still working on it.']);
   assert.deepEqual(f.voices[0].spoken, []);
   assert.deepEqual(f.store.get(f.callId)!.liveGenerations!.segments[0].version, original);
   assert.equal(f.store.get(f.callId)!.statusContextRefreshes![0].version.threadEventSequence, '281');
@@ -573,9 +573,7 @@ test('actual default backend work progress keeps its existing voice and persists
   source.options.onTranscript(source.captions); f.advanceWork();
   await wait(18500);
   assert.equal(f.voices.length, 1, 'later conversation cannot be reset by old waiting notices');
-  assert.ok(f.store.get(f.callId)!.statusContextRefreshes!.length >= 2, 'the later quiet boundary permits current status');
-  assert.ok(source.quiet.slice(1).every(text => text === 'I am still waiting for the result of your earlier request.'));
-  assert.ok(source.quiet.length <= 5, 'unchanged status has a bounded accepted notice budget');
+  assert.deepEqual(source.quiet, ['Still working on it.'], 'caller speech does not repeat an unchanged waiting status');
   f.ws.close(); await work;
 });
 
@@ -723,8 +721,9 @@ for (const outcome of ['cancelled', 'failed', 'financial_unknown'] as const) {
     await boundary('later capture started', later.entered, [work, followup]); later.release();
     await boundary('later request queued', () => (f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord)
       .deferredTurns?.some(turn => turn.status === 'queued') === true, [work, followup]);
-    const queued = 'Your later requests are queued behind the earlier request. They have not started.';
-    await boundary('truthful queued notice', () => f.voices.flatMap(voice => voice.published).includes(queued), [work, followup]);
+    const queueSpeech = /queued|later request|not started/i;
+    await wait(500);
+    assert.ok(!f.voices.flatMap(voice => voice.published).some(text => queueSpeech.test(text)), 'queue mechanics stay internal');
     const expected = 'For your earlier request: ' + (outcome === 'cancelled' ? 'The request was cancelled.'
       : outcome === 'financial_unknown' ? "I couldn't confirm the trade request. We need to check that same request before continuing."
       : 'I could not get an answer to that request.');
@@ -743,10 +742,8 @@ for (const outcome of ['cancelled', 'failed', 'financial_unknown'] as const) {
     assert.ok(beforeSecondSubmit, 'second submission must be observed');
     assert.equal(beforeSecondSubmit.delivery, 'accepted');
     assert.equal(beforeSecondSubmit.speech.filter(text => text === expected).length, 1);
-    assert.ok(beforeSecondSubmit.speech.indexOf(queued) < beforeSecondSubmit.speech.indexOf(expected),
-      'the queued notice precedes the once-delivered terminal result');
+    assert.ok(!beforeSecondSubmit.speech.some(text => queueSpeech.test(text)), 'queue mechanics stay internal');
     assert.equal(beforeSecondSubmit.speech.at(-1), expected);
-    assert.notDeepEqual(beforeSecondSubmit.speech, [expected], 'legitimate earlier progress is preserved');
     assert.equal((f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord).delivery, 'accepted');
     assert.equal(f.voices.flatMap(voice => voice.spoken).filter(text => text === expected).length, 1);
     assert.ok(!f.voices.flatMap(voice => voice.spoken).some(text => text.includes('Bought')));
@@ -762,16 +759,17 @@ test('recorded pending sale and queued buy deliver truthful status through the a
   const later = await preparedFollowup(f, [work], 'How about you buy a dollar worth');
   const next = observedWork(later.start());
   await boundary('buy admission started', later.entered, [work, next]); later.release();
-  await boundary('queued notice accepted', () => f.voices.flatMap(v => v.published).includes(
-    'Your later requests are queued behind the earlier request. They have not started.'), [work, next]);
-  assert.equal(f.posts.length, 1, 'a spoken queue receipt does not submit the buy');
+  await boundary('buy queued', () => (f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord)
+    .deferredTurns?.some(turn => turn.status === 'queued') === true, [work, next]);
+  assert.ok(!f.voices.flatMap(v => v.published).some(text => /queued|later request|not started/i.test(text)), 'queue mechanics stay internal');
+  assert.equal(f.posts.length, 1, 'queueing does not submit the buy');
   f.primary.result = async () => { throw new PrimaryApiError('http_error', 503,
     { code: 'temporarily_unavailable', retryable: true }); };
   await boundary('status error spoken', () => f.voices.flatMap(v => v.published).includes(
-    'I cannot get the latest status of the earlier request. Your later requests are queued and have not started.'), [work, next]);
+    "I can't confirm how that's going yet, so I don't know the outcome."), [work, next]);
   const call = f.store.get(f.callId)!;
   assert.deepEqual(f.voices.flatMap(v => v.spoken), [], 'pending status is quiet context, not an unsolicited spoken claim');
-  assert.ok(f.voices.flatMap(v => v.quiet).includes('I cannot get the latest status of the earlier request. Your later requests are queued and have not started.'));
+  assert.ok(f.voices.flatMap(v => v.quiet).includes("I can't confirm how that's going yet, so I don't know the outcome."));
   assert.equal((call.delegations[f.posts[0].requestId] as BrokerDelegationRecord).resultReadUnavailable, true);
   assert.equal(call.liveGenerations!.segments.length, 1);
   assert.equal((call.delegations[f.posts[0].requestId] as BrokerDelegationRecord).primaryResult?.state, 'running');
@@ -846,11 +844,17 @@ for (const change of ['queued', 'recovered'] as const) {
           (f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord).resultReadUnavailable === false, workers);
       }
       release();
-      if (change === 'queued') await boundary('current queue error is published quietly', () => f.voices.flatMap(v => v.quiet).includes(
-        'I cannot get the latest status of the earlier request. Your later requests are queued and have not started.'), workers);
-      else await wait(1000);
-      assert.ok(!f.voices.flatMap(v => v.published).includes('I cannot get the latest status of your request. Its outcome is still unconfirmed.'),
-        'the obsolete error facts must not be published after context returns');
+      const unavailable = "I can't confirm how that's going yet, so I don't know the outcome.";
+      if (change === 'queued') {
+        await boundary('current status error is published quietly', () => f.voices.flatMap(v => v.quiet).includes(unavailable), workers);
+        await wait(1000);
+        assert.equal(f.voices.flatMap(v => v.published).filter(text => text === unavailable).length, 1,
+          'the discarded publication is replaced once, not repeated');
+      } else {
+        await wait(1000);
+        assert.ok(!f.voices.flatMap(v => v.published).includes(unavailable),
+          'the obsolete error facts must not be published after context returns');
+      }
       assert.equal(f.posts.length, 1);
     } finally {
       release(); f.ws.close();
