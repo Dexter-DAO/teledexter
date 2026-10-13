@@ -95,7 +95,7 @@ for (const ledgerName of LEDGER_NAMES) {
 }
 
 test('financial readiness permits durable pending callbacks but fails closed on storage/config', () => {
-  const validPath = { ok: true as const, path: '/var/lib/dexter-phone/state.json' };
+  const validPath = { ok: true as const, path: '/srv/broker-state/state.json' };
   assert.deepEqual(phoneFinancialReadiness({
     callbackSecretReady: true,
     outboundStatePath: validPath,
