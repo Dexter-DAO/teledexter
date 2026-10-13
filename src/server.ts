@@ -247,9 +247,9 @@ Important phone rules:
 // Twilio Verify (SMS OTP for caller authentication)
 // ---------------------------------------------------------------------------
 
-const TWILIO_SID = process.env.TWILIO_ACCOUNT_SID || 'AC00000000000000000000000000000000';
-const TWILIO_TOKEN = process.env.TWILIO_AUTH_TOKEN || '***REMOVED-TWILIO-TOKEN***';
-const VERIFY_SERVICE_SID = process.env.TWILIO_VERIFY_SID || 'VA00000000000000000000000000000000';
+const TWILIO_SID = process.env.TWILIO_ACCOUNT_SID ?? '';
+const TWILIO_TOKEN = process.env.TWILIO_AUTH_TOKEN ?? '';
+const VERIFY_SERVICE_SID = process.env.TWILIO_VERIFY_SID ?? '';
 const TWILIO_VERIFY_SID = process.env.TWILIO_VERIFY_ACCOUNT_SID?.trim() || TWILIO_SID;
 const TWILIO_VERIFY_TOKEN = process.env.TWILIO_VERIFY_AUTH_TOKEN?.trim() || TWILIO_TOKEN;
 
