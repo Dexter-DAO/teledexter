@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -7,10 +8,6 @@ import {
   durablyReplaceJsonFile,
   type DurableFileSystem,
 } from '../src/outbound/DurableFile.js';
-import {
-  PendingCallRegistry,
-  pendingCallTokenHash,
-} from '../src/outbound/PendingCallRegistry.js';
 import { PhoneApiCallbackOutbox } from '../src/outbound/PhoneApiCallbackOutbox.js';
 
 const SECRET = 'phone-api-callback-secret-longer-than-thirty-two-bytes';
@@ -282,18 +279,11 @@ test('transient close fsync failure stays unhealthy and heals in-process without
 test('pre-TwiML token hash expires into one receipt and revokes late media', (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'phone-pre-twiml-ledger-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
-  const registry = new PendingCallRegistry<{ kind: 'inbound' }>();
+  const revokedMediaCalls: string[] = [];
   const token = 'pre-twiml-one-shot-token';
-  const tokenHash = pendingCallTokenHash(token);
+  const tokenHash = createHash('sha256').update(token, 'utf8').digest('hex');
   const startedAtMs = Date.parse('2026-08-17T12:00:00.000Z');
   const expiresAtMs = startedAtMs + 30_000;
-  registry.issueWithToken(
-    EXTERNAL_SID,
-    token,
-    { kind: 'inbound' },
-    expiresAtMs,
-    startedAtMs,
-  );
   const started = {
     ...callEndedBody(0),
     direction: 'inbound',
@@ -308,7 +298,7 @@ test('pre-TwiML token hash expires into one receipt and revokes late media', (t)
     signingSecret: SECRET,
     retryDelayMs: null,
     now: () => startedAtMs,
-    onMediaTokenRevoked: (callSid) => registry.revoke(callSid),
+    onMediaTokenRevoked: (callSid) => { revokedMediaCalls.push(callSid); },
   });
   outbox.beginCallFinalization({
     id: CALLBACK_ID,
@@ -331,7 +321,7 @@ test('pre-TwiML token hash expires into one receipt and revokes late media', (t)
   assert.equal(frozen.body.duration_seconds, 0);
   assert.equal(frozen.body.ended_at, new Date(expiresAtMs).toISOString());
   assert.equal(outbox.pendingCount(), 1);
-  assert.equal(registry.consume(EXTERNAL_SID, token, expiresAtMs - 1), null);
+  assert.deepEqual(revokedMediaCalls, [EXTERNAL_SID]);
   assert.throws(
     () => outbox.startCallFinalization({ id: CALLBACK_ID, mediaTokenHash: tokenHash }),
     /phone_call_finalization_already_frozen/,
