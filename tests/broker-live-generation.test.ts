@@ -42,6 +42,7 @@ function pending<T>() {
   const promise = new Promise<T>(done => { resolve = done; });
   return { promise, resolve };
 }
+const realTimers = (ms: number) => new Promise<void>(resolve => { setTimeout(resolve, ms); });
 async function until(predicate: () => boolean) {
   for (let count = 0; count < 30 && !predicate(); count++) await Promise.resolve();
   assert.equal(predicate(), true, 'expected asynchronous boundary was not reached');
@@ -597,7 +598,12 @@ test('default unsent capacity covers delayed replacement beyond eight seconds an
   assert.equal(h.controller.bufferedAudioBytes(), 256_000);
   fetched.resolve(contextFor(versionFor(2))); await replacing;
   assert.deepEqual(h.sessions[0].audio, [sent]);
+  // The 32 s backlog is replayed at real time (one frame now, then paced), never as one burst.
+  assert.deepEqual(h.sessions[1].audio, queued.slice(0, 1));
+  const resumedAt = queued.at(-1)!.observedAt;
+  h.setTime(resumedAt + 32_000); await realTimers(40);
   assert.deepEqual(h.sessions[1].audio, queued);
+  assert.equal(h.controller.bufferedAudioBytes(), 0);
   assert.equal(h.controller.snapshot().inputNextSample, 256_002);
   assert.deepEqual(h.controller.snapshot().clocks, clocks);
   await h.controller.stop();
@@ -1020,4 +1026,70 @@ test('stop before activation prevents an opening; stop during its receipt wait c
     await assert.rejects(h.controller.start());
     assert.equal(openings, Number(stopDuringOpening));
   }
+});
+
+const pcmFrame = (index: number, start: number) => ({ payload: Buffer.alloc(160, (index % 200) + 1).toString('base64'),
+  callInputStartSample: start + index * 160, observedAt: startTime + index * 20 });
+
+test('backlog replay after a block never sends input faster than real time', async () => {
+  const h = harness(); await h.controller.start();
+  const fetched = pending<EligiblePhoneCall>();
+  h.advanceVersion(); h.api.fetch = async () => fetched.promise;
+  const replacing = h.controller.beforeReuse();
+  await until(() => h.controller.snapshot().phase === 'replacing');
+  const backlog = Array.from({ length: 150 }, (_, index) => pcmFrame(index, 0)); // 3 s of caller audio
+  for (const frame of backlog) { h.setTime(frame.observedAt); assert.equal(h.controller.appendAudio(frame), 'buffered'); }
+  const resumedAt = backlog.at(-1)!.observedAt;
+  fetched.resolve(contextFor(versionFor(2))); await replacing;
+  const sent = () => h.sessions[1].audio.length;
+  // Real time t after resume permits at most t ms (one 20 ms frame is the opening allowance).
+  for (const elapsed of [0, 10, 500, 1_000, 2_000, 2_999]) {
+    h.setTime(resumedAt + elapsed); await realTimers(30);
+    assert.ok(sent() * 20 <= Math.max(20, elapsed), `sent ${sent() * 20} ms of audio after ${elapsed} ms`);
+    assert.ok(sent() * 20 >= Math.min(3_000, elapsed) - 20, `replay fell behind real time after ${elapsed} ms`);
+  }
+  // Live frames arriving during the replay join the tail in order.
+  const live = pcmFrame(150, 0);
+  assert.equal(h.controller.appendAudio(live), 'buffered');
+  h.setTime(resumedAt + 3_020); await realTimers(30);
+  assert.deepEqual(h.sessions[1].audio, [...backlog, live]);
+  assert.equal(h.controller.bufferedAudioBytes(), 0);
+  // Once drained, frames are sent directly again with contiguous accounting.
+  assert.equal(h.controller.appendAudio(pcmFrame(151, 0)), 'sent');
+  assert.equal(h.controller.snapshot().inputNextSample, 152 * 160);
+  assert.equal(h.controller.snapshot().segments[1].inputLastSampleExclusive, 152 * 160);
+  await h.controller.stop();
+});
+
+test('blocked time is not replay allowance: a second block restarts the real-time window', async () => {
+  const h = harness(); await h.controller.start();
+  let fetched = pending<EligiblePhoneCall>();
+  h.advanceVersion(); h.api.fetch = async () => fetched.promise;
+  let replacing = h.controller.beforeReuse();
+  await until(() => h.controller.snapshot().phase === 'replacing');
+  const first = Array.from({ length: 100 }, (_, index) => pcmFrame(index, 0));
+  for (const frame of first) { h.setTime(frame.observedAt); h.controller.appendAudio(frame); }
+  let resumedAt = first.at(-1)!.observedAt;
+  fetched.resolve(contextFor(versionFor(2))); await replacing;
+  h.setTime(resumedAt + 400); await realTimers(30);
+  const beforeSecondBlock = h.sessions[1].audio.length;
+  assert.ok(beforeSecondBlock * 20 <= 400);
+  fetched = pending<EligiblePhoneCall>();
+  h.advanceVersion(); h.api.fetch = async () => fetched.promise;
+  replacing = h.controller.beforeReuse();
+  await until(() => h.controller.snapshot().phase === 'replacing');
+  // Five seconds blocked: nothing reaches any session and the window does not accrue.
+  h.setTime(resumedAt + 5_400); await realTimers(30);
+  assert.equal(h.sessions[1].audio.length, beforeSecondBlock);
+  resumedAt = resumedAt + 5_400;
+  fetched.resolve(contextFor(versionFor(3))); await replacing;
+  await realTimers(30);
+  const successor = h.sessions.at(-1)!;
+  assert.ok(successor.audio.length <= 1, `burst of ${successor.audio.length} frames after a block`);
+  h.setTime(resumedAt + 200); await realTimers(30);
+  assert.ok(successor.audio.length * 20 <= 220, `sent ${successor.audio.length * 20} ms within 200 ms`);
+  const all = h.sessions.flatMap(session => session.audio);
+  assert.deepEqual(all.slice(0, first.length).map(frame => frame.callInputStartSample),
+    all.slice(0, first.length).map((_, index) => index * 160), 'replay stays contiguous and is never repeated');
+  await h.controller.stop();
 });

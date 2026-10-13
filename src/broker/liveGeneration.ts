@@ -137,6 +137,9 @@ export interface LiveGenerationOptions {
   onContextReadFailure?(failure: ContextReadFailure): void;
   onStatusContextRefresh?(refresh: StatusContextRefresh): void;
   maxBufferedAudioBytes?: number;
+  /** Backlog replay speed relative to real time (8 kHz PCMU: 8 bytes per ms). Live
+   * refuses input faster than real time, so the default never exceeds 1.0x. */
+  inputPaceRate?: number;
   /** May tighten the shared fetch/start/assert budget, never extend it. */
   transitionTimeoutMs?: number;
   now?: () => number;
@@ -218,6 +221,13 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
   let activated = false;
   let queued: Array<GenerationInputAudio & { bytes: number }> = [];
   let queuedBytes = 0;
+  const paceRate = options.inputPaceRate ?? 1;
+  // Above 1.0x is accepted only for an explicit composition; at 1.0x a backlog is replayed
+  // without loss but persists as input delay because live frames keep arriving at 1.0x.
+  if (!Number.isFinite(paceRate) || paceRate <= 0 || paceRate > 2) throw new LiveGenerationError('invalid_input_pace_rate');
+  // A replay window: audio sent since it opened never exceeds elapsed time * paceRate.
+  let pacer: ReturnType<typeof setTimeout> | undefined;
+  let pacing: { startedAt: number; sentMs: number } | undefined;
   let tail: Promise<unknown> = Promise.resolve();
   const stamp = () => new Date(now()).toISOString();
   const save = () => { options.persist(liveGenerationJournalSchema.parse(structuredClone(state))); };
@@ -240,6 +250,8 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
     return { ...state.deliveryAttachment };
   };
   const block = (phase: 'replacing' | 'unavailable' | 'stopped') => {
+    // Time spent blocked never becomes replay allowance: the next flush opens a new window.
+    clearTimeout(pacer); pacer = undefined; pacing = undefined;
     activeId = undefined;
     state.deliveryAttachment = undefined;
     state.phase = phase;
@@ -347,20 +359,38 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
     if (firstInput) save();
     return true;
   };
-  const flushInput = (check: () => void) => {
-    const buffered = queued; queued = []; queuedBytes = 0;
-    for (let index = 0; index < buffered.length; index++) {
-      let attempted = false;
-      try {
-        check(); attempted = true;
-        if (!sendInput(buffered[index])) throw new LiveGenerationError('input_transport_refused');
-      } catch (error) {
-        queued = buffered.slice(index + Number(attempted));
-        queuedBytes = queued.reduce((sum, frame) => sum + frame.bytes, 0);
-        throw error;
-      }
+  const stopPacing = () => { clearTimeout(pacer); pacer = undefined; pacing = undefined; };
+  /** Sends the queued backlog in order at no more than paceRate x real time. Live
+   * frames that arrive meanwhile join the tail (appendAudio), so order and the
+   * contiguous sample accounting are unchanged; direct sends resume once empty. */
+  const drainInput = (check: () => void) => {
+    clearTimeout(pacer); pacer = undefined;
+    pacing ??= { startedAt: now(), sentMs: 0 };
+    while (queued.length) {
+      const frame = queued[0];
+      const frameMs = frame.bytes / 8;
+      // The first frame of a window is always allowed; afterwards stay within real time.
+      if (pacing.sentMs > 0 && pacing.sentMs + frameMs > (now() - pacing.startedAt) * paceRate) break;
+      check();
+      // A refused send may have an uncertain transport outcome. It leaves the queue first, never replayed.
+      queued.shift(); queuedBytes -= frame.bytes;
+      if (!sendInput(frame)) { stopPacing(); throw new LiveGenerationError('input_transport_refused'); }
+      pacing.sentMs += frameMs;
     }
-    save();
+    if (!queued.length) { stopPacing(); save(); return; }
+    const wait = Math.max(1, Math.ceil((pacing.sentMs + queued[0].bytes / 8) / paceRate - (now() - pacing.startedAt)));
+    pacer = setTimeout(() => {
+      pacer = undefined;
+      // A block (replacement, unavailable, stop) pauses the replay; the next flush resumes it.
+      if (stopped || inputBlocked || state.phase !== 'active' || !handle || activeId === undefined) { pacing = undefined; return; }
+      try { drainInput(expire); }
+      catch { /* sendInput already reported a refusal; stop/deadline own the remaining queue. */ }
+    }, wait);
+    pacer.unref?.();
+  };
+  const flushInput = (check: () => void) => {
+    if (!queued.length) { stopPacing(); save(); return; }
+    drainInput(check);
   };
   const transient = (error: unknown): error is PrimaryApiError => error instanceof PrimaryApiError
     && (error.code === 'request_timeout' || error.code === 'request_failed'
@@ -626,7 +656,7 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
             && (!Number.isSafeInteger(frame.observedAt) || frame.observedAt < 0 || frame.observedAt > now()))) throw new Error();
       } catch { inputBlocked = true; state.inputGap = 'invalid_audio'; unavailable('invalid_input_audio'); return 'refused'; }
       const next = { ...frame, bytes: bytes.length };
-      if (state.phase === 'active') {
+      if (state.phase === 'active' && !queued.length) {
         state.inputNextSample += bytes.length;
         return sendInput(next) ? 'sent' : 'refused';
       }
@@ -685,7 +715,7 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
       // Gate immediately, including while fetch/open/assert is awaiting HTTP.
       // The host terminates the provider call on its own absolute timer without
       // awaiting this queued Live cleanup; a stalled adapter cannot extend it.
-      stopped = true; block('stopped');
+      stopped = true; block('stopped'); stopPacing();
       transitionAbort?.abort(new LiveGenerationError('call_stopped'));
       for (const read of reads) read.abort(new LiveGenerationError('call_stopped'));
       if (queuedBytes) problem('undelivered_buffered_audio');

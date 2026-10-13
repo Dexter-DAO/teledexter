@@ -452,7 +452,12 @@ export function createBrokerServer(options: BrokerServerOptions) {
   async function bind(call: BrokerCall, proof: ProviderCallProof): Promise<BrokerCall> {
     const binding = await primary.openCall(proof, call.callAssignment?.value);
     if (binding.callSid !== call.callSid || binding.state !== 'open') throw new Error('primary_call_identity_mismatch');
-    return store.recordPrimaryBinding(call.id, binding);
+    const bound = store.recordPrimaryBinding(call.id, binding);
+    // The validated binding response seeds the first generation (the path inbound
+    // admission already uses): media start then runs only the mandatory pre-load
+    // eligibility recheck instead of a full context read. Never reused after restart.
+    if (bound.direction === 'outbound' && !bound.inbound) startupContexts?.remember(bound, binding);
+    return bound;
   }
 
   async function endWaitingCall(call: BrokerCall): Promise<void> {
@@ -830,8 +835,12 @@ export function createBrokerServer(options: BrokerServerOptions) {
     if (terminalCallStatuses.has(call.status)) return xml(response, '<Response><Hangup/></Response>');
     // This is the signed answer route, distinct from a ringing status callback.
     if (managedNotification(call)) call = observeProviderState(call.id, 'in-progress');
+    // Open only the Live socket (no session, no account text) while Primary verifies
+    // the provider call; media start adopts it after binding. Bounded by its own TTL.
+    preconnect?.beginOutbound(call);
     try { call = await bind(call, proof); }
     catch (error) {
+      preconnect?.forget(call.id); startupContexts?.discard(call.id);
       store.update(call.id, { status: 'failed', failure: safeFailure(error) });
       return xml(response, fallbackTwiml('I could not reach your Dexter account just now. Please try again shortly.'));
     }
