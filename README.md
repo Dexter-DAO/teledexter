@@ -1,6 +1,31 @@
-# Teledexter
+<p align="center">
+  <img src="https://raw.githubusercontent.com/Dexter-DAO/dexter-x402-sdk/main/assets/dexter-wordmark.svg" alt="Dexter" width="360">
+</p>
+
+<h1 align="center">Teledexter</h1>
+
+<p align="center">
+  <strong>A phone line to your own AI financial agent on Solana.</strong><br>
+  Call <strong>+1 (561) 940-2402</strong> from your verified number.
+</p>
+
+<p align="center">
+  <a href="https://nodejs.org"><img src="https://img.shields.io/badge/node-%3E%3D22-339933" alt="Node 22 or newer"></a>
+  <a href="#live-on-mainnet"><img src="https://img.shields.io/badge/Solana-mainnet-6f5cff" alt="Solana mainnet"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-111111" alt="MIT license"></a>
+</p>
 
 Teledexter is a phone line to your own Dexter, an AI agent attached to your account. You call Dexter from your verified number, or Dexter calls that number when a saved watch fires or a call is arranged. On the call it can read your portfolio, research, and buy or sell Solana tokens and tokenized stocks under the standing permissions you set in advance. This repository is the voice broker that runs those calls. Teledexter succeeds an earlier product, Dexter Phone; the service and its process are still named `dexter-broker`.
+
+## Live on mainnet
+
+Each of these trades was requested by voice on a phone call to Dexter and settled on Solana mainnet. Primary Dexter carried out each one under the account's standing permissions; the broker relayed the conversation and holds no wallet keys.
+
+| Date | Trade | Transaction |
+| --- | --- | --- |
+| 2026-09-30 | Bought 0.01467362 AAPLx for 5 USDC | [`2ePLu4tj…R1AE4b`](https://solscan.io/tx/2ePLu4tj4BS3ckMsJrCe62jmEhUnU3hziSymuEyzChQoQnJLLcWBx1JHq7U5XRvpMA3KDKMDhvmBGAsQ55R1AE4b) |
+| 2026-10-13 | Sold 0.00875977 AAPLx for 2.977647 USDC | [`5XtuXQwS…efvtDP`](https://solscan.io/tx/5XtuXQwSLvtTKvdy6VzHSz9yPNPgaCK3Yxm1qifjaBikcCnPP7zuJyHLGhxQgKf2Lqcmp2FqrMb3w2onWxefvtDP) |
+| 2026-10-13 | Bought 0.00289208 AAPLx for 1 USDC | [`2TcC3Tn7…6J2bmr`](https://solscan.io/tx/2TcC3Tn7KBTLdZyfBzTzuQwJ6NdeXmzRkHpXufJHPoLkqugz2P1Bp5pyeNqboJtKmpz83Q3HS4gY5o4afp6J2bmr) |
 
 ## How it works
 
@@ -22,7 +47,7 @@ Teledexter is a phone line to your own Dexter, an AI agent attached to your acco
 
 GPT-Live holds the spoken conversation. When the caller asks for something that needs their account, GPT-Live emits a delegation. The broker turns the caller's completed words into a request, saves it, and submits it to Primary Dexter through the Dexter API. It then watches the request, relays any question Primary asks, and hands the result back to GPT-Live to speak at a quiet moment in the conversation.
 
-## What is in this repository
+## Repository map
 
 | Path | Contents |
 | --- | --- |
@@ -47,7 +72,7 @@ Not in this repository: the Dexter API, Primary Dexter, the OpenDexter tools, ac
 - **Signed webhooks and caller possession.** Every Twilio webhook and media WebSocket is checked against the Twilio signature for its exact URL. Caller ID alone never opens an account: incoming calls are admitted by the Dexter API through the same-call attachment flow, or, in callback mode, the broker confirms the call with a fresh Twilio read and calls the saved number back.
 - **Audio preflight before dialing.** Before dialing an account call (operator-arranged, callback, saved-watch or notification), the broker checks account readiness with the API and opens a short GPT-Live session that must produce real output audio. If either fails, no call is placed. Phone-setup verification callbacks are dialed only under a permit issued by the Dexter API.
 
-## Running it
+## Quick start
 
 Requires Node.js 22 (the test script relies on Node 22's `--test` glob expansion).
 
@@ -155,3 +180,11 @@ Tests use Node's built-in runner through `tsx`, with local HTTP servers and simu
 ## License
 
 [MIT](LICENSE)
+
+---
+
+<p align="center">
+  <a href="https://dexter.cash">Dexter</a> ·
+  <a href="https://docs.dexter.cash/docs">Docs</a> ·
+  <a href="https://github.com/Dexter-DAO/opendexter-ide">OpenDexter</a>
+</p>
