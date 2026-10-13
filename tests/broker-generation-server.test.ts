@@ -635,6 +635,41 @@ test('carrier playback beyond the first wait defers a completed answer without l
   assert.equal(f.posts.length, 1);
 });
 
+test('call 039b39cd: caller speech during the result read prompts delivery instead of deferring it as stale', async t => {
+  const f = await host(t, false, false, false, { admitted: true, resultText: incidentResult });
+  const work = observedWork(f.delegate());
+  await boundary('original submission', () => f.posts.length === 1, [work]);
+  const voice = f.voices[0];
+  const delivery = f.eligible.delivery;
+  const prompts = [' Hello?', ' What are you on?'];
+  let reads = 0;
+  // The caller is audible during every delivery read, as on the production call. The
+  // former frontier/quiet recheck marked each read stale and the answer was never spoken.
+  f.eligible.delivery = async (...args) => {
+    reads++;
+    const before = voice.inputs.length; f.audio();
+    await until(() => voice.inputs.length > before);
+    voice.captions.revision++; voice.captions.callerRevision++;
+    voice.captions.fragments.push({ eventId: `caller_prompt_${reads}`, role: 'user', text: prompts[(reads - 1) % prompts.length],
+      startMs: 1400 + reads * 100, endMs: 1450 + reads * 100, sequence: voice.captions.revision });
+    voice.options.onTranscript(voice.captions);
+    return delivery(...args);
+  };
+  f.release();
+  await boundary('completed result accepted after caller prompt', () =>
+    (f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord).delivery === 'accepted', [work], 10000);
+  assert.equal(reads, 1, 'the first read at a pause is delivered; caller speech during it does not force another wait');
+  assert.deepEqual(voice.spoken, ['For your earlier request: ' + incidentResult]);
+  assert.deepEqual(voice.native.filter(value => value.kind === 'result').map(value => value.id),
+    (f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord).delegationIds,
+    'the result is published only on its own request delegation');
+  assert.equal(f.posts.length, 1);
+  assert.equal(voice.captions.fragments.at(-1)!.text, ' Hello?');
+  await wait(1500);
+  assert.deepEqual(voice.spoken, ['For your earlier request: ' + incidentResult], 'an accepted result is not repeated');
+  f.ws.close(); await boundary('worker closed', work.settled, [work]);
+});
+
 test('canonical cancellation is announced without attempting a completed-result delivery', async t => {
   const f = await host(t, false, false, false, { cancelled: true });
   let resultDeliveries = 0;
