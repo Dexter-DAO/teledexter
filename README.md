@@ -28,7 +28,7 @@ GPT-Live holds the spoken conversation. When the caller asks for something that 
 | --- | --- |
 | `src/broker/` | HTTP server, Twilio webhooks and media, call journal, Primary request delivery and recovery, inbound attachment, saved-watch and notification calls, result SMS |
 | `src/live/` | GPT-Live WebSocket session and the restricted phone-setup tools |
-| `src/outbound/` | Request signing, canonical JSON, durable file writes, Twilio webhook validation, callback outbox |
+| `src/outbound/` | Request signing and verification, canonical JSON, durable file writes, Twilio webhook validation, callback outbox |
 | `src/sms/` | SMS enrollment, consent ledger and sending (optional) |
 | `scripts/broker.mts` | Operator CLI: `status`, `preflight`, `call`, `end`, `reconcile` |
 | `scripts/qualify-live-phone.mts` | Runs the broker against real GPT-Live with simulated Twilio and Primary |
@@ -36,7 +36,7 @@ GPT-Live holds the spoken conversation. When the caller asks for something that 
 | `deploy/` | PM2 configuration and an nginx location snippet |
 | `docs/` | Operator and protocol reference |
 
-Not in this repository: the Dexter API, Primary Dexter, the OpenDexter tools, account authority, the wallet vault, and all Solana transaction building, signing and execution. The broker holds no keys and never signs or submits a transaction. It forwards what the caller said and relays what Primary returns; Primary acts under the permissions the account owner granted in Dexter.
+Not in this repository: the Dexter API, Primary Dexter, the OpenDexter tools, account authority, the wallet vault, and all Solana transaction building, signing and execution. The broker holds no wallet keys and never builds, signs or submits a transaction. It forwards what the caller said and relays what Primary returns; Primary acts under the permissions the account owner granted in Dexter.
 
 ## Design points
 
