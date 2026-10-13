@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { GREETING_CLIP_ASSET, GREETING_CLIP_TEXT, greetingClipEligible, loadGreetingClip, playGreetingClip } from '../src/broker/greetingClip.js';
+import { GREETING_CLIP_ASSET, GREETING_CLIP_TEXT, INBOUND_GREETING_CLIP_ASSET, INBOUND_GREETING_CLIP_TEXT, greetingClipEligible, loadGreetingClip, playGreetingClip } from '../src/broker/greetingClip.js';
 import { brokerOpening } from '../src/broker/instructions.js';
 import { LIVE_APPEND_MAX_BYTES } from '../src/live/session.js';
 import { carriesSpeechPcmu } from '../src/broker/phone.js';
@@ -15,6 +15,11 @@ test('the shipped clip is plausible 8 kHz PCMU speech of about one second', () =
   assert.ok(clip.length >= 6_400 && clip.length <= 16_000, `${clip.length / 8} ms`);
   assert.ok(carriesSpeechPcmu(clip), 'the clip carries speech energy');
   assert.equal(GREETING_CLIP_TEXT, "Hey, it's Dexter.");
+  const inbound = loadGreetingClip(INBOUND_GREETING_CLIP_ASSET);
+  assert.ok(inbound, `missing ${INBOUND_GREETING_CLIP_ASSET.pathname}`);
+  assert.ok(inbound.length > clip.length && inbound.length <= 28_000, `${inbound.length / 8} ms`);
+  assert.ok(carriesSpeechPcmu(inbound));
+  assert.equal(INBOUND_GREETING_CLIP_TEXT, "Hey, it's Dexter. What can I do for you?");
 });
 
 test('a missing or implausible clip falls back to the Live-spoken greeting', () => {
@@ -74,8 +79,8 @@ test('the clip plays only where brokerOpening opens the call, once', () => {
   ]) assert.equal(greetingClipEligible({ ...baseCall, ...patch } as unknown as BrokerCall), false, JSON.stringify(patch));
 });
 
-test('after the clip, every opening continues without greeting or naming Dexter again and fits one append', () => {
-  for (const direction of ['outbound', 'inbound'] as const)
+test('after the clip, every outbound opening continues without greeting or naming Dexter again and fits one append', () => {
+  for (const direction of ['outbound'] as const)
     for (const registered of [false, true]) for (const watch of [false, true]) for (const notification of [false, true]) {
       const opening = brokerOpening(direction, registered, watch, notification, true);
       const label = `${direction}/${registered}/${watch}/${notification}`;
@@ -85,7 +90,13 @@ test('after the clip, every opening continues without greeting or naming Dexter 
       assert.notEqual(opening, brokerOpening(direction, registered, watch, notification), label);
     }
   assert.match(brokerOpening('outbound', true, false, false, true), /"Want me to pull up your portfolio\?"/);
-  assert.match(brokerOpening('inbound', false, false, false, true), /"What can I do for you\?"/);
+  // Inbound: the clip is the whole opening; Live neither greets nor asks again.
+  for (const registered of [false, true]) {
+    const inbound = brokerOpening('inbound', registered, false, false, true);
+    assert.equal(inbound, 'The caller already heard you say "Hey, it\'s Dexter. What can I do for you?" Do not greet or ask again. Wait for the caller and respond to what they say.');
+    assert.ok(Buffer.byteLength(inbound) <= LIVE_APPEND_MAX_BYTES);
+    assert.doesNotMatch(inbound, /Immediately/);
+  }
   assert.match(brokerOpening('outbound', true, true, false, true), /watch name, event summary and observation time/);
   assert.match(brokerOpening('outbound', true, false, true, true), /title, summary and observation time/);
   // Without the clip, Live still speaks the full greeting.

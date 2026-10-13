@@ -343,8 +343,7 @@ for (const eligible of [false, true]) test(`greeting clip plays first at media s
   const g = await greetingCall(t, { eligible });
   await g.waitFor(() => g.f.seen.opening === 1);
   assert.equal(g.f.openings.length, 1, 'exactly one opening');
-  assert.match(g.f.openings[0], /^The caller already heard you say "Hey, it's Dexter\." Do not greet or say your name again\./);
-  assert.doesNotMatch(g.f.openings[0], /Immediately say in English: "Hey, it's Dexter/);
+  assert.equal(g.f.openings[0], 'The caller already heard you say "Hey, it\'s Dexter. What can I do for you?" Do not greet or ask again. Wait for the caller and respond to what they say.');
   // Live audio that arrives during the clip is held, never interleaved.
   const live = [Buffer.alloc(800, 0xf0), spoken(1_600)];
   for (const chunk of live) g.f.emitAudio(chunk);
@@ -400,6 +399,17 @@ test('Live audio is released after the clip duration plus grace even when the ca
   assert.equal(g.f.store.get(g.call.id)!.journey!.greetingClipPlayedAt, undefined, 'unacknowledged playback is not recorded as heard');
 });
 
+test('an inbound call never plays the outbound-only clip; Live speaks the whole inbound greeting', async t => {
+  const f = await fixture(t, { outboundClipOnly: Buffer.alloc(2_400, 0x20) });
+  const media: string[] = [];
+  const { call, ws } = await connectIncomingMedia(f, raw => { if (JSON.parse(String(raw)).event === 'media') media.push('media'); }); t.after(() => ws.close());
+  for (let i = 0; i < 100 && f.seen.opening === 0; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(media.length, 0);
+  assert.equal(f.openings[0], 'Immediately say in English: "Hey, it\'s Dexter. What can I do for you?" Then pause to listen.');
+  assert.equal(f.store.get(call.id)!.journey?.greetingClipStartedAt, undefined);
+});
+
 test('without a clip the Live opening still speaks the whole greeting', async t => {
   const f = await fixture(t);
   const { call, ws } = await connectIncomingMedia(f); t.after(() => ws.close());
@@ -446,7 +456,7 @@ test('incoming legacy admission without frozen billing reference never posts a n
       callSid: call.callSid!, termsDigest: 'a'.repeat(64) } } as InboundOutcome }), /binding changed/);
 });
 
-async function fixture(t: test.TestContext, options: { selected?: boolean; retained?: BrokerCall; initialRemote?: InboundOutcome; eligible?: boolean; billing?: boolean; billingUrl?: string; duration?: string; preconnect?: boolean; replaceFirstGeneration?: boolean; greetingClip?: Buffer } = {}) {
+async function fixture(t: test.TestContext, options: { selected?: boolean; retained?: BrokerCall; initialRemote?: InboundOutcome; eligible?: boolean; billing?: boolean; billingUrl?: string; duration?: string; preconnect?: boolean; replaceFirstGeneration?: boolean; greetingClip?: Buffer; outboundClipOnly?: Buffer } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-inbound-http-'));
   if (options.retained) fs.writeFileSync(path.join(dir, 'calls.json'), JSON.stringify({ version: 1, calls: { [options.retained.id]: options.retained } }));
   const store = new BrokerStore(dir);
@@ -544,7 +554,8 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
     async update() { seen.end++; return { sid, status: 'completed' }; },
   }), { async create() { seen.dial++; throw new Error('inbound_must_not_dial'); } });
   const broker = createBrokerServer({ config, store, primary, provider: { calls: provider } as unknown as ReturnType<typeof Twilio>,
-    ...(options.greetingClip ? { greetingClip: options.greetingClip } : {}),
+    ...(options.greetingClip ? { inboundGreetingClip: options.greetingClip } : {}),
+    ...(options.outboundClipOnly ? { greetingClip: options.outboundClipOnly } : {}),
     ...(options.selected === false ? {} : { inboundAttachment: createInboundHoldAdapter({ publicOrigin: config.publicOrigin, store }) }),
     ...(options.preconnect ? { inboundPreconnect: () => {
       const connection = new PreconnectTransport(`preconnect_${transports.length + 1}`); transports.push(connection); return connection;

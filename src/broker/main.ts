@@ -10,7 +10,7 @@ import { createRequestDeliveryClient } from './requestDelivery.js';
 import { createPrimaryCallerIntentClient } from './callerIntentClient.js';
 import { safeFailure } from './phone.js';
 import { createOpenAILiveConnection } from '../live/session.js';
-import { loadGreetingClip } from './greetingClip.js';
+import { INBOUND_GREETING_CLIP_ASSET, loadGreetingClip } from './greetingClip.js';
 
 dotenv.config({ path: process.env.BROKER_ENV_FILE || '.env' });
 let sms: BrokerSmsBridge | undefined;
@@ -21,8 +21,10 @@ try {
   const setupStore = setup ? new BrokerStore(config.stateDir) : undefined;
   // A missing or implausible asset leaves the Live-spoken greeting in place.
   const greetingClip = loadGreetingClip();
+  const inboundGreetingClip = loadGreetingClip(INBOUND_GREETING_CLIP_ASSET);
   const broker = createBrokerServer({ config, sms,
     ...(greetingClip ? { greetingClip } : {}),
+    ...(inboundGreetingClip ? { inboundGreetingClip } : {}),
     inboundPreconnect: () => createOpenAILiveConnection(config.apiKey),
     ...(setup && setupStore ? { store: setupStore,
       inboundAttachment: createInboundHoldAdapter({ publicOrigin: config.publicOrigin, store: setupStore }),
@@ -54,6 +56,7 @@ try {
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
   broker.server.listen(config.port, config.host, () => {
-    console.log(JSON.stringify({ service: 'dexter-broker', model: config.model, voice: config.voice, port: config.port, greetingClipMs: greetingClip ? greetingClip.length / 8 : 0 }));
+    console.log(JSON.stringify({ service: 'dexter-broker', model: config.model, voice: config.voice, port: config.port, greetingClipMs: greetingClip ? greetingClip.length / 8 : 0,
+      inboundGreetingClipMs: inboundGreetingClip ? inboundGreetingClip.length / 8 : 0 }));
   });
 } catch (error) { await sms?.close().catch(() => {}); console.error(JSON.stringify(safeFailure(error))); process.exitCode = 1; }

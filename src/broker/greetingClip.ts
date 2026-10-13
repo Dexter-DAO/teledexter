@@ -1,10 +1,13 @@
 import { readFileSync } from 'node:fs';
 import type { BrokerCall } from './store.js';
 
-/** The words of the pre-rendered clip. The Live opening continues after them. */
+/** Outbound clip words. The Live opening continues after them with the offer. */
 export const GREETING_CLIP_TEXT = "Hey, it's Dexter.";
 /** 8 kHz mono PCMU (G.711 mu-law), headerless: OpenAI TTS gpt-4o-mini-tts, voice "marin". */
 export const GREETING_CLIP_ASSET = new URL('../../assets/greeting-hey-its-dexter.pcmu', import.meta.url);
+/** Inbound clip words: the whole inbound opening. Live then waits for the caller. */
+export const INBOUND_GREETING_CLIP_TEXT = "Hey, it's Dexter. What can I do for you?";
+export const INBOUND_GREETING_CLIP_ASSET = new URL('../../assets/greeting-hey-its-dexter-what-can-i-do.pcmu', import.meta.url);
 
 const FRAME_BYTES = 160; // 20 ms of 8 kHz PCMU, Twilio's own media frame size.
 const LEAD_BYTES = 800; // 100 ms sent ahead so carrier jitter never starves playback.

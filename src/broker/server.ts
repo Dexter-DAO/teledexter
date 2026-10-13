@@ -142,9 +142,12 @@ export interface BrokerServerOptions {
   inboundAttachment?: {
     waitingResponse(input: { callId: string; continuationUrl: string; attachmentId?: string; expiresAt?: string }): string;
   };
-  /** Pre-rendered "Hey, it's Dexter." (8 kHz PCMU), streamed at media start ahead of
-   * Live's opening. Omission retains the Live-spoken greeting. */
+  /** Pre-rendered "Hey, it's Dexter." (8 kHz PCMU) for outbound calls, streamed at media
+   * start ahead of Live's opening offer. Omission retains the Live-spoken greeting. */
   greetingClip?: Buffer;
+  /** Pre-rendered "Hey, it's Dexter. What can I do for you?" for inbound calls: the whole
+   * opening; Live then waits for the caller. Omission retains the Live-spoken greeting. */
+  inboundGreetingClip?: Buffer;
 }
 
 export function createBrokerServer(options: BrokerServerOptions) {
@@ -1081,7 +1084,8 @@ export function createBrokerServer(options: BrokerServerOptions) {
             store.observeHarkMediaStarted(call.id, new Date().toISOString());
           } else store.update(call.id, { streamSid, status: 'in-progress', mediaStartedAt: store.get(call.id)!.mediaStartedAt ?? new Date().toISOString() });
           // The clip starts before Live exists; Live's opening is told it was heard.
-          if (options.greetingClip && store.get(call.id)!.mediaStartedAt && greetingClipEligible(store.get(call.id)!)) startGreetingClip(options.greetingClip);
+          const clip = call.direction === 'inbound' ? options.inboundGreetingClip : options.greetingClip;
+          if (clip && store.get(call.id)!.mediaStartedAt && greetingClipEligible(store.get(call.id)!)) startGreetingClip(clip);
           if (!options.eligibleContext) backend = createPrimaryBackend({ callId: call.id, callSid: call.callSid!, bindingId: call.primary!.bindingId, api: primary, store, watchUntilCallEnds: true, lastCallerSpeechAt: () => lastSpeechAt });
           const voiceOptions: BrokerLiveSessionOptions = { apiKey: config.apiKey, callId: call.id, voice: config.voice,
             instructions: brokerInstructions({ direction: call.direction, purpose: call.purpose, registeredAssignment: !!call.callAssignment,
