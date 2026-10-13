@@ -70,7 +70,7 @@ Ordinary incoming SMS is stored as `pending_dispatch` for enrolled recipients an
 
 ## Requested results after a call
 
-The deferred delivery transport accepts a request that the API saved during an admitted call. It can send the requested result after hangup. The API freezes the instruction, task, owner, verified number and first-send deadline; the completed task supplies one exact saved answer. The text contains an authenticated link to that answer. The model supplies neither the destination nor the link.
+The deferred delivery transport accepts a request that the API saved during an admitted call. When sending is enabled, it can send the requested result after hangup. The API freezes the instruction, task, owner, verified number and first-send deadline; the completed task supplies one exact saved answer. The text contains an authenticated link to that answer. The model supplies neither the destination nor the link.
 
 `POST /internal/broker/result-sms` requires the existing Broker control bearer and a strict `{v,intentId,intentDigest,messageId}` reference. Broker resolves its immutable identity through the Dexter API, then reads the SMS ledger. A saved receipt remains recoverable after expiry, STOP, account revocation or provider disablement. If no receipt exists, the API must admit a new send against current authority, verified number and result eligibility. Broker checks the deadline again after that request and enforces current consent and provider readiness before sending.
 
@@ -86,4 +86,4 @@ Run `npm run typecheck` and `node --import tsx --test tests/sms.test.ts`. The te
 
 Run `node --import tsx --test tests/broker-result-sms.test.ts tests/broker-sms.test.ts tests/sms.test.ts` for the deferred HTTP transport and retained ledger. These tests cover hangup, concurrent requests, delayed admission, process exit during dispatch, restart, expiry, STOP, authority revocation, exact identity validation and shutdown.
 
-SMS is optional and off unless a `DEXTER_SMS_*` variable is set. Sending also requires an approved messaging campaign and number association, published matching disclosures, and the send and campaign flags above.
+SMS is implemented and off by default: the broker loads it only when a `DEXTER_SMS_*` variable is set, and `DEXTER_SMS_SEND_ENABLED` and `DEXTER_SMS_CAMPAIGN_APPROVED` default to false. Sending to US numbers requires an approved A2P 10DLC campaign and number association, published matching disclosures, and both flags set.

@@ -1,6 +1,6 @@
 # Teledexter
 
-Teledexter is a phone line to your own Dexter, an AI agent attached to your account. You call Dexter, or Dexter calls you when a saved watch fires or a call is arranged. On the call it can read your portfolio, research, and buy or sell Solana tokens and tokenized stocks under permissions you set in advance, and it can text you the result after you hang up. This repository is the voice broker that runs those calls. The service and its process are named `dexter-broker`.
+Teledexter is a phone line to your own Dexter, an AI agent attached to your account. You call Dexter from your verified number, or Dexter calls that number when a saved watch fires or a call is arranged. On the call it can read your portfolio, research, and buy or sell Solana tokens and tokenized stocks under the standing permissions you set in advance. This repository is the voice broker that runs those calls. Teledexter succeeds an earlier product, Dexter Phone; the service and its process are still named `dexter-broker`.
 
 ## How it works
 
@@ -43,7 +43,7 @@ Not in this repository: the Dexter API, Primary Dexter, the OpenDexter tools, ac
 - **Durable call journal with a single writer.** Calls, requests, transcript captures and delivery receipts are written to `calls.json` in `BROKER_STATE_DIR`. The store takes an exclusive `writer.lock` at startup, so two broker processes cannot write the same journal. Work is recovered from the journal after a restart.
 - **Idempotent request IDs.** An operator call is created with a caller-chosen UUID; repeating it returns the saved call instead of dialing again. Requests to Primary use IDs derived from the call, voice session and delegation, saved before submission. After a lost reply the broker reconciles by that ID and never repeats the original submit.
 - **Interjections while work is pending.** If the caller asks for something else while a request is running, the new request is saved and queued behind it. A completed result survives later interruptions and is spoken at the next quiet boundary.
-- **Results survive hangup.** Hanging up ends the voice session but does not cancel work Primary already accepted. Closeout recovers uncertain submissions and keeps the binding open until transcript captures and question replies are resolved. A result the caller asked to receive by text can be sent after the call ends (`POST /internal/broker/result-sms`), to the verified number of an opted-in caller.
+- **Results survive hangup.** Hanging up ends the voice session but does not cancel work Primary already accepted. Closeout recovers uncertain submissions and keeps the binding open until transcript captures and question replies are resolved. Texting a requested result after the call (`POST /internal/broker/result-sms`) is implemented but off by default; sending requires an approved US A2P 10DLC messaging campaign (see [docs/sms.md](docs/sms.md)).
 - **Signed webhooks and caller possession.** Every Twilio webhook and media WebSocket is checked against the Twilio signature for its exact URL. Caller ID alone never opens an account: incoming calls are admitted by the Dexter API through the same-call attachment flow, or, in callback mode, the broker confirms the call with a fresh Twilio read and calls the saved number back.
 - **Audio preflight before dialing.** Before dialing an account call (operator-arranged, callback, saved-watch or notification), the broker checks account readiness with the API and opens a short GPT-Live session that must produce real output audio. If either fails, no call is placed. Phone-setup verification callbacks are dialed only under a permit issued by the Dexter API.
 
@@ -112,7 +112,7 @@ Optional:
 | `DEXTER_INTERNAL_TOKEN` | empty | Authenticates the notification producer on `POST /internal/outbound-alerts` (at most 4096 bytes) |
 | `OUTBOUND_ALERT_SIGNING_SECRET` | empty | Read only to ensure `HARK_PHONE_CALLBACK_SIGNING_SECRET` is a different key |
 
-SMS (off unless at least one `DEXTER_SMS_*` variable is set; see [docs/sms.md](docs/sms.md)):
+SMS (implemented, off by default; the bridge loads only when a `DEXTER_SMS_*` variable is set, and sending requires an approved US A2P 10DLC campaign; see [docs/sms.md](docs/sms.md)):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -150,7 +150,7 @@ Tests use Node's built-in runner through `tsx`, with local HTTP servers and simu
 - [docs/PHONE_RESULT_CONTINUITY.md](docs/PHONE_RESULT_CONTINUITY.md): partial results, provider pauses and voice replacement
 - [docs/INBOUND_BILLING.md](docs/INBOUND_BILLING.md): incoming call outcomes and billing evidence
 - [docs/LIVE_PROTOCOL.md](docs/LIVE_PROTOCOL.md): GPT-Live event contract
-- [docs/sms.md](docs/sms.md): SMS enrollment, consent and result texts
+- [docs/sms.md](docs/sms.md): SMS enrollment, consent and result texts (off by default)
 
 ## License
 
