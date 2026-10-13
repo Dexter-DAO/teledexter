@@ -74,6 +74,8 @@ export function createCallJourneyReport(journal, logText = '', options = {}) {
     consumedAt: inbound.remote?.state === 'bound' ? time(inbound.remote.consumedAt) : null,
     mediaStartedAt: time(call.mediaStartedAt), liveReadyAt: time(journey.liveReadyAt),
     firstAudioSentAt: time(journey.firstAudioSentAt), firstPlaybackConfirmedAt: time(journey.firstPlaybackConfirmedAt),
+    // Pre-rendered "Hey, it's Dexter." clip: started at media start, played = every clip mark acknowledged.
+    greetingClipStartedAt: time(journey.greetingClipStartedAt), greetingClipPlayedAt: time(journey.greetingClipPlayedAt),
     endedAt: time(call.endedAt),
   };
   const sourceGenerations = Array.isArray(call.liveGenerations?.segments) ? call.liveGenerations.segments : [];
@@ -104,7 +106,8 @@ export function createCallJourneyReport(journal, logText = '', options = {}) {
       createdToFirstProviderReady: elapsed(timestamps.callCreatedAt, generations[0]?.providerReadyAt),
       mediaToLiveReady: elapsed(timestamps.mediaStartedAt, timestamps.liveReadyAt),
       createdToFirstAudio: elapsed(timestamps.callCreatedAt, timestamps.firstAudioSentAt),
-      createdToFirstPlayback: elapsed(timestamps.callCreatedAt, timestamps.firstPlaybackConfirmedAt) },
+      createdToFirstPlayback: elapsed(timestamps.callCreatedAt, timestamps.firstPlaybackConfirmedAt),
+      mediaToGreetingClip: elapsed(timestamps.mediaStartedAt, timestamps.greetingClipStartedAt) },
     generations, stages: parsed.spans, requests,
     coverage: { logProvided: options.logProvided ?? Boolean(logText), logTailTruncated: options.logTailTruncated === true,
       droppedSpans: parsed.dropped, oversizedLogLines: parsed.oversizedLines,

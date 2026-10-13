@@ -374,7 +374,7 @@ test('a completed provider call is not eligible for missed-call retry even if lo
   assert.equal(f.seen.create, 1); assert.equal(f.seen.readiness, 1);
 });
 
-test('a post-rename fence failure prevents create and makes exact GET/retry unavailable until restart', async t => {
+test('a post-rename fence sync failure is settled from disk and the call is created exactly once', async t => {
   const f = await fixture(t), request = selected(); const fsync = fs.fsyncSync;
   let injected = false;
   const mocked = t.mock.method(fs, 'fsyncSync', (fd: number) => {
@@ -384,23 +384,13 @@ test('a post-rename fence failure prevents create and makes exact GET/retry unav
     }
     fsync(fd);
   });
-  try { assert.equal((await f.post(request)).status, 503); } finally { mocked.mock.restore(); }
-  assert.equal(injected, true); assert.equal(f.seen.create, 0);
-  const bytes = fs.readFileSync(f.file, 'utf8');
+  try { assert.equal((await f.post(request)).status, 201); } finally { mocked.mock.restore(); }
+  assert.equal(injected, true); assert.equal(f.seen.create, 1);
   const diskCall = Object.values(f.disk()).find(call => call.requestId === request.requestId); assert.ok(diskCall);
   assert.ok(diskCall.outboundObservation?.dispatchStartedAt);
-  assert.equal(f.store.readCallRequestJournal().state, 'uncertain');
-  assert.equal((await f.lookup(request.requestId)).status, 503);
-  assert.equal((await f.post(request)).status, 503);
-  const child = { ...request, requestId: randomUUID(), retryOf: {
-    callId: diskCall.id, requestId: diskCall.requestId, settlementDigest: 'a'.repeat(64),
-  } };
-  assert.equal((await f.post(child)).status, 503);
-  assert.equal(fs.readFileSync(f.file, 'utf8'), bytes);
-  await f.restart();
-  const restored = callRequestReceiptSchema.parse((await f.lookup(request.requestId)).body);
-  assert.equal(restored.call.outboundSettlement?.state, 'unresolved');
-  assert.equal((await f.post(request)).status, 200);
-  assert.equal(fs.readFileSync(f.file, 'utf8'), bytes);
-  assert.equal(f.seen.create, 0); assert.equal(f.seen.readiness, 1);
+  assert.notEqual(f.store.readCallRequestJournal().state, 'uncertain');
+  assert.equal((await f.lookup(request.requestId)).status, 200);
+  const replay = await f.post(request);
+  assert.ok([200, 201].includes(replay.status));
+  assert.equal(f.seen.create, 1);
 });

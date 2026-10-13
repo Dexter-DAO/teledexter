@@ -67,6 +67,22 @@ test('only a fixed local pending notice can use content-equivalent status contex
   entry.status = 'completed'; assert.equal(isFixedPendingStatus(entry, update), false);
 });
 
+test('call 039b39cd: no local pending line claims a result is not back, and none is speakable once a result is available', () => {
+  const { entry } = fixture();
+  for (const status of ['prepared', 'dispatching', 'queued', 'running'] as const) {
+    entry.status = status;
+    for (const earlier of [false, true])
+      assert.doesNotMatch(pendingRequestSpeech(entry, earlier), /come back|not back|loading|not arrived|hasn't|taking/i);
+  }
+  const lines = [pendingRequestSpeech(entry, false), pendingRequestSpeech(entry, true)];
+  for (const status of ['completed', 'failed', 'cancelled'] as const) {
+    entry.status = status;
+    entry.primaryResult = { state: status } as BrokerDelegationRecord['primaryResult'];
+    for (const text of lines)
+      assert.equal(isFixedPendingStatus(entry, { id: 'request_a_1_pending_1', kind: 'progress', speak: true, text }), false, status);
+  }
+});
+
 test('financial uncertainty speech reports uncertainty without a completion or ongoing-check claim', () => {
   const { entry } = fixture();
   entry.status = 'failed'; entry.primaryResult = { state: 'failed', error: { code: 'primary_financial_result_unknown', retryable: false } } as BrokerDelegationRecord['primaryResult'];

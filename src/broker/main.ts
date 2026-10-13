@@ -10,6 +10,7 @@ import { createRequestDeliveryClient } from './requestDelivery.js';
 import { createPrimaryCallerIntentClient } from './callerIntentClient.js';
 import { safeFailure } from './phone.js';
 import { createOpenAILiveConnection } from '../live/session.js';
+import { INBOUND_GREETING_CLIP_ASSET, loadGreetingClip } from './greetingClip.js';
 
 dotenv.config({ path: process.env.BROKER_ENV_FILE || '.env' });
 let sms: BrokerSmsBridge | undefined;
@@ -18,10 +19,16 @@ try {
   sms = await createBrokerSmsBridge(process.env, process.cwd());
   const setup = config.verificationSetup;
   const setupStore = setup ? new BrokerStore(config.stateDir) : undefined;
+  // A missing or implausible asset leaves the Live-spoken greeting in place.
+  const greetingClip = loadGreetingClip();
+  const inboundGreetingClip = loadGreetingClip(INBOUND_GREETING_CLIP_ASSET);
   const broker = createBrokerServer({ config, sms,
+    ...(greetingClip ? { greetingClip } : {}),
+    ...(inboundGreetingClip ? { inboundGreetingClip } : {}),
     inboundPreconnect: () => createOpenAILiveConnection(config.apiKey),
     ...(setup && setupStore ? { store: setupStore,
-      inboundAttachment: createInboundHoldAdapter({ publicOrigin: config.publicOrigin, store: setupStore }),
+      inboundAttachment: createInboundHoldAdapter({ publicOrigin: config.publicOrigin, store: setupStore,
+        greetingClipAvailable: Boolean(inboundGreetingClip) }),
       restrictedSetup: { model: setup.model, receiptTransport: { apiBaseUrl: setup.apiBaseUrl, signingSecret: setup.signingSecret } },
     } : {}),
     eligibleContext: createEligibleContextClient({ apiBaseUrl: config.apiBaseUrl,
@@ -50,6 +57,7 @@ try {
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
   broker.server.listen(config.port, config.host, () => {
-    console.log(JSON.stringify({ service: 'dexter-broker', model: config.model, voice: config.voice, port: config.port }));
+    console.log(JSON.stringify({ service: 'dexter-broker', model: config.model, voice: config.voice, port: config.port, greetingClipMs: greetingClip ? greetingClip.length / 8 : 0,
+      inboundGreetingClipMs: inboundGreetingClip ? inboundGreetingClip.length / 8 : 0 }));
   });
 } catch (error) { await sms?.close().catch(() => {}); console.error(JSON.stringify(safeFailure(error))); process.exitCode = 1; }

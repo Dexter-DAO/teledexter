@@ -34,29 +34,28 @@ test('fresh empty storage is durably initialized and exact lookup is read-only',
   assert.throws(() => readCallRequestReceipt(f.store, randomUUID()), unavailable);
 });
 
-test('post-rename sync failure refuses lookup and later writes until restart recovers the saved reservation', t => {
+test('a post-rename sync failure is settled from the journal on disk and the reservation stands', t => {
   const f = fixture(t); const request = input(); const sync = fs.fsyncSync;
+  let injected = false;
   const mocked = t.mock.method(fs, 'fsyncSync', (fd: number) => {
-    if (fs.fstatSync(fd).isDirectory()) throw new Error('injected directory sync failure');
+    if (!injected && fs.fstatSync(fd).isDirectory()) { injected = true; throw new Error('injected directory sync failure'); }
     sync(fd);
   });
-  assert.throws(() => f.store.reserve(request, 'authenticated_broker_control'), /injected directory sync failure/);
+  const reserved = f.store.reserve(request, 'authenticated_broker_control');
   mocked.mock.restore();
+  assert.equal(injected, true);
   const bytes = fs.readFileSync(f.file, 'utf8');
   const records = Object.values(JSON.parse(bytes).calls) as Array<{ id: string; requestId: string }>;
   assert.equal(records.length, 1); assert.equal(records[0].requestId, request.requestId);
-  assert.equal(f.store.get(records[0].id), undefined);
-  assert.equal(f.store.readCallRequestJournal().state, 'uncertain');
-  assert.throws(() => readCallRequestReceipt(f.store, request.requestId), unavailable);
-  assert.throws(() => readCallRequestReceipt(f.store, randomUUID()), unavailable);
-  assert.throws(() => f.store.reserve(input(), 'authenticated_broker_control'), /write outcome is uncertain/);
-  assert.equal(fs.readFileSync(f.file, 'utf8'), bytes);
+  assert.equal(reserved.call.id, records[0].id);
+  assert.equal(f.store.get(records[0].id)?.requestId, request.requestId);
+  assert.notEqual(f.store.readCallRequestJournal().state, 'uncertain');
+  assert.equal(readCallRequestReceipt(f.store, request.requestId).call.id, records[0].id);
+  assert.equal(f.store.reserve(request, 'authenticated_broker_control').existing, true);
+  f.store.reserve(input(), 'authenticated_broker_control');
   f.store.close();
   const restarted = new BrokerStore(f.directory); t.after(() => restarted.close());
-  const receipt = readCallRequestReceipt(restarted, request.requestId);
-  assert.equal(receipt.call.status, 'prepared'); assert.equal(receipt.call.id, records[0].id);
-  assert.equal(restarted.reserve(request, 'authenticated_broker_control').existing, true);
-  assert.equal(fs.readFileSync(f.file, 'utf8'), bytes);
+  assert.equal(readCallRequestReceipt(restarted, request.requestId).call.id, records[0].id);
 });
 
 for (const failure of ['missing-file', 'malformed-file', 'cache-mismatch', 'foreign-lock', 'missing-lock'] as const) {
