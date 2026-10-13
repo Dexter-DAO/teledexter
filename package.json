@@ -1,5 +1,5 @@
 {
-  "name": "dexter-broker",
+  "name": "teledexter",
   "version": "0.1.0",
   "type": "module",
   "scripts": {
@@ -28,5 +28,13 @@
     "typescript": "^5.7.0"
   },
   "private": true,
-  "description": "Call your continuing Dexter assistant."
+  "description": "Phone line to your own Dexter agent: Twilio voice calls run on OpenAI GPT-Live, with account work delegated to Primary Dexter.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Dexter-DAO/teledexter.git"
+  },
+  "engines": {
+    "node": ">=22"
+  }
 }
