@@ -50,7 +50,13 @@ import { type BrokerConfig, isPhoneNumber } from './config.js';
 import { BrokerStore, type BrokerCall, type CallStatus, terminalCallStatuses } from './store.js';
 import { brokerInstructions, brokerHistory, brokerOpening } from './instructions.js';
 import { probeLive } from './preflight.js';
-import { authorizedControl, callTwiml, fallbackTwiml, inputSpeechEnergy, mediaStart, PlaybackReceipts, hasAudiblePcmu, safeFailure, streamToken, verifyTwilio, type ProviderCallProof } from './phone.js';
+import { authorizedControl, callTwiml, fallbackTwiml, inputSpeechEnergy, mediaStart, PlaybackReceipts, hasAudiblePcmu, carriesSpeechPcmu, safeFailure, streamToken, verifyTwilio, type ProviderCallProof } from './phone.js';
+
+/** A pre-speech backlog shorter than this is ordinary network jitter, not a delay worth clearing. */
+const PRE_SPEECH_CLEAR_MIN_MS = 300;
+/** Re-queued after a pre-speech clear: the last 200 ms of PCMU, which may hold the speech onset. */
+const PRE_SPEECH_ONSET_BYTES = 1_600;
+const PRE_SPEECH_TAIL_LIMIT = 400;
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const CALL_SID = /^CA[0-9a-f]{32}$/i;
@@ -897,9 +903,48 @@ export function createBrokerServer(options: BrokerServerOptions) {
     let audioSentRecorded = Boolean(call.journey?.firstAudioSentAt);
     let playbackRecorded = Boolean(call.journey?.firstPlaybackConfirmedAt);
     let audibleSentRecorded = false, audiblePlaybackRecorded = false;
-    const recordAudibleTiming = (stage: 'firstAudibleAudioSentAt' | 'firstAudiblePlaybackAcknowledgedAt') => {
+    let speechSentRecorded = false, speechPlaybackRecorded = false;
+    // Unplayed pre-speech chunks (mark name + payload), kept until the first speech chunk.
+    let preSpeechTail: Array<{ name: string; payload: string; bytes: number; audible: boolean }> = [];
+    const recordAudibleTiming = (stage: 'firstAudibleAudioSentAt' | 'firstAudiblePlaybackAcknowledgedAt'
+      | 'firstSpeechAudioSentAt' | 'firstSpeechPlaybackAcknowledgedAt', detail: Record<string, number> = {}) => {
       try { console.info(JSON.stringify({ event: 'broker_audio_timing', version: 1, callId: call.id,
-        stage, observedAt: new Date().toISOString() })); } catch { /* Timing cannot interrupt audio or playback. */ }
+        stage, observedAt: new Date().toISOString(), ...detail })); } catch { /* Timing cannot interrupt audio or playback. */ }
+    };
+    const sendOutputChunk = (payload: string, bytes: Buffer, audible: boolean, speech: boolean): string => {
+      ws.send(JSON.stringify({ event: 'media', streamSid, media: { payload } }));
+      if (!audioSentRecorded) {
+        const saved = store.get(call.id)!;
+        store.update(call.id, { journey: { ...saved.journey, firstAudioSentAt: new Date().toISOString() } });
+        audioSentRecorded = true;
+      }
+      if (bytes.length > 0 && audible && !audibleSentRecorded) {
+        audibleSentRecorded = true; recordAudibleTiming('firstAudibleAudioSentAt');
+      }
+      const name = receipts.sent(bytes.length, audible, speech);
+      ws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name } }));
+      return name;
+    };
+    /** Twilio plays queued outbound media in order and in real time. Live
+     * streams its own near-silent frames before it speaks, so a backlog of them
+     * would delay the greeting by exactly its length. Before the first speech
+     * chunk, drop that unplayed backlog and re-queue only its last 200 ms, which
+     * may hold the speech onset. Only ever pre-speech audio is dropped. */
+    const clearPreSpeechBacklog = () => {
+      const backlogMs = receipts.backlogMs;
+      if (backlogMs < PRE_SPEECH_CLEAR_MIN_MS) return;
+      const unplayed = preSpeechTail.filter(entry => receipts.isPending(entry.name));
+      const dropped = receipts.dropPreSpeech();
+      if (!dropped) return;
+      ws.send(JSON.stringify({ event: 'clear', streamSid }));
+      const keep: typeof unplayed = [];
+      let keptBytes = 0;
+      for (let index = unplayed.length - 1; index >= 0 && keptBytes + unplayed[index].bytes <= PRE_SPEECH_ONSET_BYTES; index--) {
+        keep.unshift(unplayed[index]); keptBytes += unplayed[index].bytes;
+      }
+      for (const entry of keep) sendOutputChunk(entry.payload, Buffer.from(entry.payload, 'base64'), entry.audible, false);
+      try { console.info(JSON.stringify({ event: 'broker_pre_speech_clear', version: 1, callId: call.id,
+        observedAt: new Date().toISOString(), backlogMs, droppedMs: dropped / 8, requeuedMs: keptBytes / 8 })); } catch { /* Telemetry only. */ }
     };
     const metrics = () => ({ receivedAudioBytes: inputBytes, sentAudioBytes: receipts.sentBytes, playedAudioBytes: receipts.playedBytes, clearedAudioBytes: receipts.clearedBytes });
     const startTimer = setTimeout(() => { void stop('media_start_timeout'); }, 8_000);
@@ -979,19 +1024,20 @@ export function createBrokerServer(options: BrokerServerOptions) {
             onAudio(payload) {
               if (stopping || ws.readyState !== WebSocket.OPEN || !streamSid) return;
               if (ws.bufferedAmount > 256_000 || receipts.pendingCount > 300 || receipts.backlogMs > 6_000) { void stop('audio_backpressure'); return; }
-              ws.send(JSON.stringify({ event: 'media', streamSid, media: { payload } }));
-              if (!audioSentRecorded) {
-                const saved = store.get(call.id)!;
-                store.update(call.id, { journey: { ...saved.journey, firstAudioSentAt: new Date().toISOString() } });
-                audioSentRecorded = true;
-              }
               const bytes = Buffer.from(payload, 'base64');
               const audible = hasAudiblePcmu(bytes);
-              if (bytes.length > 0 && audible && !audibleSentRecorded) {
-                audibleSentRecorded = true; recordAudibleTiming('firstAudibleAudioSentAt');
+              const speech = bytes.length > 0 && carriesSpeechPcmu(bytes);
+              if (speech && !speechSentRecorded) {
+                clearPreSpeechBacklog();
+                preSpeechTail = [];
               }
-              const name = receipts.sent(bytes.length, audible);
-              ws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name } }));
+              const name = sendOutputChunk(payload, bytes, audible, speech);
+              if (speech && !speechSentRecorded) {
+                speechSentRecorded = true; recordAudibleTiming('firstSpeechAudioSentAt', { queuedAheadMs: Math.max(0, receipts.backlogMs - bytes.length / 8) });
+              } else if (!speechSentRecorded) {
+                preSpeechTail.push({ name, payload, bytes: bytes.length, audible });
+                if (preSpeechTail.length > PRE_SPEECH_TAIL_LIMIT) preSpeechTail.shift();
+              }
             },
             onTranscript(snapshot) {
               store.update(call.id, { transcript: snapshot, transcriptRevision: snapshot.revision });
@@ -1061,9 +1107,13 @@ export function createBrokerServer(options: BrokerServerOptions) {
           if (live?.appendAudio(frame.media.payload) === false) void stop('input_audio_refused');
         } else if (frame.event === 'mark' && frame.streamSid === streamSid && typeof frame.mark?.name === 'string') {
           const previouslyPlayed = receipts.playedBytes, previouslyAudiblePlayed = receipts.audiblePlayedBytes;
+          const previouslySpeechPlayed = receipts.speechPlayedBytes;
           receipts.acknowledge(frame.mark.name);
           if (audibleSentRecorded && !audiblePlaybackRecorded && receipts.audiblePlayedBytes > previouslyAudiblePlayed) {
             audiblePlaybackRecorded = true; recordAudibleTiming('firstAudiblePlaybackAcknowledgedAt');
+          }
+          if (speechSentRecorded && !speechPlaybackRecorded && receipts.speechPlayedBytes > previouslySpeechPlayed) {
+            speechPlaybackRecorded = true; recordAudibleTiming('firstSpeechPlaybackAcknowledgedAt');
           }
           if (receipts.playedBytes > previouslyPlayed && !playbackRecorded) {
             const saved = store.get(call.id)!;

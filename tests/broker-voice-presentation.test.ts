@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { carrierPlaybackState, callerPresentationFrontier, hasLaterCallerSpeech, hasNewerCallerWork,
   isFixedPendingStatus, failedRequestSpeech, requestPresentationContext, pendingRequestState, pendingRequestSpeech } from '../src/broker/voicePresentation.js';
-import { hasAudiblePcmu, PlaybackReceipts } from '../src/broker/phone.js';
+import { carriesSpeechPcmu, hasAudiblePcmu, PlaybackReceipts } from '../src/broker/phone.js';
 import type { BrokerCall } from '../src/broker/store.js';
 import type { BrokerDelegationRecord } from '../src/broker/backend.js';
 
@@ -119,6 +119,30 @@ test('digital silence keeps total accounting without holding audible playback; e
   receipts.sent(320, true); receipts.clear(); receipts.acknowledge(speech);
   assert.equal(receipts.sentBytes, 483); assert.equal(receipts.playedBytes, 163); assert.equal(receipts.clearedBytes, 320);
   assert.equal(receipts.audibleSentBytes, 480); assert.equal(receipts.audiblePlayedBytes, 160); assert.equal(receipts.audibleClearedBytes, 320);
+});
+
+
+test('pre-speech drop never discards speech or counts as a speech clear, and keeps audible accounting balanced', () => {
+  // A -58 dBFS blip (max |sample| ~42/32768, as recorded in production) is audible PCMU but not speech.
+  assert.equal(hasAudiblePcmu(Buffer.alloc(800, 0xf0)), true);
+  assert.equal(carriesSpeechPcmu(Buffer.alloc(800, 0xf0)), false);
+  assert.equal(carriesSpeechPcmu(Buffer.from([0xff, 0x7f])), false);
+  assert.equal(carriesSpeechPcmu(Buffer.alloc(800, 0x20)), true);
+  const receipts = new PlaybackReceipts();
+  const silent = receipts.sent(800, false), blip = receipts.sent(800, true), played = receipts.sent(800, false);
+  receipts.acknowledge(played);
+  assert.equal(receipts.backlogMs, 200);
+  assert.equal(receipts.dropPreSpeech(), 1_600);
+  assert.equal(receipts.dropPreSpeech(), 0, 'nothing left to drop');
+  receipts.acknowledge(silent); receipts.acknowledge(blip);
+  assert.equal(receipts.playedBytes, 800); assert.equal(receipts.clearedBytes, 0); assert.equal(receipts.preSpeechDroppedBytes, 1_600);
+  assert.equal(receipts.backlogMs, 0);
+  assert.equal(carrierPlaybackState(true, receipts.audibleSentBytes, receipts.audiblePlayedBytes, receipts.audibleClearedBytes), 'idle');
+  const quiet = receipts.sent(800, true), speech = receipts.sent(800, true, true);
+  assert.equal(receipts.dropPreSpeech(), 0, 'a pending speech chunk blocks the drop');
+  assert.equal(receipts.isPending(quiet), true);
+  receipts.acknowledge(quiet); receipts.acknowledge(speech);
+  assert.equal(receipts.speechSentBytes, 800); assert.equal(receipts.speechPlayedBytes, 800);
 });
 
 

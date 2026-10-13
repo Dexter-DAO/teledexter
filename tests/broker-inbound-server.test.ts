@@ -253,11 +253,73 @@ test('audible timing excludes silence, empty audio, cleared and duplicate marks 
   assert.equal(events.length, 1, 'a cleared audible frame cannot count as played');
   const audible = await send(Buffer.from([0xfe, 0xff]));
   await mark(audible); await mark(audible);
+  assert.deepEqual(events.map(event => event.stage), ['firstAudibleAudioSentAt', 'firstAudiblePlaybackAcknowledgedAt'],
+    'quiet nonzero PCMU is audible for playback accounting but never counts as speech');
   await mark(await send(Buffer.from([0x80])));
-  assert.deepEqual(events.map(event => event.stage), ['firstAudibleAudioSentAt', 'firstAudiblePlaybackAcknowledgedAt']);
+  assert.deepEqual(events.map(event => event.stage), ['firstAudibleAudioSentAt', 'firstAudiblePlaybackAcknowledgedAt',
+    'firstSpeechAudioSentAt', 'firstSpeechPlaybackAcknowledgedAt']);
   assert.ok(events.every(event => event.callId === call.id && Number.isFinite(Date.parse(event.observedAt))));
   assert.deepEqual(Object.keys(events[0]).sort(), ['callId', 'event', 'observedAt', 'stage', 'version']);
   assert.deepEqual(Object.keys(f.store.get(call.id)!.journey!).sort(), ['firstAudioSentAt', 'firstPlaybackConfirmedAt', 'liveReadyAt']);
+});
+
+// Production evidence (calls 60616be7 / 6b2ef8d1): the first "audible" chunk was a
+// -58 dBFS Live breath/noise blip; the greeting itself was heard ~3.9 s / ~4.4 s later.
+const nearSilent = (length = 800) => Buffer.alloc(length, 0xf0); // nonzero PCMU, RMS ~0.004
+const spoken = (length = 800) => Buffer.alloc(length, 0x20); // RMS well above -40 dBFS
+
+test('a queued pre-speech Live backlog is cleared before the first speech; its last 200 ms is re-queued first', async t => {
+  const timing: Array<{ stage: string; queuedAheadMs?: number }> = [];
+  const clears: Array<{ backlogMs: number; droppedMs: number; requeuedMs: number }> = [];
+  t.mock.method(console, 'info', (value: string) => { const event = JSON.parse(value);
+    if (event.event === 'broker_audio_timing') timing.push(event); if (event.event === 'broker_pre_speech_clear') clears.push(event); });
+  const f = await fixture(t), { call, ws } = await connectIncomingMedia(f); t.after(() => ws.close());
+  const frames: Array<{ event: string; payload?: string; name?: string }> = [];
+  ws.on('message', raw => { const frame = JSON.parse(String(raw));
+    frames.push({ event: frame.event, ...(frame.media ? { payload: frame.media.payload } : {}), ...(frame.mark ? { name: frame.mark.name } : {}) }); });
+  const waitFor = async (count: number) => { for (let i = 0; i < 200 && frames.length < count; i++) await new Promise(resolve => setTimeout(resolve, 5)); };
+  const leading = Array.from({ length: 6 }, (_value, index) => Buffer.alloc(800, 0xf0 + index)); // 600 ms, unplayed
+  for (const chunk of leading) f.emitAudio(chunk);
+  await waitFor(12);
+  assert.deepEqual(timing.map(event => event.stage), ['firstAudibleAudioSentAt']);
+  const greeting = spoken();
+  f.emitAudio(greeting);
+  await waitFor(12 + 1 + 4 + 2);
+  const after = frames.slice(12);
+  assert.deepEqual(after.map(frame => frame.event), ['clear', 'media', 'mark', 'media', 'mark', 'media', 'mark']);
+  assert.deepEqual(after.filter(frame => frame.event === 'media').map(frame => frame.payload),
+    [leading[4].toString('base64'), leading[5].toString('base64'), greeting.toString('base64')], 'onset context then the greeting');
+  assert.deepEqual(clears.map(({ backlogMs, droppedMs, requeuedMs }) => ({ backlogMs, droppedMs, requeuedMs })), [{ backlogMs: 600, droppedMs: 600, requeuedMs: 200 }]);
+  assert.deepEqual(timing.map(event => event.stage), ['firstAudibleAudioSentAt', 'firstSpeechAudioSentAt']);
+  assert.equal(timing[1].queuedAheadMs, 200, 'only the re-queued onset context remains ahead of the greeting');
+  // Twilio returns the dropped marks after a clear; none of them counts as played.
+  const send = (name: string) => ws.send(JSON.stringify({ event: 'mark', streamSid: 'MZ' + '4'.repeat(32), mark: { name } }));
+  for (const frame of frames.slice(0, 12)) if (frame.event === 'mark') send(frame.name!);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(f.store.get(call.id)!.journey?.firstPlaybackConfirmedAt, undefined, 'dropped pre-speech audio was never heard');
+  for (const frame of after) if (frame.event === 'mark') send(frame.name!);
+  for (let i = 0; i < 100 && timing.length < 4; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.deepEqual(timing.map(event => event.stage), ['firstAudibleAudioSentAt', 'firstSpeechAudioSentAt',
+    'firstAudiblePlaybackAcknowledgedAt', 'firstSpeechPlaybackAcknowledgedAt']);
+  assert.ok(f.store.get(call.id)!.journey?.firstPlaybackConfirmedAt);
+  // Later speech is never cleared by this path, even with a long backlog.
+  for (let index = 0; index < 8; index++) f.emitAudio(nearSilent());
+  f.emitAudio(spoken());
+  await waitFor(frames.length + 18);
+  assert.equal(frames.filter(frame => frame.event === 'clear').length, 1);
+});
+
+test('a short pre-speech backlog is ordinary jitter and is not cleared', async t => {
+  const clears: unknown[] = [];
+  t.mock.method(console, 'info', (value: string) => { if (JSON.parse(value).event === 'broker_pre_speech_clear') clears.push(value); });
+  const f = await fixture(t), { ws } = await connectIncomingMedia(f); t.after(() => ws.close());
+  const events: string[] = [];
+  ws.on('message', raw => { events.push(JSON.parse(String(raw)).event); });
+  f.emitAudio(nearSilent()); f.emitAudio(nearSilent(1_200)); f.emitAudio(spoken()); // 250 ms queued
+  for (let i = 0; i < 100 && events.length < 6; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.deepEqual(events, ['media', 'mark', 'media', 'mark', 'media', 'mark']);
+  assert.equal(clears.length, 0);
 });
 
 test('audible timing logger failure cannot interrupt sent audio or carrier playback', async t => {
@@ -267,7 +329,9 @@ test('audible timing logger failure cannot interrupt sent audio or carrier playb
   ws.on('message', raw => { const frame = JSON.parse(String(raw)); if (frame.event === 'mark') ws.send(JSON.stringify(frame)); });
   f.emitAudio();
   for (let i = 0; i < 100 && !f.store.get(call.id)!.journey?.firstPlaybackConfirmedAt; i++) await new Promise(resolve => setTimeout(resolve, 5));
-  assert.ok(f.store.get(call.id)!.journey?.firstPlaybackConfirmedAt); assert.equal(failures, 2);
+  // Audible and speech stages (sent + acknowledged) all failed to log; audio still played.
+  for (let i = 0; i < 100 && failures < 4; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.ok(f.store.get(call.id)!.journey?.firstPlaybackConfirmedAt); assert.equal(failures, 4);
   assert.equal(f.store.get(call.id)!.endedAt, undefined);
 });
 

@@ -54,12 +54,17 @@ export class PlaybackReceipts {
   sentBytes = 0; playedBytes = 0; clearedBytes = 0;
   private next = 0;
   audibleSentBytes = 0; audiblePlayedBytes = 0; audibleClearedBytes = 0;
-  private pending = new Map<string, { bytes: number; cleared: boolean; audible: boolean }>();
-  sent(bytes: number, audible = true): string {
+  /** Speech-energy chunks (carriesSpeechPcmu), tracked only to time when speech is heard. */
+  speechSentBytes = 0; speechPlayedBytes = 0;
+  /** Unplayed audio dropped ahead of the first speech. It never held speech, so it is not clearedBytes. */
+  preSpeechDroppedBytes = 0;
+  private pending = new Map<string, { bytes: number; cleared: boolean; audible: boolean; speech: boolean }>();
+  sent(bytes: number, audible = true, speech = false): string {
     this.sentBytes += bytes;
     if (audible) this.audibleSentBytes += bytes;
+    if (speech) this.speechSentBytes += bytes;
     const id = `broker-audio-${++this.next}`;
-    this.pending.set(id, { bytes, cleared: false, audible });
+    this.pending.set(id, { bytes, cleared: false, audible, speech });
     return id;
   }
   acknowledge(id: string) {
@@ -68,6 +73,7 @@ export class PlaybackReceipts {
     if (!item.cleared) {
       this.playedBytes += item.bytes;
       if (item.audible) this.audiblePlayedBytes += item.bytes;
+      if (item.speech) this.speechPlayedBytes += item.bytes;
     }
     this.pending.delete(id);
   }
@@ -80,7 +86,21 @@ export class PlaybackReceipts {
       item.cleared = true;
     }
   }
-  get backlogMs() { return (this.sentBytes - this.playedBytes - this.clearedBytes) / 8; }
+  isPending(id: string) { const item = this.pending.get(id); return Boolean(item && !item.cleared); }
+  /** Marks every unplayed chunk dropped when none of them carries speech; the
+   * caller sends the carrier clear. Returns the dropped bytes (0 = nothing dropped). */
+  dropPreSpeech(): number {
+    const unplayed = [...this.pending.values()].filter(item => !item.cleared);
+    if (!unplayed.length || unplayed.some(item => item.speech)) return 0;
+    let dropped = 0;
+    for (const item of unplayed) {
+      item.cleared = true; dropped += item.bytes;
+      if (item.audible) this.audibleClearedBytes += item.bytes;
+    }
+    this.preSpeechDroppedBytes += dropped;
+    return dropped;
+  }
+  get backlogMs() { return (this.sentBytes - this.playedBytes - this.clearedBytes - this.preSpeechDroppedBytes) / 8; }
   get pendingCount() { return this.pending.size; }
 }
 
@@ -88,6 +108,14 @@ export class PlaybackReceipts {
  * owns its playback mark; no energy threshold can discard it as inaudible. */
 export function hasAudiblePcmu(bytes: Buffer): boolean {
   return bytes.length === 0 || bytes.some(byte => byte !== 0xff && byte !== 0x7f);
+}
+
+/** Output speech threshold: RMS -40 dBFS, the level preflight already treats as
+ * audible Live output. Live's near-silent leading frames (breath/noise around
+ * -58 dBFS) are nonzero PCMU, so hasAudiblePcmu counts them; this does not. */
+export const OUTPUT_SPEECH_ENERGY = 0.01;
+export function carriesSpeechPcmu(bytes: Buffer): boolean {
+  return inputSpeechEnergy(bytes) >= OUTPUT_SPEECH_ENERGY;
 }
 
 /** PCMU energy helps avoid submitting while the caller is still speaking. */

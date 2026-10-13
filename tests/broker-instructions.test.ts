@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { DEXTER_CAPABILITIES, brokerInstructions, brokerHistory, brokerOpening, brokerWatchBrief } from '../src/broker/instructions.js';
 import { makeHarkSnapshot } from './fixtures/broker-hark.js';
+import { LIVE_APPEND_MAX_BYTES } from '../src/live/session.js';
 import { factFreshnessScenarios, historicalAccountMessages } from './fixtures/broker-fact-freshness.js';
 
 test('call direction and purpose guide the opening while account text stays in history', () => {
@@ -162,4 +163,14 @@ test('pending work gets one short acknowledgment and no spoken queue mechanics',
   assert.match(instructions, /at most one short acknowledgment such as "On it\."/);
   assert.match(instructions, /stay quiet until the result arrives unless the caller speaks; do not say you are still waiting/);
   assert.match(instructions, /A queued receipt means the later request has not started/);
+});
+
+test('every voice opening fits one Live instructions append, so the speak-first greeting is never rejected locally', () => {
+  // 819f2af shipped a 513-byte registered outbound opening; session.ts rejected it as
+  // invalid_append_content (call 6b2ef8d1) and the greeting waited for the callee to speak.
+  for (const direction of ['outbound', 'inbound'] as const)
+    for (const registered of [false, true]) for (const watch of [false, true]) for (const notification of [false, true]) {
+      const bytes = Buffer.byteLength(brokerOpening(direction, registered, watch, notification));
+      assert.ok(bytes > 0 && bytes <= LIVE_APPEND_MAX_BYTES, `${direction}/${registered}/${watch}/${notification}: ${bytes} bytes`);
+    }
 });
