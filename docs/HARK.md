@@ -2,8 +2,6 @@
 
 A saved Hark watch can ask Dexter to call when its condition is met. The call opens with the watch name, the reported event and its observation time. Primary receives the saved assignment so the caller can discuss it, request current information and continue with work allowed by their existing permissions.
 
-This adapter is source preparation. Activation requires the matching API release, Broker configuration and coordinated routing. The existing Phone service and telephone number routing remain selected until that release is qualified.
-
 ## Assignment and delivery
 
 The existing notification producer sends its Hark-v1 body to Broker's local `POST /internal/outbound-alerts`, using `x-dexter-internal-auth`. Broker verifies the current configured `DEXTER_INTERNAL_TOKEN` locally with exact, constant-time comparison. The header must occur once and contain at most 4096 UTF-8 bytes; its value is never trimmed, logged or saved in the call journal. Dial admission forwards that credential to the local API resolver as `x-internal-auth` with `{notification}`. The resolver route is `POST /internal/phone/resolve-hark-assignment`. The existing authorization route is `/internal/phone/authorize-outbound`.
@@ -44,6 +42,6 @@ Local account or voice failures remain separate from provider termination. A cal
 
 ## Configuration and checks
 
-Set `BROKER_HARK_API_URL` to `http://127.0.0.1:3033`, the local Nginx listener that follows the selected API release and reuse `HARK_PHONE_CALLBACK_SIGNING_SECRET`. The callback key must differ from the alert ingress signing key. Hark also requires the existing API/producer `DEXTER_INTERNAL_TOKEN` in Broker's private environment. The release owner must coordinate its rotation across the producer, API and Broker. Ordinary Broker control continues to use its separate Bearer credential. The API release owner selects these values and coordinates the notification route.
+Saved-watch calls are enabled by setting `BROKER_HARK_API_URL` to a local HTTP origin for the Dexter API (for example `http://127.0.0.1:3033`). They also require `HARK_PHONE_CALLBACK_SIGNING_SECRET` (at least 32 characters, shared with the API, and different from `OUTBOUND_ALERT_SIGNING_SECRET` when that is set) and the `DEXTER_INTERNAL_TOKEN` shared with the notification producer and API. Rotate the internal token across the producer, API and broker together. Ordinary broker control uses its separate bearer credential.
 
-Focused tests cover the actual retained notification producer over local HTTP, saved assignment registration after a signed answer, duplicate and uncertain dispatch, journal recovery, signed delivery receipts, billing order, delayed timing recovery and legacy operator behavior. Shared API tests qualify database admission separately. Full source checks and a useful customer conversation remain release requirements.
+Focused tests cover the actual retained notification producer over local HTTP, saved assignment registration after a signed answer, duplicate and uncertain dispatch, journal recovery, signed delivery receipts, billing order, delayed timing recovery and operator call behavior. Database admission is tested in the Dexter API.

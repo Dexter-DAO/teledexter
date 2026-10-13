@@ -8,4 +8,4 @@ Broker writes the dispatch transition before contacting the call provider. An ac
 
 Generic calls use the existing durable outbound-status and call-ended outbox. Status callbacks retain the original event ID; call-ended retains the owner and actual provider timing. Failed, busy, unanswered or canceled calls create a terminal status without invented timing or a financial usage event. Hark case callbacks and Hark Primary receipts remain specific to saved Hark watches. Existing Hark assignment and callback bytes remain unchanged.
 
-Focused tests use local HTTP servers and provider doubles to cover source resolution, frozen identity, registration, duplicate dispatch, lost acknowledgements, restart, due-time checks, terminal status and callback ordering. These fixtures establish the tested behavior; provider-backed call quality requires a customer call.
+Focused tests use local HTTP servers and provider doubles to cover source resolution, frozen identity, registration, duplicate dispatch, lost acknowledgements, restart, due-time checks, terminal status and callback ordering. These fixtures use simulated provider and API connections.

@@ -1,70 +1,30 @@
 # Broker operations
 
-The broker connects Twilio telephone audio to GPT-Live and delegates account work to Primary Dexter. It runs as one process with a durable call journal. Primary owns account authority and accepted requests.
+The broker connects Twilio telephone audio to GPT-Live and delegates account work to Primary Dexter through the Dexter API. It runs as one process with a durable call journal. Primary owns account authority and accepted requests.
 
-## Release state
-
-As of September 22, 2026, the Broker service and shared Phone API are deployed. OpenAI credits are available. The first outbound telephone trial failed before speech because the adapter incorrectly required an event ID on Live audio chunks. That protocol repair is deployed; the next telephone trial carried two-way conversation and reached the linked account.
-
-The first Primary request returned HTTP 503, and result recovery returned no saved request. Its outcome stayed unknown until the September 22 recovery release captured its exact original transcript, closed the call binding, and obtained proof that the request was never admitted. The journal now records `not_admitted`; the original request was not resubmitted. A disposable PostgreSQL test reproduced a defect in the old submission path: a transcript beginning with a space violates the Primary message constraint. The API correction preserves the raw transcript and submits a normalized rendering with explicit memory lineage. The original live exception was not logged, so the reproduction does not establish the exact production exception.
-
-The submission repair and API diagnostics are deployed. A subsequent telephone call completed an account request with a fetched portfolio result. Broker then suppressed the answer because the caller had spoken again while it ran. Two later requests failed in shared tools. The account read succeeded; useful spoken delivery remains unqualified.
-
-The deployed conversation repair treats the call brief as Dexter's assignment and explains the help in ordinary language. A caller interjection preserves the pending result: once the caller pauses, Broker supplies the answer for speech, including each chunk of a longer result. An interruption during delivery still stops the remaining chunks. The saved result remains available. Failed requests without an answer no longer promise a result to review. A GPT-Live rehearsal returned the full portfolio answer after an interjection using simulated Twilio and Primary responses.
-
-Broker `c714a75` was deployed and its saved process definition updated at 13:35 UTC on September 22. Shared API `e93fd190` supplies the reconciliation endpoint and seed diagnostics; MCP `2cffa8d` supplies the revised seed timeout and request correlation. The deployment resolved the original pending request and preserved all other call records. It placed no telephone call. Immediate references to Broker status speech, such as "then review it," have a separate integration under development and are outside this release.
-
-A separate authorized telephone trial ran from 13:42 to 13:55 UTC. Three Primary requests completed, and their answers appear in the voice transcript. The opening portfolio figures came from older conversation history before any new request. Stored backend evidence confirms that the call made no fresh portfolio or price read; its only tool invocation returned an incomplete catalog overview. Replies took roughly 28, 62, and 36 seconds; a follow-up spoken during a running request was recorded without submission. The voice also broadened a claim about marketplace coverage into a claim about all available data. These findings remain open. The caller confirmed that the long silence near the end was an intentional mute and that he hung up himself. Transcript text and accepted speech commands alone do not establish complete playback to the caller.
-
-Use the health endpoint and the operator call journal for the selected code and actual call outcomes. Keep release acceptance and call evidence separate. Broader provider-backed memory recall remains disabled.
-
-The existing Phone service on port `3212` and the number's inbound routing remain unchanged. The new Broker serves `/broker/` on port `3213`; inbound activation and final callback experience are still under review.
-
-The deployed Primary ingress permits verified outbound calls. It rejects inbound account binding with `caller_possession_required`, because caller ID alone does not establish possession. The inbound handler therefore offers a callback without opening Primary, reading account data, or starting GPT-Live. The outbound leg establishes possession of the current saved destination.
+## Request states
 
 The client accepts `queued`, `running`, `waiting_for_reply`, `completed`, `failed`, and `cancelled`. A waiting result carries its saved question. Completion requires the identified terminal assistant output; an earlier question is not a completed result. Hangup ends voice delivery and closes admission after source recovery; it does not cancel work already accepted by Primary. Later transcript corrections are recorded as source revisions and do not retroactively change an admitted action.
 
 ## Questions during a call
 
-When Primary asks a question, the broker passes its wording, context, proposed answer, and the meaning of each choice to Live. It waits for those updates to be accepted and a subsequent completed caller turn before answering. Provider acceptance of those instructions does not prove the caller heard them; audible delivery remains part of the call trial.
+When Primary asks a question, the broker passes its wording, context, proposed answer, and the meaning of each choice to Live. It waits for those updates to be accepted and a subsequent completed caller turn before answering. Provider acceptance of those instructions does not prove the caller heard them.
 
 Literal yes and no answers, including ordinary trailing punctuation, select the corresponding saved choice. Qualified answers retain the caller's words as `other`. The broker saves the answer and its completed source turn before sending it to the exact original request and question. The API joins the answer, transcript source, and continuation of the same run in one transaction.
 
-If the response is lost, recovery reads that exact question and checks the saved reply identity and content. It can still recover the old answer after Primary has asked a second question. A changed reply, expired question, or answer already supplied elsewhere cannot become a new request. Closeout keeps unresolved reply recovery pending with the original binding.
-
-This release supports answers within the original verified call. Attaching a later verified callback to an earlier question is proposed separately. Until that integration is qualified, a different call or thread cannot reuse the original request's answer authority.
+If the response is lost, recovery reads that exact question and checks the saved reply identity and content. It can still recover the old answer after Primary has asked a second question. A changed reply, expired question, or answer already supplied elsewhere cannot become a new request. Closeout keeps unresolved reply recovery pending with the original binding. Answers are accepted only within the original verified call; a different call or thread cannot reuse the original request's answer authority.
 
 ## Configuration
 
-`src/broker/main.ts` and the operator CLI load the file named by `BROKER_ENV_FILE`, falling back to `.env`. Existing process environment values take precedence. Keep production credentials outside releases in `/var/lib/dexter-broker/config/production.env`, readable only by the service owner. Load the file through the application; shell-sourcing it is unnecessary.
+`src/broker/main.ts` and the operator CLI load the file named by `BROKER_ENV_FILE`, falling back to `.env`. Existing process environment values take precedence. Keep production credentials outside release directories, readable only by the service owner. The full variable list is in the [README](../README.md#configuration).
 
-| Variable | Required value or default |
-| --- | --- |
-| `BROKER_HOST` | Deployment pins `127.0.0.1`. |
-| `BROKER_PORT` | Deployment pins `3213`. |
-| `BROKER_PUBLIC_ORIGIN` | HTTPS origin only, normally `https://phone.dexter.cash`; no `/broker` suffix. |
-| `BROKER_STATE_DIR` | Absolute directory outside the checkout or release. Deployment uses `/var/lib/dexter-broker/state`. |
-| `BROKER_CONTROL_TOKEN` | At least 32 characters; authenticates local operator routes. |
-| `OPENAI_API_KEY` | Provider key with GPT-Live access and available credits. |
-| `BROKER_LIVE_MODEL` | `gpt-live-1`. Keep this value for the implemented voice transport. |
-| `BROKER_LIVE_VOICE` | Defaults to `marin`. |
-| `BROKER_MAX_CALL_SECONDS` | Defaults to `1800`; accepted values are `30` through `14400`. |
-| `BROKER_ALLOWED_TO` | Comma-separated E.164 outbound destinations. One entry becomes the default destination. Empty permits no outbound calls. |
-| `TWILIO_ACCOUNT_SID` | Account owning the caller number. |
-| `TWILIO_AUTH_TOKEN` | Validates callbacks and authenticates the Twilio client. |
-| `TWILIO_PHONE_NUMBER` | E.164 caller number; must differ from allowed destinations. |
-| `DEXTER_API_URL` | Same-host production uses `http://127.0.0.1:3033`, the Nginx listener that follows the selected API release. Remote API origins require HTTPS. |
-| `BROKER_HARK_API_URL` | When Hark is enabled, use the same local origin: `http://127.0.0.1:3033`. |
-| `PHONE_SERVICE_SECRET` | At least 32 characters; must match the API's phone callback signing secret. |
-| `BROKER_REVISION` | Release identifier exposed by the health endpoint. The PM2 configuration defaults to the release directory name. |
-
-The Primary client uses `/internal/primary-dexter/channels/phone`. Its bearer token is the hexadecimal HMAC-SHA256 of `dexter-broker/primary-ingress/v1` under `PHONE_SERVICE_SECRET`. The API uses `HARK_PHONE_CALLBACK_SIGNING_SECRET` for the matching value. Never put either the secret or the derived bearer in commands, receipts, or documentation.
+The Primary client uses `/internal/primary-dexter/channels/phone`. Its bearer token is the hexadecimal HMAC-SHA256 of `dexter-broker/primary-ingress/v1` under `PHONE_SERVICE_SECRET`. Never put either the secret or the derived bearer in commands, receipts, or documentation.
 
 The private journal contains phone numbers, transcripts, and account context. Its directory is created with mode `0700`; the writer lock uses `0600`. Preserve the directory and its ownership across releases. The operator call list returns only the recipient's last four digits, but purpose and failure text can still contain personal information.
 
-## Isolated deployment
+## Deployment
 
-Prepare an immutable directory under `/var/lib/dexter-broker/releases/<release-id>` containing the reviewed source, lockfile, compiled `dist`, and installed dependencies. Build and validate that exact release before starting it:
+Prepare an immutable release directory containing the reviewed source, lockfile, compiled `dist`, and installed dependencies. Build and validate that exact release before starting it:
 
 ```sh
 npm ci
@@ -73,57 +33,52 @@ npm test
 npm run build
 ```
 
-The release includes `tsx` because `npm run broker` uses the operator script. `npm start` itself runs compiled JavaScript. Record the source revision and build checks with the release receipt.
+The release includes `tsx` because `npm run broker` uses the operator script. `npm start` itself runs compiled JavaScript.
 
-The PM2 configuration requires `BROKER_RELEASE_DIR` to name the actual immutable directory. It rejects symbolic-link release paths. Set it in the operator environment, then use the configuration from that release:
+`deploy/ecosystem.config.cjs` is a PM2 configuration. It requires `BROKER_RELEASE_DIR` to name a real (non-symlinked) directory under `/var/lib/dexter-broker/releases`, and sets the state directory and env file paths for that layout; adjust them for your host.
 
 ```sh
 pm2 start "$BROKER_RELEASE_DIR/deploy/ecosystem.config.cjs" --only dexter-broker
 ```
 
-Use this command only when applying the reviewed deployment. The configuration starts one forked process and gives shutdown 65 seconds; the application has a 60-second shutdown deadline. The journal permits one writer, so upgrades require the previous broker process to stop before the replacement starts. Avoid a rolling overlap against the same state directory. A rollback selects the previous immutable release and retains the same journal; verify journal compatibility first.
+The configuration starts one forked process and gives shutdown 65 seconds; the application has a 60-second shutdown deadline. The journal permits one writer, so an upgrade must stop the previous broker process before the replacement starts. Avoid a rolling overlap against the same state directory. A rollback selects the previous release and retains the same journal; verify journal compatibility first. Preserve the current journal; restoring an earlier snapshot could erase evidence of an accepted answer or an outbound call.
 
-On this host, PM2 6.0.5 retains an existing process's normalized script and working-directory paths during `startOrRestart`. For an upgrade to another release directory, verify and stop the exact broker process, confirm its exit and writer release, then remove only its stopped PM2 definition before starting the new configuration. Check the new process's actual paths and code hashes along with health. Record the newly allocated PM2 ID for shared release coordination.
+`deploy/nginx-broker.conf` is a location snippet for the HTTPS `server` block that serves `BROKER_PUBLIC_ORIGIN`. Its `proxy_pass` preserves the `/broker/` prefix and supports WebSocket upgrades. It exposes no `/internal/` routes.
 
-The initial `fb3553f` release can read the journal's JSON shape but cannot recover the successor's pending callbacks or question replies. After the successor handles that work, use a release that understands those records for recovery. Preserve the current journal; restoring an earlier snapshot could erase evidence of an accepted answer or an outbound call.
+## Telephone routes
 
-`deploy/nginx-broker.conf` is the accepted location snippet for the existing HTTPS `server` block for `phone.dexter.cash`. Its `proxy_pass` preserves the `/broker/` prefix and supports WebSocket upgrades. It exposes no `/internal/broker/` routes. Future changes go through Angel's shared nginx release: preserve existing locations, check the full configuration with `nginx -t`, then reload.
+Outbound call creation sets its own answer and status callbacks under `/broker/answer/:id` and `/broker/status/:id`. For incoming calls, configure the Twilio number with voice POST to `/broker/incoming-call` and status POST to `/broker/status`. Media streams connect to `/broker/media/:id` (account calls) and `/broker/setup-media/:id` (phone setup calls).
 
-`GET /broker/health` reports process readiness, model, revision, and active call count. A successful health response establishes HTTP reachability. It does not establish provider credits, Primary eligibility, working audio, or a completed call.
+## Incoming calls
 
-Outbound call creation sets its own answer and status callbacks under `/broker/answer/:id` and `/broker/status/:id`; it can use the existing sender without rerouting the number. Inbound activation requires the callback source to be released and the number to be configured explicitly: voice POST to `/broker/incoming-call` and status POST to `/broker/status`. The Gather action posts to `/broker/callback/:id`. The existing number configuration remains unchanged by this preparation.
+Every Twilio webhook must carry a valid signature for the exact URL. Incoming calls follow one of two paths, selected at startup.
 
-## Inbound callback
+**Same-call attachment** (when `BROKER_VERIFICATION_SETUP_MODEL` is set). The broker saves the signed incoming call, answers with "One moment.", and redirects the same call to `POST /broker/inbound/:callId/continue` while the Dexter API decides whether the caller may attach to an account. A caller whose number is linked to an account is bound to that account's Primary Dexter and talks to GPT-Live on the same call. A caller without a linked account gets a restricted phone-setup voice whose only tools are setup status, a verified-callback request, and completing or declining setup (`src/live/restrictedSetupTools.ts`). See [inbound-call-attachments.md](inbound-call-attachments.md).
 
-The inbound response offers one DTMF choice: press 1 to request a callback. The offer and acknowledgment use the same wording whether the caller's account is ready or unavailable. The inbound leg supplies no account context to the caller or a voice model.
+**Callback offer** (when `BROKER_VERIFICATION_SETUP_MODEL` is empty). The inbound response offers one DTMF choice: press 1 to request a callback. The offer and acknowledgment use the same wording whether the caller's account is ready or unavailable. The inbound leg supplies no account context to the caller or a voice model. The Gather action posts to `/broker/callback/:id`.
 
 Consent requires the signed Twilio POST for the exact inbound call, caller number, owned destination, and provider account. A fresh Twilio read must confirm those identities and an active call before consent is saved. This read has a four-second deadline. A matching caller ID alone never opens Primary.
 
-The consent record stores a stable request UUID derived from the provider account and inbound CallSid, its timestamp, and state in the existing call journal. The HTTP response says the person can hang up and ends the inbound leg. Maintenance checks pending callbacks every 10 seconds. It fetches the exact inbound call again and requires provider-confirmed termination before invoking the existing outbound executor.
+The consent record stores a stable request UUID derived from the provider account and inbound CallSid, its timestamp, and state in the call journal. The response tells the person they can hang up and ends the inbound leg. Maintenance checks pending callbacks every 10 seconds. It fetches the exact inbound call again and requires provider-confirmed termination before invoking the outbound executor.
 
-For the initial trial, the destination must be in `BROKER_ALLOWED_TO`. The shared outbound executor then asks the API to confirm that exact number is linked to an account with ready Primary authority. Only after that check does it run the mandatory GPT-Live audio preflight and dial. A failed readiness check prevents preflight and dialing. Account readiness alone does not prove phone possession; the signed answer callback and current provider call check establish it before account access.
+The destination must be in `BROKER_ALLOWED_TO`. The outbound executor asks the API to confirm that exact number is linked to an account with ready Primary authority. Only after that check does it run the mandatory GPT-Live audio preflight and dial. A failed readiness check prevents preflight and dialing. Account readiness alone does not prove phone possession; the signed answer callback and current provider call check establish it before account access.
 
-Consent expires after five minutes. The callback helper admits at most three requests per number per hour, with at least 60 seconds between admissions; these limits survive process restart. They apply to inbound callback requests. Exact webhook retries retain the original consent and request ID. An existing outbound request is recovered even when its outcome is uncertain, so a timeout or restart cannot produce a second dial.
+Consent expires after five minutes. The callback helper admits at most three requests per number per hour, with at least 60 seconds between admissions; these limits survive process restart. Exact webhook retries retain the original consent and request ID. An existing outbound request is recovered even when its outcome is uncertain, so a timeout or restart cannot produce a second dial.
 
-The operator call list includes `callback.state`: `requested` means consent is waiting for dispatch, `started` means an outbound request is already saved, and `unavailable` means this callback will receive no further dispatch attempt. `started` does not prove that the phone rang or a person answered; inspect the associated outbound call status and provider evidence. If readiness or credits were unavailable, the caller can make a fresh request after the underlying issue is resolved and the callback limits allow it.
+The operator call list includes `callback.state`: `requested` means consent is waiting for dispatch, `started` means an outbound request is already saved, and `unavailable` means this callback will receive no further dispatch attempt. `started` does not prove that the phone rang or a person answered; inspect the associated outbound call status.
 
 ## Controlled call
 
-Run the CLI from the release with `BROKER_ENV_FILE` pointing to its private configuration. The CLI connects to loopback and supplies the control token internally.
+Run the CLI with `BROKER_ENV_FILE` pointing to the private configuration. The CLI connects to the broker on loopback and supplies the control token internally.
 
 ```sh
 npm run broker -- status
-```
-
-After provider credits and the Primary ingress release are available, an authorized operator can run a provider preflight:
-
-```sh
 npm run broker -- preflight
 ```
 
-Preflight opens one GPT-Live session for at most 15 seconds. Success requires actual output audio and the matching final `session.closed` event. It makes no telephone call. It has no retry or reconnect loop.
+Preflight opens one GPT-Live session for at most 15 seconds. Success requires actual output audio and the matching final `session.closed` event. It makes no telephone call and has no retry or reconnect loop. It consumes provider credits.
 
-For an authorized test call, save one UUID as `BROKER_REQUEST_ID` before dispatch. Keep it with the purpose and receipt. Use the same ID if the local HTTP response is lost:
+For a test call, save one UUID as `BROKER_REQUEST_ID` before dispatch. Keep it with the purpose and receipt. Use the same ID if the local HTTP response is lost:
 
 ```sh
 npm run broker -- call --request-id "$BROKER_REQUEST_ID" --purpose "Read the caller's current portfolio and discuss their questions." --receipt "$BROKER_RECEIPT_PATH"
@@ -131,7 +86,7 @@ npm run broker -- call --request-id "$BROKER_REQUEST_ID" --purpose "Read the cal
 
 The receipt path must be a new private file. With one allowed destination, the CLI needs no number in the command. Multiple destinations require `--to` with an allowed E.164 number. The service first saves the request, checks account readiness, and runs another mandatory audio preflight before dispatching to Twilio. Repeating the same request returns the saved call instead of dialing again. A different request to a person with an unresolved call is blocked.
 
-Confirm the saved provider SID, audible conversation, and an identified Primary result. Check both provider termination and local closeout afterward. A financial-action claim additionally needs the corresponding Primary result and transaction or receipt evidence. A spoken acknowledgment alone is insufficient.
+A financial-action claim needs the corresponding Primary result and transaction or receipt evidence. A spoken acknowledgment alone is insufficient.
 
 ## Close and recovery
 
@@ -146,24 +101,32 @@ npm run broker -- reconcile --id "$BROKER_CALL_ID"
 
 Before closing Primary admission, the service marks `primaryClosePending: true` in `calls.json`. It restores saved delegation and source journals, reads uncertain request admission using the original request ID, and replays pending source captures with their original IDs, revision, text, and timestamp. Pending captures or unresolved question replies keep the Primary binding open.
 
-For an ended call with a terminal provider status and finalized transcript, an unknown submission can also receive a definitive admission check. The service first captures the exact original raw transcript as revision 1 and saves the API acknowledgement, including its revision row ID and body digest. Locally initialized `sourceRevision` and `capturedText` fields do not establish that capture occurred. Qualified later revisions are saved afterward.
+For an ended call with a terminal provider status and finalized transcript, an unknown submission can also receive a definitive admission check. The service first captures the exact original raw transcript as revision 1 and saves the API acknowledgement, including its revision row ID and body digest. Qualified later revisions are saved afterward.
 
 Once captures and replies are resolved, the service closes the same binding and saves `primaryClosed`. Closure prevents new admission on that call. It then sends the original submission body to the API's request reconciliation endpoint. An existing admission returns its saved run; if recovered under a canonical request ID, that ID is retained separately for result reads. The original request ID and body remain unchanged.
 
-A `not_admitted` outcome is saved only after its call, source, raw submission digest and stored transcript receipt match the API proof. This establishes that the closed call has no matching admitted request. The cause of an earlier HTTP 503 remains a separate question. The journal retains the original submission and error alongside this outcome, without creating a failed run or assistant answer. Closeout never repeats the original submit.
+A `not_admitted` outcome is saved only after its call, source, raw submission digest and stored transcript receipt match the API proof. This establishes that the closed call has no matching admitted request. The journal retains the original submission and error alongside this outcome, without creating a failed run or assistant answer. Closeout never repeats the original submit.
 
-A failed capture, close or reconciliation leaves `primaryClosePending` set. Maintenance resumes from saved acknowledgements every 10 seconds while the process accepts work, including records loaded after restart. Explicit `reconcile` also attempts closeout for terminal calls or a pending binding. Inspect `primaryClosePending` and `transcriptCapture` in `status`; an HTTP success from reconciliation can still carry pending work. An already-closed binding with missing transcript evidence remains a capture gap.
-
-Deploy the API capture receipts and request reconciliation endpoint before this consumer. Older capture receipts without `revisionRecordId` and `bodyDigest` cannot support a non-admission decision. The focused restart tests use the service and its disk journal with simulated API outcomes; a production recovery claim requires a retained execution record from that deployment.
+A failed capture, close or reconciliation leaves `primaryClosePending` set. Maintenance resumes from saved acknowledgements every 10 seconds while the process accepts work, including records loaded after restart. Explicit `reconcile` also attempts closeout for terminal calls or a pending binding. Inspect `primaryClosePending` and `transcriptCapture` in `status`; an HTTP success from reconciliation can still carry pending work.
 
 `transcriptCapture.state: complete` means no eligible journaled captures remain pending. Its `unsupported` field can still show omitted turns. Caller turns require acoustic completion evidence. Assistant capture requires confirmed playback and session finalization. Interrupted, discarded, or unconfirmed speech stays unqualified; it cannot become proof that the person heard a result.
-
-During a call, GPT-Live transcript deltas are observed fragments. The primary WebSocket has no assistant-turn completion event or audio-to-transcript identifier. Twilio marks acknowledge queued audio, so they cannot qualify a completed assistant transcript on their own. Passing immediate dialogue to Primary is a separate integration still under design; saved account messages do not include every intervening voice exchange.
 
 A call with status `unknown` and no provider SID needs operator investigation of the original dispatch. Preserve the request ID and journal, establish the provider outcome, and resolve that record before attempting another call. Generating a new request ID to bypass uncertainty risks a duplicate call. Do not delete the writer lock while its owning process is alive.
 
 Maintenance also reconciles inactive, unresolved calls older than 60 seconds by saved SID and ends a provider call that is still open. During shutdown the service drains HTTP requests, stops its active calls, and awaits closeout before releasing the journal lock. A forced exit leaves recovery evidence on disk for the next process.
 
-The API repository supplies `ops/nginx/dexter-api-loopback.conf`. Install that listener before pointing Broker at port 3033. It uses the public API's `dexter_api_backend` selector, so API deployment and rollback move both routes together. Application ports 3030, 3031 and 3032 belong to individual release slots.
+## Health
 
-`GET /broker/health` checks the configured Primary and Hark API origins before answering. It returns HTTP 503 when either origin is unavailable, reports an invalid health identity or serves a different release. Each probe has a two-second limit and reads at most 16 KiB; concurrent checks share one request and results remain cached for at most five seconds. A later health request retries after that cache expires. This checks API transport and release identity. Account authority, provider access and completed call quality require their own checks. Call admission continues to use its existing authority checks.
+`GET /broker/health` reports process readiness, model, revision (`BROKER_REVISION`), and active call count. It checks the configured Primary and Hark API origins before answering and returns HTTP 503 when either origin is unavailable, reports an invalid health identity, or serves a different release. Each probe has a two-second limit and reads at most 16 KiB; concurrent checks share one request and results are cached for at most five seconds. A successful response establishes HTTP reachability and API release identity. It does not establish provider credits, account authority, working audio, or a completed call.
+
+## Call journey report
+
+`npm run calls -- journey` builds a read-only timing report from the call journal:
+
+```sh
+npm run calls -- journey --journal /absolute/path/to/state/calls.json --log /absolute/path/to/broker.log
+```
+
+Add `--call-id <broker-call-uuid>` to select an earlier call. The JSON report joins admission and consumption times, media startup, provider readiness, first audio and carrier playback acknowledgment. It also shows each saved request's dispatch, answer availability and publication acceptance. Publication acceptance means the answer entered the voice session; the journal has no per-answer playback or individual tool spans. Missing timestamps remain null.
+
+The report reads at most 32 MiB of journal data and the final 8 MiB of the supplied log. Its coverage fields report truncation and omitted rows. It emits timing, status and broker request IDs, excluding phone numbers, transcripts, provider proofs and raw errors. It opens neither the writer lock nor a network connection.

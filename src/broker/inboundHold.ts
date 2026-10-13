@@ -1,7 +1,7 @@
 import Twilio from 'twilio';
 import type { BrokerStore } from './store.js';
 
-/** Explicit server construction option; production startup does not select it. */
+/** Inbound hold responses for the same-call attachment flow; startup selects this when BROKER_VERIFICATION_SETUP_MODEL is set. */
 export function createInboundHoldAdapter(options: { publicOrigin: string; store: Pick<BrokerStore, 'get'> }) {
   const origin = new URL(options.publicOrigin);
   if (origin.protocol !== 'https:' || origin.username || origin.password || origin.search || origin.hash

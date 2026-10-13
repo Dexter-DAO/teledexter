@@ -8,12 +8,10 @@ The journal saves the immutable signed callback body before delivery. A lost ack
 
 First Live readiness, first audio sent and first confirmed playback are also retained on the call. These observations separate voice startup from audio generation and playback. Delegation records retain submission timing for diagnosis.
 
-## Integration
+## Compatibility
 
-Apply the API's reviewed incoming-billing schema before activating the API writer. Upgrade Broker before the new API: the previous strict response parser rejects the optional billing reference. This Broker accepts responses from the old API and preserves their historical meaning.
+The broker accepts API responses with or without the optional billing reference. Once billing journals exist, retain a compatible reader during rollback.
 
-The existing journal remains at the configured state directory. Drain calls before replacement. Once new billing journals exist, retain a compatible reader during rollback or forward repair.
+## Tests
 
-The normal inbound HTTP/media suite and API PostgreSQL fixture exercise the connected path. The fixture in `tests/fixtures/inbound-billing-journey.ts` uses actual Broker routes, persistence and signed callbacks, with simulated provider/voice connections. It supports missing timing, terminal failures and acknowledgement loss. Root integration tests cover actual API admission, receipt SQL, history and concurrent outcome conflicts. Financial settlement is replaced by a local test ledger in that fixture.
-
-The complete Broker suite passes 1,533 tests with 11 optional tests skipped. These tests establish source behavior under the supplied inputs. A controlled telephone call still supplies the provider, listening and payment evidence.
+The fixture in `tests/fixtures/inbound-billing-journey.ts` uses actual Broker routes, persistence and signed callbacks, with simulated provider/voice connections. It supports missing timing, terminal failures and acknowledgement loss. Financial settlement is replaced by a local test ledger in that fixture.

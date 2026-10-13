@@ -1,8 +1,8 @@
 # Keep an incoming call connected during account approval
 
-This source adds an incoming-call attachment to Broker. A caller stays on the original telephone leg while the shared API waits for account approval. Once that approval is consumed, Broker obtains the person's Primary Dexter context and uses the existing voice conversation path.
+The incoming-call attachment keeps a caller on the original telephone leg while the Dexter API decides whether the call may attach to an account. Once that approval is consumed, the broker obtains the person's Primary Dexter context and uses the normal voice conversation path. Callers without a linked account are routed to the restricted phone-setup voice instead.
 
-The account approval surface is still awaiting a product choice. Production startup does not select the new adapter, and this change does not move the telephone number. Existing callback calls retain their saved behavior.
+`src/broker/main.ts` selects this adapter (`createInboundHoldAdapter`) when `BROKER_VERIFICATION_SETUP_MODEL` is set. Without it, incoming calls receive the press-1 callback offer described in [BROKER_OPERATIONS.md](BROKER_OPERATIONS.md#incoming-calls).
 
 ## Integration
 
@@ -39,8 +39,6 @@ Voice finalization, completed transcript capture, accepted request recovery and 
 
 The provider leg, media playback, transcript capture, account binding and financial results have separate evidence. This adapter creates no grant and submits no task merely because approval or a binding exists.
 
-## Qualification
+## Tests
 
-Focused tests cover the original signed incoming leg through waiting, approval, media startup and closure. They exercise lost begin and consume replies, cancellation races, authority loss, fixed deadlines, restart, shutdown, stale callbacks and compatibility with existing calls. HTTP and WebSocket tests use local provider doubles; they establish Broker behavior under those inputs.
-
-Public approval UX, combined shared-API qualification, deployment and an actual incoming telephone conversation remain separate acceptance steps.
+Focused tests cover the original signed incoming leg through waiting, approval, media startup and closure. They exercise lost begin and consume replies, cancellation races, authority loss, fixed deadlines, restart, shutdown, stale callbacks and compatibility with existing calls. HTTP and WebSocket tests use local provider doubles; they establish broker behavior under those inputs.

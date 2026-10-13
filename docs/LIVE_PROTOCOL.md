@@ -18,4 +18,4 @@ SDK-typed fixtures in `tests/live-session.test.ts` participate in normal `npm ru
 
 `scripts/qualify-live-phone.mts` accepts `--module-root`, `--module-variant src|dist`, a new `--evidence-dir` outside the repository, and `--config-file`. Optional `--input-audio` takes raw 8 kHz PCMU; use the neutral request "Please ask Primary for my test phrase."
 
-Qualification uses actual Live preflight/audio/transcripts with simulated Twilio callbacks, playback receipts, and Primary. The dummy result is "Your test phrase is blue lantern." Check greeting before caller speech, complete submitted request, spoken result, and finalization. This exercises the SDK and Broker media path; carrier delivery and production account behavior require separate evidence.
+Qualification uses actual Live preflight/audio/transcripts with simulated Twilio callbacks, playback receipts, and Primary. The dummy result is "Your test phrase is blue lantern." Check greeting before caller speech, complete submitted request, spoken result, and finalization. This exercises the SDK and broker media path without a telephone carrier or a real account.
