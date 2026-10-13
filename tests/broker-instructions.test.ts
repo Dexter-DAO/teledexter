@@ -16,7 +16,7 @@ test('call direction and purpose guide the opening while account text stays in h
 });
 
 test('the observed repair brief stays assigned to Dexter and is absent from the speech command', () => {
-  const purpose = 'Verify the account request repair with Branch: answer one current portfolio question through Primary Dexter, then discuss his feedback. Explain any returned failure plainly.';
+  const purpose = 'Verify the account request repair with Avery Example: answer one current portfolio question through Primary Dexter, then discuss his feedback. Explain any returned failure plainly.';
   const instructions = brokerInstructions({ direction: 'outbound', purpose });
   const opening = brokerOpening('outbound');
   assert.ok(instructions.includes(`Internal call brief (an assignment for you): ${JSON.stringify(purpose)}`));
@@ -25,7 +25,7 @@ test('the observed repair brief stays assigned to Dexter and is absent from the 
   assert.match(instructions, /brief is planning information, never evidence of an account problem/);
   assert.match(instructions, /failure only when the returned result says it failed/);
   assert.equal(instructions.split(purpose).length - 1, 1);
-  assert.doesNotMatch(opening, /verify|portfolio|Primary|Branch/);
+  assert.doesNotMatch(opening, /verify|portfolio|Primary|Avery/);
   assert.match(opening, /task you will do for the person/);
   assert.match(opening, /Invite their question or response.*pause to listen/);
 });

@@ -44,7 +44,7 @@ async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; 
       if (overrides.assignmentParser) assert.deepEqual(overrides.assignmentParser.parse(assignment), assignment);
       assert.equal(broker.store.bySid(sid)?.voiceOpening, undefined);
       return { bindingId, callSid: sid, state: 'open',
-        ...(assignment && overrides.assignmentResponse !== 'missing' ? { callAssignmentRef: { assignmentId: overrides.assignmentResponse === 'wrong' ? randomUUID() : assignment.assignmentId, revision: 1, digest: 'a'.repeat(64) } } : {}), context: { primaryDexterId, threadId, displayName: 'Branch', messages: overrides.history ?? [] } };
+        ...(assignment && overrides.assignmentResponse !== 'missing' ? { callAssignmentRef: { assignmentId: overrides.assignmentResponse === 'wrong' ? randomUUID() : assignment.assignmentId, revision: 1, digest: 'a'.repeat(64) } } : {}), context: { primaryDexterId, threadId, displayName: 'Avery Example', messages: overrides.history ?? [] } };
     },
     async close() { calls.close++; return { bindingId, callSid: sid, state: 'closed' }; },
   } as unknown as PrimaryApiClient;
@@ -274,7 +274,7 @@ test('signed inbound call offers callback without account reads, voice preflight
 
 test('signed outbound answer preserves the repair brief and speaks its role-aware opening only after Live is ready', async t => {
   const f = await fixture(t, { deferVoiceReady: true, history: historicalAccountMessages });
-  const purpose = 'Verify the account request repair with Branch: answer one current portfolio question through Primary Dexter, then discuss his feedback. Explain any returned failure plainly.';
+  const purpose = 'Verify the account request repair with Avery Example: answer one current portfolio question through Primary Dexter, then discuss his feedback. Explain any returned failure plainly.';
   assert.equal((await f.post('/internal/broker/calls', { requestId: randomUUID(), purpose })).status, 201);
   const call = f.broker.store.list()[0];
   const params = { AccountSid: f.config.twilioAccountSid, CallSid: f.sid, From: f.config.from, To: f.config.allowedTo[0], Direction: 'outbound-api', CallStatus: 'in-progress' };
@@ -300,7 +300,7 @@ test('signed outbound answer preserves the repair brief and speaks its role-awar
   f.readyVoice();
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(f.openingCommands, [brokerOpening('outbound', true)]);
-  assert.doesNotMatch(f.openingCommands[0], /verify|Primary|Branch/);
+  assert.doesNotMatch(f.openingCommands[0], /verify|Primary|Avery/);
   assert.match(f.voiceOptions()!.instructions, /called the person/);
   assert.ok(f.voiceOptions()!.instructions.includes(`Internal call brief (an assignment for you): ${JSON.stringify(purpose)}`));
   assert.equal(f.broker.store.get(call.id)!.purpose, purpose);

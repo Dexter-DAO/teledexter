@@ -90,7 +90,7 @@ async function fixture(t: test.TestContext) {
       if (contextError) throw contextError;
       if (!contextAllowed) throw new Error('authority_unavailable');
       return { bindingId, callSid: params.CallSid, state: 'open' as const,
-        context: { primaryDexterId, threadId, displayName: 'Branch', messages: [] } };
+        context: { primaryDexterId, threadId, displayName: 'Avery Example', messages: [] } };
     },
     async closeInbound(id: string, input: { begin: InboundBeginIdentity; approvalRef: typeof approvalRef; bindingId: string }) {
       counts.close++; assert.equal(id, attachmentId); assert.deepEqual(input.begin, beginIdentity);

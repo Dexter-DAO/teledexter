@@ -124,7 +124,7 @@ async function fixture(t: test.TestContext, overrides: { ambiguousDial?: boolean
       return { bindingId, callSid: sid, state: 'open',
         ...(assignment ? { callAssignmentRef: { assignmentId: overrides.mismatchedAssignmentRef ? randomUUID() : assignment.assignmentId,
           revision: 1, digest: 'a'.repeat(64) } } : {}),
-        context: { primaryDexterId: randomUUID(), threadId: randomUUID(), displayName: 'Branch', messages: [] } };
+        context: { primaryDexterId: randomUUID(), threadId: randomUUID(), displayName: 'Avery Example', messages: [] } };
     },
     async submit(binding: string, requestId: string, input: PrimarySubmission) {
       const disk = JSON.parse(fs.readFileSync(path.join(directory, 'calls.json'), 'utf8')) as { calls: Record<string, BrokerCall> };
@@ -579,7 +579,7 @@ test('actual retained API notificationVoice producer crosses Broker admission an
 
 function producerInput(f: Awaited<ReturnType<typeof fixture>>) {
   const snapshot = f.resolved.callAssignment.hark;
-  return { to: f.resolved.to, recipientName: 'Branch', title: 'Watched market movement',
+  return { to: f.resolved.to, recipientName: 'Avery Example', title: 'Watched market movement',
     message: 'Incoming source explanation, not an owner command.', priority: 'high', tags: ['stock'],
     observedAt: snapshot.event.observedAt,
     metadata: { eventId: `hark:${snapshot.deliveryId}`, destinationId: snapshot.destinationId,

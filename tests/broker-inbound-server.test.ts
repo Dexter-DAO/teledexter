@@ -314,7 +314,7 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
   const billing = options.billing ? { version: 1 as const, bindingId, callSid: params.CallSid, termsDigest: 'f'.repeat(64) } : undefined;
   if (options.billingUrl) { config.harkApiBaseUrl = options.billingUrl; config.harkCallbackSigningSecret = 'b'.repeat(40); }
   const eligiblePage: EligiblePhoneCall = { billing, bindingId, callSid: params.CallSid, state: 'open', context: {
-    primaryDexterId, threadId, displayName: 'Branch', messages: [{ id: randomUUID(), role: 'user', text: 'The earlier caller request.',
+    primaryDexterId, threadId, displayName: 'Avery Example', messages: [{ id: randomUUID(), role: 'user', text: 'The earlier caller request.',
       eventSequence: '1', provenance: { messageCreatedAt: '2026-09-26T12:00:00.000Z', eventId: randomUUID(),
         eventOccurredAt: '2026-09-26T12:00:00.000Z', runId: randomUUID() } }], history: {
       version: { ownerPrincipalId: randomUUID(), primaryDexterId, threadId, contextEpoch: '1', threadEventSequence: '2', digest: 'a'.repeat(64) },
@@ -342,7 +342,7 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
     if (!authority) throw new Error('authority_unavailable');
     if (options.eligible) return structuredClone(eligiblePage);
     return { billing, bindingId, callSid: params.CallSid, state: 'open' as const,
-      context: { primaryDexterId, threadId, displayName: 'Branch', messages: [] } };
+      context: { primaryDexterId, threadId, displayName: 'Avery Example', messages: [] } };
   };
   const primary = {
     async beginInbound(begin: InboundBeginIdentity) {
