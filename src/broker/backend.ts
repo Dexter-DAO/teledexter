@@ -344,7 +344,7 @@ const storeWorkers = new WeakMap<object, Map<string, Promise<void>>>();
 // reservations without changing its admission or transcript journal.
 const storeNotices = new WeakMap<object, Map<string, {
   submitAnnounced: boolean; progressCount: number; lastAt: number; inFlight: boolean;
-  stateKey?: string; attempt?: number; deferred?: boolean; uncertainKey?: string; wake?: () => void;
+  stateKey?: string; attempt?: number; deferred?: boolean; uncertainKey?: string; wake?: () => void; spokenText?: string;
 }>>();
 
 /** Timestamp grouping is application presentation state, not a provider turn-complete event. */
@@ -1679,18 +1679,19 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
               if (lastSpeech !== undefined && now() - lastSpeech < stabilityMs) return;
               const stateKey = JSON.stringify([pendingRequestState(current), revision]);
               const changed = notice!.stateKey !== undefined && notice!.stateKey !== stateKey;
-              const queued = current.deferredTurns?.some(turn => turn.status === 'queued') === true;
-              const urgent = (changed || notice!.stateKey === undefined) && (queued || current.resultReadUnavailable
-                || revision !== reviewedRevision);
+              const text = pendingRequestSpeech(current, revision !== reviewedRevision);
+              // Caller speech and queued turns are not news for the caller; only an unreadable status is.
+              const urgent = (changed || notice!.stateKey === undefined) && current.resultReadUnavailable === true;
               const announceSubmit = immediate && current.status === 'dispatch_unknown' && !notice!.submitAnnounced;
               const retryAfter = notice!.deferred ? Math.min(progressIntervalMs, 1000) : progressIntervalMs;
               if (notice!.uncertainKey === stateKey) return; // An unknown append is not authority to speak it again.
               if (!announceSubmit && !urgent && (immediate || now() - notice!.lastAt < retryAfter)) return;
               if (!options.watchUntilCallEnds && now() >= deadline) return;
-              if (changed) { notice!.progressCount = 0; notice!.deferred = false; }
-              if (notice!.progressCount >= 4) return;
+              if (changed) notice!.deferred = false;
+              // Speak each distinct status line once; repeated waiting lines only interrupt the caller.
+              if (text !== notice!.spokenText) notice!.progressCount = 0;
+              if (notice!.progressCount >= 1) return;
               notice!.stateKey = stateKey;
-              const text = pendingRequestSpeech(current, revision !== reviewedRevision);
               notice!.lastAt = now();
               notice!.inFlight = true;
               const attempt = notice!.attempt = (notice!.attempt ?? 0) + 1;
@@ -1702,6 +1703,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
                   if (delivery.status === 'accepted') {
                     if (announceSubmit) notice!.submitAnnounced = true;
                     else notice!.progressCount++;
+                    notice!.spokenText = text;
                     notice!.deferred = false;
                   } else if (delivery.status === 'unconfirmed') notice!.uncertainKey = stateKey;
                   else notice!.deferred = delivery.status === 'stale' || delivery.status === 'rejected';

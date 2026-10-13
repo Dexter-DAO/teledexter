@@ -59,7 +59,7 @@ test('an accepted answer advances its own task presentation source but an unacce
 test('only a fixed local pending notice can use content-equivalent status context', () => {
   const { entry } = fixture();
   const update = { id: 'request_a_1_pending_1', kind: 'progress' as const, speak: true,
-    text: 'Your request is still being handled. I am waiting for its result.' };
+    text: 'Still working on it.' };
   assert.equal(isFixedPendingStatus(entry, update), true);
   assert.equal(isFixedPendingStatus(entry, { ...update, text: 'Buying five dollars of Apple.' }), false);
   assert.equal(isFixedPendingStatus(entry, { ...update, kind: 'result' }), false);
@@ -82,19 +82,24 @@ test('late transcript correction cannot move the original task past new caller s
   assert.equal(hasLaterCallerSpeech(f.call, f.entry), true);
 });
 
-test('fixed status must agree with the current queued and unavailable observation', () => {
+test('fixed status must agree with the current unavailable observation and never speaks queue mechanics', () => {
   const { entry } = fixture(); entry.resultReadUnavailable = true;
-  const old = { id: 'request_a_pending_1', kind: 'progress' as const,
-    text: 'Your request is still being handled. I am waiting for its result.' };
+  const old = { id: 'request_a_pending_1', kind: 'progress' as const, text: 'Still working on it.' };
+  const unavailable = "I can't confirm how that's going yet, so I don't know the outcome.";
   assert.equal(isFixedPendingStatus(entry, old), false);
-  assert.equal(isFixedPendingStatus(entry, { ...old,
-    text: 'I cannot get the latest status of your request. Its outcome is still unconfirmed.' }), true);
+  assert.equal(isFixedPendingStatus(entry, { ...old, text: unavailable }), true);
   entry.deferredTurns = [{ status: 'queued', sourceEventId: 'new_buy' }] as BrokerDelegationRecord['deferredTurns'];
-  assert.equal(isFixedPendingStatus(entry, { ...old,
-    text: 'I cannot get the latest status of the earlier request. Your later requests are queued and have not started.' }), true);
+  assert.equal(isFixedPendingStatus(entry, { ...old, text: unavailable }), true, 'a queued turn adds nothing to the spoken status');
   entry.resultReadUnavailable = false;
-  assert.equal(isFixedPendingStatus(entry, { ...old,
-    text: 'Your later requests are queued behind the earlier request. They have not started.' }), true);
+  assert.equal(isFixedPendingStatus(entry, old), true);
+  for (const status of ['prepared', 'dispatching', 'dispatch_unknown', 'queued', 'running'] as const) {
+    entry.status = status;
+    for (const unread of [true, false]) {
+      entry.resultReadUnavailable = unread;
+      for (const earlier of [true, false])
+        assert.doesNotMatch(pendingRequestSpeech(entry, earlier), /queued|follow-up|later request|not started|waiting/i);
+    }
+  }
 });
 
 

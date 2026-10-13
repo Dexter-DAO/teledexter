@@ -95,12 +95,9 @@ export function requestFailureSpeech(entry: BrokerDelegationRecord): string | un
   return 'The AI response failed before I could finish explaining this request.';
 }
 
+/** Spoken pending status. Queue state stays internal; the caller hears one plain line. */
 export function pendingRequestSpeech(entry: BrokerDelegationRecord, earlier: boolean): string {
-  const queued = entry.deferredTurns?.some(turn => turn.status === 'queued');
-  if (entry.resultReadUnavailable) return queued
-    ? 'I cannot get the latest status of the earlier request. Your later requests are queued and have not started.'
-    : 'I cannot get the latest status of your request. Its outcome is still unconfirmed.';
-  if (queued) return 'Your later requests are queued behind the earlier request. They have not started.';
+  if (entry.resultReadUnavailable) return "I can't confirm how that's going yet, so I don't know the outcome.";
   const failure = requestFailureSpeech(entry);
   if (failure) return failure;
   if (['prepared', 'dispatching', 'dispatch_unknown'].includes(entry.status)) {
@@ -109,8 +106,7 @@ export function pendingRequestSpeech(entry: BrokerDelegationRecord, earlier: boo
     return earlier ? 'I am still checking whether your earlier request was saved.'
       : 'I have not confirmed whether your request was saved. I am checking the original request.';
   }
-  return earlier ? 'I am still waiting for the result of your earlier request.'
-    : 'Your request is still being handled. I am waiting for its result.';
+  return 'Still working on it.';
 }
 
 export function isFixedPendingStatus(entry: BrokerDelegationRecord, update?: LiveBackendUpdate): boolean {

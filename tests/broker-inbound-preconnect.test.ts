@@ -75,3 +75,68 @@ test('synchronous connector failure retains one failed initial slot without reco
   assert.throws(() => manager.factory(c)!(), /inbound_preconnect_unavailable/);
   assert.equal(attempts, 1); manager.close();
 });
+
+function outboundCall() {
+  return { id: '55555555-5555-4555-8555-555555555555', callSid: 'CA' + '2'.repeat(32), direction: 'outbound' } as unknown as BrokerCall;
+}
+function bindOutbound(c: BrokerCall) {
+  c.primary = { bindingId: '66666666-6666-4666-8666-666666666666' } as BrokerCall['primary'];
+  c.mediaStartedAt = new Date().toISOString(); return c;
+}
+
+test('outbound answer warms only the socket; a bound call adopts it and session.start is the first command', async () => {
+  const transport = new PreconnectTransport(), c = outboundCall(); let connects = 0;
+  const timings: InboundTransportTiming[] = [];
+  const manager = createInboundPreconnect(() => { connects++; return transport; }, event => timings.push(event));
+  manager.beginOutbound(c); transport.open();
+  assert.deepEqual(transport.sent, [], 'no session, instructions, history or audio before binding and media');
+  bindOutbound(c);
+  const live = session(c, manager.factory(c)! as () => PreconnectTransport);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(transport.sent[0]?.type, 'session.start');
+  assert.equal(connects, 1);
+  assert.deepEqual(timings.map(event => event.stage), ['connecting', 'open', 'adopted']);
+  await live.close(); manager.close();
+});
+
+for (const state of ['unbound', 'no_media', 'ended', 'inbound', 'callSid'] as const) test(`outbound adoption with ${state} discards the warm socket and connects fresh`, () => {
+  const warm = new PreconnectTransport(), fresh = new PreconnectTransport(), c = outboundCall();
+  let connects = 0;
+  const manager = createInboundPreconnect(() => (++connects === 1 ? warm : fresh));
+  manager.beginOutbound(c); bindOutbound(c);
+  if (state === 'unbound') c.primary = undefined;
+  if (state === 'no_media') c.mediaStartedAt = undefined;
+  if (state === 'ended') c.endedAt = new Date().toISOString();
+  if (state === 'inbound') (c as { direction: string }).direction = 'inbound';
+  if (state === 'callSid') c.callSid = 'CA' + '3'.repeat(32);
+  if (state === 'inbound') assert.throws(() => manager.factory(c)!(), /inbound_preconnect_unavailable/);
+  else assert.equal(manager.factory(c)!(), fresh);
+  assert.deepEqual(warm.sent, []); assert.equal(warm.terminated, 1); manager.close();
+});
+
+test('outbound warm socket is closed at its TTL when media never starts; an expired slot falls back to a normal connect', t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
+  const transport = new PreconnectTransport(), c = outboundCall();
+  const manager = createInboundPreconnect(() => transport, undefined, 20_000);
+  manager.beginOutbound(c); transport.open();
+  t.mock.timers.tick(19_999); assert.equal(transport.terminated, 0);
+  t.mock.timers.tick(1); assert.equal(transport.terminated, 1);
+  assert.deepEqual(transport.sent, []);
+  bindOutbound(c);
+  assert.equal(manager.factory(c), undefined, 'the session uses its own connector');
+  manager.close();
+});
+
+test('outbound warm socket that closes early is never adopted and binding failure cleanup terminates it', () => {
+  const closedEarly = new PreconnectTransport(), c = outboundCall();
+  const manager = createInboundPreconnect(() => closedEarly);
+  manager.beginOutbound(c); closedEarly.open(); closedEarly.fail();
+  assert.equal(closedEarly.terminated, 1); bindOutbound(c);
+  assert.equal(manager.factory(c), undefined, 'a failed warm socket is never adopted; the session connects normally');
+  assert.deepEqual(closedEarly.sent, []);
+  const other = new PreconnectTransport(), d = { ...outboundCall(), id: '77777777-7777-4777-8777-777777777777' } as BrokerCall;
+  const second = createInboundPreconnect(() => other);
+  second.beginOutbound(d); other.open(); second.forget(d.id);
+  assert.equal(other.terminated, 1); assert.deepEqual(other.sent, []);
+  manager.close(); second.close();
+});
