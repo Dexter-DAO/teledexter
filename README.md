@@ -1,32 +1,157 @@
-# Dexter Broker
+# Teledexter
 
-Dexter Broker is the Stocklana project for a personal stock broker you can call, and that calls you when a saved watch condition occurs. GPT-Live handles the voice conversation; Primary Dexter, the continuing agent attached to your account, handles research and account requests through OpenDexter and your existing permissions.
+Teledexter is a phone line to your own Dexter, an AI agent attached to your account. You call Dexter, or Dexter calls you when a saved watch fires or a call is arranged. On the call it can read your portfolio, research, and buy or sell Solana tokens and tokenized stocks under permissions you set in advance, and it can text you the result after you hang up. This repository is the voice broker that runs those calls. The service and its process are named `dexter-broker`.
 
-The product covers stock research, portfolio discussion, Buy and Sell instructions, watch alerts and saved results you can reopen. Portfolio answers start with the useful summary, with details available on request. Dexter can ask a question while handling a request and keep your reply attached to that work. Calls and completed conversation turns are saved with the requests they produced.
+## How it works
 
-This repository contains the voice transport, Twilio calling, and the connection to Primary. It builds on Dexter Phone. The main implementation lives in [src/broker](src/broker) and [src/live](src/live); account execution lives in the shared Dexter API.
+```
+  Caller (phone)
+      ^
+      |  PSTN
+      v
+  Twilio Programmable Voice + Media Streams (8 kHz PCMU over WebSocket)
+      ^
+      |  signed webhooks, media WebSocket
+      v
+  Teledexter broker (this repo) <---- WebSocket ----> OpenAI GPT-Live (gpt-live-1)
+      |                                               conversation and delegation
+      |  HTTP(S), service-authenticated requests
+      v
+  Dexter API (private) --> Primary Dexter agent --> OpenDexter tools --> Solana
+```
 
-As of 24 September, arranged outbound calls have connected callers to Primary and returned spoken answers. Earlier trials exposed stale portfolio answers, long waits and a lost follow-up. The shared portfolio tools now return current prices and daily changes, with summary and detail views. The full conversation still needs to demonstrate dependable research, current account answers, authorized Buy and Sell, and useful follow-ups together.
+GPT-Live holds the spoken conversation. When the caller asks for something that needs their account, GPT-Live emits a delegation. The broker turns the caller's completed words into a request, saves it, and submits it to Primary Dexter through the Dexter API. It then watches the request, relays any question Primary asks, and hands the result back to GPT-Live to speak at a quiet moment in the conversation.
 
-The saved-watch call adapter and its API integration are deployed. Connecting the existing watch service to this adapter, configuring the demonstration's stock watch and verifying its source evaluation and useful call remain delivery work. See [watch calls](docs/HARK.md) for the integration details.
+## What is in this repository
 
-The existing telephone number still reaches legacy Dexter Phone. The new incoming-call implementation keeps the caller on the same call while account access is approved; its public approval experience and release remain pending. Saved-work web pages, later-call replies and voice-session refresh are also being completed. These are part of the product, along with the recorded demonstration and Stocklana submission. Core conversation continuity and saved work remain required; richer long-term recall is optional for the hackathon.
+| Path | Contents |
+| --- | --- |
+| `src/broker/` | HTTP server, Twilio webhooks and media, call journal, Primary request delivery and recovery, inbound attachment, saved-watch and notification calls, result SMS |
+| `src/live/` | GPT-Live WebSocket session and the restricted phone-setup tools |
+| `src/outbound/` | Request signing, canonical JSON, durable file writes, Twilio webhook validation, callback outbox |
+| `src/sms/` | SMS enrollment, consent ledger and sending (optional) |
+| `scripts/broker.mts` | Operator CLI: `status`, `preflight`, `call`, `end`, `reconcile` |
+| `scripts/qualify-live-phone.mts` | Runs the broker against real GPT-Live with simulated Twilio and Primary |
+| `scripts/calls.mjs` | Read-only call journey timing report |
+| `deploy/` | PM2 configuration and an nginx location snippet |
+| `docs/` | Operator and protocol reference |
 
-For development, use Node.js 22 and npm:
+Not in this repository: the Dexter API, Primary Dexter, the OpenDexter tools, account authority, the wallet vault, and all Solana transaction building, signing and execution. The broker holds no keys and never signs or submits a transaction. It forwards what the caller said and relays what Primary returns; Primary acts under the permissions the account owner granted in Dexter.
+
+## Design points
+
+- **Durable call journal with a single writer.** Calls, requests, transcript captures and delivery receipts are written to `calls.json` in `BROKER_STATE_DIR`. The store takes an exclusive `writer.lock` at startup, so two broker processes cannot write the same journal. Work is recovered from the journal after a restart.
+- **Idempotent request IDs.** An operator call is created with a caller-chosen UUID; repeating it returns the saved call instead of dialing again. Requests to Primary use IDs derived from the call, voice session and delegation, saved before submission. After a lost reply the broker reconciles by that ID and never repeats the original submit.
+- **Interjections while work is pending.** If the caller asks for something else while a request is running, the new request is saved and queued behind it. A completed result survives later interruptions and is spoken at the next quiet boundary.
+- **Results survive hangup.** Hanging up ends the voice session but does not cancel work Primary already accepted. Closeout recovers uncertain submissions and keeps the binding open until transcript captures and question replies are resolved. A result the caller asked to receive by text can be sent after the call ends (`POST /internal/broker/result-sms`), to the verified number of an opted-in caller.
+- **Signed webhooks and caller possession.** Every Twilio webhook and media WebSocket is checked against the Twilio signature for its exact URL. Caller ID alone never opens an account: incoming calls are admitted by the Dexter API through the same-call attachment flow, or, in callback mode, the broker confirms the call with a fresh Twilio read and calls the saved number back.
+- **Audio preflight before dialing.** Before dialing an account call (operator-arranged, callback, saved-watch or notification), the broker checks account readiness with the API and opens a short GPT-Live session that must produce real output audio. If either fails, no call is placed. Phone-setup verification callbacks are dialed only under a permit issued by the Dexter API.
+
+## Running it
+
+Requires Node.js 22 (the test script relies on Node 22's `--test` glob expansion).
 
 ```sh
 npm ci
-cp .env.example .env
+cp .env.example .env     # fill in the required values
+npm run dev              # tsx watch src/broker/main.ts
 ```
 
-Configure Twilio, GPT-Live access, and the Dexter API connection using the [configuration reference](docs/BROKER_OPERATIONS.md#configuration). Set `BROKER_STATE_DIR` to a private absolute directory outside the checkout; it holds call records and transcripts.
+Compiled:
+
+```sh
+npm run build            # emits dist/
+npm start                # node dist/broker/main.js
+```
+
+The broker listens on `BROKER_HOST:BROKER_PORT` (default `127.0.0.1:3213`) and serves Twilio under `/broker/`. Expose it through an HTTPS reverse proxy at `BROKER_PUBLIC_ORIGIN` (see `deploy/nginx-broker.conf`), point the Twilio number's voice webhook at `/broker/incoming-call` and its status callback at `/broker/status`. A working call also needs a reachable Dexter API that accepts the broker's `PHONE_SERVICE_SECRET`.
+
+Operator CLI (talks to the running broker on loopback):
+
+```sh
+npm run broker -- status
+npm run broker -- preflight     # one short GPT-Live session; consumes provider credits
+npm run broker -- call --request-id <uuid> --purpose "<why Dexter is calling>" --receipt <new-file>
+```
+
+`call` dials a real telephone. See [docs/BROKER_OPERATIONS.md](docs/BROKER_OPERATIONS.md) for deployment, incoming-call modes, recovery and the health endpoint.
+
+## Configuration
+
+`src/broker/main.ts` loads the file named by `BROKER_ENV_FILE` (default `.env`); values already in the process environment take precedence.
+
+Required:
+
+| Variable | Meaning |
+| --- | --- |
+| `BROKER_PUBLIC_ORIGIN` | HTTPS origin Twilio reaches the broker at, with no path |
+| `BROKER_STATE_DIR` | Absolute directory outside the source tree for the call journal |
+| `BROKER_CONTROL_TOKEN` | At least 32 characters; bearer token for the operator routes |
+| `OPENAI_API_KEY` | OpenAI key with GPT-Live access |
+| `TWILIO_ACCOUNT_SID` | Twilio account that owns the phone number |
+| `TWILIO_AUTH_TOKEN` | Twilio auth token; also validates webhook signatures |
+| `TWILIO_PHONE_NUMBER` | E.164 number the broker calls from and answers on |
+| `DEXTER_API_URL` | Dexter API origin; plain HTTP is accepted only for loopback |
+| `PHONE_SERVICE_SECRET` | At least 32 characters; shared with the Dexter API to authenticate broker requests |
+
+Optional:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `BROKER_ENV_FILE` | `.env` | Environment file loaded at startup and by the CLI |
+| `BROKER_HOST` | `127.0.0.1` | Listen address |
+| `BROKER_PORT` | `3213` | Listen port (1024-65535) |
+| `BROKER_LIVE_MODEL` | `gpt-live-1` | GPT-Live model |
+| `BROKER_LIVE_VOICE` | `marin` | GPT-Live voice |
+| `BROKER_MAX_CALL_SECONDS` | `1800` | Call length limit (30-14400) |
+| `BROKER_ALLOWED_TO` | empty | Comma-separated E.164 numbers that operator and callback calls may dial; must not include `TWILIO_PHONE_NUMBER`. With one entry, the CLI uses it by default |
+| `BROKER_REVISION` | `development` | Release identifier reported by `GET /broker/health` |
+| `BROKER_VERIFICATION_SETUP_MODEL` | empty | GPT-Live model for the restricted phone-setup voice. Setting it enables same-call incoming attachment; empty selects the press-1 callback offer. Requires a loopback HTTP API origin and `HARK_PHONE_CALLBACK_SIGNING_SECRET` |
+| `BROKER_HARK_API_URL` | empty | Loopback HTTP origin of the Dexter API; enables calls from saved watches and notifications. Requires `HARK_PHONE_CALLBACK_SIGNING_SECRET` and `DEXTER_INTERNAL_TOKEN` |
+| `HARK_PHONE_CALLBACK_SIGNING_SECRET` | empty | At least 32 characters; signs callbacks to the Dexter API for watch calls and phone setup |
+| `DEXTER_INTERNAL_TOKEN` | empty | Authenticates the notification producer on `POST /internal/outbound-alerts` (at most 4096 bytes) |
+| `OUTBOUND_ALERT_SIGNING_SECRET` | empty | Read only to ensure `HARK_PHONE_CALLBACK_SIGNING_SECRET` is a different key |
+
+SMS (off unless at least one `DEXTER_SMS_*` variable is set; see [docs/sms.md](docs/sms.md)):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `DEXTER_SMS_STATE_PATH` | none | Absolute path to the SMS ledger, outside the release directory and temporary directories |
+| `DEXTER_SMS_INTERNAL_SECRET` | none | At least 32 characters; authenticates the enrollment proxy |
+| `DEXTER_PHONE_PUBLIC_URL` | none | HTTPS origin for SMS webhooks and links |
+| `TWILIO_VERIFY_SID` | none | Twilio Verify service SID (`VA...`) used for enrollment codes |
+| `TWILIO_VERIFY_ACCOUNT_SID` | `TWILIO_ACCOUNT_SID` | Account for Twilio Verify |
+| `TWILIO_VERIFY_AUTH_TOKEN` | `TWILIO_AUTH_TOKEN` | Auth token for Twilio Verify |
+| `TWILIO_MESSAGING_SERVICE_SID` | empty | Messaging service used to send |
+| `DEXTER_SMS_ENROLLMENT_ENABLED` | `false` | Accept web enrollment |
+| `DEXTER_SMS_SEND_ENABLED` | `false` | Allow sending |
+| `DEXTER_SMS_CAMPAIGN_APPROVED` | `false` | Operator assertion that the messaging campaign is approved |
+| `DEXTER_SMS_ADVANCED_OPT_OUT_CONFIGURED` | `false` | Operator assertion that Twilio Advanced Opt Out is configured |
+| `DEXTER_SMS_CONSENT_RETENTION_DAYS` | `1461` | Consent record retention |
+| `DEXTER_SMS_MESSAGE_RETENTION_DAYS` | `90` | Message record retention |
+| `TWILIO_VALIDATE_WEBHOOKS` | `true` | Setting `false` disables SMS sending |
+
+## Tests
 
 ```sh
 npm run typecheck
 npm test
-npm run dev
 ```
 
-For a compiled build, run `npm run build` followed by `npm start`. The inherited Phone entrypoint is available through `npm run start:legacy`.
+Tests use Node's built-in runner through `tsx`, with local HTTP servers and simulated Twilio, GPT-Live and Dexter API peers. They place no calls and need no credentials. The SMS tests create a temporary ledger under `~/.local/state`, because the ledger validator refuses temporary directories.
 
-The [operations guide](docs/BROKER_OPERATIONS.md) covers deployment and call recovery. Its [controlled call procedure](docs/BROKER_OPERATIONS.md#controlled-call) explains the operator CLI; preflight consumes provider credits, and the call command dials a telephone. Use the [demo procedure](docs/DEMO.md) to verify audible conversation and account results together.
+`scripts/qualify-live-phone.mts` runs the broker against real GPT-Live with simulated telephony and account results; it needs an OpenAI key and consumes credits. See [docs/LIVE_PROTOCOL.md](docs/LIVE_PROTOCOL.md).
+
+## Documentation
+
+- [docs/BROKER_OPERATIONS.md](docs/BROKER_OPERATIONS.md): deployment, incoming calls, controlled calls, recovery, health
+- [docs/inbound-call-attachments.md](docs/inbound-call-attachments.md): keeping an incoming caller on the line during account admission
+- [docs/HARK.md](docs/HARK.md) and [docs/NOTIFICATIONS.md](docs/NOTIFICATIONS.md): calls from saved watches and notifications
+- [docs/PHONE_RESULT_CONTINUITY.md](docs/PHONE_RESULT_CONTINUITY.md): partial results, provider pauses and voice replacement
+- [docs/INBOUND_BILLING.md](docs/INBOUND_BILLING.md): incoming call outcomes and billing evidence
+- [docs/LIVE_PROTOCOL.md](docs/LIVE_PROTOCOL.md): GPT-Live event contract
+- [docs/sms.md](docs/sms.md): SMS enrollment, consent and result texts
+
+## License
+
+[MIT](LICENSE)
