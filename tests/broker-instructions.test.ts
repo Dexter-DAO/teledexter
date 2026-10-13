@@ -153,8 +153,30 @@ test('capability and conversational questions are answered by voice without dele
     assert.match(instructions, /Refer only to requests the caller actually made during this call/);
     assert.match(instructions, /A repeat of the request already pending is not a new task/);
   }
-  for (const capability of ['portfolio', 'wallet history', 'tokenized stocks', 'buys and sells under the permissions you already set', 'watches', 'text you'])
+  for (const capability of ['portfolio', 'wallet history', 'tokenized stocks', 'buy and sell for you under the permissions you\'ve set',
+    'paid data services', 'price or market-cap watches'])
     assert.ok(DEXTER_CAPABILITIES.includes(capability), capability);
+});
+
+test('call 039b39cd: the capability answer is two short sentences from the list only, with no history or limitations', () => {
+  // SMS delivery is disabled in production, and the list states only what Primary's tools do.
+  assert.doesNotMatch(DEXTER_CAPABILITIES, /\btext\b|\bSMS\b|\bcan't\b|\bcannot\b|\bonly\b|limit order|USDC/i);
+  assert.equal(DEXTER_CAPABILITIES.split(/[.!?](?:\s|$)/).filter(Boolean).length, 1, 'the list itself is one spoken sentence');
+  for (const direction of ['inbound', 'outbound'] as const) {
+    const instructions = brokerInstructions({ direction, purpose: 'Read the current portfolio.', registeredAssignment: direction === 'outbound' });
+    assert.match(instructions, /That list is the only source for a capability answer: say at most two short sentences/);
+    assert.match(instructions, /never add, rename, or qualify capabilities using startup history, earlier conversation, or returned results/);
+    assert.match(instructions, /never count or enumerate categories/);
+    assert.match(instructions, /Do not mention limitations, restrictions, or things you cannot do unless the caller asks what you can't do/);
+    assert.equal(instructions.match(/What you can do: /g)?.length, 1, 'one capability list reaches the voice');
+  }
+});
+
+test('call 039b39cd: pending speech never claims an available result has not come back', () => {
+  const instructions = brokerInstructions({ direction: 'outbound', purpose: 'Read the current portfolio.', registeredAssignment: true });
+  assert.doesNotMatch(instructions, /say that the result has not arrived/);
+  assert.match(instructions, /If no stage is available, say only that you're on it/);
+  assert.match(instructions, /Never say a result has not come back, is still loading, or is taking long/);
 });
 
 test('pending work gets one short acknowledgment and no spoken queue mechanics', () => {

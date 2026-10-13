@@ -271,6 +271,12 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
     const pendingStatus = isFixedPendingStatus(entry, update);
     const ordinaryResult = isPartialResultUpdate(entry, update)
       || !update && ['completed', 'failed', 'cancelled', 'waiting_for_reply'].includes(entry.status);
+    // A terminal outcome for this exact request is what the caller is waiting for. Once
+    // a pause admits it, caller speech during the context read ("Hello?", "What are you
+    // on?") is a prompt to hear it, not a reason to withhold it (call 039b39cd). Request
+    // identity, the "For your earlier request" label and per-chunk barge-in still apply.
+    const availableResult = !update && ['completed', 'failed', 'cancelled'].includes(entry.status)
+      && entry.primaryResult?.state === entry.status;
     const deferred = () => ({ delivery: { eventId: '', status: 'stale' as const, reason: 'caller_presentation_deferred' } });
     if ((ordinaryResult || pendingStatus) && !await atSpeechBoundary(entry, pendingStatus)) return deferred();
     const statusCurrent = () => {
@@ -282,9 +288,9 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
     // old answer current after the caller has started another turn.
     const frontier = presentationFrontier();
     const stillRelevant = () => !stopped && !observer.signal.aborted && !call().endedAt
-      && frontier === presentationFrontier()
-      && (!ordinaryResult || (!blocksEarlierPresentation(entry) && quiet()))
-      && (!pendingStatus || (statusCurrent() && quiet()));
+      && (availableResult || (frontier === presentationFrontier()
+        && (!ordinaryResult || (!blocksEarlierPresentation(entry) && quiet()))
+        && (!pendingStatus || (statusCurrent() && quiet()))));
     const canonicalRequestId = entry.reconciliation?.outcome === 'admitted' ? entry.reconciliation.canonicalRequestId : entry.requestId;
     let attachment: LiveGenerationAttachment;
     let delivery: GenerationPublication;
@@ -305,11 +311,12 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
     } else {
       const outcomeText = update?.text ?? (entry.status === 'failed' ? failedRequestSpeech(entry)
         : entry.status === 'cancelled' ? 'The request was cancelled.' : 'I am checking the saved request status.');
-      const text = !update && ['failed', 'cancelled'].includes(entry.status) && entry.primaryResult?.state === entry.status
+      // Label at publication time: caller speech during the context read still marks it earlier.
+      const text = () => !update && ['failed', 'cancelled'].includes(entry.status) && entry.primaryResult?.state === entry.status
         && hasLaterCallerSpeech(call(), entry) ? `For your earlier request: ${outcomeText}` : outcomeText;
       const present = async (currentAttachment: LiveGenerationAttachment) => ({ attachment: currentAttachment,
         delivery: stillRelevant()
-          ? await publishText(entry, currentAttachment, text, update?.kind ?? 'result', update?.id ?? `${entry.requestId}_${entry.status}`,undefined,false,!pendingStatus)
+          ? await publishText(entry, currentAttachment, text(), update?.kind ?? 'result', update?.id ?? `${entry.requestId}_${entry.status}`,undefined,false,!pendingStatus)
           : { eventId: '', status: 'stale' as const, reason: 'caller_context_changed' } });
       let published: Awaited<ReturnType<typeof present>>;
       try { published = pendingStatus ? await controller.withStatusAttachment(stillRelevant, present)
