@@ -1158,7 +1158,10 @@ export function createBrokerServer(options: BrokerServerOptions) {
             onReady: voiceOptions.onReady, onClosed: voiceOptions.onClosed,
             onPlaybackClear: () => voiceOptions.onPlaybackClear?.('application_interrupt'),
             onProblem(code) { queueMicrotask(() => { if (stopping) return;
-              store.update(call.id, { failure: safeFailure(Object.assign(new Error(code), { code })) });
+              // Recording the failure must never take down the process and every other call with it.
+              try { store.update(call.id, { failure: safeFailure(Object.assign(new Error(code), { code })) }); }
+              catch (error) { console.error(JSON.stringify({ event: 'broker_failure_record_unavailable', callId: call.id, code,
+                message: (error as Error).message })); }
               void stop('voice_unavailable');
             }); },
           }) : voiceFactory(voiceOptions);
