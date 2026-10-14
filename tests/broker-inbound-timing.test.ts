@@ -53,18 +53,15 @@ test('stream timing distinguishes a dropped HTTP response from a completed strea
   assert.deepEqual(events.map(event => event.phase), ['started', 'aborted']);
 });
 
-for (const abort of [false, true]) test(`hold response ${abort ? 'abort' : 'finish'} controls admission callback`, async t => {
-  const events: InboundTimingEvent[] = []; let contacts = 0;
+for (const abort of [false, true]) test(`hold response ${abort ? 'abort' : 'finish'} is timed without starting admission`, async t => {
+  const events: InboundTimingEvent[] = [];
   const server = createServer((_request, response) => {
-    observeInboundHoldResponse(randomUUID(), response, event => events.push(event), () => { contacts++; assert.ok(response.writableFinished); });
-    assert.equal(contacts, 0);
-    if (abort) response.destroy(); else response.end('<Response><Say>One moment.</Say><Redirect/></Response>');
-    assert.equal(contacts, 0);
+    observeInboundHoldResponse(randomUUID(), response, event => events.push(event));
+    if (abort) response.destroy(); else response.end('<Response><Redirect/></Response>');
   });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
   const request = fetch(`http://127.0.0.1:${(server.address() as { port: number }).port}`);
   if (abort) await assert.rejects(request); else await (await request).text();
-  assert.equal(contacts, abort ? 0 : 1);
-  assert.deepEqual(events.map(event => event.phase), ['started', abort ? 'aborted' : 'completed']);
+  assert.deepEqual(events.map(event => [event.stage, event.phase]), [['hold_response', 'started'], ['hold_response', abort ? 'aborted' : 'completed']]);
 });

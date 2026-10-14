@@ -23,19 +23,23 @@ test('joins startup, persisted consumption and first playback without equating p
   const report = createCallJourneyReport(journal());
   assert.deepEqual(report.durationsMs, { createdToMedia: 7000, consumption: 2000, consumedToMedia: 2000,
     mediaToFirstProviderOpen: 1000, createdToFirstProviderReady: 9000, mediaToLiveReady: 3000,
-    createdToFirstAudio: 11000, createdToFirstPlayback: 12000, mediaToGreetingClip: null });
+    createdToFirstAudio: 11000, createdToFirstPlayback: 12000, createdToStream: null, streamToGreetingClip: null,
+    greetingClipPlayedToMedia: null });
   assert.equal(report.generations[0].providerOpenMs, 1000);
   assert.equal(report.generations[0].providerReadyAt, at(9));
   assert.equal(report.timestamps.liveReadyAt, at(10));
 });
 
-test('reports the pre-rendered greeting clip separately from Live readiness', () => {
+test('reports the greeting stream and clip separately from Live attaching and readiness', () => {
   const call: any = baseCall();
-  call.journey = { ...call.journey, greetingClipStartedAt: at(7), greetingClipPlayedAt: at(9) };
+  call.journey = { ...call.journey, streamStartedAt: at(1), greetingClipStartedAt: at(1), greetingClipPlayedAt: at(4) };
   const report = createCallJourneyReport(journal(call));
-  assert.equal(report.timestamps.greetingClipStartedAt, at(7));
-  assert.equal(report.timestamps.greetingClipPlayedAt, at(9));
-  assert.equal(report.durationsMs.mediaToGreetingClip, 0);
+  assert.equal(report.timestamps.streamStartedAt, at(1));
+  assert.equal(report.timestamps.greetingClipStartedAt, at(1));
+  assert.equal(report.timestamps.greetingClipPlayedAt, at(4));
+  assert.equal(report.durationsMs.createdToStream, 1000);
+  assert.equal(report.durationsMs.streamToGreetingClip, 0);
+  assert.equal(report.durationsMs.greetingClipPlayedToMedia, 3000);
   assert.equal(report.durationsMs.mediaToLiveReady, 3000);
 });
 

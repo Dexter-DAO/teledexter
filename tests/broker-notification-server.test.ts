@@ -119,8 +119,12 @@ test('unauthenticated dispatch and refused answer registration cannot obtain acc
   assert.equal((await f.post(notificationWire(f.resolved), 'wrong-token')).status, 401);
   assert.equal(f.resolutions, 0); assert.equal(f.creates, 0);
   assert.equal((await f.post()).status, 202);
-  const answer = await f.answer(); assert.doesNotMatch(await answer.text(), /<Stream/);
-  assert.equal(f.broker.store.get(f.resolved.callAssignment.brokerCallId)?.primary, undefined);
+  // The answer carries only the greeting stream; the refused registration never binds the account.
+  const answer = await f.answer(); assert.match(await answer.text(), /<Connect><Stream/);
+  const id = f.resolved.callAssignment.brokerCallId;
+  for (let i = 0; i < 400 && !f.broker.store.get(id)?.failure; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.ok(f.broker.store.get(id)?.failure);
+  assert.equal(f.broker.store.get(id)?.primary, undefined);
 });
 
 test('health advertises watcher-source reader capability before a producer can transfer an event', async t => {

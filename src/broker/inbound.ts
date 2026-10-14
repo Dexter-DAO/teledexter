@@ -64,13 +64,24 @@ export function createInboundFlow(options: InboundFlowOptions) {
   function bound(call: BrokerCall): Extract<InboundOutcome, { state: 'bound' }> | undefined {
     return call.inbound?.remote?.state === 'bound' ? call.inbound.remote : undefined;
   }
+  /** Account media (Live with the caller's context) may start: admission is bound and its context loaded. */
   function mediaAllowed(call: BrokerCall): boolean {
     if (call.inbound?.mode && call.inbound.mode.kind !== 'ordinary') return false;
-    if (call.inbound?.earlyAdmission && !call.inbound.continuation) return false;
     const receipt = bound(call);
     return Boolean(receipt && receipt.callState === 'open' && !call.inbound?.closure && !call.primaryClosed
       && call.primary?.bindingId === receipt.bindingId && !stopped(call) && !call.mediaStartedAt
       && call.inbound?.mediaStartBy && now() < Date.parse(call.inbound.mediaStartBy));
+  }
+  /** The greeting stream may hold this leg while admission is still running: a signed
+   * continuation answered it, and no stop, refusal, deadline or earlier media ended the wait.
+   * That stream carries only the constant greeting; account media still needs mediaAllowed. */
+  function waitingMediaAllowed(call: BrokerCall): boolean {
+    const journal = call.inbound;
+    if (!journal?.continuation || (journal.mode && journal.mode.kind !== 'ordinary') || stopped(call)
+      || call.mediaStartedAt || journal.closure || call.primaryClosed) return false;
+    const remote = journal.remote;
+    if (remote?.state === 'cancelled' || remote?.state === 'expired') return false;
+    return now() < Date.parse(remote?.state === 'bound' ? journal.mediaStartBy! : journal.waitUntil);
   }
   function stopLocal(id: string, reason: string): BrokerCall {
     const call = store.transitionInbound(id, { type: 'stop', reason, observedAt: timestamp() });
@@ -166,9 +177,6 @@ export function createInboundFlow(options: InboundFlowOptions) {
       stopLocal(id, previous ? 'media_start_expired' : 'broker_cancelled'); return settle(id);
     }
     if (call.inbound?.mode?.kind === 'undecided') return call;
-    // Only the signed continuation releases a new early contact into recovery and consumption.
-    // Historical approved journals without this marker retain their original recovery path.
-    if (call.inbound!.earlyAdmission && !call.inbound!.continuation) return call;
     if (!primary.beginInbound || !primary.recoverInbound || !primary.inboundStatus || !primary.openInboundCall)
       throw new Error('inbound_api_unavailable');
     // Recover an uncertain old attempt before considering fresh admission. Historical
@@ -186,8 +194,8 @@ export function createInboundFlow(options: InboundFlowOptions) {
     const state = call.inbound!.remote?.state;
     if (state === undefined || state === 'absent' || state === 'pending') {
       if (now() >= Date.parse(call.inbound!.waitUntil)) { stopLocal(id, 'broker_cancelled'); return settle(id); }
-      // After the optional early contact, only the signed continuation can
-      // recover and resubmit this same original-proof admission.
+      // Admission begins only after the signed continuation. Its stream instructions
+      // answer the leg, and the API's begin refuses a leg that is still ringing.
       if (!call.inbound!.continuation) return call;
       store.transitionInbound(id, { type: 'begin_attempted', observedAt: timestamp() });
       // A retryable 503 or lost response preserves this attempt. The next
@@ -266,48 +274,45 @@ export function createInboundFlow(options: InboundFlowOptions) {
     }
   }
   const advance = (id: string) => admissionOperation(id, () => advanceAttempt(id));
-  /** Called only after the original ordinary hold response has finished. No private context or transport. */
-  function beginEarly(id: string): Promise<BrokerCall> {
-    return serial(id, () => admissionOperation(id, async () => {
-      const call = saved(id), journal = call.inbound!;
-      if (stopped(call)) return settle(id);
-      if (now() >= Date.parse(journal.waitUntil)) { stopLocal(id, 'broker_cancelled'); return settle(id); }
-      if (journal.mode || journal.continuation || journal.beginAttemptedAt || journal.remote || journal.earlyAdmission) return call;
-      if (!primary.beginInbound) throw new Error('inbound_api_unavailable');
-      store.transitionInbound(id, { type: 'early_admission_started', observedAt: timestamp() });
-      // A lost response or ringing refusal preserves this single contact. A real
-      // continuation recovers the same identity through the existing path.
-      const result = await createInboundAttemptTiming(id, options.onTiming).measure('early_begin_admission',
-        () => primary.beginInbound!(journal.begin));
-      record(id, result);
-      if (stopped(saved(id))) return settle(id);
-      if (now() >= Date.parse(journal.waitUntil) || result.state === 'expired' || result.state === 'cancelled') {
-        stopLocal(id, 'broker_cancelled'); return settle(id);
-      }
-      return saved(id);
-    }));
-  }
   function accept(proof: ProviderCallProof): Promise<BrokerCall> {
     verify(proof, '/broker/incoming-call');
     const requestId = createHash('sha256').update(`incoming:${proof.params.CallSid}`).digest('hex');
     const { call, existing } = store.reserveInbound({ requestId, purpose: 'The person called Dexter.', providerProof: proof },
       inboundPolicy, timestamp(), options.enrollment !== undefined);
-    // Original webhook duplicates must also return hold while the early contact is pending.
-    if (!existing || (call.inbound!.earlyAdmission && !call.inbound!.continuation)) return Promise.resolve(call);
+    if (!existing) return Promise.resolve(call);
     return serial(call.id, () => advance(call.id));
   }
-  function resume(id: string, proof: ProviderCallProof): Promise<BrokerCall> {
-    const call = saved(id);
-    verify(proof, `/broker/inbound/${id}/continue`, call);
+  function continuation(id: string, proof: ProviderCallProof): void {
+    const current = saved(id);
+    // A terminal/expired callback remains useful for recovery and closure.
+    if (!stopped(current) && now() < Date.parse(current.inbound!.waitUntil))
+      store.transitionInbound(id, { type: 'continuation', providerProof: proof, observedAt: timestamp() });
+  }
+  function verifyContinuation(id: string, proof: ProviderCallProof): void {
+    verify(proof, `/broker/inbound/${id}/continue`, saved(id));
     if (Object.prototype.hasOwnProperty.call(proof.params, 'Digits')) throw new Error('inbound_digit_form_route_mismatch');
+  }
+  /** Saves the signed continuation of an ordinary leg without starting admission, so the route
+   * can answer with the greeting stream first; tick() then runs admission on the answered leg.
+   * Enrollment legs keep their queued order with the digit form through resume(). */
+  function recordContinuation(id: string, proof: ProviderCallProof): void {
+    verifyContinuation(id, proof);
+    const mode = saved(id).inbound?.mode;
+    if (!mode || mode.kind === 'ordinary') continuation(id, proof);
+  }
+  function resume(id: string, proof: ProviderCallProof): Promise<BrokerCall> {
+    verifyContinuation(id, proof);
     return serial(id, () => {
-      const current = saved(id);
-      if (current.inbound?.mode?.kind === 'enrollment-only') return advanceEnrollment(id);
-      // A terminal/expired callback remains useful for recovery and closure.
-      if (!stopped(current) && now() < Date.parse(current.inbound!.waitUntil))
-        store.transitionInbound(id, { type: 'continuation', providerProof: proof, observedAt: timestamp() });
+      if (saved(id).inbound?.mode?.kind === 'enrollment-only') return advanceEnrollment(id);
+      continuation(id, proof);
       return advance(id);
     });
+  }
+  /** An admission operation is queued or running for this call. */
+  function busy(id: string): boolean { return pending.has(id); }
+  /** Settles when no admission operation is queued or running for this call. */
+  async function idle(id: string): Promise<void> {
+    for (let work = pending.get(id); work; work = pending.get(id)) await work.catch(() => undefined);
   }
   function completeEnrollment(id: string, digitProof: ProviderCallProof): Promise<BrokerCall> {
     const call = saved(id);
@@ -361,5 +366,5 @@ export function createInboundFlow(options: InboundFlowOptions) {
   }
   function tick(id: string): Promise<BrokerCall> { return serial(id, () => advance(id)); }
   async function drain(): Promise<void> { await Promise.allSettled([...pending.values(), ...ending.values()]); }
-  return { accept, beginEarly, resume, completeEnrollment, stop, stopLocal, tick, mediaAllowed, drain };
+  return { accept, recordContinuation, resume, busy, idle, completeEnrollment, stop, stopLocal, tick, mediaAllowed, waitingMediaAllowed, drain };
 }

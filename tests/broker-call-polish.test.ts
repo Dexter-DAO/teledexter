@@ -38,19 +38,15 @@ test('a result appended to the provider counts as presented even when journaled 
   assert.equal(resultAlreadyPresented(callWith([record('accepted', 'broker_7')]), { ...entry, status: 'failed' } as BrokerDelegationRecord), false);
 });
 
-test('inbound hold answers silently instead of saying "One moment." when a greeting clip opens the call', () => {
+test('the inbound hold is a bare redirect: the signed continuation, not a hold verb, answers the leg', () => {
   const origin = 'https://broker.example';
   const callId = '2d141fec-4a9d-4967-82f0-815492d7b334';
   const call = { id: callId, direction: 'inbound', inbound: { begin: { providerProof: { url: `${origin}/broker/incoming-call` } } } };
   const store = { get: () => call } as never;
   const input = { callId, continuationUrl: `${origin}/broker/inbound/${callId}/continue` };
-  const withClip = createInboundHoldAdapter({ publicOrigin: origin, store, greetingClipAvailable: true }).waitingResponse(input);
-  assert.doesNotMatch(withClip, /<Say>/); assert.doesNotMatch(withClip, /<Pause/);
-  // The first verb must answer the call: a silent play, never a bare pause or redirect.
-  assert.match(withClip, /^<\?xml[^>]*><Response><Play digits="w"\/><Redirect method="POST">/);
-  assert.match(createInboundHoldAdapter({ publicOrigin: origin, store }).waitingResponse(input), /<Say>One moment\.<\/Say><Redirect/);
-  (call.inbound as Record<string, unknown>).continuation = {};
-  assert.match(createInboundHoldAdapter({ publicOrigin: origin, store, greetingClipAvailable: true }).waitingResponse(input), /<Pause length="1"\/><Redirect/);
+  // No Say, Play or Pause: the caller hears ringing until the continuation's media stream answers.
+  assert.equal(createInboundHoldAdapter({ publicOrigin: origin, store }).waitingResponse(input),
+    `<?xml version="1.0" encoding="UTF-8"?><Response><Redirect method="POST">${origin}/broker/inbound/${callId}/continue</Redirect></Response>`);
 });
 
 test('voice instructions forbid delegating acknowledgements and volunteering recaps', () => {

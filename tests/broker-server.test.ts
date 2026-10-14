@@ -19,7 +19,7 @@ import type { BrokerDependencyHealth } from '../src/broker/dependencyHealth.js';
 import { factFreshnessScenarios, historicalAccountMessages } from './fixtures/broker-fact-freshness.js';
 import { loadSharedAssignmentParser, sharedAssignmentParserConfigured } from './helpers/shared-assignment-parser.js';
 
-async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; failVoice?: boolean; ambiguousDial?: boolean; deferVoiceReady?: boolean; history?: PrimaryContextMessage[]; assignmentResponse?: 'missing' | 'wrong'; assignmentParser?: { parse(value: unknown): unknown }; retainedCall?: BrokerCall; dependencyHealth?: () => Promise<BrokerDependencyHealth> } = {}) {
+async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; failVoice?: boolean; ambiguousDial?: boolean; deferVoiceReady?: boolean; history?: PrimaryContextMessage[]; assignmentResponse?: 'missing' | 'wrong'; assignmentParser?: { parse(value: unknown): unknown }; retainedCall?: BrokerCall; dependencyHealth?: () => Promise<BrokerDependencyHealth>; greetingClip?: Buffer; gateBind?: boolean } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-server-test-'));
   const config: BrokerConfig = { host: '127.0.0.1', port: 3213, publicOrigin: 'https://phone.example.test', stateDir: directory,
     controlToken: 'c'.repeat(40), apiKey: 'fixture-key', model: 'gpt-live-1', voice: 'marin',
@@ -35,6 +35,13 @@ async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; 
   let voiceOptions: BrokerLiveSessionOptions | undefined;
   let readyVoice: (() => void) | undefined;
   const openingCommands: string[] = [];
+  const appended: string[] = [];
+  const providerUpdates: Array<Record<string, unknown>> = [];
+  let releaseBind: ((failure?: Error) => void) | undefined;
+  const bindGate = overrides.gateBind ? new Promise<void>((resolve, reject) => {
+    releaseBind = failure => { if (failure) reject(failure); else resolve(); };
+  }) : undefined;
+  void bindGate?.catch(() => {});
   const primary = {
     async readiness() { calls.readiness++; return { eligible: overrides.eligibility !== false, reason: overrides.eligibility === false ? 'authority_unavailable' : 'ready' }; },
     async openCall(proof: { params: Record<string, string> }, assignment?: PhoneCallAssignment) {
@@ -43,13 +50,14 @@ async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; 
       assert.deepEqual(assignment, broker.store.bySid(sid)?.callAssignment?.value);
       if (overrides.assignmentParser) assert.deepEqual(overrides.assignmentParser.parse(assignment), assignment);
       assert.equal(broker.store.bySid(sid)?.voiceOpening, undefined);
+      await bindGate;
       return { bindingId, callSid: sid, state: 'open',
         ...(assignment && overrides.assignmentResponse !== 'missing' ? { callAssignmentRef: { assignmentId: overrides.assignmentResponse === 'wrong' ? randomUUID() : assignment.assignmentId, revision: 1, digest: 'a'.repeat(64) } } : {}), context: { primaryDexterId, threadId, displayName: 'Avery Example', messages: overrides.history ?? [] } };
     },
     async close() { calls.close++; return { bindingId, callSid: sid, state: 'closed' }; },
   } as unknown as PrimaryApiClient;
   const provider = Object.assign((callSid: string) => ({
-    async update() { calls.update++; return { sid: callSid, status: 'completed' }; },
+    async update(input: Record<string, unknown>) { calls.update++; providerUpdates.push(input); return { sid: callSid, status: 'completed' }; },
     async fetch() {
       calls.fetch++;
       const inbound = broker.store.bySid(callSid)?.direction === 'inbound';
@@ -65,6 +73,7 @@ async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; 
     JSON.stringify({ version: 1, calls: { [overrides.retainedCall.id]: overrides.retainedCall } }, null, 2) + '\n');
   const broker = createBrokerServer({ config, primary, provider: { calls: provider } as unknown as ReturnType<typeof Twilio>,
     dependencyHealth: overrides.dependencyHealth,
+    ...(overrides.greetingClip ? { greetingClip: overrides.greetingClip } : {}),
     probe: async () => {
       calls.preflight++;
       if (overrides.failVoice) throw Object.assign(new Error('Voice unavailable'), { code: 'credit_balance_exhausted' });
@@ -75,7 +84,7 @@ async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; 
       readyVoice = () => options.onReady({ callId: options.callId, sessionId: 'fixture-live' });
       if (!overrides.deferVoiceReady) queueMicrotask(readyVoice);
       return {
-        appendAudio() { calls.audio++; options.onAudio(Buffer.alloc(160, 255).toString('base64'), { deliveryId: 'audio-1' }); return true; },
+        appendAudio(payload: string) { calls.audio++; appended.push(payload); options.onAudio(Buffer.alloc(160, 255).toString('base64'), { deliveryId: 'audio-1' }); return true; },
         async appendContext() { return { eventId: 'c', status: 'accepted' }; },
         async appendInstructions(text: string) { openingCommands.push(text); return { eventId: 'i', status: 'accepted' }; },
         async interruptPlayback() { return { eventId: 'p', status: 'accepted' }; },
@@ -94,7 +103,8 @@ async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; 
     method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-twilio-signature': valid ? Twilio.getExpectedTwilioSignature(config.twilioAuthToken, config.publicOrigin + route, params) : 'bad' }, body: new URLSearchParams(params),
   });
   return { broker, config, calls, sid, bindingId, primaryDexterId, threadId, base, post, webhook, voiceOptions: () => voiceOptions,
-    readyVoice: () => { assert.ok(readyVoice); readyVoice(); }, openingCommands,
+    readyVoice: () => { assert.ok(readyVoice); readyVoice(); }, openingCommands, appended, providerUpdates,
+    releaseBind: (failure?: Error) => { assert.ok(releaseBind); releaseBind(failure); },
     setInboundStatus: (status: string) => { inboundStatus = status; } };
 }
 
@@ -383,20 +393,131 @@ for (const eligibility of [true, false]) {
   });
 }
 
+async function answeredStream(f: Awaited<ReturnType<typeof fixture>>, call: BrokerCall) {
+  const params = { AccountSid: f.config.twilioAccountSid, CallSid: f.sid, From: f.config.from,
+    To: f.config.allowedTo[0], Direction: 'outbound-api', CallStatus: 'in-progress' };
+  const response = await f.webhook(`/broker/answer/${call.id}`, params);
+  assert.equal(response.status, 200);
+  const twiml = await response.text();
+  const route = `/broker/media/${call.id}`;
+  const signature = Twilio.getExpectedTwilioSignature(f.config.twilioAuthToken, f.config.publicOrigin + route, {});
+  const connect = async () => {
+    const ws = new WebSocket(f.base.replace('http:', 'ws:') + route, { headers: { 'x-twilio-signature': signature } });
+    const frames: Array<{ event: string; payload?: string; name?: string }> = [];
+    ws.on('message', bytes => { const frame = JSON.parse(bytes.toString());
+      frames.push({ event: frame.event, ...(frame.media ? { payload: frame.media.payload } : {}), ...(frame.mark ? { name: frame.mark.name } : {}) }); });
+    await new Promise<void>((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
+    const streamSid = 'MZ' + '3'.repeat(32);
+    ws.send(JSON.stringify({ event: 'start', start: { accountSid: f.config.twilioAccountSid, callSid: f.sid, streamSid,
+      customParameters: { token: streamToken(f.config.controlToken, call.id, f.sid) }, mediaFormat: { encoding: 'audio/x-mulaw', sampleRate: 8000, channels: 1 } } }));
+    const caller = (bytes: Buffer) => ws.send(JSON.stringify({ event: 'media', streamSid, media: { track: 'inbound', payload: bytes.toString('base64') } }));
+    const ack = (name: string) => ws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name } }));
+    return { ws, frames, caller, ack };
+  };
+  return { twiml, connect };
+}
+const until = async (predicate: () => boolean, ms = 2_000) => {
+  for (let i = 0; i < ms / 5 && !predicate(); i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(predicate(), true);
+};
+
 for (const assignmentResponse of ['missing', 'wrong'] as const) {
   test(`an assigned call cannot open its media without its exact returned reference (${assignmentResponse})`, async t => {
     const f = await fixture(t, { assignmentResponse });
     assert.equal((await f.post('/internal/broker/calls', { requestId: randomUUID(), purpose: ' Read the current portfolio. ' })).status, 201);
     const call = f.broker.store.list()[0];
     assert.equal(call.callAssignment?.value.purpose, 'Read the current portfolio.');
-    const params = { AccountSid: f.config.twilioAccountSid, CallSid: f.sid, From: f.config.from,
-      To: f.config.allowedTo[0], Direction: 'outbound-api', CallStatus: 'in-progress' };
-    const response = await f.webhook(`/broker/answer/${call.id}`, params);
-    assert.doesNotMatch(await response.text(), /<Stream/);
+    // The answer carries only the greeting stream; the binding is checked behind it.
+    const answered = await answeredStream(f, call);
+    assert.match(answered.twiml, /<Connect><Stream/);
+    await until(() => Boolean(f.broker.store.get(call.id)!.failure));
     assert.equal(f.broker.store.get(call.id)?.primary, undefined);
+    const media = await answered.connect(); t.after(() => media.ws.close());
+    await until(() => f.calls.update === 1);
+    assert.match(String(f.providerUpdates[0].twiml), /I could not reach your Dexter account just now/);
+    assert.equal(f.voiceOptions(), undefined, 'no Live session or account context');
     assert.deepEqual(f.openingCommands, []);
+    assert.equal(f.broker.store.get(call.id)?.primary, undefined);
+    assert.equal(f.broker.store.get(call.id)?.mediaStartedAt, undefined);
   });
 }
+
+test('outbound answer streams the greeting before the binding exists; speech over it is dropped and later speech reaches Live in order', async t => {
+  const clip = Buffer.alloc(2_400, 0x20); // 300 ms
+  const f = await fixture(t, { gateBind: true, greetingClip: clip });
+  assert.equal((await f.post('/internal/broker/calls', { requestId: randomUUID(), purpose: 'Read the current portfolio.' })).status, 201);
+  const call = f.broker.store.list()[0];
+  const answered = await answeredStream(f, call);
+  assert.match(answered.twiml, /^<\?xml[^>]*><Response><Connect><Stream url="wss:\/\/phone\.example\.test\/broker\/media\/[0-9a-f-]{36}">.*<\/Connect><Hangup\/><\/Response>$/);
+  assert.equal(f.calls.bind, 1); assert.equal(f.broker.store.get(call.id)!.primary, undefined, 'answered before the binding exists');
+  const media = await answered.connect(); t.after(() => media.ws.close());
+  await until(() => media.frames.filter(frame => frame.event === 'media').length === 15);
+  assert.equal(f.voiceOptions(), undefined, 'the greeting needs no Live session');
+  const overGreeting = Buffer.alloc(800, 0x10); media.caller(overGreeting);
+  for (const frame of media.frames.filter(frame => frame.event === 'mark')) media.ack(frame.name!);
+  await until(() => Boolean(f.broker.store.get(call.id)!.journey?.greetingClipPlayedAt));
+  const first = Buffer.alloc(800, 0x21), second = Buffer.alloc(800, 0x22);
+  media.caller(first); media.caller(second);
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(f.voiceOptions(), undefined);
+  f.releaseBind();
+  await until(() => f.appended.length === 2);
+  assert.deepEqual(f.appended, [first.toString('base64'), second.toString('base64')], 'held speech, in order, without the words spoken over the greeting');
+  const third = Buffer.alloc(800, 0x23); media.caller(third);
+  await until(() => f.appended.length === 3);
+  assert.equal(f.appended[2], third.toString('base64'));
+  f.readyVoice(); await until(() => f.openingCommands.length === 1);
+  assert.equal(f.openingCommands[0], brokerOpening('outbound', true, false, false, true));
+  const saved = f.broker.store.get(call.id)!;
+  assert.ok(saved.journey!.streamStartedAt! <= saved.journey!.greetingClipStartedAt!);
+  assert.ok(saved.mediaStartedAt! >= saved.journey!.greetingClipStartedAt!, 'Live input starts at the greeting end');
+  assert.equal(saved.primary!.bindingId, f.bindingId);
+});
+
+test('Live attached while the greeting still plays hears silence in place of the words spoken over it', async t => {
+  const clip = Buffer.alloc(16_000, 0x20); // 2 s
+  const f = await fixture(t, { greetingClip: clip });
+  assert.equal((await f.post('/internal/broker/calls', { requestId: randomUUID(), purpose: 'Read the current portfolio.' })).status, 201);
+  const call = f.broker.store.list()[0];
+  const answered = await answeredStream(f, call);
+  await until(() => Boolean(f.broker.store.get(call.id)!.primary));
+  const media = await answered.connect(); t.after(() => media.ws.close());
+  await until(() => Boolean(f.voiceOptions()));
+  const spoken = Buffer.alloc(800, 0x10); media.caller(spoken);
+  await until(() => f.appended.length === 1);
+  assert.equal(f.appended[0], Buffer.alloc(800, 0xff).toString('base64'));
+  assert.equal(f.broker.store.get(call.id)!.journey!.greetingClipPlayedAt, undefined);
+});
+
+test('a call that ends while Primary is binding it closes that binding once it lands', async t => {
+  const f = await fixture(t, { gateBind: true });
+  assert.equal((await f.post('/internal/broker/calls', { requestId: randomUUID(), purpose: 'Read the current portfolio.' })).status, 201);
+  const call = f.broker.store.list()[0];
+  const answered = await answeredStream(f, call);
+  assert.match(answered.twiml, /<Stream/);
+  const params = { AccountSid: f.config.twilioAccountSid, CallSid: f.sid, From: f.config.from,
+    To: f.config.allowedTo[0], Direction: 'outbound-api', CallStatus: 'completed' };
+  await (await f.webhook(`/broker/status/${call.id}`, params)).text();
+  assert.equal(f.calls.close, 0);
+  f.releaseBind();
+  await until(() => f.calls.close === 1);
+  assert.equal(f.voiceOptions(), undefined);
+  assert.ok(f.broker.store.get(call.id)!.primaryClosed);
+});
+
+test('a stream that hangs up while Primary is binding closes that binding after its stop', async t => {
+  const f = await fixture(t, { gateBind: true });
+  assert.equal((await f.post('/internal/broker/calls', { requestId: randomUUID(), purpose: 'Read the current portfolio.' })).status, 201);
+  const call = f.broker.store.list()[0];
+  const answered = await answeredStream(f, call);
+  const media = await answered.connect();
+  await until(() => Boolean(f.broker.store.get(call.id)!.streamSid));
+  media.ws.send(JSON.stringify({ event: 'stop', streamSid: 'MZ' + '3'.repeat(32) }));
+  await until(() => Boolean(f.broker.store.get(call.id)!.endedAt));
+  f.releaseBind();
+  await until(() => f.calls.close === 1);
+  assert.equal(f.voiceOptions(), undefined);
+});
 
 test('caller cannot inject assignment provenance through unauthenticated or extra control fields', async t => {
   const f = await fixture(t);

@@ -218,13 +218,16 @@ test('terminal callback during account binding closes the late binding without s
   const bindGate = deferred();
   const f = await fixture(t, { bindGate });
   const id = await f.dial();
-  const pendingAnswer = f.webhook(`/broker/answer/${id}`, f.params('outbound-api'));
+  // The answer returns the greeting stream before the binding exists.
+  const answer = await f.webhook(`/broker/answer/${id}`, f.params('outbound-api'));
+  assert.match(await answer.text(), /<Connect><Stream/);
   await f.bindStarted.promise;
   assert.equal((await f.webhook(`/broker/status/${id}`, f.params('outbound-api', 'completed'))).status, 200);
+  assert.deepEqual(f.closures, []);
   bindGate.resolve();
-  const answer = await pendingAnswer;
-  assert.doesNotMatch(await answer.text(), /<Stream/);
+  for (let i = 0; i < 400 && f.closures.length === 0; i++) await new Promise(resolve => setTimeout(resolve, 5));
   assert.deepEqual(f.closures, [f.bindingId]);
+  assert.equal(f.broker.store.get(id)!.mediaStartedAt, undefined);
   assert.equal(f.broker.store.get(id)!.status, 'completed');
   assert.equal(f.created(), 1);
   assert.equal(f.proofs[0].url, `${f.config.publicOrigin}/broker/answer/${id}`);
