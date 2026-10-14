@@ -65,7 +65,7 @@ Caller audio on that stream:
 
 `mediaStartedAt` is the time of the first caller sample Live receives: the greeting's end (or attach time, if the clip is still playing), and never earlier than an inbound binding's `consumedAt`. Input sample positions count from it. `journey.streamStartedAt` records the provider stream start; `journey.greetingClipStartedAt` and `greetingClipPlayedAt` record the clip.
 
-While an inbound stream waits, the broker polls the same admission every second, the pace of the hold redirects it replaced. A refusal, cancellation or the 120-second wait limit ends the wait. The broker then closes the stream after the clip. Twilio runs the trailing redirect, and the continuation answers with restricted setup or a hangup. A failed outbound binding is spoken ("I could not reach your Dexter account just now. Please try again shortly.") and ends the call. A call that ends while Primary is still binding it has that binding closed when it lands.
+While an inbound stream waits, the broker polls the same admission every second, the pace of the hold redirects it replaced. A refusal, cancellation or the 120-second wait limit ends the wait. The broker then closes the stream after the clip. Twilio runs the trailing redirect, and the continuation answers with restricted setup or a hangup. A failed outbound binding is spoken ("I could not reach your Dexter account just now. Please try again shortly.") and ends the call. A call that ends while Primary is still binding it, or whose stream is stopping, has that binding closed by the answer route when it lands. Shutdown waits for every in-flight outbound binding and closes it before the journal closes, so the binding is saved and closed rather than left open in the API.
 
 Log events: `broker_audio_timing` stages `greetingClipStartedAt`, `greetingClipFirstPlaybackAcknowledgedAt` and `greetingClipPlayedAt`; `broker_account_media` (`mediaStartedAt`, `heldInputMs`, `droppedInputMs`, `greetingInputMs`) when Live attaches; and `broker_greeting_stream_released` when an inbound stream is handed back to its TwiML.
 
@@ -133,7 +133,7 @@ A failed capture, close or reconciliation leaves `primaryClosePending` set. Main
 
 A call with status `unknown` and no provider SID needs operator investigation of the original dispatch. Preserve the request ID and journal, establish the provider outcome, and resolve that record before attempting another call. Generating a new request ID to bypass uncertainty risks a duplicate call. Do not delete the writer lock while its owning process is alive.
 
-Maintenance also reconciles inactive, unresolved calls older than 60 seconds by saved SID and ends a provider call that is still open. During shutdown the service drains HTTP requests, stops its active calls, and awaits closeout before releasing the journal lock. A forced exit leaves recovery evidence on disk for the next process.
+Maintenance also reconciles inactive, unresolved calls older than 60 seconds by saved SID and ends a provider call that is still open. During shutdown the service drains HTTP requests, stops its active calls, waits for any outbound Primary binding still being opened in the background (and closes it), and awaits closeout before releasing the journal lock. A forced exit leaves recovery evidence on disk for the next process.
 
 ## Health
 

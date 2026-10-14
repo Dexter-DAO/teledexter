@@ -519,6 +519,45 @@ test('a stream that hangs up while Primary is binding closes that binding after 
   assert.equal(f.voiceOptions(), undefined);
 });
 
+for (const streamConnected of [false, true]) {
+  test(`a broker shutdown waits for an in-flight outbound binding and closes it (${streamConnected ? 'stream connected' : 'no stream yet'})`, async t => {
+    const f = await fixture(t, { gateBind: true });
+    assert.equal((await f.post('/internal/broker/calls', { requestId: randomUUID(), purpose: 'Read the current portfolio.' })).status, 201);
+    const call = f.broker.store.list()[0];
+    const answered = await answeredStream(f, call);
+    assert.equal(f.calls.bind, 1);
+    if (streamConnected) {
+      const media = await answered.connect(); t.after(() => media.ws.close());
+      await until(() => Boolean(f.broker.store.get(call.id)!.streamSid));
+    }
+    let closed = false;
+    const closing = f.broker.close().then(() => { closed = true; });
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.equal(closed, false, 'shutdown waits for the binding Primary is still opening');
+    f.releaseBind();
+    await closing;
+    assert.equal(f.calls.close, 1, 'the API binding that landed during shutdown is closed');
+    const saved = f.broker.store.get(call.id)!;
+    assert.equal(saved.primary?.bindingId, f.bindingId, 'the journal names the binding');
+    assert.equal(saved.primaryClosed?.state, 'closed');
+    assert.equal(saved.primaryClosePending, false);
+    assert.equal(f.voiceOptions(), undefined, 'no Live session during shutdown');
+  });
+}
+
+test('a broker shutdown whose in-flight outbound binding fails still finishes', async t => {
+  const f = await fixture(t, { gateBind: true });
+  assert.equal((await f.post('/internal/broker/calls', { requestId: randomUUID(), purpose: 'Read the current portfolio.' })).status, 201);
+  const call = f.broker.store.list()[0];
+  await answeredStream(f, call);
+  const closing = f.broker.close();
+  await new Promise(resolve => setTimeout(resolve, 20));
+  f.releaseBind(new Error('primary unavailable'));
+  await closing;
+  assert.equal(f.calls.close, 0);
+  assert.equal(f.broker.store.get(call.id)!.primary, undefined);
+});
+
 test('caller cannot inject assignment provenance through unauthenticated or extra control fields', async t => {
   const f = await fixture(t);
   const input = { requestId: randomUUID(), purpose: 'Read my portfolio.' };

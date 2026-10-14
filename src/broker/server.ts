@@ -215,6 +215,9 @@ export function createBrokerServer(options: BrokerServerOptions) {
   const closingBindings = new Map<string, Promise<void>>();
   // Outbound Primary bindings started by the answer route; the media stream attaches Live when one settles.
   const pendingBinds = new Map<string, Promise<BrokerCall>>();
+  // Each background binding until it settles and, when nothing will attach it, its close finishes.
+  // Shutdown waits for these: a binding that lands after the store closes is named nowhere and stays open.
+  const bindSettlements = new Set<Promise<void>>();
   // Keep a stopped host until its already-observed source preparation settles.
   // A restart recovers only the durable captures and reply-read obligations.
   const selectedHosts = new Map<string, GenerationVoiceSession>();
@@ -892,18 +895,21 @@ export function createBrokerServer(options: BrokerServerOptions) {
       preconnect?.beginOutbound(call);
       const binding = bind(call, proof);
       pendingBinds.set(id, binding);
-      binding.then(() => {
-        // A connected stream owns the binding from here. Without one, a leg that already
-        // ended (or a stopping broker) leaves the new binding to close.
-        if (active.has(id) || claimed.has(id)) return;
+      const settled = binding.then(() => {
+        // A live stream (connected now or later) attaches the binding. A leg that already ended,
+        // a stream that is stopping (its stop sets endedAt first) or a stopping broker leaves
+        // nothing to attach it, so it closes here, before shutdown closes the store.
         const current = store.get(id)!;
         if (accepting && !current.endedAt && !terminalCallStatuses.has(current.status)) return;
         pendingBinds.delete(id);
-        void closePrimary(current);
+        return closePrimary(current);
       }, error => {
         preconnect?.forget(id); startupContexts?.discard(id);
         try { store.update(id, { failure: safeFailure(error) }); } catch { /* The stream speaks the failure and ends the call. */ }
       });
+      bindSettlements.add(settled);
+      const forget = () => { bindSettlements.delete(settled); };
+      void settled.then(forget, forget);
     }
     xml(response, callTwiml(config.publicOrigin, call.id, streamToken(config.controlToken, call.id, call.callSid!)));
   }
@@ -1293,11 +1299,10 @@ export function createBrokerServer(options: BrokerServerOptions) {
     function awaitOutboundBinding(): void {
       const binding = store.get(call.id)!.primary ? undefined : pendingBinds.get(call.id);
       if (!binding) { attachSafely(); return; }
-      binding.then(() => {
-        if (!stopping) { attachSafely(); return; }
-        // The call ended while Primary was binding it: close that binding after this stop.
-        void stopPromise!.then(() => closePrimary(store.get(call.id)!));
-      }, () => { pendingBinds.delete(call.id); void stop('primary_unavailable'); });
+      // A binding that lands after this stream began stopping is closed by the answer route,
+      // which sees the endedAt that stop() records first.
+      binding.then(() => { if (!stopping) attachSafely(); },
+        () => { pendingBinds.delete(call.id); void stop('primary_unavailable'); });
     }
 
     active.set(call.id, { stop });
@@ -1454,6 +1459,9 @@ export function createBrokerServer(options: BrokerServerOptions) {
     await options.sms?.close();
     await maintenance;
     await Promise.allSettled([...active.values()].map(call => call.stop('service_shutdown')));
+    // The answer route finished long ago, but Primary may still be opening its binding. A binding
+    // that lands now (accepting is false) is recorded and closed by its settlement, before the store closes.
+    await Promise.allSettled([...bindSettlements]);
     for (const call of store.list()) if (call.verificationCallback || call.restrictedSetup) {
       if (restricted) await restricted.stop(call, 'service_shutdown').catch(() => {});
     }
