@@ -406,7 +406,7 @@ test('an inbound call never plays the outbound-only clip; Live speaks the whole 
   for (let i = 0; i < 100 && f.seen.opening === 0; i++) await new Promise(resolve => setTimeout(resolve, 5));
   await new Promise(resolve => setTimeout(resolve, 30));
   assert.equal(media.length, 0);
-  assert.equal(f.openings[0], 'Immediately say in English: "Hey, it\'s Dexter. What can I do for you?" Then pause to listen.');
+  assert.equal(f.openings[0], 'Immediately say: "Hey, it\'s Dexter. What can I do for you?" Then pause to listen.');
   assert.equal(f.store.get(call.id)!.journey?.greetingClipStartedAt, undefined);
 });
 
@@ -414,7 +414,7 @@ test('without a clip the Live opening still speaks the whole greeting', async t 
   const f = await fixture(t);
   const { call, ws } = await connectIncomingMedia(f); t.after(() => ws.close());
   for (let i = 0; i < 100 && f.seen.opening === 0; i++) await new Promise(resolve => setTimeout(resolve, 5));
-  assert.equal(f.openings[0], 'Immediately say in English: "Hey, it\'s Dexter. What can I do for you?" Then pause to listen.');
+  assert.equal(f.openings[0], 'Immediately say: "Hey, it\'s Dexter. What can I do for you?" Then pause to listen.');
   assert.equal(f.store.get(call.id)!.journey?.greetingClipStartedAt, undefined);
 });
 

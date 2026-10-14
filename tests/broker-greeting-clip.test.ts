@@ -100,5 +100,5 @@ test('after the clip, every outbound opening continues without greeting or namin
   assert.match(brokerOpening('outbound', true, true, false, true), /watch name, event summary and observation time/);
   assert.match(brokerOpening('outbound', true, false, true, true), /title, summary and observation time/);
   // Without the clip, Live still speaks the full greeting.
-  assert.match(brokerOpening('outbound', true), /Immediately say in English "Hey, it's Dexter\."/);
+  assert.match(brokerOpening('outbound', true), /Immediately say "Hey, it's Dexter\."/);
 });

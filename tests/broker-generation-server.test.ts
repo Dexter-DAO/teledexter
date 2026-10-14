@@ -1032,7 +1032,7 @@ test('an outbound call with the greeting clip opens once, continuing after "Hey,
   const f = await host(t, false, false, false, { greetingClip: Buffer.alloc(2_400, 0x20) });
   await until(() => f.store.get(f.callId)?.voiceOpening?.status === 'accepted');
   assert.equal(f.opening.length, 1);
-  assert.match(f.opening[0], /^The caller already heard you say "Hey, it's Dexter\." Do not greet or say your name again\. Immediately continue in English with one short question/);
+  assert.match(f.opening[0], /^The caller already heard you say "Hey, it's Dexter\." Do not greet or say your name again\. Immediately continue with one short question/);
   assert.ok(f.store.get(f.callId)!.journey?.greetingClipStartedAt);
 });
 

@@ -39,7 +39,7 @@ test('an inbound opening follows the person even when an outbound work brief was
   assert.match(instructions, /The person called you/);
   assert.ok(!instructions.includes(purpose));
   assert.doesNotMatch(instructions, /Call brief for Dexter|You called the person/);
-  assert.match(opening, /Immediately say in English: "Hey, it's Dexter\. What can I do for you\?"/);
+  assert.match(opening, /Immediately say: "Hey, it's Dexter\. What can I do for you\?"/);
   assert.doesNotMatch(opening, /assignment|call brief/);
 });
 
@@ -195,4 +195,12 @@ test('every voice opening fits one Live instructions append, so the speak-first 
       const bytes = Buffer.byteLength(brokerOpening(direction, registered, watch, notification));
       assert.ok(bytes > 0 && bytes <= LIVE_APPEND_MAX_BYTES, `${direction}/${registered}/${watch}/${notification}: ${bytes} bytes`);
     }
+});
+
+test('openings name no language and the instructions follow the caller into theirs', () => {
+  for (const direction of ['inbound', 'outbound'] as const)
+    for (const greeted of [false, true])
+      assert.doesNotMatch(brokerOpening(direction, direction === 'outbound', false, false, greeted), /English/);
+  assert.match(brokerInstructions({ direction: 'inbound', purpose: '' }),
+    /When the caller speaks another language, reply in that language for the rest of the call/);
 });
