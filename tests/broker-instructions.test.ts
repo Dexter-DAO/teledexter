@@ -204,3 +204,29 @@ test('openings name no language and the instructions follow the caller into thei
   assert.match(brokerInstructions({ direction: 'inbound', purpose: '' }),
     /When the caller speaks another language, reply in that language for the rest of the call/);
 });
+
+test('spoken amounts are dollars first, taken only from results delivered during this call, and never raw units', () => {
+  for (const direction of ['inbound', 'outbound'] as const) {
+    const text = brokerInstructions({ direction, purpose: 'Read the current portfolio.' });
+    assert.match(text, /Spoken amounts:\nSay holding and trade amounts in dollars, rounded to the cent \("about three dollars of Apple"\), or "less than a cent"\./);
+    assert.match(text, /Give a token or share count only when the caller asks, as a short decimal with two significant digits/);
+    assert.match(text, /Never say "base tokens", "base units", "raw" or "lamports", or read out a long string of digits\./);
+    assert.match(text, /Speak only figures that appear in a result delivered during this call\. Never compute totals, differences or percentages, and never present a figure from startup history as current\./);
+    assert.doesNotMatch(text, /meaning and units of returned amounts/);
+    assert.match(text, /Keep the meaning of returned percentages and times\./);
+  }
+});
+
+test('after the opening a lone hello gets "I\'m here" only when nothing is pending, and Dexter never greets or asks again', () => {
+  for (const direction of ['inbound', 'outbound'] as const) {
+    const text = brokerInstructions({ direction, purpose: 'Read the current portfolio.' });
+    assert.match(text, /After the opening, answer a lone "hello\?" or "are you there\?" with a brief "I'm here\." only when nothing is pending; while work is pending, say you're on it\. Never greet the caller again or ask again what they want\./);
+  }
+});
+
+test('main instructions stay within the Live configuration limit for inbound and the longest outbound brief', () => {
+  // src/live/session.ts refuses instructions over 16,384 bytes (invalid_live_configuration).
+  assert.ok(Buffer.byteLength(brokerInstructions({ direction: 'inbound', purpose: 'The person called Dexter.' })) < 12_000);
+  assert.ok(Buffer.byteLength(brokerInstructions({ direction: 'outbound', purpose: 'x'.repeat(1500), registeredAssignment: true })) < 14_000);
+});
+
