@@ -49,11 +49,31 @@ The configuration starts one forked process and gives shutdown 65 seconds; the a
 
 Outbound call creation sets its own answer and status callbacks under `/broker/answer/:id` and `/broker/status/:id`. For incoming calls, configure the Twilio number with voice POST to `/broker/incoming-call` and status POST to `/broker/status`. Media streams connect to `/broker/media/:id` (account calls) and `/broker/setup-media/:id` (phone setup calls).
 
+## Greeting and media start
+
+Account calls answer with the media stream before account work finishes, so the greeting is heard at pickup:
+
+- **Outbound.** The signed answer callback returns `<Connect><Stream>` immediately and starts the Primary binding (`openCall`, including the API's provider-call check) in the background.
+- **Inbound** (same-call attachment). The first webhook returns a bare `<Redirect>`, which does not pick up. The signed continuation returns `<Connect><Stream>` and then a signed `<Redirect>` back to the continuation. The `<Connect>` answers the call. Admission begins once that response is delivered, because the API's begin refuses a leg that is still ringing.
+
+The pre-rendered clip starts as soon as Twilio's media `start` frame arrives: "Hey, it's Dexter." for outbound calls, and "Hey, it's Dexter. What can I do for you?" for inbound calls. It carries no account data. GPT-Live, with the account context, attaches to the stream only after the binding exists (outbound) or admission is bound with its context (inbound). Until then the stream carries only the clip. Selected-question continuations, verification callbacks and restricted setup keep their own Live-spoken openings and play no clip.
+
+Caller audio on that stream:
+
+- Audio spoken while the clip plays is discarded, so Live never answers a greeting that is already over. The clip counts as playing until Twilio acknowledges its last mark, or its length plus 1.5 s without marks. If Live is already attached, it receives the same length of silence instead.
+- Audio after the clip is kept. Until Live attaches, the broker holds the newest 15 s, then delivers it first and in order; the generation controller replays that backlog at 1.5x real time.
+
+`mediaStartedAt` is the time of the first caller sample Live receives: the greeting's end (or attach time, if the clip is still playing), and never earlier than an inbound binding's `consumedAt`. Input sample positions count from it. `journey.streamStartedAt` records the provider stream start; `journey.greetingClipStartedAt` and `greetingClipPlayedAt` record the clip.
+
+While an inbound stream waits, the broker polls the same admission every second, the pace of the hold redirects it replaced. A refusal, cancellation or the 120-second wait limit ends the wait. The broker then closes the stream after the clip. Twilio runs the trailing redirect, and the continuation answers with restricted setup or a hangup. A failed outbound binding is spoken ("I could not reach your Dexter account just now. Please try again shortly.") and ends the call. A call that ends while Primary is still binding it has that binding closed when it lands.
+
+Log events: `broker_audio_timing` stages `greetingClipStartedAt`, `greetingClipFirstPlaybackAcknowledgedAt` and `greetingClipPlayedAt`; `broker_account_media` (`mediaStartedAt`, `heldInputMs`, `droppedInputMs`, `greetingInputMs`) when Live attaches; and `broker_greeting_stream_released` when an inbound stream is handed back to its TwiML.
+
 ## Incoming calls
 
 Every Twilio webhook must carry a valid signature for the exact URL. Incoming calls follow one of two paths, selected at startup.
 
-**Same-call attachment** (when `BROKER_VERIFICATION_SETUP_MODEL` is set). The broker saves the signed incoming call, answers with "One moment.", and redirects the same call to `POST /broker/inbound/:callId/continue` while the Dexter API decides whether the caller may attach to an account. A caller whose number is linked to an account is bound to that account's Primary Dexter and talks to GPT-Live on the same call. A caller without a linked account gets a restricted phone-setup voice whose only tools are setup status, a verified-callback request, and completing or declining setup (`src/live/restrictedSetupTools.ts`). See [inbound-call-attachments.md](inbound-call-attachments.md).
+**Same-call attachment** (when `BROKER_VERIFICATION_SETUP_MODEL` is set). The broker saves the signed incoming call and redirects it to `POST /broker/inbound/:callId/continue`. The signed continuation answers with the media stream, and the greeting plays while the Dexter API decides whether the caller may attach to an account ([Greeting and media start](#greeting-and-media-start)). A caller whose number is linked to an account is bound to that account's Primary Dexter and talks to GPT-Live on the same call. A caller without a linked account hears the greeting, then gets a restricted phone-setup voice whose only tools are setup status, a verified-callback request, and completing or declining setup (`src/live/restrictedSetupTools.ts`). See [inbound-call-attachments.md](inbound-call-attachments.md).
 
 **Callback offer** (when `BROKER_VERIFICATION_SETUP_MODEL` is empty). The inbound response offers one DTMF choice: press 1 to request a callback. The offer and acknowledgment use the same wording whether the caller's account is ready or unavailable. The inbound leg supplies no account context to the caller or a voice model. The Gather action posts to `/broker/callback/:id`.
 
@@ -127,6 +147,6 @@ Maintenance also reconciles inactive, unresolved calls older than 60 seconds by 
 npm run calls -- journey --journal /absolute/path/to/state/calls.json --log /absolute/path/to/broker.log
 ```
 
-Add `--call-id <broker-call-uuid>` to select an earlier call. The JSON report joins admission and consumption times, media startup, provider readiness, first audio and carrier playback acknowledgment. It also shows each saved request's dispatch, answer availability and publication acceptance. Publication acceptance means the answer entered the voice session; the journal has no per-answer playback or individual tool spans. Missing timestamps remain null.
+Add `--call-id <broker-call-uuid>` to select an earlier call. The JSON report joins admission and consumption times, stream start, the greeting clip, Live attaching (`mediaStartedAt`), provider readiness, first audio and carrier playback acknowledgment. `createdToStream` approximates time to pickup plus stream setup, and `greetingClipPlayedToMedia` is how long the caller waited after the greeting before Live attached. It also shows each saved request's dispatch, answer availability and publication acceptance. Publication acceptance means the answer entered the voice session; the journal has no per-answer playback or individual tool spans. Missing timestamps remain null.
 
 The report reads at most 32 MiB of journal data and the final 8 MiB of the supplied log. Its coverage fields report truncation and omitted rows. It emits timing, status and broker request IDs, excluding phone numbers, transcripts, provider proofs and raw errors. It opens neither the writer lock nor a network connection.
