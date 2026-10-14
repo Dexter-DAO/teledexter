@@ -229,7 +229,7 @@ test('incoming audio timing separates sent audio, cleared marks, and confirmed p
   assert.equal(f.store.get(call.id)!.journey?.firstAudioSentAt, sentAt);
 });
 
-test('audible timing excludes silence, empty audio, cleared and duplicate marks without changing the journal', async t => {
+test('audible timing excludes silence, empty audio, cleared and duplicate marks; only first speech reaches the journal', async t => {
   const events: Array<{ event: string; callId: string; stage: string; observedAt: string }> = [];
   t.mock.method(console, 'info', (value: string) => { const event = JSON.parse(value); if (event.event === 'broker_audio_timing') events.push(event); });
   const f = await fixture(t), { call, ws } = await connectIncomingMedia(f); t.after(() => ws.close());
@@ -262,7 +262,8 @@ test('audible timing excludes silence, empty audio, cleared and duplicate marks 
     'firstSpeechAudioSentAt', 'firstSpeechPlaybackAcknowledgedAt']);
   assert.ok(events.every(event => event.callId === call.id && Number.isFinite(Date.parse(event.observedAt))));
   assert.deepEqual(Object.keys(events[0]).sort(), ['callId', 'event', 'observedAt', 'stage', 'version']);
-  assert.deepEqual(Object.keys(f.store.get(call.id)!.journey!).sort(), ['firstAudioSentAt', 'firstPlaybackConfirmedAt', 'liveReadyAt', 'streamStartedAt']);
+  // No caller spoke, so no callerSpeechEndedAt: the first words answer nothing the caller said.
+  assert.deepEqual(Object.keys(f.store.get(call.id)!.journey!).sort(), ['firstAudioSentAt', 'firstPlaybackConfirmedAt', 'firstSpeechAudioSentAt', 'liveReadyAt', 'streamStartedAt']);
 });
 
 // Production evidence (calls 60616be7 / 6b2ef8d1): the first "audible" chunk was a
@@ -457,7 +458,7 @@ test('incoming legacy admission without frozen billing reference never posts a n
       callSid: call.callSid!, termsDigest: 'a'.repeat(64) } } as InboundOutcome }), /binding changed/);
 });
 
-async function fixture(t: test.TestContext, options: { selected?: boolean; retained?: BrokerCall; initialRemote?: InboundOutcome; eligible?: boolean; billing?: boolean; billingUrl?: string; duration?: string; preconnect?: boolean; replaceFirstGeneration?: boolean; greetingClip?: Buffer; outboundClipOnly?: Buffer } = {}) {
+async function fixture(t: test.TestContext, options: { selected?: boolean; retained?: BrokerCall; initialRemote?: InboundOutcome; eligible?: boolean; billing?: boolean; billingUrl?: string; duration?: string; preconnect?: boolean; replaceFirstGeneration?: boolean; greetingClip?: Buffer; outboundClipOnly?: Buffer; startupPageFreshMs?: number } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-inbound-http-'));
   if (options.retained) fs.writeFileSync(path.join(dir, 'calls.json'), JSON.stringify({ version: 1, calls: { [options.retained.id]: options.retained } }));
   const store = new BrokerStore(dir);
@@ -488,7 +489,7 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
   let assertGate: Promise<void> | undefined, releaseAssert: (() => void) | undefined;
   let voiceOptions: BrokerLiveSessionOptions | undefined;
   let remote = options.initialRemote;
-  let loseConsume = false, lostBegin = false, authority = true, cancellationUnavailable = false;
+  let loseConsume = false, lostBegin = false, authority = true, cancellationUnavailable = false, generationReplaced = false;
   const lifecycle: string[] = [];
   let providerGate: Promise<void> | undefined; let releaseProvider: (() => void) | undefined;
   let providerEntered: (() => void) | undefined; let providerState = 'in-progress';
@@ -566,6 +567,7 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
   }
   const broker = createBrokerServer({ config, store, primary, provider: { calls: provider } as unknown as ReturnType<typeof Twilio>,
     inboundAdmissionPollMs: 5,
+    ...(options.startupPageFreshMs === undefined ? {} : { startupPageFreshMs: options.startupPageFreshMs }),
     ...(options.greetingClip ? { inboundGreetingClip: options.greetingClip } : {}),
     ...(options.outboundClipOnly ? { greetingClip: options.outboundClipOnly } : {}),
     ...(options.selected === false ? {} : { inboundAttachment: createInboundHoldAdapter({ publicOrigin: config.publicOrigin, store }) }),
@@ -578,7 +580,9 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
         seen.contextAssert++; assert.equal(binding.bindingId, bindingId); assert.equal(binding.callSid, params.CallSid);
         if (assertGate) await assertGate;
         if (!authority) throw new PrimaryApiError('http_error', 403, { code: 'binding_revoked', retryable: false });
-        if (options.replaceFirstGeneration && seen.voice === 1 && seen.contextAssert === 2) {
+        // The first assertion made after the first Live session opened (a pre-load recheck runs before it).
+        if (options.replaceFirstGeneration && seen.voice === 1 && !generationReplaced) {
+          generationReplaced = true;
           eligiblePage.context.history.version = { ...eligiblePage.context.history.version, contextEpoch: '2', digest: 'c'.repeat(64) };
           throw new PrimaryApiError('http_error', 409, { code: 'context_changed', retryable: false });
         }
@@ -673,8 +677,9 @@ test('actual HTTP incoming waits on same leg and approved continuation enters ex
   ws.close(); await new Promise<void>(resolve => ws.once('close', () => resolve()));
 });
 
-test('admitted eligible history reaches first voice startup without a duplicate GET and keeps both original assertions', async t => {
-  const f = await fixture(t, { eligible: true });
+for (const fresh of [true, false])
+test(`admitted eligible history reaches first voice startup without a duplicate GET (${fresh ? 'fresh binding response: post-open assertion only' : 'older page: pre-load and post-open assertions'})`, async t => {
+  const f = await fixture(t, { eligible: true, ...(fresh ? {} : { startupPageFreshMs: 0 }) });
   await (await f.webhook('/broker/incoming-call')).text();
   const call = f.store.list()[0]; await f.waitForAdmission(); f.approve();
   assert.match(await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text(), /<Stream/);
@@ -691,7 +696,9 @@ test('admitted eligible history reaches first voice startup without a duplicate 
     streamSid: 'MZ' + '4'.repeat(32), customParameters: { token: streamToken(f.config.controlToken, call.id, f.params.CallSid) },
     mediaFormat: { encoding: 'audio/x-mulaw', sampleRate: 8000, channels: 1 } } }));
   for (let count = 0; count < 100 && f.seen.opening === 0; count++) await new Promise(resolve => setTimeout(resolve, 10));
-  assert.equal(f.seen.opening, 1); assert.equal(f.seen.contextAssert, 2, 'pre-load and post-open checks also qualify the initial greeting');
+  assert.equal(f.seen.opening, 1);
+  assert.equal(f.seen.contextAssert, fresh ? 1 : 2, fresh ? 'the binding response qualifies the page; the post-open check qualifies the greeting'
+    : 'pre-load and post-open checks also qualify the initial greeting');
   assert.equal(f.seen.startupFetch, 0); assert.equal(f.seen.context, 1);
   assert.deepEqual(f.startupPages, [f.eligiblePage]);
   ws.close(); await new Promise<void>(resolve => ws.once('close', () => resolve()));
@@ -905,8 +912,9 @@ async function preconnectMedia(f: Awaited<ReturnType<typeof fixture>>, call: Bro
   return ws;
 }
 
-test('approved inbound transport overlaps context I/O and stays command-free through media and pre-start assertion', async t => {
-  const f = await fixture(t, { eligible: true, preconnect: true });
+for (const fresh of [true, false])
+test(`approved inbound transport overlaps context I/O and stays command-free through media and ${fresh ? 'the post-open' : 'the pre-start'} assertion`, async t => {
+  const f = await fixture(t, { eligible: true, preconnect: true, ...(fresh ? {} : { startupPageFreshMs: 0 }) });
   const call = await preconnectApproved(f), release = f.gateConsume();
   const response = f.webhook(`/broker/inbound/${call.id}/continue`);
   await preconnectUntil(() => f.seen.consume === 1);
@@ -917,10 +925,16 @@ test('approved inbound transport overlaps context I/O and stays command-free thr
   assert.deepEqual(transport.sent, []);
   const releaseAssert = f.gateAssert(), ws = await preconnectMedia(f, call); t.after(() => ws.close());
   await preconnectUntil(() => f.seen.contextAssert === 1);
-  assert.deepEqual(transport.sent, []); assert.equal(f.seen.voice, 0);
+  if (fresh) {
+    // The binding response just qualified the page: Live opens on it at once, but neither the
+    // opening nor any caller audio passes until the post-open assertion succeeds.
+    assert.equal(f.seen.voice, 1);
+    assert.deepEqual(transport.sent.map(event => event.type), ['session.start']);
+    assert.equal(f.store.get(call.id)!.voiceOpening, undefined);
+  } else { assert.deepEqual(transport.sent, []); assert.equal(f.seen.voice, 0); }
   releaseAssert();
   await preconnectUntil(() => f.store.get(call.id)!.voiceOpening?.status === 'accepted');
-  assert.equal(f.transports.length, 1); assert.equal(f.seen.contextAssert, 2, 'opening shares the validated activation');
+  assert.equal(f.transports.length, 1); assert.equal(f.seen.contextAssert, fresh ? 1 : 2, 'opening shares the validated activation');
   assert.equal(f.seen.startupFetch, 0); assert.equal(f.seen.context, 1);
   assert.equal(transport.sent.filter(event => event.type === 'session.start').length, 1);
   assert.deepEqual(f.startupPages, [f.eligiblePage]);
@@ -952,7 +966,8 @@ for (const refusal of ['unapproved', 'wrong-provider', 'provider-ended'] as cons
 
 for (const failure of ['consume', 'early-error', 'early-close', 'media-token', 'revoked', 'hangup', 'shutdown'] as const)
   test(`inbound preconnect cleans ${failure} without private commands or automatic replacement`, async t => {
-    const f = await fixture(t, { eligible: true, preconnect: true });
+    // Revocation between an older admission and media: the pre-load recheck refuses before Live opens.
+    const f = await fixture(t, { eligible: true, preconnect: true, ...(failure === 'revoked' ? { startupPageFreshMs: 0 } : {}) });
     const call = await preconnectApproved(f);
     if (failure === 'consume') f.loseConsume();
     await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text();
@@ -971,6 +986,22 @@ for (const failure of ['consume', 'early-error', 'early-close', 'media-token', '
     assert.equal(transport.terminated, 1); assert.deepEqual(transport.sent, []);
     assert.equal(f.transports.length, 1);
   });
+
+test('authority revoked just after a fresh binding response: Live opens but no opening, audio or caller input passes', async t => {
+  const f = await fixture(t, { eligible: true, preconnect: true });
+  const call = await preconnectApproved(f);
+  await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text();
+  const transport = f.transports[0]; transport.open();
+  f.refuseContext();
+  const ws = await preconnectMedia(f, call); t.after(() => ws.close());
+  await preconnectUntil(() => ws.readyState === WebSocket.CLOSED);
+  assert.equal(f.seen.contextAssert, 1, 'the post-open assertion refused');
+  assert.deepEqual(transport.sent.filter(event => event.type !== 'session.close').map(event => event.type), ['session.start'],
+    'no opening, instruction or caller audio reached the session');
+  assert.equal(f.seen.opening, 0); assert.equal(f.store.get(call.id)!.voiceOpening, undefined);
+  assert.equal(f.transports.length, 1, 'no automatic replacement');
+  assert.ok(transport.closed + transport.terminated >= 1);
+});
 
 test('inbound preconnect adoption preserves a managed generation replacement after context changes', async t => {
   const f = await fixture(t, { eligible: true, preconnect: true, replaceFirstGeneration: true });
@@ -1096,6 +1127,30 @@ test('the greeting plays at stream start while admission waits; words over it ar
   assert.ok(Date.parse(saved.mediaStartedAt!) >= Date.parse((saved.inbound!.remote as { consumedAt: string }).consumedAt));
   assert.deepEqual(media.map(({ heldInputMs, droppedInputMs, greetingInputMs }) => ({ heldInputMs, droppedInputMs, greetingInputMs })),
     [{ heldInputMs: 200, droppedInputMs: 0, greetingInputMs: 100 }]);
+});
+
+test('in the greeting-stream order Live opens on the binding response with only its post-open assertion; the wait after the caller\'s words is journaled', async t => {
+  const f = await fixture(t, { eligible: true, greetingClip: greetingFixtureClip });
+  await (await f.webhook('/broker/incoming-call')).text();
+  const call = f.store.list()[0]; await f.waitForAdmission();
+  const g = await greetingMedia(f, call); t.after(() => g.ws.close());
+  for (let i = 0; i < 200 && g.clipFrames() < 15; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  g.ackClip();
+  for (let i = 0; i < 100 && !f.store.get(call.id)!.journey?.greetingClipPlayedAt; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  g.caller(Buffer.alloc(800, 0x21)); g.caller(Buffer.alloc(800, 0xff)); // A question, then silence, while admission runs.
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(f.seen.voice, 0);
+  f.approve();
+  for (let i = 0; i < 200 && f.seen.opening === 0; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(f.seen.opening, 1);
+  assert.equal(f.seen.contextAssert, 1, 'no second eligibility read between the binding response and Live');
+  assert.equal(f.seen.startupFetch, 0); assert.equal(f.seen.context, 1);
+  assert.deepEqual(f.startupPages, [f.eligiblePage]);
+  f.emitAudio(Buffer.alloc(800, 0x20)); // Dexter's first words.
+  for (let i = 0; i < 100 && !f.store.get(call.id)!.journey?.firstSpeechAudioSentAt; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  const journey = f.store.get(call.id)!.journey!;
+  assert.ok(journey.callerSpeechEndedAt && journey.firstSpeechAudioSentAt);
+  assert.ok(journey.greetingClipPlayedAt! <= journey.callerSpeechEndedAt && journey.callerSpeechEndedAt <= journey.firstSpeechAudioSentAt);
 });
 
 test('held caller audio keeps the newest 15 s while admission waits', async t => {

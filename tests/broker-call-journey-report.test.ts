@@ -24,7 +24,7 @@ test('joins startup, persisted consumption and first playback without equating p
   assert.deepEqual(report.durationsMs, { createdToMedia: 7000, consumption: 2000, consumedToMedia: 2000,
     mediaToFirstProviderOpen: 1000, createdToFirstProviderReady: 9000, mediaToLiveReady: 3000,
     createdToFirstAudio: 11000, createdToFirstPlayback: 12000, createdToStream: null, streamToGreetingClip: null,
-    greetingClipPlayedToMedia: null });
+    greetingClipPlayedToMedia: null, callerSpeechEndToFirstSpeech: null });
   assert.equal(report.generations[0].providerOpenMs, 1000);
   assert.equal(report.generations[0].providerReadyAt, at(9));
   assert.equal(report.timestamps.liveReadyAt, at(10));
@@ -41,6 +41,15 @@ test('reports the greeting stream and clip separately from Live attaching and re
   assert.equal(report.durationsMs.streamToGreetingClip, 0);
   assert.equal(report.durationsMs.greetingClipPlayedToMedia, 3000);
   assert.equal(report.durationsMs.mediaToLiveReady, 3000);
+});
+
+test('reports the silence between the caller\'s last words and Dexter\'s first reply', () => {
+  const call: any = baseCall();
+  call.journey = { ...call.journey, callerSpeechEndedAt: at(13), firstSpeechAudioSentAt: at(16) };
+  const report = createCallJourneyReport(journal(call));
+  assert.equal(report.timestamps.callerSpeechEndedAt, at(13));
+  assert.equal(report.timestamps.firstSpeechAudioSentAt, at(16));
+  assert.equal(report.durationsMs.callerSpeechEndToFirstSpeech, 3000);
 });
 
 test('historical calls retain missing timing instead of inferring audio from transcripts', () => {

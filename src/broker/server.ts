@@ -65,6 +65,8 @@ const GREETING_ACK_GRACE_MS = 1_500;
 /** Caller audio kept between the greeting's end and Live attaching: the newest 15 s. Typical admission
  * keeps 0-2 s here; Live startup then buffers up to its own 15 s inside the generation controller's ~35 s. */
 const HELD_INPUT_MAX_BYTES = 120_000;
+/** Caller frame energy above this is speech (the threshold every caller-speech observation uses). */
+const CALLER_SPEECH_ENERGY = 0.012;
 /** Admission poll interval while a greeting stream waits for inbound approval: the pace of the
  * Pause-and-redirect hold loop it replaces, so the API sees the same status and begin rate. */
 const INBOUND_ADMISSION_POLL_MS = 1_000;
@@ -162,6 +164,9 @@ export interface BrokerServerOptions {
   inboundGreetingClip?: Buffer;
   /** Admission poll interval for a greeting stream waiting on inbound approval (default 1 s). */
   inboundAdmissionPollMs?: number;
+  /** Age up to which a binding response seeds Live without a second eligibility read
+   * (default STARTUP_PAGE_FRESH_MS); 0 rechecks every page first. */
+  startupPageFreshMs?: number;
 }
 
 export function createBrokerServer(options: BrokerServerOptions) {
@@ -180,7 +185,8 @@ export function createBrokerServer(options: BrokerServerOptions) {
   });
   const preconnect = options.eligibleContext && options.inboundPreconnect ? createInboundPreconnect(options.inboundPreconnect,
     event => console.info(JSON.stringify(event))) : undefined;
-  const startupContexts = options.eligibleContext ? createInboundStartupContexts(options.eligibleContext) : undefined;
+  const startupContexts = options.eligibleContext ? createInboundStartupContexts(options.eligibleContext,
+    options.startupPageFreshMs === undefined ? {} : { freshMs: options.startupPageFreshMs }) : undefined;
   const resolveHarkAssignment = options.resolveHarkAssignment ?? (config.harkApiBaseUrl
     ? createHarkAssignmentResolver({ apiBaseUrl: config.harkApiBaseUrl }) : undefined);
   const resolveNotificationAssignment = options.resolveNotificationAssignment ?? (config.harkApiBaseUrl
@@ -986,6 +992,9 @@ export function createBrokerServer(options: BrokerServerOptions) {
     let heldInputBytes = 0, droppedInputBytes = 0, greetingInputBytes = 0;
     // Caller audio Live has received: Live's input clock, counted from mediaStartedAt.
     let fedBytes = 0;
+    // Arrival of the latest caller speech frame after the greeting and before Dexter first spoke:
+    // the end of what the caller said before the first reply (journey.callerSpeechEndedAt).
+    let callerSpeechEndedAt: number | undefined;
     const recordAudibleTiming = (stage: 'firstAudibleAudioSentAt' | 'firstAudiblePlaybackAcknowledgedAt'
       | 'firstSpeechAudioSentAt' | 'firstSpeechPlaybackAcknowledgedAt'
       | 'greetingClipStartedAt' | 'greetingClipFirstPlaybackAcknowledgedAt' | 'greetingClipPlayedAt', detail: Record<string, number> = {}) => {
@@ -1040,7 +1049,18 @@ export function createBrokerServer(options: BrokerServerOptions) {
       }
       const name = sendOutputChunk(payload, bytes, audible, speech);
       if (speech && !speechSentRecorded) {
-        speechSentRecorded = true; recordAudibleTiming('firstSpeechAudioSentAt', { queuedAheadMs: Math.max(0, receipts.backlogMs - bytes.length / 8) });
+        speechSentRecorded = true;
+        // Dexter's first words (never the greeting clip). After a caller who already spoke, the gap
+        // since their last speech frame is the silence they heard before the first reply.
+        const sentAt = Date.now();
+        try {
+          const saved = store.get(call.id)!;
+          if (!saved.journey?.firstSpeechAudioSentAt) store.update(call.id, { journey: { ...saved.journey,
+            firstSpeechAudioSentAt: new Date(sentAt).toISOString(),
+            ...(callerSpeechEndedAt === undefined ? {} : { callerSpeechEndedAt: new Date(callerSpeechEndedAt).toISOString() }) } });
+        } catch { /* Timing evidence cannot interrupt audio. */ }
+        recordAudibleTiming('firstSpeechAudioSentAt', { queuedAheadMs: Math.max(0, receipts.backlogMs - bytes.length / 8),
+          ...(callerSpeechEndedAt === undefined ? {} : { afterCallerSpeechMs: sentAt - callerSpeechEndedAt }) });
       } else if (!speechSentRecorded) {
         preSpeechTail.push({ name, payload, bytes: bytes.length, audible });
         if (preSpeechTail.length > PRE_SPEECH_TAIL_LIMIT) preSpeechTail.shift();
@@ -1088,7 +1108,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
       const bytes = Buffer.from(payload, 'base64');
       fedBytes += bytes.length;
       // Twilio timestamps are media positions, not an authorization or a turn boundary.
-      if (inputSpeechEnergy(bytes) > 0.012) { lastSpeechAt = Date.now(); backend?.noteCallerSpeech(lastSpeechAt, fedBytes / 8); }
+      if (inputSpeechEnergy(bytes) > CALLER_SPEECH_ENERGY) { lastSpeechAt = Date.now(); backend?.noteCallerSpeech(lastSpeechAt, fedBytes / 8); }
       return live!.appendAudio(payload) !== false;
     };
     const metrics = () => ({ receivedAudioBytes: inputBytes, sentAudioBytes: receipts.sentBytes, playedAudioBytes: receipts.playedBytes, clearedAudioBytes: receipts.clearedBytes });
@@ -1342,6 +1362,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
             if (live && !feedLive(Buffer.alloc(bytes.length, 0xff).toString('base64'))) void stop('input_audio_refused');
             return;
           }
+          if (!speechSentRecorded && inputSpeechEnergy(bytes) > CALLER_SPEECH_ENERGY) callerSpeechEndedAt = Date.now();
           if (live) { if (!feedLive(frame.media.payload)) void stop('input_audio_refused'); return; }
           heldInput.push({ payload: frame.media.payload, bytes: bytes.length }); heldInputBytes += bytes.length;
           while (heldInputBytes > HELD_INPUT_MAX_BYTES) {

@@ -59,13 +59,13 @@ async function fixture(t: TestContext, rejectPostOpenAssert = false) {
   } };
   store.recordPrimaryBinding(call.id, page);
   store.update(call.id, { mediaStartedAt: new Date().toISOString() });
-  let assertions = 0, fetches = 0, ready = 0;
+  let assertions = 0, fetches = 0, ready = 0, created = false;
   const problems: string[] = [], audio: string[] = [];
   const client: EligibleContextClient = {
     async fetch() { fetches++; return page; },
     async assert(_binding, version) {
       assertions++;
-      if (rejectPostOpenAssert && assertions > 1) throw new PrimaryApiError('http_error', 503);
+      if (rejectPostOpenAssert && created) throw new PrimaryApiError('http_error', 503);
       return { bindingId, callSid, current: true, version };
     },
     async delivery() { throw new Error('No delivery is authorized'); },
@@ -73,7 +73,6 @@ async function fixture(t: TestContext, rejectPostOpenAssert = false) {
   const startup = createInboundStartupContexts(client);
   startup.remember(store.get(call.id)!, page);
   const connection = new Connection();
-  let created = false;
   const voice = createGenerationVoice({ call: store.get(call.id)!, callDeadlineAt: new Date(Date.now() + 60_000).toISOString(),
     apiKey: 'synthetic-key', voice: 'marin', store, primary: {} as PrimaryApiClient,
     context: startup.take(store.get(call.id)!),
@@ -85,7 +84,8 @@ async function fixture(t: TestContext, rejectPostOpenAssert = false) {
   await until(() => created);
   connection.connect();
   assert.equal(connection.sent[0]?.type, 'session.start');
-  assert.equal(assertions, 1, 'cached context retains its mandatory fresh assertion before opening');
+  // The binding response landed moments ago: it is the eligibility read, so Live opens at once.
+  assert.equal(assertions, 0, 'a fresh binding response opens Live without a second read');
   assert.equal(fetches, 0);
   return { store, callId: call.id, connection, problems, audio, get ready() { return ready; }, get assertions() { return assertions; } };
 }
@@ -109,7 +109,7 @@ for (const [providerCode, expectedCode] of [
     assert.equal(segment.readyAt, undefined);
     assert.equal(call.failure?.code, expectedCode);
     assert.ok(f.problems.length > 0 && f.problems.every(code => code === expectedCode));
-    assert.equal(f.assertions, 1, 'post-open assertion cannot run before a ready session');
+    assert.equal(f.assertions, 0, 'post-open assertion cannot run before a ready session');
     assert.equal(f.ready, 0);
     assert.deepEqual(f.audio, []);
     assert.equal(f.connection.terminated, 1);
@@ -134,7 +134,7 @@ test('post-open authority failure remains separate from Live startup failure', a
   assert.equal(segment.sessionId, 'started_fixture');
   assert.ok(segment.readyAt);
   assert.equal(Object.hasOwn(segment, 'startupFailure'), false);
-  assert.equal(f.assertions, 2);
+  assert.equal(f.assertions, 1);
   assert.equal(f.ready, 0);
   assert.deepEqual(f.audio, []);
 });

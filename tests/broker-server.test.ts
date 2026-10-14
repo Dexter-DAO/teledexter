@@ -519,6 +519,34 @@ test('a stream that hangs up while Primary is binding closes that binding after 
   assert.equal(f.voiceOptions(), undefined);
 });
 
+for (const spokeAfterGreeting of [true, false]) {
+  test(`the journal records how long the caller waited after speaking for Dexter's first words (${spokeAfterGreeting ? 'spoke after the greeting' : 'spoke only over it'})`, async t => {
+    const clip = Buffer.alloc(2_400, 0x20); // 300 ms
+    const f = await fixture(t, { greetingClip: clip });
+    assert.equal((await f.post('/internal/broker/calls', { requestId: randomUUID(), purpose: 'Read the current portfolio.' })).status, 201);
+    const call = f.broker.store.list()[0];
+    const answered = await answeredStream(f, call);
+    await until(() => Boolean(f.broker.store.get(call.id)!.primary));
+    const media = await answered.connect(); t.after(() => media.ws.close());
+    await until(() => media.frames.filter(frame => frame.event === 'media').length === 15);
+    const speech = Buffer.alloc(800, 0x21), silence = Buffer.alloc(800, 0xff);
+    media.caller(speech); // Over the greeting: never the caller's question.
+    for (const frame of media.frames.filter(frame => frame.event === 'mark')) media.ack(frame.name!);
+    await until(() => Boolean(f.broker.store.get(call.id)!.journey?.greetingClipPlayedAt));
+    if (spokeAfterGreeting) media.caller(speech);
+    media.caller(silence);
+    await until(() => f.appended.length === (spokeAfterGreeting ? 3 : 2));
+    await new Promise(resolve => setTimeout(resolve, 40));
+    f.voiceOptions()!.onAudio(Buffer.alloc(1_600, 0x21).toString('base64'), { deliveryId: 'first-words' });
+    await until(() => Boolean(f.broker.store.get(call.id)!.journey?.firstSpeechAudioSentAt));
+    const journey = f.broker.store.get(call.id)!.journey!;
+    assert.ok(journey.firstAudioSentAt! <= journey.firstSpeechAudioSentAt!);
+    if (!spokeAfterGreeting) { assert.equal(journey.callerSpeechEndedAt, undefined); return; }
+    const waited = Date.parse(journey.firstSpeechAudioSentAt!) - Date.parse(journey.callerSpeechEndedAt!);
+    assert.ok(waited >= 30 && waited < 2_000, `caller waited ${waited} ms`);
+  });
+}
+
 for (const streamConnected of [false, true]) {
   test(`a broker shutdown waits for an in-flight outbound binding and closes it (${streamConnected ? 'stream connected' : 'no stream yet'})`, async t => {
     const f = await fixture(t, { gateBind: true });

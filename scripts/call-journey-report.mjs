@@ -78,6 +78,8 @@ export function createCallJourneyReport(journal, logText = '', options = {}) {
     firstAudioSentAt: time(journey.firstAudioSentAt), firstPlaybackConfirmedAt: time(journey.firstPlaybackConfirmedAt),
     // Pre-rendered greeting clip: started at stream start, played = every clip mark acknowledged.
     greetingClipStartedAt: time(journey.greetingClipStartedAt), greetingClipPlayedAt: time(journey.greetingClipPlayedAt),
+    // Dexter's first spoken words (never the clip), and the caller's last speech frame before them.
+    callerSpeechEndedAt: time(journey.callerSpeechEndedAt), firstSpeechAudioSentAt: time(journey.firstSpeechAudioSentAt),
     endedAt: time(call.endedAt),
   };
   const sourceGenerations = Array.isArray(call.liveGenerations?.segments) ? call.liveGenerations.segments : [];
@@ -111,7 +113,9 @@ export function createCallJourneyReport(journal, logText = '', options = {}) {
       createdToFirstPlayback: elapsed(timestamps.callCreatedAt, timestamps.firstPlaybackConfirmedAt),
       createdToStream: elapsed(timestamps.callCreatedAt, timestamps.streamStartedAt),
       streamToGreetingClip: elapsed(timestamps.streamStartedAt, timestamps.greetingClipStartedAt),
-      greetingClipPlayedToMedia: elapsed(timestamps.greetingClipPlayedAt, timestamps.mediaStartedAt) },
+      greetingClipPlayedToMedia: elapsed(timestamps.greetingClipPlayedAt, timestamps.mediaStartedAt),
+      // The silence a caller who spoke after the greeting heard before Dexter's first reply.
+      callerSpeechEndToFirstSpeech: elapsed(timestamps.callerSpeechEndedAt, timestamps.firstSpeechAudioSentAt) },
     generations, stages: parsed.spans, requests,
     coverage: { logProvided: options.logProvided ?? Boolean(logText), logTailTruncated: options.logTailTruncated === true,
       droppedSpans: parsed.dropped, oversizedLogLines: parsed.oversizedLines,
