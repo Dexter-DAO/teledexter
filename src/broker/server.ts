@@ -1,4 +1,5 @@
 import type { BrokerSmsBridge } from './sms.js';
+import { formatCallTranscript } from './callTranscript.js';
 import { createResultSmsClient, type ResultSmsClient } from './resultSmsClient.js';
 import { dispatchResultSms, resultSmsFailure } from './resultSmsDispatch.js';
 import { createInboundBillingLifecycle } from './inboundBillingLifecycle.js';
@@ -226,6 +227,14 @@ export function createBrokerServer(options: BrokerServerOptions) {
   const pendingRequests = new Set<Promise<void>>();
   const sessionCalls = new Set<string>();
   const closingBindings = new Map<string, Promise<void>>();
+  // Retained calls have already ended; do not replay their logs on broker restart.
+  const loggedTranscripts = new Set(store.list().filter(call => call.endedAt).map(call => call.id));
+  function logTranscript(id: string): void {
+    const call = store.get(id);
+    if (!call?.endedAt || active.has(id) || closingBindings.has(id) || loggedTranscripts.has(id)) return;
+    console.info(formatCallTranscript(call));
+    loggedTranscripts.add(id);
+  }
   // Outbound Primary bindings started by the answer route; the media stream attaches Live when one settles.
   const pendingBinds = new Map<string, Promise<BrokerCall>>();
   // Each background binding until it settles and, when nothing will attach it, its close finishes.
@@ -311,7 +320,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
     preconnect?.forget(call.id);
     const inboundBound = call.inbound?.remote?.state === 'bound' ? call.inbound.remote : undefined;
     const bindingId = call.primary?.bindingId ?? inboundBound?.bindingId;
-    if (!bindingId) return Promise.resolve();
+    if (!bindingId) { logTranscript(call.id); return Promise.resolve(); }
     const existing = closingBindings.get(call.id);
     if (existing) return existing;
     store.update(call.id, { primaryClosePending: true });
@@ -394,7 +403,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
       store.update(call.id, { primaryClosePending: false });
       selectedHosts.delete(call.id);
     })().catch(error => { store.update(call.id, { failure: safeFailure(error) }); })
-      .finally(() => closingBindings.delete(call.id));
+      .finally(() => { closingBindings.delete(call.id); logTranscript(call.id); });
     closingBindings.set(call.id, pending);
     return pending;
   }
@@ -898,6 +907,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
             if (active.has(call.id)) await active.get(call.id)!.stop('provider_terminal');
             else if (call.inbound) await inbound.stop(call.id, 'provider_terminal');
             else { pendingBinds.delete(call.id); await closePrimary(call); }
+            logTranscript(call.id);
           }
         }
         return json(response, 200, { ok: true });
@@ -1189,7 +1199,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
         }
         store.update(call.id, { metrics: metrics() });
         await closePrimary(store.get(call.id)!);
-      })().finally(() => { claimed.delete(call.id); active.delete(call.id); });
+      })().finally(() => { claimed.delete(call.id); active.delete(call.id); logTranscript(call.id); });
       return stopPromise;
     }
 
