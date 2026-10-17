@@ -122,7 +122,13 @@ function acquireWriterLock(lockPath, fileSystem) {
   const take = () => {
     const descriptor = fileSystem.openSync(lockPath, 'wx', 0o600);
     try { fileSystem.writeFileSync(descriptor, JSON.stringify({ pid: process.pid, id }), { encoding: 'utf8' }); fileSystem.fsyncSync(descriptor); }
-    finally { fileSystem.closeSync(descriptor); }
+    catch (error) {
+      // Never leave an empty or partial lock: the next broker could not parse it and would not start.
+      try { fileSystem.closeSync(descriptor); } catch { /* Closed below otherwise. */ }
+      try { fileSystem.unlinkSync(lockPath); } catch { /* Already gone. */ }
+      throw error;
+    }
+    fileSystem.closeSync(descriptor);
   };
   try { take(); } catch (error) {
     if (error?.code !== 'EEXIST') throw error;
@@ -158,6 +164,7 @@ export function runRollbackJournalCompat(args, options = {}) {
   // A dry run only reads (the store replaces the journal by rename, so any read is a whole
   // journal); it can run while the broker is still up. A real run needs the writer lock.
   const release = dryRun ? () => {} : acquireWriterLock(path.join(directory, 'writer.lock'), fileSystem);
+  let failed = false;
   try {
     if (!fs.existsSync(file)) return { stateDir: directory, calls: 0, changedCalls: 0, journeysDropped: 0, journeyKeysRemoved: 0,
       backup: null, written: false, dryRun };
@@ -176,7 +183,11 @@ export function runRollbackJournalCompat(args, options = {}) {
     durablyReplace(file, body, fileSystem, binding);
     if (fs.readFileSync(file, 'utf8') !== body || fs.readFileSync(backup, 'utf8') !== original) throw new Error('rollback_write_unverified');
     return { ...summary, backup, written: true };
-  } finally { release(); }
+  } catch (error) { failed = true; throw error; }
+  finally {
+    try { release(); }
+    catch (error) { if (!failed) throw error; /* Report the original failure, not the lock cleanup. */ }
+  }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href) {

@@ -157,3 +157,21 @@ test('a journey the previous release could not read even after the change is ref
   assert.deepEqual(rollbackJournal(input).journal.calls[id].journey, { liveReadyAt: at(2) });
   assert.deepEqual(input, frozen, 'the input is not modified');
 });
+
+test('a lock that cannot be written is removed, so the next broker still starts, and the journal is untouched', t => {
+  const f = branchJournal(t);
+  const original = fs.readFileSync(f.file, 'utf8');
+  const fileSystem = {
+    openSync: (target: string, flags: string, mode?: number) => fs.openSync(target, flags, mode),
+    writeFileSync: (fd: number, data: string, options: { encoding: 'utf8' }) => fs.writeFileSync(fd, data, options),
+    chmodSync: (target: string, mode: number) => fs.chmodSync(target, mode),
+    fsyncSync: () => { throw Object.assign(new Error('no space left on device'), { code: 'ENOSPC' }); },
+    closeSync: (fd: number) => fs.closeSync(fd),
+    renameSync: (from: string, to: string) => fs.renameSync(from, to),
+    unlinkSync: (target: string) => fs.unlinkSync(target),
+  };
+  assert.throws(() => runRollbackJournalCompat([f.directory], { fileSystem }), /no space left on device/);
+  assert.deepEqual(fs.readdirSync(f.directory), ['calls.json'], 'no empty writer.lock is left behind');
+  assert.equal(fs.readFileSync(f.file, 'utf8'), original);
+  const reopened = new BrokerStore(f.directory); assert.equal(reopened.list().length, 5); reopened.close();
+});
