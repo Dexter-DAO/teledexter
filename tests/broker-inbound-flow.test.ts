@@ -37,6 +37,7 @@ async function fixture(t: test.TestContext) {
   let providerStatus = 'in-progress';
   let providerGate: ReturnType<typeof deferred<void>> | undefined;
   let providerFailure: Error | undefined;
+  let providerMismatch = false;
   let contextAllowed = true;
   let loseBegin = false, loseConsume = false, loseClose = false;
   let includeOutcome = false;
@@ -48,6 +49,7 @@ async function fixture(t: test.TestContext) {
   let consumeError: Error | undefined, contextError: Error | undefined; let refuseBeforeConsume = false;
   const counts = { begin: 0, recover: 0, status: 0, consume: 0, context: 0, cancel: 0, close: 0, provider: 0, closeout: 0 };
   const timings: InboundTimingEvent[] = [];
+  const contexts: Array<{ receivedAt: number; handedAt: number }> = [];
   const remember = (begin: InboundBeginIdentity) => {
     if (beginIdentity) assert.deepEqual(begin, beginIdentity); else beginIdentity = structuredClone(begin);
   };
@@ -106,11 +108,12 @@ async function fixture(t: test.TestContext) {
   function build() {
     return createInboundFlow({ config, store, primary: primary as unknown as PrimaryApiClient, now: () => clock,
       onTiming: event => timings.push(event),
+      onContext: (_call, _context, receivedAt) => { contexts.push({ receivedAt, handedAt: clock }); },
       async fetchCall(sid) { counts.provider++; assert.equal(sid, params.CallSid);
         if (providerGate) await providerGate.promise;
         if (providerFailure) { const failure = providerFailure; providerFailure = undefined; throw failure; }
         return { sid, accountSid: config.twilioAccountSid,
-        direction: 'inbound', from: params.From, to: params.To, status: providerStatus }; },
+        direction: 'inbound', from: params.From, to: providerMismatch ? '+12025550999' : params.To, status: providerStatus }; },
       async closeBound(call) {
         counts.closeout++;
         if (call.primaryClosed) { store.update(call.id, { primaryClosePending: false }); return; }
@@ -126,7 +129,7 @@ async function fixture(t: test.TestContext) {
   let flow = build();
   t.after(async () => { beginGate?.resolve(); contextGate?.resolve(); providerGate?.resolve(); await flow.drain(); store.close(); fs.rmSync(directory, { recursive: true, force: true }); });
   return {
-    get flow() { return flow; }, get store() { return store; }, config, params, original, proof, counts, timings, directory,
+    get flow() { return flow; }, get store() { return store; }, config, params, original, proof, counts, timings, contexts, directory,
     clock: () => clock, advance: (ms: number) => { clock += ms; },
     approve() { assert.ok(remote && remote.state === 'pending'); remote = { ...remote, state: 'approved', approvalRef }; },
     remote: () => remote,
@@ -147,6 +150,7 @@ async function fixture(t: test.TestContext) {
     providerStatus(status: string) { providerStatus = status; },
     gateProvider() { providerGate = deferred<void>(); return providerGate; },
     failProviderOnce(error: Error) { providerFailure = error; },
+    mismatchProvider() { providerMismatch = true; },
     restart() { store.close(); store = new BrokerStore(directory); flow = build(); },
   };
 }
@@ -345,15 +349,29 @@ test('the provider check runs alongside the consume; context is recorded only on
   assert.equal(f.store.get(first.id)!.inbound!.remote?.state, 'bound');
   assert.equal(f.store.get(first.id)!.primary, undefined);
   assert.equal(f.flow.mediaAllowed(f.store.get(first.id)!), false);
+  const consumedAt = f.clock();
+  f.advance(1_500); // A slow provider read: the page in hand ages meanwhile.
   gate.resolve();
   const admitted = await ticking;
   assert.ok(f.flow.mediaAllowed(admitted)); assert.equal(admitted.primary?.bindingId, (admitted.inbound!.remote as { bindingId: string }).bindingId);
   assert.equal(f.counts.provider, 1); assert.equal(f.counts.consume, 1); assert.equal(f.counts.context, 1);
+  // The startup page's age counts from the consume reply, not from the later handoff.
+  assert.deepEqual(f.contexts, [{ receivedAt: consumedAt, handedAt: consumedAt + 1_500 }]);
   const started = f.timings.filter(event => event.phase === 'started').map(event => event.stage);
   assert.ok(started.indexOf('open_context') >= 0 && started.indexOf('provider_identity') >= 0);
   const providerDone = f.timings.findIndex(event => event.stage === 'provider_identity' && event.phase === 'completed');
   const consumeStart = f.timings.findIndex(event => event.stage === 'open_context' && event.phase === 'started');
   assert.ok(consumeStart < providerDone, 'the consume starts before the provider read finishes');
+});
+
+test('a provider leg that is not the signed one ends the wait and closes the binding the consume made', async t => {
+  const f = await fixture(t); f.includeOutcome();
+  const first = await f.begin(); f.approve(); f.mismatchProvider();
+  const ended = await f.flow.tick(first.id);
+  assert.equal(ended.inbound!.localStop?.reason, 'provider_identity_mismatch');
+  assert.equal(ended.inbound!.remote?.state, 'bound'); assert.equal(ended.inbound!.closure?.state, 'closed');
+  assert.equal(ended.primary, undefined); assert.equal(f.contexts.length, 0);
+  assert.equal(f.counts.consume, 1); assert.equal(f.counts.close, 1);
 });
 
 test('a failed provider read after the consume leaves the binding unused until the next poll passes the check', async t => {

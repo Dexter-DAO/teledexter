@@ -166,16 +166,57 @@ test('the signed continuation opens only the socket; approval keeps it and Live 
   await live.close(); manager.close();
 });
 
-test('after approval the continuation socket is held to that approval like an approved socket', () => {
-  for (const drift of ['approval', 'failed'] as const) {
-    const transport = new PreconnectTransport(), manager = createInboundPreconnect(() => transport);
+test('after approval the continuation socket is adopted only for that approval; if it failed, the session connects normally', () => {
+  const drifted = new PreconnectTransport(), strictManager = createInboundPreconnect(() => drifted);
+  const first = continued();
+  strictManager.beginInbound(first.c); strictManager.begin(first.approve()); admit(first.c);
+  if (first.c.inbound!.remote!.state === 'bound') first.c.inbound!.remote!.approvalRef.digest = 'e'.repeat(64);
+  assert.throws(() => strictManager.factory(first.c)!(), /inbound_preconnect_unavailable/, 'a different approval never adopts it');
+  assert.deepEqual(drifted.sent, []); assert.equal(drifted.terminated, 1); strictManager.close();
+  // An idle socket can be closed by the provider between approval and media start; it carried
+  // nothing, so Live opens its own connection instead of ending the call.
+  const failed = new PreconnectTransport(), manager = createInboundPreconnect(() => failed);
+  const second = continued();
+  manager.beginInbound(second.c); manager.begin(second.approve()); failed.end(); admit(second.c);
+  assert.equal(manager.factory(second.c), undefined);
+  assert.deepEqual(failed.sent, []); manager.close();
+});
+
+test('a failed admission step keeps a warm socket and a committed binding\'s socket; only an uncommitted approved socket closes', () => {
+  // Warm: opened at the continuation, approval attached or not.
+  for (const approved of [false, true]) {
+    const warm = new PreconnectTransport(), manager = createInboundPreconnect(() => warm);
     const { c, approve } = continued();
-    manager.beginInbound(c); manager.begin(approve()); admit(c);
-    if (drift === 'approval' && c.inbound!.remote!.state === 'bound') c.inbound!.remote!.approvalRef.digest = 'e'.repeat(64);
-    if (drift === 'failed') transport.fail();
-    assert.throws(() => manager.factory(c)!(), /inbound_preconnect_unavailable/, drift);
-    assert.deepEqual(transport.sent, []); assert.equal(transport.terminated, 1); manager.close();
+    manager.beginInbound(c); if (approved) manager.begin(approve());
+    manager.afterAdmissionError(c.id, false);
+    assert.equal(warm.terminated, 0, `warm socket kept (approved=${approved})`); manager.close();
   }
+  // Strict: opened at approval (no continuation socket), as before the continuation opened one.
+  for (const committed of [false, true]) {
+    const strict = new PreconnectTransport(), manager = createInboundPreconnect(() => strict);
+    const c = call(); manager.begin(c);
+    manager.afterAdmissionError(c.id, committed);
+    assert.equal(strict.terminated, committed ? 0 : 1, `committed=${committed}`);
+    admit(c);
+    if (committed) assert.equal(manager.factory(c)!(), strict);
+    else assert.throws(() => manager.factory(c)!(), /inbound_preconnect_unavailable/);
+    manager.close();
+  }
+});
+
+test('a late close from a replaced socket never discards its successor', () => {
+  const sockets: PreconnectTransport[] = [];
+  const manager = createInboundPreconnect(() => { const next = new PreconnectTransport(); sockets.push(next); return next; });
+  const { c, approve } = continued();
+  manager.beginInbound(c);
+  // The first socket failed (its close handlers stay registered), and approval replaced it.
+  sockets[0].opened = false; for (const fn of sockets[0].errors) fn(new Error('closed_by_provider'));
+  manager.begin(approve());
+  assert.equal(sockets.length, 2);
+  for (const fn of sockets[0].closes) fn(); // A late close event from the replaced socket.
+  admit(c);
+  assert.equal(manager.factory(c)!(), sockets[1], 'the replacement is still adoptable');
+  manager.close();
 });
 
 test('a continuation socket that fails or expires before approval is replaced by one fresh socket at approval', t => {

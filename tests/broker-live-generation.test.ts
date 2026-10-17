@@ -1182,3 +1182,18 @@ test('inputDelivered settles when the paced replay reaches a queued frame, at on
   assert.equal(await h.controller.inputDelivered(0), false);
   assert.equal(h.sessions[0].audio.length, 10, 'waiting sends nothing of its own');
 });
+
+test('a startup page counts its age from when the API returned it, even if the handoff came later', async () => {
+  const clock = startTime;
+  const h = harness(), cache = createInboundStartupContexts(h.api, { now: () => clock }), call = startupCall();
+  // Handed over now, but returned STARTUP_PAGE_FRESH_MS + 1 ago (the provider check finished after the consume).
+  cache.remember(call, contextFor(versionFor(1)), clock - STARTUP_PAGE_FRESH_MS - 1); h.options.context = cache.take(call);
+  await h.controller.start();
+  assert.deepEqual(h.operations.map(value => value.name), ['assert', 'assert'], 'rechecked before Live opens, then asserted after');
+  await h.controller.stop();
+  const fresh = harness(), recent = createInboundStartupContexts(fresh.api, { now: () => clock });
+  recent.remember(call, contextFor(versionFor(1)), clock + 60_000); fresh.options.context = recent.take(call);
+  await fresh.controller.start();
+  assert.deepEqual(fresh.operations.map(value => value.name), ['assert'], 'a receipt time later than now counts as now');
+  await fresh.controller.stop();
+});

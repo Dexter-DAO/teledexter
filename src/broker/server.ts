@@ -292,8 +292,9 @@ export function createBrokerServer(options: BrokerServerOptions) {
   const inbound = createInboundFlow({ config, store, primary,
     onTiming: logInboundTiming,
     onApprovedTransport: call => preconnect?.begin(call),
-    onTransportDiscard: (id, terminal) => terminal ? preconnect?.forget(id) : preconnect?.discard(id),
-    onContext: (call, context) => startupContexts?.remember(call, context),
+    onTransportDiscard: (id, terminal) => terminal ? preconnect?.forget(id)
+      : preconnect?.afterAdmissionError(id, store.get(id)?.inbound?.remote?.state === 'bound'),
+    onContext: (call, context, receivedAt) => startupContexts?.remember(call, context, receivedAt),
     fetchCall: sid => provider.calls(sid).fetch(), closeBound: async call => {
       // Media may have started while a provider/account read was in flight.
       // Its owner must finalize Live and capture before closing account admission.
@@ -563,7 +564,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
       `${config.publicOrigin}/broker/inbound/${call.id}/continue`));
     // Open only the Live socket (no session, no account text) while admission runs, as the outbound
     // answer does; the handshake (0.24-0.68 s on the Oct 13 calls) is then done before Live attaches.
-    preconnect?.beginInbound(call);
+    preconnect?.beginInbound(store.get(call.id)!);
   }
 
   async function handle(request: IncomingMessage, response: ServerResponse) {

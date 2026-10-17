@@ -18,11 +18,13 @@ export interface InboundFlowOptions {
   primary: PrimaryApiClient;
   fetchCall(sid: string): Promise<InboundProviderCall>;
   closeBound(call: BrokerCall): Promise<void>;
-  /** In-memory handoff after the original leg and context have been admitted. */
-  onContext?(call: BrokerCall, context: PrimaryCall): void;
+  /** In-memory handoff after the original leg and context have been admitted. `receivedAt` is when
+   * the API returned that context (it can precede the handoff while the provider check finishes). */
+  onContext?(call: BrokerCall, context: PrimaryCall, receivedAt: number): void;
   onTiming?: InboundTimingSink;
-  /** After canonical approval and a fresh exact in-progress provider identity, before context I/O. */
+  /** After canonical approval, as consumption starts (the provider check runs alongside it), before context I/O. */
   onApprovedTransport?(call: BrokerCall): void;
+  /** `terminal`: the account wait ended (stop, refusal); otherwise a failed step the next poll retries. */
   onTransportDiscard?(callId: string, terminal?: boolean): void;
   now?: () => number;
   /** Internal composition only. No entry gesture, route, settings or runtime activation is selected here. */
@@ -216,18 +218,24 @@ export function createInboundFlow(options: InboundFlowOptions) {
       stopLocal(id, 'provider_terminal'); return settle(id);
     };
     const ended = (observed: InboundProviderCall) => terminalCallStatuses.has(observed.status as BrokerCall['status']);
+    // Twilio describing a different leg than the signed one is not a read to retry: the wait ends and
+    // any binding is closed rather than left open until the media grace runs out.
+    const mismatched = (error: unknown) => error instanceof Error && error.message === 'inbound_provider_identity_mismatch';
+    const providerMismatch = (): Promise<BrokerCall> => { stopLocal(id, 'provider_identity_mismatch'); return settle(id); };
     let context: PrimaryCall;
+    let contextReceivedAt = now();
     const approved = !bound(call) && call.inbound!.remote?.state === 'approved' ? call.inbound!.remote : undefined;
     if (approved) {
       // The API's consume makes the same active-call check (it refuses a leg that is not in progress),
       // so the broker's own provider read runs alongside it rather than before it. The context is
       // recorded, and Live can attach, only when both pass.
       const providerCheck = timing.measure('provider_identity', () => observe(call));
-      void providerCheck.catch(() => {}); // Awaited on every path below.
+      void providerCheck.catch(() => {}); // Settled below; this keeps an early throw from leaving it unhandled.
       options.onApprovedTransport?.(call);
       store.transitionInbound(id, { type: 'consume_attempted', observedAt: timestamp() });
       try {
         context = await timing.measure('open_context', () => primary.openInboundCall!(call.inbound!.begin.providerProof, approved.approvalRef));
+        contextReceivedAt = now();
         // The negotiated response carries the same persisted outcome as recovery.
         // Older APIs and uncertain replies retain the original recovery path.
         const recovered = context.inboundOutcome
@@ -238,14 +246,16 @@ export function createInboundFlow(options: InboundFlowOptions) {
       } catch (error) {
         // A lost consume/context reply can hide a committed binding. Retain the attempt and
         // recover its context-free outcome on the next iteration before any further action.
-        // A leg that ended meanwhile stops the wait, as when the provider check ran first.
-        const observed = await providerCheck.catch(() => undefined);
+        // A leg that ended (or is not the signed one) stops the wait, as when the check ran first.
+        const observed = await providerCheck.then(value => value, failure => (mismatched(failure) ? 'mismatch' as const : undefined));
+        if (observed === 'mismatch') return providerMismatch();
         if (observed && ended(observed)) return providerEnded(observed);
         throw error;
       }
       let observed: InboundProviderCall;
       try { observed = await providerCheck; }
       catch (error) {
+        if (mismatched(error)) return providerMismatch();
         // The new binding stays unused: no context is recorded, so Live cannot attach. The next
         // poll reads the provider again before reading this binding's context.
         store.update(id, { failure: safeFailure(error) });
@@ -258,7 +268,9 @@ export function createInboundFlow(options: InboundFlowOptions) {
       // Bound but not yet in progress: the next poll checks again and refreshes its context.
       if (observed.status !== 'in-progress') return call;
     } else {
-      const observed = await timing.measure('provider_identity', () => observe(call));
+      let observed: InboundProviderCall;
+      try { observed = await timing.measure('provider_identity', () => observe(call)); }
+      catch (error) { if (mismatched(error) && bound(saved(id))) return providerMismatch(); throw error; }
       call = saved(id);
       if (ended(observed)) return providerEnded(observed);
       if (stopped(call)) return settle(id);
@@ -270,6 +282,7 @@ export function createInboundFlow(options: InboundFlowOptions) {
         stopLocal(id, receipt.callState === 'closed' ? 'binding_closed' : 'media_start_expired'); return settle(id);
       }
       context = await timing.measure('refresh_context', () => primary.getContext(receipt.bindingId));
+      contextReceivedAt = now();
     }
     call = saved(id);
     if (stopped(call)) return settle(id);
@@ -281,7 +294,7 @@ export function createInboundFlow(options: InboundFlowOptions) {
       stopLocal(id, context.state !== 'open' ? 'binding_closed' : 'media_start_expired'); return settle(id);
     }
     store.transitionInbound(id, { type: 'context', context, observedAt: timestamp() });
-    options.onContext?.(saved(id), context);
+    options.onContext?.(saved(id), context, contextReceivedAt);
     return saved(id);
   }
   async function admissionOperation(id: string, operation: () => Promise<BrokerCall>): Promise<BrokerCall> {
@@ -295,6 +308,7 @@ export function createInboundFlow(options: InboundFlowOptions) {
         // Current enrollment may fail at begin, consumption, or context access.
         // Local refusal never proves cancellation; a committed consume wins and closes.
         store.transitionInbound(id, { type: 'admission_refused', code: error.remoteCode, observedAt: timestamp() });
+        options.onTransportDiscard?.(id, true); // The account wait is over: no Live will use its socket.
         return settle(id);
       }
       throw error;

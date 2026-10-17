@@ -26,13 +26,14 @@ export function createInboundStartupContexts(client: EligibleContextClient, opti
   const freshMs = options.freshMs ?? STARTUP_PAGE_FRESH_MS;
   const pages = new Map<string, { page: EligiblePhoneCall; receivedAt: number }>();
   return {
-    remember(call: StartupCall, response: PrimaryCall): void {
+    /** `receivedAt`: when the API returned the page, if earlier than this handoff; the fresh window counts from it. */
+    remember(call: StartupCall, response: PrimaryCall, receivedAt = now()): void {
       pages.delete(call.id);
       const binding = bindingFor(call);
       if (!binding || call.liveGenerations) return;
       try {
         const page = parseEligiblePhoneCall(response, binding);
-        if (page.state === 'open') pages.set(call.id, { page, receivedAt: now() });
+        if (page.state === 'open') pages.set(call.id, { page, receivedAt: Math.min(receivedAt, now()) });
       } catch { /* An unavailable optimization must retain the normal fresh fetch. */ }
     },
     take(call: StartupCall): EligibleContextClient {
