@@ -561,6 +561,9 @@ export function createBrokerServer(options: BrokerServerOptions) {
     observeInboundStreamResponse(call.id, response, logInboundTiming);
     xml(response, callTwiml(config.publicOrigin, call.id, streamToken(config.controlToken, call.id, call.callSid!),
       `${config.publicOrigin}/broker/inbound/${call.id}/continue`));
+    // Open only the Live socket (no session, no account text) while admission runs, as the outbound
+    // answer does; the handshake (0.24-0.68 s on the Oct 13 calls) is then done before Live attaches.
+    preconnect?.beginInbound(call);
   }
 
   async function handle(request: IncomingMessage, response: ServerResponse) {

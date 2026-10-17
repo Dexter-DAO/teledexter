@@ -140,3 +140,86 @@ test('outbound warm socket that closes early is never adopted and binding failur
   assert.equal(other.terminated, 1); assert.deepEqual(other.sent, []);
   manager.close(); second.close();
 });
+
+function continued() {
+  const c = call(), approved = c.inbound!.remote!;
+  (c as { direction: string }).direction = 'inbound';
+  c.inbound = { ...c.inbound!, waitUntil: new Date(Date.now() + 120_000).toISOString(),
+    continuation: { observedAt: new Date().toISOString(), beginBodyDigest: 'e'.repeat(64), providerProof: {} } } as BrokerCall['inbound'];
+  delete c.inbound!.remote; // Admission has not answered yet.
+  return { c, approve() { c.inbound!.remote = { ...approved, expiresAt: new Date(Date.now() + 60_000).toISOString() }; return c; } };
+}
+
+test('the signed continuation opens only the socket; approval keeps it and Live adopts it with session.start first', async () => {
+  const transport = new PreconnectTransport(), timings: InboundTransportTiming[] = []; let connects = 0;
+  const manager = createInboundPreconnect(() => { connects++; return transport; }, event => timings.push(event));
+  const { c, approve } = continued();
+  manager.beginInbound(c); manager.beginInbound(c); transport.open();
+  assert.equal(connects, 1); assert.deepEqual(transport.sent, [], 'no session, instructions, history or audio while admission runs');
+  manager.begin(approve());
+  assert.equal(connects, 1, 'approval keeps the continuation socket');
+  admit(c);
+  const live = session(c, manager.factory(c)! as () => PreconnectTransport);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(transport.sent[0]?.type, 'session.start');
+  assert.deepEqual(timings.map(event => event.stage), ['connecting', 'open', 'adopted']);
+  await live.close(); manager.close();
+});
+
+test('after approval the continuation socket is held to that approval like an approved socket', () => {
+  for (const drift of ['approval', 'failed'] as const) {
+    const transport = new PreconnectTransport(), manager = createInboundPreconnect(() => transport);
+    const { c, approve } = continued();
+    manager.beginInbound(c); manager.begin(approve()); admit(c);
+    if (drift === 'approval' && c.inbound!.remote!.state === 'bound') c.inbound!.remote!.approvalRef.digest = 'e'.repeat(64);
+    if (drift === 'failed') transport.fail();
+    assert.throws(() => manager.factory(c)!(), /inbound_preconnect_unavailable/, drift);
+    assert.deepEqual(transport.sent, []); assert.equal(transport.terminated, 1); manager.close();
+  }
+});
+
+test('a continuation socket that fails or expires before approval is replaced by one fresh socket at approval', t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
+  for (const loss of ['failed', 'expired'] as const) {
+    const sockets: PreconnectTransport[] = [];
+    const manager = createInboundPreconnect(() => { const next = new PreconnectTransport(); sockets.push(next); return next; }, undefined, 20_000);
+    const { c, approve } = continued();
+    manager.beginInbound(c);
+    if (loss === 'failed') sockets[0].fail(); else t.mock.timers.tick(20_000); // The warm TTL bounds an unapproved socket.
+    assert.equal(sockets[0].terminated, 1, loss);
+    manager.begin(approve()); manager.begin(c);
+    assert.equal(sockets.length, 2, 'one replacement, opened at approval');
+    admit(c); assert.equal(manager.factory(c)!(), sockets[1]);
+    assert.deepEqual(sockets[0].sent, []); manager.close();
+  }
+});
+
+test('a continuation socket never tied to an approval is adopted for the bound admission, or the session connects normally', () => {
+  const warm = new PreconnectTransport(), manager = createInboundPreconnect(() => warm);
+  const { c, approve } = continued();
+  manager.beginInbound(c); approve(); admit(c); // A recovered binding: no approval reached this manager.
+  assert.equal(manager.factory(c)!(), warm);
+  const failed = new PreconnectTransport(), second = createInboundPreconnect(() => failed);
+  const other = continued();
+  second.beginInbound(other.c); failed.fail(); other.approve(); admit(other.c);
+  assert.equal(second.factory(other.c), undefined, 'a failed warm socket leaves the session its own connector');
+  manager.close(); second.close();
+});
+
+test('the continuation opens nothing for a leg without a continuation, a stopped, ended or later-mode wait, or after close', () => {
+  for (const state of ['no_continuation', 'stopped', 'ended', 'media', 'mode', 'closed_binding', 'closed_manager'] as const) {
+    let connects = 0;
+    const manager = createInboundPreconnect(() => { connects++; return new PreconnectTransport(); });
+    const { c } = continued();
+    if (state === 'no_continuation') delete c.inbound!.continuation;
+    if (state === 'stopped') c.inbound!.localStop = { observedAt: new Date().toISOString(), reason: 'caller_hangup' };
+    if (state === 'ended') c.endedAt = new Date().toISOString();
+    if (state === 'media') c.mediaStartedAt = new Date().toISOString();
+    if (state === 'mode') c.inbound!.mode = { kind: 'undecided' } as NonNullable<BrokerCall['inbound']>['mode'];
+    if (state === 'closed_binding') c.primaryClosed = { bindingId: 'b', callSid: c.callSid!, state: 'closed' };
+    if (state === 'closed_manager') manager.close();
+    manager.beginInbound(c);
+    assert.equal(connects, 0, state);
+    manager.close();
+  }
+});

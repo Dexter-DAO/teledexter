@@ -974,6 +974,45 @@ test('duplicate approved continuations share the original transport and account 
   await f.close(); assert.equal(f.transports[0].terminated, 1);
 });
 
+test('the signed continuation opens the Live socket while admission runs, and Live starts on it without a second connect', async t => {
+  const transportEvents: Array<{ stage: string; at: number }> = [];
+  t.mock.method(console, 'info', (value: string) => {
+    const event = JSON.parse(value); if (event.event === 'broker_inbound_transport') transportEvents.push({ stage: event.stage, at: Date.now() });
+  });
+  const f = await fixture(t, { eligible: true, preconnect: true });
+  await (await f.webhook('/broker/incoming-call')).text();
+  const call = f.store.list()[0];
+  assert.equal(f.transports.length, 0, 'the unanswered first leg opens nothing');
+  const release = f.gateBegin(); t.after(release);
+  assert.match(await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text(), /<Connect><Stream/);
+  assert.equal(f.transports.length, 1, 'opened with the stream response, before admission answers');
+  const transport = f.transports[0]; transport.open();
+  assert.deepEqual(transport.sent, [], 'only the socket: no session, history or audio');
+  assert.equal(f.seen.context, 0);
+  release(); await f.settle(); f.approve();
+  const ws = await preconnectMedia(f, call); t.after(() => ws.close());
+  await preconnectUntil(() => f.store.get(call.id)!.voiceOpening?.status === 'accepted');
+  assert.equal(f.transports.length, 1, 'no second connect');
+  assert.equal(transport.sent[0]?.type, 'session.start');
+  assert.equal(transport.sent.filter(event => event.type === 'session.start').length, 1);
+  assert.deepEqual(transportEvents.map(event => event.stage), ['connecting', 'open', 'adopted']);
+});
+
+test('a continuation socket that failed before approval is replaced at approval and Live starts on the replacement', async t => {
+  const f = await fixture(t, { eligible: true, preconnect: true });
+  await (await f.webhook('/broker/incoming-call')).text(); await f.waitForAdmission();
+  const call = f.store.list()[0];
+  assert.equal(f.transports.length, 1); f.transports[0].fail(); // For example, the provider closed an idle socket.
+  assert.equal(f.transports[0].terminated, 1);
+  f.approve();
+  const ws = await preconnectMedia(f, call); t.after(() => ws.close());
+  await preconnectUntil(() => f.transports.length === 2);
+  f.transports[1].open();
+  await preconnectUntil(() => f.store.get(call.id)!.voiceOpening?.status === 'accepted');
+  assert.equal(f.transports.length, 2); assert.deepEqual(f.transports[0].sent, []);
+  assert.equal(f.transports[1].sent[0]?.type, 'session.start');
+});
+
 for (const refusal of ['unapproved', 'wrong-provider', 'provider-ended'] as const)
   test(`an ${refusal} admission records no context and sends no command to any Live socket`, async t => {
     const f = await fixture(t, { eligible: true, preconnect: true });
@@ -1087,12 +1126,14 @@ test('duplicate first webhooks contact nothing; only the continuation releases a
   const continued = await f.webhook(`/broker/inbound/${call.id}/continue`);
   assert.match(await continued.text(), /<Stream/);
   await preconnectUntil(() => f.seen.begin === 1);
-  assert.equal(f.seen.consume, 0); assert.equal(f.transports.length, 0);
+  // The continuation opens only the Live socket: no session, history or audio while admission runs.
+  assert.equal(f.seen.consume, 0); assert.equal(f.transports.length, 1); assert.deepEqual(f.transports[0].sent, []);
   release(); await f.settle();
   assert.equal(f.store.get(call.id)!.inbound!.remote?.state, 'pending');
   f.approve(); await f.broker.maintain();
-  assert.equal(f.seen.begin, 1); assert.equal(f.seen.consume, 1); assert.equal(f.transports.length, 1);
-  assert.deepEqual(f.transports[0].sent, []);
+  assert.equal(f.seen.begin, 1); assert.equal(f.seen.consume, 1);
+  assert.equal(f.transports.length, 1, 'approval keeps the socket the continuation opened');
+  assert.deepEqual(f.transports[0].sent, []); assert.equal(f.transports[0].terminated, 0);
 });
 
 test('shutdown during the first admission contact settles its same attachment without starting voice', async t => {
@@ -1107,7 +1148,9 @@ test('shutdown during the first admission contact settles its same attachment wi
   release(); await closing;
   assert.equal(f.seen.begin, 1); assert.equal(f.seen.cancel, 1);
   assert.equal(f.store.get(call.id)!.inbound!.remote?.state, 'cancelled');
-  assert.equal(f.seen.voice, 0); assert.equal(f.seen.context, 0); assert.equal(f.transports.length, 0);
+  assert.equal(f.seen.voice, 0); assert.equal(f.seen.context, 0);
+  assert.equal(f.transports.length, 1, 'only the continuation socket');
+  assert.deepEqual(f.transports[0].sent, []); assert.equal(f.transports[0].terminated, 1);
 });
 
 async function greetingMedia(f: Awaited<ReturnType<typeof fixture>>, call: BrokerCall) {
