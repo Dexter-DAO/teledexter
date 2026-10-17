@@ -43,6 +43,28 @@ pm2 start "$BROKER_RELEASE_DIR/deploy/ecosystem.config.cjs" --only dexter-broker
 
 The configuration starts one forked process and gives shutdown 65 seconds; the application has a 60-second shutdown deadline. The journal permits one writer, so an upgrade must stop the previous broker process before the replacement starts. Avoid a rolling overlap against the same state directory. A rollback selects the previous release and retains the same journal; verify journal compatibility first. Preserve the current journal; restoring an earlier snapshot could erase evidence of an accepted answer or an outbound call.
 
+### Rolling back to prod-2026-10-13
+
+The release before the greeting stream (`prod-2026-10-13`, release directory `teledexter-50e476cb88d7`) refuses to start on a journal this release has written, even after one call:
+
+- its journey schema rejects the keys `streamStartedAt`, `firstSpeechAudioSentAt` and `callerSpeechEndedAt`;
+- it rejects any journey on a call without `mediaStartedAt` ("Call journey lacks media evidence"), which is every call that ended during the greeting.
+
+Under PM2 that refusal is a restart loop and every call fails. Check and convert the journal with this release's script, after this broker stops and before the previous release starts:
+
+```sh
+node "$CURRENT_RELEASE_DIR/scripts/rollback-journal-compat.mjs" /var/lib/dexter-broker/state --dry-run
+pm2 stop dexter-broker
+node "$CURRENT_RELEASE_DIR/scripts/rollback-journal-compat.mjs" /var/lib/dexter-broker/state
+```
+
+Then start the previous release as in the deployment step above, with `BROKER_RELEASE_DIR` naming its directory.
+
+- **What changes.** The script removes those three keys and drops the journey of calls without `mediaStartedAt`, and a journey left empty. Every other field of every call stays as saved. The journey is timing evidence only; no call, request or binding state depends on it. A journal that needs no change (one the previous release wrote) is left untouched.
+- **Safety.** It takes the broker's writer lock, so it refuses (`rollback_broker_running`) while a broker owns the directory. `--dry-run` only reads and reports, so it can run while the broker is still up.
+- **Durability.** The original journal is kept beside it as `calls.json.rollback-<time>.bak`. Both files are written the way the store writes: a new `0600` temporary file, fsync, rename, then fsync of the directory.
+- **Proof.** Journals written by this release (an outbound call that ended during the greeting, an attached outbound call, an attached inbound call, and an inbound caller who hung up during the greeting) were refused by that release's `dist/broker/store.js` before the script and loaded after it. This release still reads the converted journal, so rolling forward again needs no step.
+
 `deploy/nginx-broker.conf` is a location snippet for the HTTPS `server` block that serves `BROKER_PUBLIC_ORIGIN`. Its `proxy_pass` preserves the `/broker/` prefix and supports WebSocket upgrades. It exposes no `/internal/` routes.
 
 ## Telephone routes

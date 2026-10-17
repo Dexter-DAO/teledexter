@@ -64,6 +64,7 @@ GPT-Live holds the spoken conversation. When the caller asks for something that 
 | `scripts/broker.mts` | Operator CLI: `status`, `preflight`, `call`, `end`, `reconcile` |
 | `scripts/qualify-live-phone.mts` | Runs the broker against real GPT-Live with simulated Twilio and Primary |
 | `scripts/calls.mjs` | Read-only call journey timing report |
+| `scripts/rollback-journal-compat.mjs` | Converts the call journal before a rollback to `prod-2026-10-13` ([BROKER_OPERATIONS.md](docs/BROKER_OPERATIONS.md#rolling-back-to-prod-2026-10-13)) |
 | `deploy/` | PM2 configuration and an nginx location snippet |
 | `docs/` | Operator and protocol reference |
 
