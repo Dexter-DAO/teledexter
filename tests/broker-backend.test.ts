@@ -7,6 +7,7 @@ import { BrokerStore } from '../src/broker/store.js';
 import { createPrimaryBackend, literalPhoneAnswer, type PrimaryBackendOptions, type BrokerDelegationRecord } from '../src/broker/backend.js';
 import type { PrimaryQuestion, PrimaryQuestionResult, PrimaryReplyInput, PrimaryResult, PrimarySubmission, PrimaryTurn } from '../src/broker/primaryApi.js';
 import { PrimaryApiError } from '../src/broker/primaryApi.js';
+import { createPortfolioContext } from '../src/broker/portfolioContext.js';
 import { turnBodyDigest } from '../src/broker/reconciliation.js';
 import { rejectBrokerPublication } from '../src/broker/publications.js';
 import type { LiveBackendChannel, LiveBackendUpdate, LiveDelegationRequest, LiveTranscriptSnapshot } from '../src/live/session.js';
@@ -116,6 +117,29 @@ async function fixture(t: TestContext, overrides: Partial<PrimaryBackendOptions>
   return { ...c, directory, store, call, api, options, backend, speech, request, posts, reads, captures, replies, questionReads, behavior, completed,
     saved, result: (text: string) => { resultText = text; } };
 }
+
+test('a saved confirmed action and final completion refresh call portfolio without changing Primary delegation', async t => {
+  let reads = 0;
+  const portfolio = createPortfolioContext('synthetic', bindingId, { portfolio: async () => {
+    reads++; return { version: 'phone.portfolio.v1', bindingId, observedAt: new Date().toISOString(), totalUsd: '10',
+      holdingsComplete: true, holdingCount: 0, unpricedCount: 0, omittedCount: 0, holdings: [] };
+  } }); t.after(() => portfolio.stop());
+  // This checks the completed result as well as repeated partials, so leave
+  // time for all three polls and their durable writes under suite contention.
+  const f = await fixture(t, { maxPollMs: 5000, onResult: result => portfolio.observe(result) });
+  let polls = 0;
+  const partialResult = { kind: 'action_status' as const, actionState: 'confirmed' as const,
+    intentId: '55555555-5555-4555-8555-555555555555', toolInvocationId: '66666666-6666-4666-8666-666666666666',
+    observedAt: new Date().toISOString(), text: 'The purchase was confirmed.' };
+  f.behavior.result = async requestId => ++polls < 3 ? { bindingId, requestId, state: 'running', partialResult }
+    : f.completed(requestId);
+  f.add('Buy one dollar of Apple.'); f.speech();
+  await f.backend.delegate(f.request(), f.channel);
+  assert.equal(f.posts.length, 1);
+  assert.equal(polls, 3);
+  assert.equal(f.saved()[0].status, 'completed');
+  assert.equal(reads, 3, 'initial read, confirmed-action refresh and final refresh despite repeated polls');
+});
 
 test('accepted publication binds the next unchanged caller request and exact retry retains its pair', async t => {
   const f = await fixture(t);

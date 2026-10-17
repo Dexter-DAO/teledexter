@@ -30,6 +30,9 @@ export class PreconnectTransport implements BrokerLiveConnection {
     if (event.type === 'session.instructions.append') queueMicrotask(() => this.receive({
       type: 'session.instructions.appended', event_id: `ack_${event.event_id}`, client_event_id: event.event_id, start_ms: 0, end_ms: 0,
     }));
+    if (event.type === 'session.thinking.append') queueMicrotask(() => this.receive({
+      type: 'session.thinking.appended', event_id: `ack_${event.event_id}`, client_event_id: event.event_id, start_ms: 0, end_ms: 0,
+    }));
   }
   close() { this.closed++; this.end(); }
   terminate() { this.terminated++; this.end(); }

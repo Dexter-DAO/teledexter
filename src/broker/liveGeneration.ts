@@ -130,6 +130,8 @@ export interface LiveGenerationOptions {
   /** One initial greeting, inside the post-open assertion operation. Must not call queued controller
    * methods; it may await inputDelivered() to let held caller input reach Live first. */
   onInitialActivation?(attachment: LiveGenerationAttachment): Promise<void>;
+  /** Optional context starts after activation and opening dispatch, without blocking input. */
+  onActivated?(attachment: LiveGenerationAttachment): void;
   /** Drain only source admissions already observed on this generation; the host deadline remains independent. */
   beforeRetire?(generationId: string): Promise<void>;
   onAudio(payload: string, attachment: LiveGenerationAttachment): void;
@@ -540,7 +542,9 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
         // operation. Later publications still perform their own current-context check.
         if (allowOpening && options.onInitialActivation)
           await wait(() => options.onInitialActivation!(attachment()));
-        return attachment();
+        const activeAttachment = attachment();
+        try { options.onActivated?.(activeAttachment); } catch { /* Optional context. */ }
+        return activeAttachment;
       }
       throw new LiveGenerationError('context_unavailable');
     } catch (error) {

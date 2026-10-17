@@ -458,7 +458,7 @@ test('incoming legacy admission without frozen billing reference never posts a n
       callSid: call.callSid!, termsDigest: 'a'.repeat(64) } } as InboundOutcome }), /binding changed/);
 });
 
-async function fixture(t: test.TestContext, options: { selected?: boolean; retained?: BrokerCall; initialRemote?: InboundOutcome; eligible?: boolean; billing?: boolean; billingUrl?: string; duration?: string; preconnect?: boolean; replaceFirstGeneration?: boolean; greetingClip?: Buffer; outboundClipOnly?: Buffer; startupPageFreshMs?: number; defaultAdmissionPoll?: boolean } = {}) {
+async function fixture(t: test.TestContext, options: { portfolio?: PrimaryApiClient['portfolio']; selected?: boolean; retained?: BrokerCall; initialRemote?: InboundOutcome; eligible?: boolean; billing?: boolean; billingUrl?: string; duration?: string; preconnect?: boolean; replaceFirstGeneration?: boolean; greetingClip?: Buffer; outboundClipOnly?: Buffer; startupPageFreshMs?: number; defaultAdmissionPoll?: boolean } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-inbound-http-'));
   if (options.retained) fs.writeFileSync(path.join(dir, 'calls.json'), JSON.stringify({ version: 1, calls: { [options.retained.id]: options.retained } }));
   const store = new BrokerStore(dir);
@@ -510,6 +510,7 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
       context: { primaryDexterId, threadId, displayName: 'Avery Example', messages: [] } };
   };
   const primary = {
+    ...(options.portfolio ? { portfolio: options.portfolio } : {}),
     async beginInbound(begin: InboundBeginIdentity) {
       seen.begin++; beginTimes.push(Date.now());
       if (beginGate) await beginGate;
@@ -935,6 +936,40 @@ async function preconnectMedia(f: Awaited<ReturnType<typeof fixture>>, call: Bro
     mediaFormat: { encoding: 'audio/x-mulaw', sampleRate: 8000, channels: 1 } } }));
   return ws;
 }
+
+test('bound inbound fetch runs before Live, leaves opening free, and delivers quiet portfolio context before a question', async t => {
+  let reads = 0, release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const f = await fixture(t, { eligible: true, preconnect: true, portfolio: async bindingId => {
+    reads++;
+    assert.equal(f.store.list()[0].primary?.bindingId, bindingId);
+    await gate;
+    return { version: 'phone.portfolio.v1', bindingId, observedAt: '2026-10-17T12:52:00.000Z', totalUsd: '28.86',
+      holdingsComplete: true, holdingCount: 1, unpricedCount: 0, omittedCount: 0,
+      holdings: [{ name: 'USD Coin', symbol: 'USDC', assetClass: 'token', amount: '28.86', valueUsd: '28.86', change24hPercent: null }] };
+  } }); t.after(release);
+  const call = await preconnectApproved(f);
+  assert.equal(reads, 0, 'no portfolio access before a bound account');
+  await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text();
+  await preconnectUntil(() => reads === 1);
+  assert.equal(f.seen.voice, 0, 'fetch starts at binding, before voice construction');
+  const transport = f.transports[0]; transport.open();
+  const ws = await preconnectMedia(f, call); t.after(() => ws.close());
+  await preconnectUntil(() => f.store.get(call.id)!.voiceOpening?.status === 'accepted');
+  assert.equal(transport.sent.some(event => event.type === 'session.thinking.append'), false, 'opening completed while fetch is pending');
+  release();
+  await preconnectUntil(() => transport.sent.some(event => event.type === 'session.thinking.append' && event.content.includes('only current portfolio note')));
+  const notes = transport.sent.filter(event => event.type === 'session.thinking.append');
+  assert.ok(notes.every(event => event.delegation_id === null && Buffer.byteLength(event.content) <= 500));
+  assert.match(notes.map(event => event.content).join(' '), /as of 2026-10-17T12:52:00.000Z: Your portfolio totals about \$28.86/);
+  assert.equal(transport.sent.some(event => event.type === 'session.commentary.append'), false);
+  transport.receive({ type: 'session.input_transcript.delta', event_id: 'portfolio_question', delta: "What's in my portfolio?",
+    start_ms: 1000, end_ms: 1500 });
+  await preconnectUntil(() => f.store.get(call.id)!.liveGenerations!.segments.some(segment =>
+    segment.transcript.fragments.some(fragment => fragment.eventId === 'portfolio_question')));
+  assert.equal(Object.keys(f.store.get(call.id)!.delegations).length, 0, 'a transcript alone still does not submit work');
+  assert.equal(reads, 1);
+});
 
 for (const fresh of [true, false])
 test(`approved inbound transport overlaps context I/O and stays command-free through media and ${fresh ? 'the post-open' : 'the pre-start'} assertion`, async t => {

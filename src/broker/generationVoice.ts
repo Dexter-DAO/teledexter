@@ -19,11 +19,13 @@ import type { RequestDeliveryClient } from './requestDelivery.js';
 import { createSelectedQuestionVoiceAdapter, createSelectedQuestionRecovery, selectedQuestionSourceAnchors,
   type SelectedQuestionCloseout } from './selectedQuestionVoice.js';
 import { brokerInstructions, brokerOpening } from './instructions.js';
+import type { PortfolioContext } from './portfolioContext.js';
 import { inputSpeechEnergy, hasAudiblePcmu } from './phone.js';
 import type { BrokerLiveSession, BrokerLiveSessionOptions, LiveBackendUpdate, LiveDelivery,
   LiveDelegationRequest, LiveSessionClosed, LiveTranscriptSnapshot } from '../live/types.js';
 
 export interface GenerationVoiceOptions {
+  portfolioContext?: PortfolioContext;
   call: BrokerCall;
   callDeadlineAt: string;
   apiKey: string;
@@ -339,6 +341,10 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
   // Drain a startup or delivery backlog at 1.5x real time so the caller is heard
   // without a lasting lag; unpaced bursts tripped input_audio_rate_limit_exceeded.
   const controller = createLiveGenerationController({ callId: initialCall.id, binding, inputPaceRate: 1.5,
+    onActivated(attachment) {
+      const voice = sessions.get(attachment.sessionId)?.voice;
+      if (voice) options.portfolioContext?.attach(voice);
+    },
     clocks: initialCall.liveGenerations?.clocks ?? { callDeadlineAt: options.callDeadlineAt, mediaStartedAt: initialCall.mediaStartedAt,
       ...(initialCall.inbound?.remote?.state === 'bound' ? { consumedAt: initialCall.inbound.remote.consumedAt,
         mediaStartBy: initialCall.inbound.mediaStartBy! } : {}) },
@@ -480,6 +486,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
               }
               sessionId = value.sessionId;
               backend = createPrimaryBackend({ callId: initialCall.id, callSid: binding.callSid, bindingId: binding.bindingId,
+                onResult: result => options.portfolioContext?.observe(result),
                 api: options.primary, store: options.store, sourceSessionId: sessionId, watchUntilCallEnds: true,
                 admissionSettled(request) { pending.get(request)?.resolve(); pending.delete(request); mixed?.admissionSettled(request); },
                 lastCallerSpeechAt: () => sourceSpeechAt,
@@ -539,6 +546,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
               });
             },
             onClosed(result) {
+              options.portfolioContext?.detach(voice);
               clearTimeout(startTimer); input.signal.removeEventListener('abort', cancelStart); finalResult = result;
               input.callbacks.onClosed(result);
               if (!ready) { startCancelled = true; reject(new LiveGenerationStartupError(result.reason)); }

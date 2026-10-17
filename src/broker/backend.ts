@@ -29,6 +29,7 @@ export type SelectedQuestionSourceAnchor = CallerSourceAnchor;
 export type ResolvedCallerTaskReference = NonNullable<Extract<CallerIntentDecision, { kind: 'task' }>['reference']>;
 
 export interface PrimaryBackendOptions {
+  onResult?(result: PrimaryResult): void;
   callId: string;
   callSid: string;
   bindingId: string;
@@ -1341,10 +1342,12 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       throw new Error('primary_terminal_result_changed');
     if (result.question) current = observeQuestion(current, result.question);
     if (result.state === 'waiting_for_reply' && !result.question) throw new Error('invalid_primary_result');
-    return save({ ...current, status: result.state, primaryResult: structuredClone(result), resultReadUnavailable: false,
+    const saved = save({ ...current, status: result.state, primaryResult: structuredClone(result), resultReadUnavailable: false,
       ...(reconciliation ? { reconciliation: structuredClone(reconciliation) } : {}),
       ...(result.question ? { currentQuestionId: result.question.id } : {}),
       ...(result.assistant ? { result: result.assistant.text } : {}) });
+    try { options.onResult?.(result); } catch { /* Optional background reads cannot affect work. */ }
+    return saved;
   };
   const captureRevision = async (entry: BrokerDelegationRecord, channel: LiveBackendChannel): Promise<BrokerDelegationRecord> => {
     if (options.sourceSessionId && entry.sessionId !== options.sourceSessionId) return load(entry);
