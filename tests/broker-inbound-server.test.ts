@@ -671,10 +671,30 @@ test('actual HTTP incoming waits on same leg and approved continuation enters ex
     mediaFormat: { encoding: 'audio/x-mulaw', sampleRate: 8000, channels: 1 } } }));
   await new Promise(resolve => setTimeout(resolve, 20));
   assert.equal(f.seen.voice, 1); assert.ok(f.store.get(call.id)!.mediaStartedAt);
+  // Twilio runs the trailing redirect only after the stream ends: the leg is hung up, never re-streamed.
   const repeat = await f.webhook(`/broker/inbound/${call.id}/continue`);
-  assert.equal(repeat.status, 409); await repeat.text();
+  assert.equal(repeat.status, 200); assert.equal(await repeat.text(), '<Response><Hangup/></Response>');
   assert.equal(f.seen.voice, 1);
   ws.close(); await new Promise<void>(resolve => ws.once('close', () => resolve()));
+});
+
+test('the trailing redirect after a restart that lost an attached call hangs up instead of an application error', async t => {
+  const f = await fixture(t);
+  const { call, ws } = await connectIncomingMedia(f); t.after(() => ws.close());
+  const attached = f.store.get(call.id)!;
+  assert.ok(attached.mediaStartedAt); assert.equal(attached.endedAt, undefined);
+  // The process crashed with Live attached: a new broker reads the journal, with no stream of its own.
+  const restarted = await fixture(t, { retained: attached, initialRemote: attached.inbound!.remote });
+  const response = await restarted.webhook(`/broker/inbound/${call.id}/continue`);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('content-type'), 'text/xml');
+  assert.equal(await response.text(), '<Response><Hangup/></Response>');
+  assert.equal(restarted.seen.voice, 0); assert.equal(restarted.seen.begin, 0); assert.equal(restarted.seen.consume, 0);
+  // The ended leg's status callback then closes the attachment, as for any ended call.
+  assert.equal((await restarted.webhook('/broker/status', { CallStatus: 'completed' })).status, 200);
+  await restarted.settle();
+  const closed = restarted.store.get(call.id)!;
+  assert.equal(closed.status, 'completed'); assert.equal(closed.inbound!.closure?.state, 'closed');
 });
 
 for (const fresh of [true, false])

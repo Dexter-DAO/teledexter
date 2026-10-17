@@ -524,7 +524,11 @@ export function createBrokerServer(options: BrokerServerOptions) {
       });
       return;
     }
-    if (call.mediaStartedAt || active.has(call.id) || claimed.has(call.id)) return json(response, 409, { error: 'media_already_started' });
+    // The account stream already started: Twilio follows its trailing redirect only once that stream
+    // is gone (a crash or restart after Live attached). Its media cannot resume, and a non-TwiML
+    // reply plays Twilio's "application error", so end the leg. Its status callback and maintenance
+    // close the attachment as for any ended call.
+    if (call.mediaStartedAt || active.has(call.id) || claimed.has(call.id)) return xml(response, '<Response><Hangup/></Response>');
     if (inbound.mediaAllowed(call) || inbound.waitingMediaAllowed(call)) return inboundStream(call, response);
     const remote = call.inbound!.remote;
     try {
