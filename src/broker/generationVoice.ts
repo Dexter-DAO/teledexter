@@ -88,6 +88,8 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
   let speechRevision = 0;
   let lastOutputAt = 0;
   let inputNextSample = initialCall.liveGenerations?.inputNextSample ?? 0;
+  // Call sample just after the latest caller speech frame handed to the controller.
+  let speechInputEnd: number | undefined;
   let closing: Promise<LiveSessionClosed> | undefined;
   let finalResult: LiveSessionClosed | undefined;
   let selected: ReturnType<typeof createSelectedQuestionVoiceAdapter> | undefined;
@@ -347,6 +349,19 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
       if (!voice) throw new LiveGenerationError('generation_source_not_ready');
       if (!readyReported) { readyReported = true; options.onReady({ callId: initialCall.id, sessionId: attachment.sessionId }); }
       if (stopped || observer.signal.aborted || call().endedAt) return;
+      // An outbound opening makes Live speak first. Everything the person said while Live started
+      // (a "Hello?" after "Hey, it's Dexter.") is still queued for its paced replay; it reaches Live
+      // before the opening, so Live answers it inside the offer rather than after the offer began.
+      // Silence alone holds nothing back.
+      const heldSpeechEnd = initialCall.direction === 'outbound' ? speechInputEnd : undefined;
+      if (heldSpeechEnd !== undefined) {
+        const waitStartedAt = Date.now();
+        if (!(await controller.inputDelivered(heldSpeechEnd))) return;
+        if (stopped || observer.signal.aborted || call().endedAt) return;
+        try { console.info(JSON.stringify({ event: 'broker_opening_after_caller_speech', version: 1, callId: initialCall.id,
+          observedAt: new Date().toISOString(), heldSpeechInputMs: heldSpeechEnd / 8, waitedMs: Date.now() - waitStartedAt })); }
+        catch { /* Telemetry only. */ }
+      }
       // A saved intent prevents a restart or an unknown append receipt from
       // issuing another opening. Acceptance describes injection, not playback.
       options.store.update(initialCall.id, { voiceOpening: { status: 'pending' } });
@@ -354,7 +369,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
       try { receipt = await voice.appendInstructions(brokerOpening(initialCall.direction, Boolean(initialCall.callAssignment),
         initialCall.callAssignment?.origin === 'authenticated_hark_delivery',
         initialCall.callAssignment?.origin === 'authenticated_notification_delivery',
-        Boolean(call().journey?.greetingClipStartedAt))); }
+        Boolean(call().journey?.greetingClipStartedAt), heldSpeechEnd !== undefined)); }
       catch { receipt = { eventId: '', status: 'unconfirmed', reason: 'opening_delivery_failed' }; }
       if (!stopped && !observer.signal.aborted && !call().endedAt
         && controller.snapshot().deliveryAttachment?.generationId === attachment.generationId)
@@ -705,9 +720,12 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
     appendAudio(payload) {
       const bytes = Buffer.from(payload, 'base64');
       const observedAt = Date.now();
-      if (inputSpeechEnergy(bytes) > 0.012) { lastSpeechAt = observedAt; speechRevision++; }
-      const outcome = controller.appendAudio({ payload, callInputStartSample: inputNextSample, observedAt });
+      const speech = inputSpeechEnergy(bytes) > 0.012;
+      if (speech) { lastSpeechAt = observedAt; speechRevision++; }
+      const start = inputNextSample;
+      const outcome = controller.appendAudio({ payload, callInputStartSample: start, observedAt });
       inputNextSample = controller.snapshot().inputNextSample;
+      if (speech && outcome !== 'refused') speechInputEnd = start + bytes.length;
       return outcome !== 'refused';
     },
     appendContext: async () => ({ eventId: '', status: 'rejected', reason: 'eligible_context_required' }),

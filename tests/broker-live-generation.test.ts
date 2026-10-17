@@ -1161,3 +1161,24 @@ test('blocked time is not replay allowance: a second block restarts the real-tim
     all.slice(0, first.length).map((_, index) => index * 160), 'replay stays contiguous and is never repeated');
   await h.controller.stop();
 });
+
+test('inputDelivered settles when the paced replay reaches a queued frame, at once for sent input, and false when input stops', async () => {
+  const h = harness(undefined, { inputPaceRate: 1.5 });
+  const frames = Array.from({ length: 10 }, (_, index) => ({ payload: Buffer.alloc(160, index + 1).toString('base64'),
+    callInputStartSample: index * 160, observedAt: startTime }));
+  for (const frame of frames) assert.equal(h.controller.appendAudio(frame), 'buffered');
+  await h.controller.start();
+  assert.equal(h.sessions[0].audio.length, 1, 'activation sends one frame; the rest of the backlog is paced');
+  assert.equal(await h.controller.inputDelivered(160), true, 'already sent');
+  let delivered: boolean | undefined;
+  void h.controller.inputDelivered(1_600).then(value => { delivered = value; });
+  await realTimers(40);
+  assert.equal(delivered, undefined, 'the last queued frame has not been replayed yet');
+  h.setTime(startTime + 1_000); await realTimers(60);
+  assert.equal(delivered, true); assert.equal(h.sessions[0].audio.length, 10);
+  const never = h.controller.inputDelivered(99_999);
+  await h.controller.stop();
+  assert.equal(await never, false, 'a stop settles every waiter');
+  assert.equal(await h.controller.inputDelivered(0), false);
+  assert.equal(h.sessions[0].audio.length, 10, 'waiting sends nothing of its own');
+});

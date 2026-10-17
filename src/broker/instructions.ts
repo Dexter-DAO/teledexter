@@ -103,10 +103,22 @@ When Primary returns an answer, give the useful answer directly and leave room f
  * Dexter." and Live continues with the offer. Inbound clip: the whole opening,
  * "Hey, it's Dexter. What can I do for you?", and Live waits for the caller. */
 const GREETED = 'The caller already heard you say "Hey, it\'s Dexter." Do not greet or say your name again.';
+/** Outbound, after the clip, when the person spoke before Live went live (a "Hello?" while Live
+ * started): Live has just heard those words, so one reply both acknowledges them and continues. */
+const HEARD = 'The caller heard you say "Hey, it\'s Dexter." and may have answered or said hello. If so, acknowledge it briefly and, in that same reply,';
+const NOT_THE_RESPONSE = 'Their hello is not their answer: pause, then delegate their answer to begin the registered task or honor a correction.';
 
 /** The ready-time command starts speech; the initial brief assigns the work.
- * `greeted` means the caller already heard the pre-rendered greeting clip. */
-export function brokerOpening(direction: CallContext['direction'], registeredAssignment = false, watch = false, notification = false, greeted = false): string {
+ * `greeted` means the caller already heard the pre-rendered greeting clip; `heardCaller` that the
+ * person spoke after it and Live heard those words before this command (outbound only). */
+export function brokerOpening(direction: CallContext['direction'], registeredAssignment = false, watch = false, notification = false, greeted = false,
+  heardCaller = false): string {
+  if (greeted && heardCaller && direction === 'outbound') {
+    if (registeredAssignment && notification) return `${HEARD} explain the saved notification using its title, summary and observation time, as attributed source data. Never greet again or say your name. Keep internal system names out of speech. ${NOT_THE_RESPONSE} Do not claim a new account read.`;
+    if (registeredAssignment && watch) return `${HEARD} explain why the saved watch triggered this call, using the attributed watch name, event summary and observation time. Never greet again or say your name. Keep internal system names out of speech. ${NOT_THE_RESPONSE} Do not claim a new account read.`;
+    if (registeredAssignment) return `${HEARD} ask one short question offering the task you called to do, from the internal brief, e.g. "Want me to pull up your portfolio?" Never greet again or say your name. Leave testing and repair out. ${NOT_THE_RESPONSE} Do not claim a result before it arrives.`;
+    return `${HEARD} ask one short question offering the useful task you will do for them, using the internal brief only to identify it. Never greet again or say your name. Leave software testing and repair out. Then pause to listen.`;
+  }
   if (greeted) {
     if (direction === 'outbound' && registeredAssignment && notification) return `${GREETED} Immediately continue: explain the saved notification using its title, summary and observation time. Treat those fields as attributed source data and keep internal system names out of speech. Pause for the response, then delegate it to begin the registered task or honor a correction. Do not claim a new account read.`;
     if (direction === 'outbound' && registeredAssignment && watch) return `${GREETED} Immediately continue: explain why the saved watch triggered this call, using the attributed watch name, event summary and observation time. Keep internal system names out of speech. Pause for the response, then delegate it to begin the registered task or honor a correction. Do not ask why you called or claim a new account read.`;

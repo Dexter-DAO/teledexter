@@ -191,10 +191,30 @@ test('every voice opening fits one Live instructions append, so the speak-first 
   // 819f2af shipped a 513-byte registered outbound opening; session.ts rejected it as
   // invalid_append_content (call 6b2ef8d1) and the greeting waited for the callee to speak.
   for (const direction of ['outbound', 'inbound'] as const)
-    for (const registered of [false, true]) for (const watch of [false, true]) for (const notification of [false, true]) {
-      const bytes = Buffer.byteLength(brokerOpening(direction, registered, watch, notification));
-      assert.ok(bytes > 0 && bytes <= LIVE_APPEND_MAX_BYTES, `${direction}/${registered}/${watch}/${notification}: ${bytes} bytes`);
-    }
+    for (const registered of [false, true]) for (const watch of [false, true]) for (const notification of [false, true])
+      for (const greeted of [false, true]) for (const heard of [false, true]) {
+        const bytes = Buffer.byteLength(brokerOpening(direction, registered, watch, notification, greeted, heard));
+        assert.ok(bytes > 0 && bytes <= LIVE_APPEND_MAX_BYTES, `${direction}/${registered}/${watch}/${notification}/${greeted}/${heard}: ${bytes} bytes`);
+      }
+});
+
+test('an outbound opening after held caller words acknowledges them and offers in one reply, with no second greeting', () => {
+  for (const [registered, watch, notification] of [[false, false, false], [true, false, false], [true, true, false], [true, false, true]] as const) {
+    const heard = brokerOpening('outbound', registered, watch, notification, true, true);
+    assert.notEqual(heard, brokerOpening('outbound', registered, watch, notification, true));
+    assert.match(heard, /^The caller heard you say "Hey, it's Dexter\." and may have answered or said hello\. If so, acknowledge it briefly and, in that same reply, /);
+    assert.match(heard, /Never greet again or say your name\./);
+    assert.doesNotMatch(heard, /Immediately say|"Hey, it's Dexter\. Want/);
+    // A registered task starts from the person's answer to the offer, never from the hello before it.
+    if (registered) assert.match(heard, /Their hello is not their answer: pause, then delegate their answer to begin the registered task or honor a correction\./);
+    else assert.match(heard, /Then pause to listen\.$/);
+  }
+  assert.match(brokerOpening('outbound', true, false, false, true, true), /"Want me to pull up your portfolio\?"/);
+  assert.match(brokerOpening('outbound', true, true, false, true, true), /explain why the saved watch triggered this call/);
+  assert.match(brokerOpening('outbound', true, false, true, true, true), /explain the saved notification/);
+  // Inbound openings wait for the caller and keep their own text; without the clip Live's own greeting answers the hello.
+  assert.equal(brokerOpening('inbound', false, false, false, true, true), brokerOpening('inbound', false, false, false, true));
+  assert.equal(brokerOpening('outbound', false, false, false, false, true), brokerOpening('outbound'));
 });
 
 test('openings name no language and the instructions follow the caller into theirs', () => {

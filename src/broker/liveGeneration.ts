@@ -127,7 +127,8 @@ export interface LiveGenerationOptions {
   /** Adapter startup/close/publication promises retain their bounded Live timeouts. */
   open(input: { generationId: string; ordinal: number; context: EligiblePhoneCall;
     allowOpening: boolean; signal: AbortSignal; callbacks: GenerationCallbacks }): Promise<GenerationHandle>;
-  /** One initial greeting, inside the post-open assertion operation. Must not call queued controller methods. */
+  /** One initial greeting, inside the post-open assertion operation. Must not call queued controller
+   * methods; it may await inputDelivered() to let held caller input reach Live first. */
   onInitialActivation?(attachment: LiveGenerationAttachment): Promise<void>;
   /** Drain only source admissions already observed on this generation; the host deadline remains independent. */
   beforeRetire?(generationId: string): Promise<void>;
@@ -249,12 +250,21 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
       throw new LiveGenerationError('generation_unavailable');
     return { ...state.deliveryAttachment };
   };
+  // inputDelivered() waiters: settled as frames reach the active generation, or (false) when it stops taking input.
+  const deliveryWaiters = new Set<{ sample: number; resolve(delivered: boolean): void }>();
+  const settleDeliveryWaiters = (blocked: boolean) => {
+    const sent = activeId === undefined ? undefined : segment(activeId).inputLastSampleExclusive;
+    for (const waiter of deliveryWaiters) if (blocked || (sent !== undefined && sent >= waiter.sample)) {
+      deliveryWaiters.delete(waiter); waiter.resolve(!blocked);
+    }
+  };
   const block = (phase: 'replacing' | 'unavailable' | 'stopped') => {
     // Time spent blocked never becomes replay allowance: the next flush opens a new window.
     clearTimeout(pacer); pacer = undefined; pacing = undefined;
     activeId = undefined;
     state.deliveryAttachment = undefined;
     state.phase = phase;
+    settleDeliveryWaiters(true);
     save();
     try { options.clearPlayback(); } catch { problem('playback_clear_failed'); }
   };
@@ -357,6 +367,7 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
     current.inputFirstSample ??= frame.callInputStartSample;
     current.inputLastSampleExclusive = frame.callInputStartSample + frame.bytes;
     if (firstInput) save();
+    if (deliveryWaiters.size) settleDeliveryWaiters(false);
     return true;
   };
   const stopPacing = () => { clearTimeout(pacer); pacer = undefined; pacing = undefined; };
@@ -615,6 +626,15 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
   return {
     snapshot: (): LiveGenerationJournal => structuredClone(state),
     bufferedAudioBytes: () => queuedBytes,
+    /** Settles true once caller input before this call sample has been sent to the active generation
+     * (a paced backlog replay included), or false if that generation stops taking input first. Not
+     * queued: an initial activation can await it. It sends nothing. */
+    inputDelivered(sampleExclusive: number): Promise<boolean> {
+      if (stopped || state.phase !== 'active' || activeId === undefined) return Promise.resolve(false);
+      const sent = segment(activeId).inputLastSampleExclusive;
+      if (sent !== undefined && sent >= sampleExclusive) return Promise.resolve(true);
+      return new Promise(resolve => { deliveryWaiters.add({ sample: sampleExclusive, resolve }); });
+    },
     start: () => serial(beforeReuse),
     beforeReuse: () => serial(beforeReuse),
     /** Keep a complete status publication inside the same queue as exact result
