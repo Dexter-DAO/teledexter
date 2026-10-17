@@ -243,12 +243,15 @@ test('failure to persist the dispatch fence prevents provider completion contact
 });
 
 
-test('after-response early admission stays excluded from undecided and enrollment-only legs', async t => {
+test('a recorded continuation leaves undecided and enrollment-only legs to their queued order', async t => {
   const f = fixture(t), call = await f.reserve();
-  await f.flow.beginEarly(call.id); noOrdinary(f.counts);
-  assert.equal(f.store.get(call.id)!.inbound!.earlyAdmission, undefined);
+  f.flow.recordContinuation(call.id, f.proof(`/broker/inbound/${call.id}/continue`)); noOrdinary(f.counts);
+  assert.deepEqual(f.store.get(call.id)!.inbound!.mode, { kind: 'undecided' });
+  assert.equal(f.store.get(call.id)!.inbound!.continuation, undefined);
+  assert.equal(f.flow.waitingMediaAllowed(f.store.get(call.id)!), false);
   await f.flow.completeEnrollment(call.id, f.digit());
   assert.equal(f.store.get(call.id)!.inbound!.mode?.kind, 'enrollment-only');
-  await f.flow.beginEarly(call.id); noOrdinary(f.counts);
-  assert.equal(f.store.get(call.id)!.inbound!.earlyAdmission, undefined);
+  f.flow.recordContinuation(call.id, f.proof(`/broker/inbound/${call.id}/continue`)); noOrdinary(f.counts);
+  assert.equal(f.store.get(call.id)!.inbound!.continuation, undefined);
+  assert.equal(f.flow.waitingMediaAllowed(f.store.get(call.id)!), false);
 });

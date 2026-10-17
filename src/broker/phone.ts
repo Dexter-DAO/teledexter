@@ -24,11 +24,15 @@ export function verifyTwilio(config: Pick<BrokerConfig, 'twilioAuthToken' | 'twi
 
 export const streamToken = (secret: string, id: string, callSid: string) => createHmac('sha256', secret).update(`dexter-broker/media/v1:${id}:${callSid}`).digest('base64url');
 
-export function callTwiml(origin: string, id: string, token: string): string {
+/** Media stream instructions. When the broker closes the stream, Twilio runs the next verb:
+ * a hangup, or (`continuationUrl`) a signed redirect that lets an inbound leg whose admission
+ * ended without account media receive its next instructions (restricted setup or hangup). */
+export function callTwiml(origin: string, id: string, token: string, continuationUrl?: string): string {
   const response = new Twilio.twiml.VoiceResponse();
   const stream = response.connect().stream({ url: `${origin.replace(/^https:/, 'wss:')}/broker/media/${id}` });
   stream.parameter({ name: 'token', value: token });
-  response.hangup();
+  if (continuationUrl) response.redirect({ method: 'POST' }, continuationUrl);
+  else response.hangup();
   return response.toString();
 }
 

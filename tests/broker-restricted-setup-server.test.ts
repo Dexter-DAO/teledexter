@@ -360,11 +360,12 @@ test('actual non-A incoming settles ordinary attachment before restricted conver
     CallStatus: 'ringing', StirVerstat: 'TN-Validation-Passed-C' };
   let remote: InboundOutcome | undefined, voice: BrokerLiveSessionOptions | undefined;
   const counts = { begin: 0, status: 0, cancel: 0, dial: 0, private: 0, receipt: 0 };
+  let releaseBegin!: () => void; const beginGate = new Promise<void>(resolve => { releaseBegin = resolve; });
   const forbidden = async () => { counts.private++; throw new Error('No account access on original restricted leg'); };
   const primary = { openCall: forbidden, openInboundCall: forbidden, getContext: forbidden, submit: forbidden, captureTurn: forbidden,
     async recoverInbound(begin: InboundBeginIdentity) { return remote ?? { state: 'absent', beginRef: inboundBeginRef(begin) }; },
     async inboundStatus(attachmentId: string) { counts.status++; assert.equal(attachmentId, id(40)); assert.ok(remote); return structuredClone(remote); },
-    async beginInbound() { counts.begin++; throw new PrimaryApiError('http_error', 403, { code: 'inbound_carrier_attestation_required', retryable: false }); },
+    async beginInbound() { counts.begin++; await beginGate; throw new PrimaryApiError('http_error', 403, { code: 'inbound_carrier_attestation_required', retryable: false }); },
     async cancelInbound(begin: InboundBeginIdentity) { counts.cancel++; remote ??= { attachmentId: id(40), beginRef: inboundBeginRef(begin),
       state: 'cancelled', expiresAt: null, cancelledAt: new Date().toISOString() }; return remote; },
   } as unknown as PrimaryApiClient;
@@ -388,10 +389,23 @@ test('actual non-A incoming settles ordinary attachment before restricted conver
     headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-twilio-signature': Twilio.getExpectedTwilioSignature(config.twilioAuthToken, config.publicOrigin + route, body) },
     body: new URLSearchParams(body) }); }
   const first = await post('/broker/incoming-call', params); assert.equal(first.status, 200);
-  assert.match(await first.text(), /<Say>One moment\.<\/Say><Redirect/);
-  await until(() => counts.begin === 1, 'early ordinary admission reaches its current carrier refusal');
-  assert.equal(counts.private, 0); assert.equal(voice, undefined);
+  assert.match(await first.text(), /<Response><Redirect method="POST">/);
+  assert.equal(counts.begin, 0, 'no admission contact before the signed continuation');
   const original = store.bySid(sid)!;
+  // The continuation answers with the greeting stream; admission refuses this caller behind it.
+  const answered = await post(`/broker/inbound/${original.id}/continue`, params);
+  assert.match(await answered.text(), /<Connect><Stream url="wss:\/\/broker\.example\.test\/broker\/media\/[0-9a-f-]{36}">.*<\/Connect><Redirect method="POST">/);
+  const greetingRoute = `/broker/media/${original.id}`;
+  const greeting = new WebSocket(origin.replace('http:', 'ws:') + greetingRoute, { headers: { 'x-twilio-signature': Twilio.getExpectedTwilioSignature(config.twilioAuthToken, config.publicOrigin + greetingRoute, {}) } });
+  await new Promise<void>((resolve, reject) => { greeting.once('open', resolve); greeting.once('error', reject); });
+  greeting.send(JSON.stringify({ event: 'start', start: { streamSid: stream, accountSid: config.twilioAccountSid, callSid: sid,
+    mediaFormat: { encoding: 'audio/x-mulaw', sampleRate: 8000, channels: 1 }, customParameters: { token: streamToken(config.controlToken, original.id, sid) } } }));
+  await until(() => counts.begin === 1, 'admission starts after the stream answered the leg');
+  await until(() => Boolean(store.get(original.id)!.streamSid), 'the greeting stream started');
+  const released = new Promise<void>(resolve => greeting.once('close', () => resolve()));
+  releaseBegin(); await released;
+  assert.equal(counts.private, 0); assert.equal(voice, undefined);
+  assert.equal(store.get(original.id)!.endedAt, undefined, 'the released stream leaves the call to its trailing redirect');
   const continuation = await post(`/broker/inbound/${original.id}/continue`, { ...params, CallStatus: 'in-progress' });
   const continuationBody = await continuation.text();
   assert.equal(continuation.status, 200); assert.equal(counts.begin, 1); assert.equal(counts.cancel, 1); assert.equal(counts.status, 0);

@@ -2,7 +2,7 @@ import type { BrokerConfig } from './config.js';
 import { PrimaryApiError, type PrimaryApiClient, type PrimaryCall } from './primaryApi.js';
 import type { InboundOutcome } from './inboundContract.js';
 import { BrokerStore, type BrokerCall, terminalCallStatuses } from './store.js';
-import { verifyTwilio, type ProviderCallProof } from './phone.js';
+import { safeFailure, verifyTwilio, type ProviderCallProof } from './phone.js';
 import { createHash } from 'node:crypto';
 import { createInboundAttemptTiming, type InboundTimingSink } from './inboundTiming.js';
 import { INBOUND_ENROLLMENT_RESPONSE_PATH, enrollmentCompletionInputSchema, enrollmentCommand,
@@ -18,11 +18,13 @@ export interface InboundFlowOptions {
   primary: PrimaryApiClient;
   fetchCall(sid: string): Promise<InboundProviderCall>;
   closeBound(call: BrokerCall): Promise<void>;
-  /** In-memory handoff after the original leg and context have been admitted. */
-  onContext?(call: BrokerCall, context: PrimaryCall): void;
+  /** In-memory handoff after the original leg and context have been admitted. `receivedAt` is when
+   * the API returned that context (it can precede the handoff while the provider check finishes). */
+  onContext?(call: BrokerCall, context: PrimaryCall, receivedAt: number): void;
   onTiming?: InboundTimingSink;
-  /** After canonical approval and a fresh exact in-progress provider identity, before context I/O. */
+  /** After canonical approval, as consumption starts (the provider check runs alongside it), before context I/O. */
   onApprovedTransport?(call: BrokerCall): void;
+  /** `terminal`: the account wait ended (stop, refusal); otherwise a failed step the next poll retries. */
   onTransportDiscard?(callId: string, terminal?: boolean): void;
   now?: () => number;
   /** Internal composition only. No entry gesture, route, settings or runtime activation is selected here. */
@@ -64,13 +66,24 @@ export function createInboundFlow(options: InboundFlowOptions) {
   function bound(call: BrokerCall): Extract<InboundOutcome, { state: 'bound' }> | undefined {
     return call.inbound?.remote?.state === 'bound' ? call.inbound.remote : undefined;
   }
+  /** Account media (Live with the caller's context) may start: admission is bound and its context loaded. */
   function mediaAllowed(call: BrokerCall): boolean {
     if (call.inbound?.mode && call.inbound.mode.kind !== 'ordinary') return false;
-    if (call.inbound?.earlyAdmission && !call.inbound.continuation) return false;
     const receipt = bound(call);
     return Boolean(receipt && receipt.callState === 'open' && !call.inbound?.closure && !call.primaryClosed
       && call.primary?.bindingId === receipt.bindingId && !stopped(call) && !call.mediaStartedAt
       && call.inbound?.mediaStartBy && now() < Date.parse(call.inbound.mediaStartBy));
+  }
+  /** The greeting stream may hold this leg while admission is still running: a signed
+   * continuation answered it, and no stop, refusal, deadline or earlier media ended the wait.
+   * That stream carries only the constant greeting; account media still needs mediaAllowed. */
+  function waitingMediaAllowed(call: BrokerCall): boolean {
+    const journal = call.inbound;
+    if (!journal?.continuation || (journal.mode && journal.mode.kind !== 'ordinary') || stopped(call)
+      || call.mediaStartedAt || journal.closure || call.primaryClosed) return false;
+    const remote = journal.remote;
+    if (remote?.state === 'cancelled' || remote?.state === 'expired') return false;
+    return now() < Date.parse(remote?.state === 'bound' ? journal.mediaStartBy! : journal.waitUntil);
   }
   function stopLocal(id: string, reason: string): BrokerCall {
     const call = store.transitionInbound(id, { type: 'stop', reason, observedAt: timestamp() });
@@ -166,9 +179,6 @@ export function createInboundFlow(options: InboundFlowOptions) {
       stopLocal(id, previous ? 'media_start_expired' : 'broker_cancelled'); return settle(id);
     }
     if (call.inbound?.mode?.kind === 'undecided') return call;
-    // Only the signed continuation releases a new early contact into recovery and consumption.
-    // Historical approved journals without this marker retain their original recovery path.
-    if (call.inbound!.earlyAdmission && !call.inbound!.continuation) return call;
     if (!primary.beginInbound || !primary.recoverInbound || !primary.inboundStatus || !primary.openInboundCall)
       throw new Error('inbound_api_unavailable');
     // Recover an uncertain old attempt before considering fresh admission. Historical
@@ -186,8 +196,8 @@ export function createInboundFlow(options: InboundFlowOptions) {
     const state = call.inbound!.remote?.state;
     if (state === undefined || state === 'absent' || state === 'pending') {
       if (now() >= Date.parse(call.inbound!.waitUntil)) { stopLocal(id, 'broker_cancelled'); return settle(id); }
-      // After the optional early contact, only the signed continuation can
-      // recover and resubmit this same original-proof admission.
+      // Admission begins only after the signed continuation. Its stream instructions
+      // answer the leg, and the API's begin refuses a leg that is still ringing.
       if (!call.inbound!.continuation) return call;
       store.transitionInbound(id, { type: 'begin_attempted', observedAt: timestamp() });
       // A retryable 503 or lost response preserves this attempt. The next
@@ -201,28 +211,31 @@ export function createInboundFlow(options: InboundFlowOptions) {
     }
     if (now() >= Date.parse(call.inbound!.waitUntil) && !bound(call)) { stopLocal(id, 'broker_cancelled'); return settle(id); }
     if (call.inbound!.remote?.state === 'pending') return call;
-    const observed = await timing.measure('provider_identity', () => observe(call));
-    call = saved(id);
-    if (terminalCallStatuses.has(observed.status as BrokerCall['status'])) {
-      store.update(id, { status: observed.status as BrokerCall['status'], endedAt: call.endedAt ?? timestamp() });
+    // The broker's own provider check: a leg that ended stops the wait (and closes any binding);
+    // account context is recorded only for a leg in progress.
+    const providerEnded = (observed: InboundProviderCall): Promise<BrokerCall> => {
+      store.update(id, { status: observed.status as BrokerCall['status'], endedAt: saved(id).endedAt ?? timestamp() });
       stopLocal(id, 'provider_terminal'); return settle(id);
-    }
-    if (stopped(call)) return settle(id);
-    if (call.mediaStartedAt) return call;
-    if (observed.status !== 'in-progress') return call;
+    };
+    const ended = (observed: InboundProviderCall) => terminalCallStatuses.has(observed.status as BrokerCall['status']);
+    // Twilio describing a different leg than the signed one is not a read to retry: the wait ends and
+    // any binding is closed rather than left open until the media grace runs out.
+    const mismatched = (error: unknown) => error instanceof Error && error.message === 'inbound_provider_identity_mismatch';
+    const providerMismatch = (): Promise<BrokerCall> => { stopLocal(id, 'provider_identity_mismatch'); return settle(id); };
     let context: PrimaryCall;
-    try {
-      const receipt = bound(call);
-      if (receipt) {
-        if (receipt.callState === 'closed' || now() >= Date.parse(call.inbound!.mediaStartBy!)) {
-          stopLocal(id, receipt.callState === 'closed' ? 'binding_closed' : 'media_start_expired'); return settle(id);
-        }
-        context = await timing.measure('refresh_context', () => primary.getContext(receipt.bindingId));
-      } else if (call.inbound!.remote?.state === 'approved') {
-        options.onApprovedTransport?.(call);
-        store.transitionInbound(id, { type: 'consume_attempted', observedAt: timestamp() });
-        const approvalRef = call.inbound!.remote.approvalRef;
-        context = await timing.measure('open_context', () => primary.openInboundCall!(call.inbound!.begin.providerProof, approvalRef));
+    let contextReceivedAt = now();
+    const approved = !bound(call) && call.inbound!.remote?.state === 'approved' ? call.inbound!.remote : undefined;
+    if (approved) {
+      // The API's consume makes the same active-call check (it refuses a leg that is not in progress),
+      // so the broker's own provider read runs alongside it rather than before it. The context is
+      // recorded, and Live can attach, only when both pass.
+      const providerCheck = timing.measure('provider_identity', () => observe(call));
+      void providerCheck.catch(() => {}); // Settled below; this keeps an early throw from leaving it unhandled.
+      options.onApprovedTransport?.(call);
+      store.transitionInbound(id, { type: 'consume_attempted', observedAt: timestamp() });
+      try {
+        context = await timing.measure('open_context', () => primary.openInboundCall!(call.inbound!.begin.providerProof, approved.approvalRef));
+        contextReceivedAt = now();
         // The negotiated response carries the same persisted outcome as recovery.
         // Older APIs and uncertain replies retain the original recovery path.
         const recovered = context.inboundOutcome
@@ -230,11 +243,46 @@ export function createInboundFlow(options: InboundFlowOptions) {
         if (recovered.state === 'absent') throw new Error('inbound_binding_outcome_unavailable');
         call = record(id, recovered);
         if (!bound(call)) throw new Error('inbound_binding_outcome_unavailable');
-      } else return call;
-    } catch (error) {
-      // A lost consume/context reply can hide a committed binding. Retain the attempt and
-      // recover its context-free outcome on the next iteration before any further action.
-      throw error;
+      } catch (error) {
+        // A lost consume/context reply can hide a committed binding. Retain the attempt and
+        // recover its context-free outcome on the next iteration before any further action.
+        // A leg that ended (or is not the signed one) stops the wait, as when the check ran first.
+        const observed = await providerCheck.then(value => value, failure => (mismatched(failure) ? 'mismatch' as const : undefined));
+        if (observed === 'mismatch') return providerMismatch();
+        if (observed && ended(observed)) return providerEnded(observed);
+        throw error;
+      }
+      let observed: InboundProviderCall;
+      try { observed = await providerCheck; }
+      catch (error) {
+        if (mismatched(error)) return providerMismatch();
+        // The new binding stays unused: no context is recorded, so Live cannot attach. The next
+        // poll reads the provider again before reading this binding's context.
+        store.update(id, { failure: safeFailure(error) });
+        return saved(id);
+      }
+      if (ended(observed)) return providerEnded(observed);
+      call = saved(id);
+      if (stopped(call)) return settle(id);
+      if (call.mediaStartedAt) return call;
+      // Bound but not yet in progress: the next poll checks again and refreshes its context.
+      if (observed.status !== 'in-progress') return call;
+    } else {
+      let observed: InboundProviderCall;
+      try { observed = await timing.measure('provider_identity', () => observe(call)); }
+      catch (error) { if (mismatched(error) && bound(saved(id))) return providerMismatch(); throw error; }
+      call = saved(id);
+      if (ended(observed)) return providerEnded(observed);
+      if (stopped(call)) return settle(id);
+      if (call.mediaStartedAt) return call;
+      if (observed.status !== 'in-progress') return call;
+      const receipt = bound(call);
+      if (!receipt) return call;
+      if (receipt.callState === 'closed' || now() >= Date.parse(call.inbound!.mediaStartBy!)) {
+        stopLocal(id, receipt.callState === 'closed' ? 'binding_closed' : 'media_start_expired'); return settle(id);
+      }
+      context = await timing.measure('refresh_context', () => primary.getContext(receipt.bindingId));
+      contextReceivedAt = now();
     }
     call = saved(id);
     if (stopped(call)) return settle(id);
@@ -246,7 +294,7 @@ export function createInboundFlow(options: InboundFlowOptions) {
       stopLocal(id, context.state !== 'open' ? 'binding_closed' : 'media_start_expired'); return settle(id);
     }
     store.transitionInbound(id, { type: 'context', context, observedAt: timestamp() });
-    options.onContext?.(saved(id), context);
+    options.onContext?.(saved(id), context, contextReceivedAt);
     return saved(id);
   }
   async function admissionOperation(id: string, operation: () => Promise<BrokerCall>): Promise<BrokerCall> {
@@ -260,54 +308,52 @@ export function createInboundFlow(options: InboundFlowOptions) {
         // Current enrollment may fail at begin, consumption, or context access.
         // Local refusal never proves cancellation; a committed consume wins and closes.
         store.transitionInbound(id, { type: 'admission_refused', code: error.remoteCode, observedAt: timestamp() });
+        options.onTransportDiscard?.(id, true); // The account wait is over: no Live will use its socket.
         return settle(id);
       }
       throw error;
     }
   }
   const advance = (id: string) => admissionOperation(id, () => advanceAttempt(id));
-  /** Called only after the original ordinary hold response has finished. No private context or transport. */
-  function beginEarly(id: string): Promise<BrokerCall> {
-    return serial(id, () => admissionOperation(id, async () => {
-      const call = saved(id), journal = call.inbound!;
-      if (stopped(call)) return settle(id);
-      if (now() >= Date.parse(journal.waitUntil)) { stopLocal(id, 'broker_cancelled'); return settle(id); }
-      if (journal.mode || journal.continuation || journal.beginAttemptedAt || journal.remote || journal.earlyAdmission) return call;
-      if (!primary.beginInbound) throw new Error('inbound_api_unavailable');
-      store.transitionInbound(id, { type: 'early_admission_started', observedAt: timestamp() });
-      // A lost response or ringing refusal preserves this single contact. A real
-      // continuation recovers the same identity through the existing path.
-      const result = await createInboundAttemptTiming(id, options.onTiming).measure('early_begin_admission',
-        () => primary.beginInbound!(journal.begin));
-      record(id, result);
-      if (stopped(saved(id))) return settle(id);
-      if (now() >= Date.parse(journal.waitUntil) || result.state === 'expired' || result.state === 'cancelled') {
-        stopLocal(id, 'broker_cancelled'); return settle(id);
-      }
-      return saved(id);
-    }));
-  }
   function accept(proof: ProviderCallProof): Promise<BrokerCall> {
     verify(proof, '/broker/incoming-call');
     const requestId = createHash('sha256').update(`incoming:${proof.params.CallSid}`).digest('hex');
     const { call, existing } = store.reserveInbound({ requestId, purpose: 'The person called Dexter.', providerProof: proof },
       inboundPolicy, timestamp(), options.enrollment !== undefined);
-    // Original webhook duplicates must also return hold while the early contact is pending.
-    if (!existing || (call.inbound!.earlyAdmission && !call.inbound!.continuation)) return Promise.resolve(call);
+    if (!existing) return Promise.resolve(call);
     return serial(call.id, () => advance(call.id));
   }
-  function resume(id: string, proof: ProviderCallProof): Promise<BrokerCall> {
-    const call = saved(id);
-    verify(proof, `/broker/inbound/${id}/continue`, call);
+  function continuation(id: string, proof: ProviderCallProof): void {
+    const current = saved(id);
+    // A terminal/expired callback remains useful for recovery and closure.
+    if (!stopped(current) && now() < Date.parse(current.inbound!.waitUntil))
+      store.transitionInbound(id, { type: 'continuation', providerProof: proof, observedAt: timestamp() });
+  }
+  function verifyContinuation(id: string, proof: ProviderCallProof): void {
+    verify(proof, `/broker/inbound/${id}/continue`, saved(id));
     if (Object.prototype.hasOwnProperty.call(proof.params, 'Digits')) throw new Error('inbound_digit_form_route_mismatch');
+  }
+  /** Saves the signed continuation of an ordinary leg without starting admission, so the route
+   * can answer with the greeting stream first; tick() then runs admission on the answered leg.
+   * Enrollment legs keep their queued order with the digit form through resume(). */
+  function recordContinuation(id: string, proof: ProviderCallProof): void {
+    verifyContinuation(id, proof);
+    const mode = saved(id).inbound?.mode;
+    if (!mode || mode.kind === 'ordinary') continuation(id, proof);
+  }
+  function resume(id: string, proof: ProviderCallProof): Promise<BrokerCall> {
+    verifyContinuation(id, proof);
     return serial(id, () => {
-      const current = saved(id);
-      if (current.inbound?.mode?.kind === 'enrollment-only') return advanceEnrollment(id);
-      // A terminal/expired callback remains useful for recovery and closure.
-      if (!stopped(current) && now() < Date.parse(current.inbound!.waitUntil))
-        store.transitionInbound(id, { type: 'continuation', providerProof: proof, observedAt: timestamp() });
+      if (saved(id).inbound?.mode?.kind === 'enrollment-only') return advanceEnrollment(id);
+      continuation(id, proof);
       return advance(id);
     });
+  }
+  /** An admission operation is queued or running for this call. */
+  function busy(id: string): boolean { return pending.has(id); }
+  /** Settles when no admission operation is queued or running for this call. */
+  async function idle(id: string): Promise<void> {
+    for (let work = pending.get(id); work; work = pending.get(id)) await work.catch(() => undefined);
   }
   function completeEnrollment(id: string, digitProof: ProviderCallProof): Promise<BrokerCall> {
     const call = saved(id);
@@ -361,5 +407,5 @@ export function createInboundFlow(options: InboundFlowOptions) {
   }
   function tick(id: string): Promise<BrokerCall> { return serial(id, () => advance(id)); }
   async function drain(): Promise<void> { await Promise.allSettled([...pending.values(), ...ending.values()]); }
-  return { accept, beginEarly, resume, completeEnrollment, stop, stopLocal, tick, mediaAllowed, drain };
+  return { accept, recordContinuation, resume, busy, idle, completeEnrollment, stop, stopLocal, tick, mediaAllowed, waitingMediaAllowed, drain };
 }

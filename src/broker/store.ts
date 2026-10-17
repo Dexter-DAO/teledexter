@@ -71,6 +71,9 @@ export interface BrokerCall {
   contextReadFailures?: ContextReadFailure[];
   statusContextRefreshes?: StatusContextRefresh[];
   sourceAcousticSpans?: Record<string, unknown>;
+  /** Account media start: recorded when Live attaches after binding, and the time of the first
+   * caller sample Live receives (greeting end, or stream start without a clip; never before an
+   * inbound binding's consumedAt). Input sample positions count from it. */
   mediaStartedAt?: string;
   harkJournal?: HarkJournal;
   harkReceiptOutbox?: PrimaryHarkReceiptOutbox;
@@ -96,9 +99,12 @@ export interface BrokerCall {
     pending: number;
     unsupported: string[];
   };
-  /** greetingClip*: the pre-rendered "Hey, it's Dexter." clip, played before Live speaks. */
-  journey?: { liveReadyAt?: string; firstAudioSentAt?: string; firstPlaybackConfirmedAt?: string;
-    greetingClipStartedAt?: string; greetingClipPlayedAt?: string };
+  /** streamStartedAt: the provider media stream started (it may carry only the greeting while
+   * admission or binding finishes). greetingClip*: the pre-rendered greeting clip on that stream.
+   * firstSpeechAudioSentAt: Dexter's first spoken words sent (never the clip); callerSpeechEndedAt:
+   * the caller's last speech frame before them, when the caller spoke after the greeting. */
+  journey?: { streamStartedAt?: string; liveReadyAt?: string; firstAudioSentAt?: string; firstPlaybackConfirmedAt?: string;
+    greetingClipStartedAt?: string; greetingClipPlayedAt?: string; firstSpeechAudioSentAt?: string; callerSpeechEndedAt?: string };
   metrics?: { receivedAudioBytes: number; sentAudioBytes: number; playedAudioBytes: number; clearedAudioBytes: number };
   delegations: Record<string, { requestId: string; status: string; updatedAt: string; result?: string }>;
 }
@@ -385,17 +391,24 @@ function assertHarkReceiptUpdate(previous: BrokerCall, next: BrokerCall): void {
 
 interface State { version: 1; calls: Record<string, BrokerCall> }
 
-const journeySchema = z.object({ liveReadyAt: z.iso.datetime({ offset: true }).optional(),
+const journeySchema = z.object({ streamStartedAt: z.iso.datetime({ offset: true }).optional(), liveReadyAt: z.iso.datetime({ offset: true }).optional(),
   firstAudioSentAt: z.iso.datetime({ offset: true }).optional(), firstPlaybackConfirmedAt: z.iso.datetime({ offset: true }).optional(),
-  greetingClipStartedAt: z.iso.datetime({ offset: true }).optional(), greetingClipPlayedAt: z.iso.datetime({ offset: true }).optional() }).strict();
+  greetingClipStartedAt: z.iso.datetime({ offset: true }).optional(), greetingClipPlayedAt: z.iso.datetime({ offset: true }).optional(),
+  firstSpeechAudioSentAt: z.iso.datetime({ offset: true }).optional(), callerSpeechEndedAt: z.iso.datetime({ offset: true }).optional() }).strict();
 function validateCallJourney(call: BrokerCall, previous?: BrokerCall): void {
   if (call.journey) {
     journeySchema.parse(call.journey);
-    if (!call.mediaStartedAt || (call.journey.firstPlaybackConfirmedAt && !call.journey.firstAudioSentAt)
-      || (call.journey.greetingClipPlayedAt && !call.journey.greetingClipStartedAt))
+    // Journals saved before streamStartedAt existed carry mediaStartedAt as their stream evidence.
+    if (!(call.journey.streamStartedAt || call.mediaStartedAt) || (call.journey.firstPlaybackConfirmedAt && !call.journey.firstAudioSentAt)
+      || (call.journey.greetingClipPlayedAt && !call.journey.greetingClipStartedAt)
+      || (call.journey.liveReadyAt && !call.mediaStartedAt)
+      || (call.journey.firstSpeechAudioSentAt && !call.journey.firstAudioSentAt)
+      || (call.journey.callerSpeechEndedAt && !(call.journey.firstSpeechAudioSentAt
+        && Date.parse(call.journey.callerSpeechEndedAt) <= Date.parse(call.journey.firstSpeechAudioSentAt))))
       throw new Error('Call journey lacks media evidence');
   }
-  for (const key of ['liveReadyAt', 'firstAudioSentAt', 'firstPlaybackConfirmedAt', 'greetingClipStartedAt', 'greetingClipPlayedAt'] as const)
+  for (const key of ['streamStartedAt', 'liveReadyAt', 'firstAudioSentAt', 'firstPlaybackConfirmedAt', 'greetingClipStartedAt',
+    'greetingClipPlayedAt', 'firstSpeechAudioSentAt', 'callerSpeechEndedAt'] as const)
     if (previous?.journey?.[key] && previous.journey[key] !== call.journey?.[key]) throw new Error('Call journey observation changed');
 }
 

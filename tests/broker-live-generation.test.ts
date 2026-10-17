@@ -7,7 +7,7 @@ import { createLiveGenerationController, LiveGenerationError,
 import { PrimaryApiError } from '../src/broker/primaryApi.js';
 import type { EligibleContextClient, EligiblePhoneCall, HistoryVersion } from '../src/broker/eligibleContext.js';
 import type { LiveSessionClosed, LiveTranscriptSnapshot } from '../src/live/types.js';
-import { createInboundStartupContexts } from '../src/broker/startupContext.js';
+import { createInboundStartupContexts, STARTUP_PAGE_FRESH_MS } from '../src/broker/startupContext.js';
 
 const callId = '11111111-1111-4111-8111-111111111111';
 const bindingId = '22222222-2222-4222-8222-222222222222';
@@ -239,9 +239,17 @@ test('transient retries use the original transition deadline rather than restart
 });
 
 const startupCall = () => ({ id: callId, callSid, primary: { bindingId, primaryDexterId, threadId, name: 'Dexter', context: '' } });
+/** Admission well before media (an older binding response): the page is rechecked before Live opens. */
+function agedStartupContexts(api: EligibleContextClient) {
+  let clock = startTime;
+  const cache = createInboundStartupContexts(api, { now: () => clock });
+  return { ...cache, take(call: Parameters<typeof cache.take>[0]) { clock += STARTUP_PAGE_FRESH_MS + 1; return cache.take(call); } };
+}
+/** Live attached in the same turn its binding landed: the binding response is the eligibility read. */
+const freshStartupContexts = (api: EligibleContextClient) => createInboundStartupContexts(api, { now: () => startTime });
 
 test('admitted startup page is snapshotted and consumed only once for its exact call', async () => {
-  const h = harness(), cache = createInboundStartupContexts(h.api), call = startupCall();
+  const h = harness(), cache = agedStartupContexts(h.api), call = startupCall();
   const page = contextFor(versionFor(1));
   page.context.history.localContext = 'Retain the complete attributed history envelope.';
   page.context.messages.push({ id: messageId, role: 'user', text: 'The earlier caller request.', eventSequence: '1',
@@ -259,7 +267,7 @@ test('admitted startup page is snapshotted and consumed only once for its exact 
 });
 
 test('admitted startup page still withholds audio until a fresh version assertion succeeds', async () => {
-  const h = harness(), cache = createInboundStartupContexts(h.api), call = startupCall();
+  const h = harness(), cache = agedStartupContexts(h.api), call = startupCall();
   cache.remember(call, contextFor(versionFor(1))); h.options.context = cache.take(call);
   const asserted = pending<void>(), assertVersion = h.api.assert;
   let assertions = 0;
@@ -277,7 +285,7 @@ test('admitted startup page still withholds audio until a fresh version assertio
 });
 
 test('stop during the retained-page eligibility check prevents a late page from opening Live', async () => {
-  const h = harness(), cache = createInboundStartupContexts(h.api), call = startupCall();
+  const h = harness(), cache = agedStartupContexts(h.api), call = startupCall();
   cache.remember(call, contextFor(versionFor(1))); h.options.context = cache.take(call);
   const checked = pending<void>(), assertVersion = h.api.assert; let checking = false;
   h.api.assert = async (scope, version) => { checking = true; await checked.promise; return assertVersion(scope, version); };
@@ -290,7 +298,7 @@ test('stop during the retained-page eligibility check prevents a late page from 
 });
 
 test('a stale admitted page is replaced from a fresh read before any retained text reaches Live', async () => {
-  const h = harness(), cache = createInboundStartupContexts(h.api), call = startupCall();
+  const h = harness(), cache = agedStartupContexts(h.api), call = startupCall();
   cache.remember(call, contextFor(versionFor(1))); h.options.context = cache.take(call); h.advanceVersion();
   const open = h.options.open;
   h.options.open = async input => { const result = await open(input); input.callbacks.onAudio('unasserted'); return result; };
@@ -302,7 +310,7 @@ test('a stale admitted page is replaced from a fresh read before any retained te
 });
 
 test('unavailable authority after seeded startup never enables output or substitutes unasserted history', async () => {
-  const h = harness(), cache = createInboundStartupContexts(h.api), call = startupCall();
+  const h = harness(), cache = agedStartupContexts(h.api), call = startupCall();
   cache.remember(call, contextFor(versionFor(1))); h.options.context = cache.take(call);
   h.api.assert = async () => { throw new PrimaryApiError('http_error', 403, { code: 'authority_unavailable', retryable: false }); };
   await assert.rejects(h.controller.start());
@@ -310,6 +318,66 @@ test('unavailable authority after seeded startup never enables output or substit
   assert.equal(h.controller.snapshot().deliveryAttachment, undefined); assert.deepEqual(h.audio, []);
   assert.deepEqual(h.operations, []);
   await h.controller.stop();
+});
+
+test('a fresh binding response opens Live at once; caller audio and output still wait for the post-open assertion', async () => {
+  const h = harness(), cache = freshStartupContexts(h.api), call = startupCall();
+  cache.remember(call, contextFor(versionFor(1))); h.options.context = cache.take(call);
+  const asserted = pending<void>(), assertVersion = h.api.assert;
+  h.api.assert = async (scope, version) => { await asserted.promise; return assertVersion(scope, version); };
+  const starting = h.controller.start();
+  await until(() => h.sessions.length === 1);
+  assert.deepEqual(h.operations, [], 'no second eligibility read before Live opens');
+  assert.deepEqual(h.sessions[0].input.context, contextFor(versionFor(1)));
+  h.sessions[0].input.callbacks.onAudio('before_assert');
+  assert.equal(h.controller.snapshot().deliveryAttachment, undefined, 'no attachment, so no caller input is sent either');
+  assert.deepEqual(h.audio, []);
+  asserted.resolve(); await starting;
+  assert.deepEqual(h.operations.map(value => value.name), ['assert']);
+  h.sessions[0].input.callbacks.onAudio('after_assert');
+  assert.deepEqual(h.audio, [{ payload: 'after_assert', sessionId: 'session_1' }]);
+  await h.controller.stop();
+});
+
+test('a fresh page that changed before Live opened is replaced before any output', async () => {
+  const h = harness(), cache = freshStartupContexts(h.api), call = startupCall();
+  cache.remember(call, contextFor(versionFor(1))); h.options.context = cache.take(call); h.advanceVersion();
+  const open = h.options.open;
+  h.options.open = async input => { const result = await open(input); input.callbacks.onAudio('unasserted'); return result; };
+  assert.equal((await h.controller.start()).sessionId, 'session_2');
+  assert.deepEqual(h.operations.map(value => value.name), ['assert', 'fetch', 'assert']);
+  assert.equal(h.sessions.length, 2); assert.deepEqual(h.audio, []);
+  assert.deepEqual(h.sessions[0].closes, ['context_unavailable'], 'the session opened from the changed page is retired');
+  assert.deepEqual(h.sessions[1].input.context, contextFor(versionFor(2)));
+  await h.controller.stop();
+});
+
+test('a fresh page whose authority ended never enables output', async () => {
+  const h = harness(), cache = freshStartupContexts(h.api), call = startupCall();
+  cache.remember(call, contextFor(versionFor(1))); h.options.context = cache.take(call);
+  h.api.assert = async () => { throw new PrimaryApiError('http_error', 403, { code: 'authority_unavailable', retryable: false }); };
+  const open = h.options.open;
+  h.options.open = async input => { const result = await open(input); input.callbacks.onAudio('unasserted'); return result; };
+  await assert.rejects(h.controller.start());
+  assert.equal(h.controller.snapshot().deliveryAttachment, undefined); assert.deepEqual(h.audio, []);
+  await until(() => h.sessions[0]?.closes.length === 1);
+  await h.controller.stop();
+});
+
+test('an admission page older than the fresh window is rechecked before Live opens', async () => {
+  let clock = startTime;
+  const h = harness(), cache = createInboundStartupContexts(h.api, { now: () => clock }), call = startupCall();
+  cache.remember(call, contextFor(versionFor(1))); h.options.context = cache.take(call);
+  clock += STARTUP_PAGE_FRESH_MS;
+  await h.controller.start();
+  assert.deepEqual(h.operations.map(value => value.name), ['assert'], 'at the window edge the page is still fresh');
+  await h.controller.stop();
+  const later = harness(), aged = createInboundStartupContexts(later.api, { now: () => clock });
+  aged.remember(call, contextFor(versionFor(1))); later.options.context = aged.take(call);
+  clock += STARTUP_PAGE_FRESH_MS + 1;
+  await later.controller.start();
+  assert.deepEqual(later.operations.map(value => value.name), ['assert', 'assert']);
+  await later.controller.stop();
 });
 
 for (const key of ['bindingId', 'callSid', 'ownerPrincipalId', 'primaryDexterId', 'threadId'] as const) {
@@ -323,7 +391,7 @@ for (const key of ['bindingId', 'callSid', 'ownerPrincipalId', 'primaryDexterId'
 }
 
 test('another call cannot consume the page and a changed saved binding cannot reuse it', async () => {
-  const h = harness(), cache = createInboundStartupContexts(h.api), call = startupCall();
+  const h = harness(), cache = agedStartupContexts(h.api), call = startupCall();
   cache.remember(call, contextFor(versionFor(1)));
   await cache.take({ ...call, id: requestId }).fetch(binding);
   assert.deepEqual(h.operations.map(value => value.name), ['fetch']);
@@ -956,7 +1024,7 @@ test('admitted removal still replaces the session and never sends old audio duri
 });
 
 test('cached startup retains its original page digest and version when admitted sources validate at a newer version', async () => {
-  const h = harness(), cache = createInboundStartupContexts(h.api), call = startupCall();
+  const h = harness(), cache = agedStartupContexts(h.api), call = startupCall();
   let openings = 0;
   h.options.onInitialActivation = async () => { openings++; };
   const page = contextFor(versionFor(1));
@@ -1092,4 +1160,40 @@ test('blocked time is not replay allowance: a second block restarts the real-tim
   assert.deepEqual(all.slice(0, first.length).map(frame => frame.callInputStartSample),
     all.slice(0, first.length).map((_, index) => index * 160), 'replay stays contiguous and is never repeated');
   await h.controller.stop();
+});
+
+test('inputDelivered settles when the paced replay reaches a queued frame, at once for sent input, and false when input stops', async () => {
+  const h = harness(undefined, { inputPaceRate: 1.5 });
+  const frames = Array.from({ length: 10 }, (_, index) => ({ payload: Buffer.alloc(160, index + 1).toString('base64'),
+    callInputStartSample: index * 160, observedAt: startTime }));
+  for (const frame of frames) assert.equal(h.controller.appendAudio(frame), 'buffered');
+  await h.controller.start();
+  assert.equal(h.sessions[0].audio.length, 1, 'activation sends one frame; the rest of the backlog is paced');
+  assert.equal(await h.controller.inputDelivered(160), true, 'already sent');
+  let delivered: boolean | undefined;
+  void h.controller.inputDelivered(1_600).then(value => { delivered = value; });
+  await realTimers(40);
+  assert.equal(delivered, undefined, 'the last queued frame has not been replayed yet');
+  h.setTime(startTime + 1_000); await realTimers(60);
+  assert.equal(delivered, true); assert.equal(h.sessions[0].audio.length, 10);
+  const never = h.controller.inputDelivered(99_999);
+  await h.controller.stop();
+  assert.equal(await never, false, 'a stop settles every waiter');
+  assert.equal(await h.controller.inputDelivered(0), false);
+  assert.equal(h.sessions[0].audio.length, 10, 'waiting sends nothing of its own');
+});
+
+test('a startup page counts its age from when the API returned it, even if the handoff came later', async () => {
+  const clock = startTime;
+  const h = harness(), cache = createInboundStartupContexts(h.api, { now: () => clock }), call = startupCall();
+  // Handed over now, but returned STARTUP_PAGE_FRESH_MS + 1 ago (the provider check finished after the consume).
+  cache.remember(call, contextFor(versionFor(1)), clock - STARTUP_PAGE_FRESH_MS - 1); h.options.context = cache.take(call);
+  await h.controller.start();
+  assert.deepEqual(h.operations.map(value => value.name), ['assert', 'assert'], 'rechecked before Live opens, then asserted after');
+  await h.controller.stop();
+  const fresh = harness(), recent = createInboundStartupContexts(fresh.api, { now: () => clock });
+  recent.remember(call, contextFor(versionFor(1)), clock + 60_000); fresh.options.context = recent.take(call);
+  await fresh.controller.start();
+  assert.deepEqual(fresh.operations.map(value => value.name), ['assert'], 'a receipt time later than now counts as now');
+  await fresh.controller.stop();
 });

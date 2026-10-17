@@ -453,14 +453,32 @@ test('expired saved event cannot dial and its refusal survives exact retry', asy
   assert.equal(f.counters.readiness, 0);
 });
 
-test('registration refusal cannot start voice or replace the saved assignment', async t => {
+async function until(predicate: () => boolean) {
+  for (let i = 0; i < 400 && !predicate(); i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(predicate(), true);
+}
+
+test('registration refusal cannot start voice or replace the saved assignment; the greeting stream speaks the failure', async t => {
   const f = await fixture(t, { failedRegistration: true });
   assert.equal((await f.post(f.notification())).status, 202);
   const call = f.broker.store.list()[0];
   const answer = await f.answer(call.id);
-  assert.doesNotMatch(await answer.text(), /<Stream/);
-  assert.equal(f.broker.store.get(call.id)?.status, 'failed');
-  assert.equal(f.counters.voice, 0);
+  // The answer carries only the greeting stream; registration runs behind it.
+  assert.match(await answer.text(), /<Connect><Stream/);
+  await until(() => Boolean(f.broker.store.get(call.id)?.failure));
+  assert.equal(f.broker.store.get(call.id)?.primary, undefined);
+  const route = `/broker/media/${call.id}`;
+  const ws = new WebSocket(f.base.replace('http:', 'ws:') + route, { headers: {
+    'x-twilio-signature': Twilio.getExpectedTwilioSignature(f.config.twilioAuthToken, f.config.publicOrigin + route, {}),
+  } });
+  t.after(() => ws.terminate());
+  await new Promise<void>((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
+  ws.send(JSON.stringify({ event: 'start', start: { accountSid: f.config.twilioAccountSid, callSid: f.sid,
+    streamSid: 'MZ' + '3'.repeat(32), customParameters: { token: streamToken(f.config.controlToken, call.id, f.sid) },
+    mediaFormat: { encoding: 'audio/x-mulaw', sampleRate: 8000, channels: 1 } } }));
+  await until(() => f.counters.updates === 1);
+  assert.equal(f.counters.voice, 0); assert.equal(f.counters.opening, 0);
+  assert.equal(f.broker.store.get(call.id)?.mediaStartedAt, undefined);
   assert.deepEqual(f.broker.store.get(call.id)?.callAssignment, call.callAssignment);
 });
 
@@ -469,7 +487,8 @@ test('mismatched Hark assignment reference cannot register voice or submit calle
   assert.equal((await f.post(f.notification())).status, 202);
   const call = f.broker.store.list()[0];
   const answer = await f.answer(call.id);
-  assert.doesNotMatch(await answer.text(), /<Stream/);
+  assert.match(await answer.text(), /<Connect><Stream/);
+  await until(() => Boolean(f.broker.store.get(call.id)?.failure));
   assert.equal(f.counters.voice, 0);
   assert.equal(f.submissions.length, 0);
   assert.equal(f.broker.store.get(call.id)?.primary, undefined);
@@ -480,8 +499,9 @@ test('local registration failure keeps provider call blocking overlap and allows
   const f = await fixture(t, { failedRegistration: true });
   assert.equal((await f.post(f.notification())).status, 202);
   const call = f.broker.store.list()[0];
-  await f.answer(call.id);
-  assert.equal(f.broker.store.get(call.id)?.status, 'failed');
+  await (await f.answer(call.id)).text();
+  await until(() => Boolean(f.broker.store.get(call.id)?.failure));
+  assert.equal(f.broker.store.get(call.id)?.status, 'in-progress', 'the answered provider leg stays open until it ends');
   assert.equal(f.broker.store.get(call.id)?.harkJournal?.providerStatus, 'answered');
   assert.equal((await f.control(randomUUID())).status, 409);
   assert.equal(f.counters.create, 1);

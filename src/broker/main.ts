@@ -19,7 +19,8 @@ try {
   sms = await createBrokerSmsBridge(process.env, process.cwd());
   const setup = config.verificationSetup;
   const setupStore = setup ? new BrokerStore(config.stateDir) : undefined;
-  // A missing or implausible asset leaves the Live-spoken greeting in place.
+  // Both clips play on the media stream at pickup, while admission and binding run. A missing
+  // or implausible asset leaves the Live-spoken greeting, heard once Live attaches.
   const greetingClip = loadGreetingClip();
   const inboundGreetingClip = loadGreetingClip(INBOUND_GREETING_CLIP_ASSET);
   const broker = createBrokerServer({ config, sms,
@@ -27,8 +28,7 @@ try {
     ...(inboundGreetingClip ? { inboundGreetingClip } : {}),
     inboundPreconnect: () => createOpenAILiveConnection(config.apiKey),
     ...(setup && setupStore ? { store: setupStore,
-      inboundAttachment: createInboundHoldAdapter({ publicOrigin: config.publicOrigin, store: setupStore,
-        greetingClipAvailable: Boolean(inboundGreetingClip) }),
+      inboundAttachment: createInboundHoldAdapter({ publicOrigin: config.publicOrigin, store: setupStore }),
       restrictedSetup: { model: setup.model, receiptTransport: { apiBaseUrl: setup.apiBaseUrl, signingSecret: setup.signingSecret } },
     } : {}),
     eligibleContext: createEligibleContextClient({ apiBaseUrl: config.apiBaseUrl,

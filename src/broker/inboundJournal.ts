@@ -22,7 +22,8 @@ export interface InboundJournal {
   continuation?: { observedAt: string; beginBodyDigest: string; providerProof: InboundBeginIdentity['providerProof'] };
   admissionRefusal?: { observedAt: string; beginBodyDigest: string; status: 403; retryable: false;
     code: 'inbound_carrier_attestation_required' | 'inbound_enrollment_required' };
-  /** One admission contact after the first hold response finishes; consumption still needs continuation. */
+  /** Saved by earlier releases: one admission contact made before the continuation. New calls
+   * begin admission only after the continuation; the field is validated for saved journals. */
   earlyAdmission?: { startedAt: string; beginBodyDigest: string };
   beginAttemptedAt?: string;
   consumeAttemptedAt?: string;
@@ -40,7 +41,7 @@ export type InboundJournalEvent =
   | { type: 'enrollment_observation'; result: EnrollmentCompletionRecovery; observedAt: string }
   | { type: 'enrollment_error'; error: EnrollmentTransportError; observedAt: string }
   | { type: 'enrollment_end_requested' | 'enrollment_end_acknowledged'; observedAt: string }
-  | { type: 'early_admission_started' | 'begin_attempted' | 'consume_attempted' | 'cancel_requested' | 'close_requested'; observedAt: string }
+  | { type: 'begin_attempted' | 'consume_attempted' | 'cancel_requested' | 'close_requested'; observedAt: string }
   | { type: 'continuation'; providerProof: InboundBeginIdentity['providerProof']; observedAt: string }
   | { type: 'admission_refused'; code: 'inbound_carrier_attestation_required' | 'inbound_enrollment_required'; observedAt: string }
   | { type: 'stop'; reason: string; observedAt: string }
@@ -294,12 +295,6 @@ export function reduceInboundJournal(call: BrokerCall, event: InboundJournalEven
     journal.admissionRefusal ??= { observedAt: at, beginBodyDigest: journal.beginBodyDigest, status: 403, retryable: false, code };
     journal.localStop ??= { observedAt: at, reason: code };
     journal.cancelRequestedAt ??= at;
-  } else if (event.type === 'early_admission_started') {
-    if (stopped() || next.endedAt || Date.parse(at) >= Date.parse(journal.waitUntil)) throw new Error('Inbound wait stopped');
-    if (journal.mode || journal.continuation || journal.beginAttemptedAt || journal.remote || journal.earlyAdmission)
-      throw new Error('Inbound early admission unavailable');
-    journal.earlyAdmission = { startedAt: at, beginBodyDigest: journal.beginBodyDigest };
-    journal.beginAttemptedAt = at;
   } else if (event.type === 'begin_attempted') {
     if (stopped() || next.endedAt || Date.parse(at) >= Date.parse(journal.waitUntil)) throw new Error('Inbound wait stopped');
     if (!journal.continuation) throw new Error('Inbound continuation required');

@@ -60,8 +60,27 @@ const PRE_SPEECH_ONSET_BYTES = 1_600;
 const PRE_SPEECH_TAIL_LIMIT = 400;
 /** Live output held behind the greeting clip is bounded like the carrier backlog (6 s). */
 const GREETING_HOLD_MAX_BYTES = 48_000;
-/** Live output is released this long after the clip's own duration even without carrier marks. */
+/** Live output is released, and caller input opened, this long after the clip's own duration even without carrier marks. */
 const GREETING_ACK_GRACE_MS = 1_500;
+/** Caller audio kept between the greeting's end and Live attaching: the newest 15 s. Typical admission
+ * keeps 0-2 s here; Live startup then buffers up to its own 15 s inside the generation controller's ~35 s. */
+const HELD_INPUT_MAX_BYTES = 120_000;
+/** Caller frame energy above this is speech (the threshold every caller-speech observation uses). */
+const CALLER_SPEECH_ENERGY = 0.012;
+/** Admission poll intervals while a greeting stream waits for inbound approval. Admission starts as
+ * the stream response leaves, which can race Twilio's pickup: the API's begin then refuses the
+ * still-ringing leg (call_not_active). Quick first retries make that miss cost 0.1-0.3 s instead of
+ * a full second; a longer wait settles at the 1 s pace of the hold redirects the stream replaced. */
+const INBOUND_ADMISSION_POLL_MS = [100, 200, 400, 1_000] as const;
+/** The wait before admission poll `poll` (0-based) of one greeting stream. */
+export function inboundAdmissionPollDelay(poll: number): number {
+  return INBOUND_ADMISSION_POLL_MS[Math.min(Math.max(0, poll), INBOUND_ADMISSION_POLL_MS.length - 1)];
+}
+/** Spoken before the provider hangup for stops the caller should hear explained. */
+const SPOKEN_STOPS: Record<string, string> = {
+  voice_unavailable: 'My voice connection stopped working. Please try me again shortly.',
+  primary_unavailable: 'I could not reach your Dexter account just now. Please try again shortly.',
+};
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const CALL_SID = /^CA[0-9a-f]{32}$/i;
@@ -142,12 +161,19 @@ export interface BrokerServerOptions {
   inboundAttachment?: {
     waitingResponse(input: { callId: string; continuationUrl: string; attachmentId?: string; expiresAt?: string }): string;
   };
-  /** Pre-rendered "Hey, it's Dexter." (8 kHz PCMU) for outbound calls, streamed at media
-   * start ahead of Live's opening offer. Omission retains the Live-spoken greeting. */
+  /** Pre-rendered "Hey, it's Dexter." (8 kHz PCMU) for outbound calls, streamed as soon as the
+   * media stream starts (while Primary binds) ahead of Live's opening offer. Omission retains
+   * the Live-spoken greeting. */
   greetingClip?: Buffer;
   /** Pre-rendered "Hey, it's Dexter. What can I do for you?" for inbound calls: the whole
    * opening; Live then waits for the caller. Omission retains the Live-spoken greeting. */
   inboundGreetingClip?: Buffer;
+  /** A fixed admission poll interval for a greeting stream waiting on inbound approval. The default
+   * backs off 100, 200 and 400 ms, then polls every 1 s (`inboundAdmissionPollDelay`). */
+  inboundAdmissionPollMs?: number;
+  /** Age up to which a binding response seeds Live without a second eligibility read
+   * (default STARTUP_PAGE_FRESH_MS); 0 rechecks every page first. */
+  startupPageFreshMs?: number;
 }
 
 export function createBrokerServer(options: BrokerServerOptions) {
@@ -166,7 +192,8 @@ export function createBrokerServer(options: BrokerServerOptions) {
   });
   const preconnect = options.eligibleContext && options.inboundPreconnect ? createInboundPreconnect(options.inboundPreconnect,
     event => console.info(JSON.stringify(event))) : undefined;
-  const startupContexts = options.eligibleContext ? createInboundStartupContexts(options.eligibleContext) : undefined;
+  const startupContexts = options.eligibleContext ? createInboundStartupContexts(options.eligibleContext,
+    options.startupPageFreshMs === undefined ? {} : { freshMs: options.startupPageFreshMs }) : undefined;
   const resolveHarkAssignment = options.resolveHarkAssignment ?? (config.harkApiBaseUrl
     ? createHarkAssignmentResolver({ apiBaseUrl: config.harkApiBaseUrl }) : undefined);
   const resolveNotificationAssignment = options.resolveNotificationAssignment ?? (config.harkApiBaseUrl
@@ -199,6 +226,11 @@ export function createBrokerServer(options: BrokerServerOptions) {
   const pendingRequests = new Set<Promise<void>>();
   const sessionCalls = new Set<string>();
   const closingBindings = new Map<string, Promise<void>>();
+  // Outbound Primary bindings started by the answer route; the media stream attaches Live when one settles.
+  const pendingBinds = new Map<string, Promise<BrokerCall>>();
+  // Each background binding until it settles and, when nothing will attach it, its close finishes.
+  // Shutdown waits for these: a binding that lands after the store closes is named nowhere and stays open.
+  const bindSettlements = new Set<Promise<void>>();
   // Keep a stopped host until its already-observed source preparation settles.
   // A restart recovers only the durable captures and reply-read obligations.
   const selectedHosts = new Map<string, GenerationVoiceSession>();
@@ -260,8 +292,9 @@ export function createBrokerServer(options: BrokerServerOptions) {
   const inbound = createInboundFlow({ config, store, primary,
     onTiming: logInboundTiming,
     onApprovedTransport: call => preconnect?.begin(call),
-    onTransportDiscard: (id, terminal) => terminal ? preconnect?.forget(id) : preconnect?.discard(id),
-    onContext: (call, context) => startupContexts?.remember(call, context),
+    onTransportDiscard: (id, terminal) => terminal ? preconnect?.forget(id)
+      : preconnect?.afterAdmissionError(id, store.get(id)?.inbound?.remote?.state === 'bound'),
+    onContext: (call, context, receivedAt) => startupContexts?.remember(call, context, receivedAt),
     fetchCall: sid => provider.calls(sid).fetch(), closeBound: async call => {
       // Media may have started while a provider/account read was in flight.
       // Its owner must finalize Live and capture before closing account admission.
@@ -499,11 +532,12 @@ export function createBrokerServer(options: BrokerServerOptions) {
       });
       return;
     }
-    if (call.mediaStartedAt || active.has(call.id) || claimed.has(call.id)) return json(response, 409, { error: 'media_already_started' });
-    if (inbound.mediaAllowed(call)) {
-      observeInboundStreamResponse(call.id, response, logInboundTiming);
-      return xml(response, callTwiml(config.publicOrigin, call.id, streamToken(config.controlToken, call.id, call.callSid!)));
-    }
+    // The account stream already started: Twilio follows its trailing redirect only once that stream
+    // is gone (a crash or restart after Live attached). Its media cannot resume, and a non-TwiML
+    // reply plays Twilio's "application error", so end the leg. Its status callback and maintenance
+    // close the attachment as for any ended call.
+    if (call.mediaStartedAt || active.has(call.id) || claimed.has(call.id)) return xml(response, '<Response><Hangup/></Response>');
+    if (inbound.mediaAllowed(call) || inbound.waitingMediaAllowed(call)) return inboundStream(call, response);
     const remote = call.inbound!.remote;
     try {
       const rendered = options.inboundAttachment!.waitingResponse({ callId: call.id,
@@ -512,20 +546,25 @@ export function createBrokerServer(options: BrokerServerOptions) {
         ...(remote && 'expiresAt' in remote && remote.expiresAt ? { expiresAt: remote.expiresAt } : {}),
       });
       if (originalHold && !call.inbound!.mode && !call.inbound!.continuation)
-        observeInboundHoldResponse(call.id, response, logInboundTiming, () => {
-          void inbound.beginEarly(call.id).catch(error => {
-            // This optional contact can reach a still-ringing leg. Its failure does
-            // not describe the eventual call; normal continuation owns that result.
-            try { console.error('[dexter-broker] Early inbound admission did not finish', { callId: call.id, code: safeFailure(error).code }); }
-            catch { /* Diagnostic output must not change recovery. */ }
-          });
-        });
+        observeInboundHoldResponse(call.id, response, logInboundTiming);
       return xml(response, rendered);
     } catch (error) {
       store.update(call.id, { failure: safeFailure(error) });
       await inbound.stop(call.id, 'approval_surface_unavailable').catch(() => {});
       return xml(response, '<Response><Hangup/></Response>');
     }
+  }
+
+  /** Stream instructions answer the leg. Before admission binds, the stream carries only the
+   * greeting clip; its trailing signed redirect returns the leg to the continuation if admission
+   * ends without account media (restricted setup or hangup). */
+  function inboundStream(call: BrokerCall, response: ServerResponse): void {
+    observeInboundStreamResponse(call.id, response, logInboundTiming);
+    xml(response, callTwiml(config.publicOrigin, call.id, streamToken(config.controlToken, call.id, call.callSid!),
+      `${config.publicOrigin}/broker/inbound/${call.id}/continue`));
+    // Open only the Live socket (no session, no account text) while admission runs, as the outbound
+    // answer does; the handshake (0.24-0.68 s on the Oct 13 calls) is then done before Live attaches.
+    preconnect?.beginInbound(store.get(call.id)!);
   }
 
   async function handle(request: IncomingMessage, response: ServerResponse) {
@@ -786,6 +825,21 @@ export function createBrokerServer(options: BrokerServerOptions) {
         await inbound.stop(saved.id, 'service_unavailable').catch(error => { store.update(saved.id, { failure: safeFailure(error) }); });
         return xml(response, '<Response><Hangup/></Response>');
       }
+      try { inbound.recordContinuation(saved.id, proof); }
+      catch (error) { store.update(saved.id, { failure: safeFailure(error) }); return inboundResponse(store.get(saved.id)!, response); }
+      // The saved continuation lets the stream answer this leg now. The greeting clip plays
+      // while admission runs, and the stream attaches Live once admission binds.
+      const current = store.get(saved.id)!;
+      if (!current.mediaStartedAt && !active.has(current.id) && !claimed.has(current.id) && inbound.waitingMediaAllowed(current)) {
+        // Admission begins once these instructions are delivered: they answer the leg, and
+        // the API's begin refuses a leg that is still ringing.
+        response.once('close', () => {
+          void inbound.tick(saved.id).catch(error => {
+            try { store.update(saved.id, { failure: safeFailure(error) }); } catch { /* The stream's admission loop retries or ends the wait. */ }
+          });
+        });
+        return inboundStream(current, response);
+      }
       try { call = await inbound.resume(saved.id, proof); }
       catch (error) { store.update(saved.id, { failure: safeFailure(error) }); call = store.get(saved.id)!; }
       return inboundResponse(call, response);
@@ -843,7 +897,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
           if (terminalCallStatuses.has(call.status)) {
             if (active.has(call.id)) await active.get(call.id)!.stop('provider_terminal');
             else if (call.inbound) await inbound.stop(call.id, 'provider_terminal');
-            else await closePrimary(call);
+            else { pendingBinds.delete(call.id); await closePrimary(call); }
           }
         }
         return json(response, 200, { ok: true });
@@ -852,18 +906,31 @@ export function createBrokerServer(options: BrokerServerOptions) {
     if (terminalCallStatuses.has(call.status)) return xml(response, '<Response><Hangup/></Response>');
     // This is the signed answer route, distinct from a ringing status callback.
     if (managedNotification(call)) call = observeProviderState(call.id, 'in-progress');
-    // Open only the Live socket (no session, no account text) while Primary verifies
-    // the provider call; media start adopts it after binding. Bounded by its own TTL.
-    preconnect?.beginOutbound(call);
-    try { call = await bind(call, proof); }
-    catch (error) {
-      preconnect?.forget(call.id); startupContexts?.discard(call.id);
-      store.update(call.id, { status: 'failed', failure: safeFailure(error) });
-      return xml(response, fallbackTwiml('I could not reach your Dexter account just now. Please try again shortly.'));
-    }
-    if (!accepting || terminalCallStatuses.has(store.get(call.id)!.status)) {
-      await closePrimary(store.get(call.id)!);
-      return xml(response, '<Response><Hangup/></Response>');
+    // Answer with the media stream at once. The greeting clip carries no account data and
+    // plays while Primary verifies and binds this provider call; the stream attaches Live
+    // (account context) only once that binding exists, or speaks the failure if it does not.
+    if (!call.primary && !pendingBinds.has(call.id)) {
+      const id = call.id;
+      // Open only the Live socket (no session, no account text) while Primary binds;
+      // Live adopts it at attach. Bounded by its own TTL.
+      preconnect?.beginOutbound(call);
+      const binding = bind(call, proof);
+      pendingBinds.set(id, binding);
+      const settled = binding.then(() => {
+        // A live stream (connected now or later) attaches the binding. A leg that already ended,
+        // a stream that is stopping (its stop sets endedAt first) or a stopping broker leaves
+        // nothing to attach it, so it closes here, before shutdown closes the store.
+        const current = store.get(id)!;
+        if (accepting && !current.endedAt && !terminalCallStatuses.has(current.status)) return;
+        pendingBinds.delete(id);
+        return closePrimary(current);
+      }, error => {
+        preconnect?.forget(id); startupContexts?.discard(id);
+        try { store.update(id, { failure: safeFailure(error) }); } catch { /* The stream speaks the failure and ends the call. */ }
+      });
+      bindSettlements.add(settled);
+      const forget = () => { bindSettlements.delete(settled); };
+      void settled.then(forget, forget);
     }
     xml(response, callTwiml(config.publicOrigin, call.id, streamToken(config.controlToken, call.id, call.callSid!)));
   }
@@ -892,9 +959,13 @@ export function createBrokerServer(options: BrokerServerOptions) {
       }
       claimed.add(call.id); sockets.handleUpgrade(request, socket, head, ws => restricted.connect(ws, call)); return;
     }
-    if (!call?.primary || !call.callSid || call.endedAt || terminalCallStatuses.has(call.status) || claimed.has(call.id)
-      || (call.verificationCallback && (!restricted || !restricted.privateMediaAllowed(call)))
-      || (call.inbound && !inbound.mediaAllowed(call))) {
+    // A stream may connect before its account binding exists (outbound binding in flight,
+    // inbound admission after the signed continuation); it then carries only the greeting.
+    // An inbound stream whose wait already ended is accepted only to hand the leg back to its TwiML.
+    if (!call?.callSid || call.endedAt || terminalCallStatuses.has(call.status) || claimed.has(call.id)
+      || !(call.verificationCallback ? call.primary && restricted?.privateMediaAllowed(call)
+        : call.inbound ? inbound.mediaAllowed(call) || (Boolean(call.inbound.continuation) && !call.mediaStartedAt)
+          : call.primary || pendingBinds.has(call.id))) {
       socket.write('HTTP/1.1 409 Conflict\r\n\r\n'); socket.destroy(); return;
     }
     claimed.add(call.id);
@@ -908,6 +979,8 @@ export function createBrokerServer(options: BrokerServerOptions) {
     let backend: ReturnType<typeof createPrimaryBackend> | undefined;
     let stopping = false;
     let stopPromise: Promise<void> | undefined;
+    // Inbound admission ended without account media: the stream was handed back to its TwiML.
+    let released = false, releaseAfterGreeting = false;
     let inputBytes = call.liveGenerations?.inputNextSample ?? 0;
     let lastSpeechAt = 0;
     const receipts = new PlaybackReceipts();
@@ -925,6 +998,18 @@ export function createBrokerServer(options: BrokerServerOptions) {
     let greetingReleaseTimer: ReturnType<typeof setTimeout> | undefined;
     const greetingMarks = new Set<string>();
     let greetingPlaybackRecorded = false;
+    // Caller input gate. Closed while the greeting clip plays, so words spoken over the greeting
+    // never reach Live and cannot draw a reply to a greeting that is already over. From the
+    // moment it opens, every caller frame is kept: held here until Live attaches, then
+    // delivered first and in order.
+    let inputOpenedAt: number | undefined;
+    let heldInput: Array<{ payload: string; bytes: number }> = [];
+    let heldInputBytes = 0, droppedInputBytes = 0, greetingInputBytes = 0;
+    // Caller audio Live has received: Live's input clock, counted from mediaStartedAt.
+    let fedBytes = 0;
+    // Arrival of the latest caller speech frame after the greeting and before Dexter first spoke:
+    // the end of what the caller said before the first reply (journey.callerSpeechEndedAt).
+    let callerSpeechEndedAt: number | undefined;
     const recordAudibleTiming = (stage: 'firstAudibleAudioSentAt' | 'firstAudiblePlaybackAcknowledgedAt'
       | 'firstSpeechAudioSentAt' | 'firstSpeechPlaybackAcknowledgedAt'
       | 'greetingClipStartedAt' | 'greetingClipFirstPlaybackAcknowledgedAt' | 'greetingClipPlayedAt', detail: Record<string, number> = {}) => {
@@ -979,11 +1064,28 @@ export function createBrokerServer(options: BrokerServerOptions) {
       }
       const name = sendOutputChunk(payload, bytes, audible, speech);
       if (speech && !speechSentRecorded) {
-        speechSentRecorded = true; recordAudibleTiming('firstSpeechAudioSentAt', { queuedAheadMs: Math.max(0, receipts.backlogMs - bytes.length / 8) });
+        speechSentRecorded = true;
+        // Dexter's first words (never the greeting clip). After a caller who already spoke, the gap
+        // since their last speech frame is the silence they heard before the first reply.
+        const sentAt = Date.now();
+        try {
+          const saved = store.get(call.id)!;
+          if (!saved.journey?.firstSpeechAudioSentAt) store.update(call.id, { journey: { ...saved.journey,
+            firstSpeechAudioSentAt: new Date(sentAt).toISOString(),
+            ...(callerSpeechEndedAt === undefined ? {} : { callerSpeechEndedAt: new Date(callerSpeechEndedAt).toISOString() }) } });
+        } catch { /* Timing evidence cannot interrupt audio. */ }
+        recordAudibleTiming('firstSpeechAudioSentAt', { queuedAheadMs: Math.max(0, receipts.backlogMs - bytes.length / 8),
+          ...(callerSpeechEndedAt === undefined ? {} : { afterCallerSpeechMs: sentAt - callerSpeechEndedAt }) });
       } else if (!speechSentRecorded) {
         preSpeechTail.push({ name, payload, bytes: bytes.length, audible });
         if (preSpeechTail.length > PRE_SPEECH_TAIL_LIMIT) preSpeechTail.shift();
       }
+    };
+    /** The greeting has been heard (or its playback can no longer be confirmed): keep caller audio from now on. */
+    const openInput = () => {
+      if (inputOpenedAt !== undefined) return;
+      inputOpenedAt = Date.now();
+      if (releaseAfterGreeting) releaseToTwiml();
     };
     /** Ends the hold and sends held Live audio, in arrival order, behind the clip. */
     const releaseGreetingHold = (reason: 'played' | 'ack_timeout' | 'send_stopped') => {
@@ -996,6 +1098,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
         if (!saved.journey?.greetingClipPlayedAt) store.update(call.id, { journey: { ...saved.journey, greetingClipPlayedAt: new Date().toISOString() } });
       }
       recordAudibleTiming('greetingClipPlayedAt', { heldLiveMs: heldMs, ...(reason === 'played' ? {} : { incomplete: 1 }) });
+      openInput();
       for (const payload of held) { if (stopping) break; forwardLiveAudio(payload); }
     };
     const startGreetingClip = (clip: Buffer) => {
@@ -1015,10 +1118,32 @@ export function createBrokerServer(options: BrokerServerOptions) {
       });
       if (!greeting.sending && greetingMarks.size === 0) releaseGreetingHold('send_stopped');
     };
+    /** Delivers one caller frame to Live and advances Live's input clock. */
+    const feedLive = (payload: string): boolean => {
+      const bytes = Buffer.from(payload, 'base64');
+      fedBytes += bytes.length;
+      // Twilio timestamps are media positions, not an authorization or a turn boundary.
+      if (inputSpeechEnergy(bytes) > CALLER_SPEECH_ENERGY) { lastSpeechAt = Date.now(); backend?.noteCallerSpeech(lastSpeechAt, fedBytes / 8); }
+      return live!.appendAudio(payload) !== false;
+    };
     const metrics = () => ({ receivedAudioBytes: inputBytes, sentAudioBytes: receipts.sentBytes, playedAudioBytes: receipts.playedBytes, clearedAudioBytes: receipts.clearedBytes });
     const startTimer = setTimeout(() => { void stop('media_start_timeout'); }, 8_000);
     const callDeadlineAt = call.liveGenerations?.clocks.callDeadlineAt ?? call.verificationCallback?.media?.deadlineAt ?? new Date(Date.now() + config.maxCallSeconds * 1000).toISOString();
     const durationTimer = setTimeout(() => { void stop('duration_limit'); }, Math.max(0, Date.parse(callDeadlineAt) - Date.now()));
+
+    /** Inbound admission ended without account media (refusal, expiry, cancellation): close this
+     * stream so Twilio runs its trailing signed redirect, whose continuation answers with
+     * restricted setup or a hangup. The caller hears the whole greeting first. */
+    function releaseToTwiml(): void {
+      if (stopping || released) return;
+      if (inputOpenedAt === undefined) { releaseAfterGreeting = true; return; }
+      released = true;
+      clearTimeout(startTimer); clearTimeout(durationTimer);
+      try { console.info(JSON.stringify({ event: 'broker_greeting_stream_released', version: 1, callId: call.id,
+        observedAt: new Date().toISOString() })); } catch { /* Telemetry only. */ }
+      claimed.delete(call.id); active.delete(call.id);
+      if (ws.readyState === WebSocket.OPEN) ws.close();
+    }
 
     function stop(reason: string): Promise<void> {
       if (stopPromise) return stopPromise;
@@ -1028,7 +1153,8 @@ export function createBrokerServer(options: BrokerServerOptions) {
       greeting?.cancel(); clearTimeout(greetingReleaseTimer); greetingHold = undefined;
       const previous = store.get(call.id)!;
       if (previous.inbound) inbound.stopLocal(call.id, reason);
-      store.update(call.id, { endedAt: previous.endedAt ?? new Date().toISOString(), primaryClosePending: true });
+      // An unbound call has nothing to close yet; a binding that lands later is closed by its owner.
+      store.update(call.id, { endedAt: previous.endedAt ?? new Date().toISOString(), ...(previous.primary ? { primaryClosePending: true } : {}) });
       stopPromise = (async () => {
         const closing = live?.close(reason);
         try {
@@ -1037,8 +1163,8 @@ export function createBrokerServer(options: BrokerServerOptions) {
             if (!restricted) throw new Error('restricted_phone_unavailable');
             await restricted.endPrivateProvider(saved, reason);
           } else if (reason !== 'provider_terminal' && saved && !providerFinished(saved)) {
-            if (reason === 'voice_unavailable') {
-              const spoken = await provider.calls(call.callSid!).update({ twiml: fallbackTwiml('My voice connection stopped working. Please try me again shortly.') });
+            if (SPOKEN_STOPS[reason]) {
+              const spoken = await provider.calls(call.callSid!).update({ twiml: fallbackTwiml(SPOKEN_STOPS[reason]) });
               if (providerStates.has(spoken.status as CallStatus)) observeProviderRecord(saved, spoken, 'authenticated_update');
               else store.update(call.id, { status: 'unknown' });
             } else {
@@ -1048,7 +1174,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
             }
           }
         } catch (error) { store.update(call.id, { status: 'unknown', failure: safeFailure(error) }); }
-        // Closing <Connect><Stream> resumes its trailing <Hangup>. Install any
+        // Closing <Connect><Stream> resumes its trailing verb. Install any
         // audible failure response on the provider before closing this socket.
         if (ws.readyState === WebSocket.OPEN) ws.close();
         const result = await closing;
@@ -1066,115 +1192,199 @@ export function createBrokerServer(options: BrokerServerOptions) {
       })().finally(() => { claimed.delete(call.id); active.delete(call.id); });
       return stopPromise;
     }
+
+    /** Starts the account voice once the binding exists: Live opens with this call's context and
+     * receives the caller audio kept since the greeting ended, first and in order. */
+    function attach(): void {
+      if (stopping || released || live) return;
+      if (!accepting) { void stop('service_shutdown'); return; }
+      const bound = store.get(call.id)!;
+      if (!bound.primary || (bound.inbound && !inbound.mediaAllowed(bound))) throw new Error('media_binding_unavailable');
+      pendingBinds.delete(call.id);
+      // Input sample 0 is the first caller frame Live receives: the greeting's end (now, if the
+      // greeting is still playing), moved past any dropped held audio, and never before an
+      // inbound binding was consumed.
+      const now = Date.now();
+      let origin = Math.min(now, inputOpenedAt === undefined ? now : inputOpenedAt + droppedInputBytes / 8);
+      if (bound.inbound?.remote?.state === 'bound') origin = Math.max(origin, Date.parse(bound.inbound.remote.consumedAt));
+      const mediaStartedAt = bound.mediaStartedAt ?? new Date(origin).toISOString();
+      if (managedNotification(bound)) store.observeHarkMediaStarted(call.id, mediaStartedAt);
+      else store.update(call.id, { mediaStartedAt });
+      // Evidence for the caller audio Live receives: held since the greeting ended, dropped from
+      // an overlong wait, and discarded because it was spoken over the greeting.
+      try { console.info(JSON.stringify({ event: 'broker_account_media', version: 1, callId: call.id, observedAt: new Date(now).toISOString(),
+        mediaStartedAt, heldInputMs: heldInputBytes / 8, droppedInputMs: droppedInputBytes / 8, greetingInputMs: greetingInputBytes / 8 })); }
+      catch { /* Telemetry only. */ }
+      if (!options.eligibleContext) backend = createPrimaryBackend({ callId: call.id, callSid: call.callSid!, bindingId: bound.primary.bindingId, api: primary, store, watchUntilCallEnds: true, lastCallerSpeechAt: () => lastSpeechAt });
+      const voiceOptions: BrokerLiveSessionOptions = { apiKey: config.apiKey, callId: call.id, voice: config.voice,
+        instructions: brokerInstructions({ direction: call.direction, purpose: call.purpose, registeredAssignment: !!call.callAssignment,
+          ...(call.callAssignment?.origin === 'authenticated_hark_delivery' ? { watch: call.callAssignment.value.hark } : {}),
+          ...(call.callAssignment?.origin === 'authenticated_notification_delivery' ? { notification: call.callAssignment.value.notification } : {}),
+          name: bound.primary.name, context: bound.primary.context }),
+        history: brokerHistory({ name: bound.primary.name, context: bound.primary.context }),
+        backend: backend ?? { async delegate() { throw new Error('generation_backend_required'); } },
+        onAudio(payload) {
+          if (stopping || ws.readyState !== WebSocket.OPEN || !streamSid) return;
+          if (greetingHold) {
+            greetingHeldBytes += Buffer.byteLength(payload, 'base64');
+            if (greetingHeldBytes > GREETING_HOLD_MAX_BYTES) { void stop('audio_backpressure'); return; }
+            greetingHold.push(payload); return;
+          }
+          forwardLiveAudio(payload);
+        },
+        onTranscript(snapshot) {
+          store.update(call.id, { transcript: snapshot, transcriptRevision: snapshot.revision });
+          backend?.observeTranscript(snapshot);
+        },
+        onReady({ sessionId }) {
+          connectedSessionId = sessionId;
+          const saved = store.get(call.id)!;
+          if (!saved.journey?.liveReadyAt) store.update(call.id, { journey: { ...saved.journey, liveReadyAt: new Date().toISOString() } });
+          // The selected host publishes the exact eligible saved question.
+          // Its operator purpose must never become an automatic new task.
+          if (call.continuation) return;
+          // The generation controller owns its opening inside validated activation.
+          if (options.eligibleContext) return;
+          store.update(call.id, { liveSessionId: sessionId, voiceOpening: { status: 'pending' } });
+          // Live's documented speak-first command runs while phone audio
+          // continues. Its receipt confirms context injection, not playback.
+          queueMicrotask(() => {
+            if (stopping || !live) return;
+            void live.appendInstructions(brokerOpening(call.direction, !!call.callAssignment, call.callAssignment?.origin === 'authenticated_hark_delivery', call.callAssignment?.origin === 'authenticated_notification_delivery',
+              Boolean(store.get(call.id)!.journey?.greetingClipStartedAt)))
+              .then(result => { store.update(call.id, { voiceOpening: result }); })
+              .catch(() => { if (!stopping) store.update(call.id, { voiceOpening: { status: 'unconfirmed', reason: 'opening_delivery_failed' } }); });
+          });
+        },
+        onClosed(result) { store.update(call.id, { finalized: result.finalized, metrics: metrics() }); if (!stopping) void stop(result.finalized ? result.reason : 'voice_unavailable'); },
+        onPlaybackClear() {
+          // During the clip the carrier holds only the clip: Live's clear drops its own held audio.
+          if (greetingHold) { greetingHold = []; greetingHeldBytes = 0; return; }
+          receipts.clear();
+          if (ws.readyState === WebSocket.OPEN && streamSid) ws.send(JSON.stringify({ event: 'clear', streamSid }));
+        },
+        onEvent(event) {
+          if (event.type === 'live.append.late_rejection' && connectedSessionId && typeof event.eventId === 'string')
+            rejectBrokerPublication(store, { callId: call.id, callSid: call.callSid!, bindingId: bound.primary!.bindingId,
+              sessionId: connectedSessionId }, event.eventId, typeof event.code === 'string' ? event.code : 'provider_error');
+          if (event.type === 'live.error') store.update(call.id, { failure: { code: String(event.code || 'live_error'), message: 'The voice connection could not continue' } });
+        },
+      };
+      live = options.eligibleContext ? createGenerationVoice({ call: store.get(call.id)!, callDeadlineAt,
+        apiKey: config.apiKey, voice: config.voice, store, primary,
+        playbackState: () => carrierPlaybackState(!stopping && ws.readyState === WebSocket.OPEN,
+          receipts.audibleSentBytes, receipts.audiblePlayedBytes, receipts.audibleClearedBytes),
+        context: startupContexts!.take(store.get(call.id)!),
+        voiceFactory(settings) {
+          const connectionFactory = preconnect?.factory(store.get(call.id)!);
+          return voiceFactory(connectionFactory ? { ...settings, connectionFactory } : settings);
+        },
+        ...(options.selectedQuestion ? { selectedQuestion: options.selectedQuestion } : {}),
+        ...(call.continuation && options.callerIntent ? { callerIntent: createCallerIntentResolver({
+          callId: call.id, store, client: options.callerIntent.client, timeoutMs: options.callerIntent.timeoutMs,
+        }) } : {}),
+        onAudio: payload => voiceOptions.onAudio(payload, { deliveryId: 'generation_host_audio' }),
+        onReady: voiceOptions.onReady, onClosed: voiceOptions.onClosed,
+        onPlaybackClear: () => voiceOptions.onPlaybackClear?.('application_interrupt'),
+        onProblem(code) { queueMicrotask(() => { if (stopping) return;
+          // Recording the failure must never take down the process and every other call with it.
+          try { store.update(call.id, { failure: safeFailure(Object.assign(new Error(code), { code })) }); }
+          catch (error) { console.error(JSON.stringify({ event: 'broker_failure_record_unavailable', callId: call.id, code,
+            message: (error as Error).message })); }
+          void stop('voice_unavailable');
+        }); },
+      }) : voiceFactory(voiceOptions);
+      if (call.continuation && options.eligibleContext) selectedHosts.set(call.id, live as GenerationVoiceSession);
+      const held = heldInput; heldInput = []; heldInputBytes = 0;
+      for (const entry of held) if (stopping || !feedLive(entry.payload)) { if (!stopping) void stop('input_audio_refused'); return; }
+    }
+    const attachSafely = () => {
+      try { attach(); }
+      catch (error) {
+        try { store.update(call.id, { failure: safeFailure(error) }); } catch { /* The stop below still ends the call. */ }
+        void stop('media_error');
+      }
+    };
+
+    /** Drives the queued inbound admission while the greeting stream holds the leg (the signed
+     * redirect loop used to drive it). Live attaches when the binding and its context exist. */
+    async function admitInbound(): Promise<void> {
+      // The continuation's own admission counts as the first poll.
+      let polled = true, waits = 0;
+      for (;;) {
+        if (stopping || released || live) return;
+        const current = store.get(call.id)!;
+        if (inbound.mediaAllowed(current)) { attachSafely(); return; }
+        if (!inbound.waitingMediaAllowed(current)) { releaseToTwiml(); return; }
+        if (inbound.busy(call.id)) { await inbound.idle(call.id); continue; }
+        if (polled) {
+          polled = false;
+          const delay = options.inboundAdmissionPollMs ?? inboundAdmissionPollDelay(waits++);
+          await new Promise<void>(resolve => { setTimeout(resolve, delay).unref(); });
+          continue;
+        }
+        polled = true;
+        try { await inbound.tick(call.id); }
+        catch (error) {
+          // The same admission recovers on the next poll; the original wait deadline still ends it.
+          try { store.update(call.id, { failure: safeFailure(error) }); } catch { /* Retry regardless. */ }
+        }
+      }
+    }
+    /** Attaches Live when the answer route's Primary binding settles; a failed binding is spoken and ends the call. */
+    function awaitOutboundBinding(): void {
+      const binding = store.get(call.id)!.primary ? undefined : pendingBinds.get(call.id);
+      if (!binding) { attachSafely(); return; }
+      // A binding that lands after this stream began stopping is closed by the answer route,
+      // which sees the endedAt that stop() records first.
+      binding.then(() => { if (!stopping) attachSafely(); },
+        () => { pendingBinds.delete(call.id); void stop('primary_unavailable'); });
+    }
+
     active.set(call.id, { stop });
-    ws.on('error', () => { void stop('media_socket_error'); });
-    ws.on('close', () => { void stop('caller_disconnected'); });
+    ws.on('error', () => { if (!released) void stop('media_socket_error'); });
+    ws.on('close', () => { if (!released) void stop('caller_disconnected'); });
     ws.on('message', raw => {
-      if (stopping) return;
+      if (stopping || released) return;
       try {
         const frame = JSON.parse(raw.toString());
         if (frame.event === 'start') {
           if (streamSid) throw new Error('duplicate_media_start');
-          if (call.verificationCallback && (!restricted || !restricted.privateMediaAllowed(store.get(call.id)!))) throw new Error('callback_media_not_admitted');
-          if (call.inbound && !inbound.mediaAllowed(store.get(call.id)!)) throw new Error('inbound_media_not_admitted');
+          const current = store.get(call.id)!;
+          if (call.verificationCallback && (!restricted || !restricted.privateMediaAllowed(current))) throw new Error('callback_media_not_admitted');
+          // An inbound wait that ended before this frame (refusal, expiry) plays no greeting; its
+          // admission loop hands the leg straight back to the continuation.
+          const greets = !call.inbound || inbound.mediaAllowed(current) || inbound.waitingMediaAllowed(current);
           streamSid = mediaStart(frame.start, { accountSid: config.twilioAccountSid, callSid: call.callSid!, token: streamToken(config.controlToken, call.id, call.callSid!) });
           clearTimeout(startTimer);
-          if (managedNotification(call)) {
-            store.update(call.id, { streamSid });
-            store.observeHarkMediaStarted(call.id, new Date().toISOString());
-          } else store.update(call.id, { streamSid, status: 'in-progress', mediaStartedAt: store.get(call.id)!.mediaStartedAt ?? new Date().toISOString() });
-          // The clip starts before Live exists; Live's opening is told it was heard.
+          store.update(call.id, { streamSid, ...(managedNotification(call) ? {} : { status: 'in-progress' as const }),
+            journey: { ...current.journey, streamStartedAt: current.journey?.streamStartedAt ?? new Date().toISOString() } });
+          // The clip carries no account data, so it starts now, before admission or binding
+          // finishes; Live's opening is later told it was heard.
           const clip = call.direction === 'inbound' ? options.inboundGreetingClip : options.greetingClip;
-          if (clip && store.get(call.id)!.mediaStartedAt && greetingClipEligible(store.get(call.id)!)) startGreetingClip(clip);
-          if (!options.eligibleContext) backend = createPrimaryBackend({ callId: call.id, callSid: call.callSid!, bindingId: call.primary!.bindingId, api: primary, store, watchUntilCallEnds: true, lastCallerSpeechAt: () => lastSpeechAt });
-          const voiceOptions: BrokerLiveSessionOptions = { apiKey: config.apiKey, callId: call.id, voice: config.voice,
-            instructions: brokerInstructions({ direction: call.direction, purpose: call.purpose, registeredAssignment: !!call.callAssignment,
-              ...(call.callAssignment?.origin === 'authenticated_hark_delivery' ? { watch: call.callAssignment.value.hark } : {}),
-              ...(call.callAssignment?.origin === 'authenticated_notification_delivery' ? { notification: call.callAssignment.value.notification } : {}),
-              name: call.primary!.name, context: call.primary!.context }),
-            history: brokerHistory({ name: call.primary!.name, context: call.primary!.context }),
-            backend: backend ?? { async delegate() { throw new Error('generation_backend_required'); } },
-            onAudio(payload) {
-              if (stopping || ws.readyState !== WebSocket.OPEN || !streamSid) return;
-              if (greetingHold) {
-                greetingHeldBytes += Buffer.byteLength(payload, 'base64');
-                if (greetingHeldBytes > GREETING_HOLD_MAX_BYTES) { void stop('audio_backpressure'); return; }
-                greetingHold.push(payload); return;
-              }
-              forwardLiveAudio(payload);
-            },
-            onTranscript(snapshot) {
-              store.update(call.id, { transcript: snapshot, transcriptRevision: snapshot.revision });
-              backend?.observeTranscript(snapshot);
-            },
-            onReady({ sessionId }) {
-              connectedSessionId = sessionId;
-              const saved = store.get(call.id)!;
-              if (!saved.journey?.liveReadyAt) store.update(call.id, { journey: { ...saved.journey, liveReadyAt: new Date().toISOString() } });
-              // The selected host publishes the exact eligible saved question.
-              // Its operator purpose must never become an automatic new task.
-              if (call.continuation) return;
-              // The generation controller owns its opening inside validated activation.
-              if (options.eligibleContext) return;
-              store.update(call.id, { liveSessionId: sessionId, voiceOpening: { status: 'pending' } });
-              // Live's documented speak-first command runs while phone audio
-              // continues. Its receipt confirms context injection, not playback.
-              queueMicrotask(() => {
-                if (stopping || !live) return;
-                void live.appendInstructions(brokerOpening(call.direction, !!call.callAssignment, call.callAssignment?.origin === 'authenticated_hark_delivery', call.callAssignment?.origin === 'authenticated_notification_delivery',
-                  Boolean(store.get(call.id)!.journey?.greetingClipStartedAt)))
-                  .then(result => { store.update(call.id, { voiceOpening: result }); })
-                  .catch(() => { if (!stopping) store.update(call.id, { voiceOpening: { status: 'unconfirmed', reason: 'opening_delivery_failed' } }); });
-              });
-            },
-            onClosed(result) { store.update(call.id, { finalized: result.finalized, metrics: metrics() }); if (!stopping) void stop(result.finalized ? result.reason : 'voice_unavailable'); },
-            onPlaybackClear() {
-              // During the clip the carrier holds only the clip: Live's clear drops its own held audio.
-              if (greetingHold) { greetingHold = []; greetingHeldBytes = 0; return; }
-              receipts.clear();
-              if (ws.readyState === WebSocket.OPEN && streamSid) ws.send(JSON.stringify({ event: 'clear', streamSid }));
-            },
-            onEvent(event) {
-              if (event.type === 'live.append.late_rejection' && connectedSessionId && typeof event.eventId === 'string')
-                rejectBrokerPublication(store, { callId: call.id, callSid: call.callSid!, bindingId: call.primary!.bindingId,
-                  sessionId: connectedSessionId }, event.eventId, typeof event.code === 'string' ? event.code : 'provider_error');
-              if (event.type === 'live.error') store.update(call.id, { failure: { code: String(event.code || 'live_error'), message: 'The voice connection could not continue' } });
-            },
-          };
-          live = options.eligibleContext ? createGenerationVoice({ call: store.get(call.id)!, callDeadlineAt,
-            apiKey: config.apiKey, voice: config.voice, store, primary,
-            playbackState: () => carrierPlaybackState(!stopping && ws.readyState === WebSocket.OPEN,
-              receipts.audibleSentBytes, receipts.audiblePlayedBytes, receipts.audibleClearedBytes),
-            context: startupContexts!.take(store.get(call.id)!),
-            voiceFactory(settings) {
-              const connectionFactory = preconnect?.factory(store.get(call.id)!);
-              return voiceFactory(connectionFactory ? { ...settings, connectionFactory } : settings);
-            },
-            ...(options.selectedQuestion ? { selectedQuestion: options.selectedQuestion } : {}),
-            ...(call.continuation && options.callerIntent ? { callerIntent: createCallerIntentResolver({
-              callId: call.id, store, client: options.callerIntent.client, timeoutMs: options.callerIntent.timeoutMs,
-            }) } : {}),
-            onAudio: payload => voiceOptions.onAudio(payload, { deliveryId: 'generation_host_audio' }),
-            onReady: voiceOptions.onReady, onClosed: voiceOptions.onClosed,
-            onPlaybackClear: () => voiceOptions.onPlaybackClear?.('application_interrupt'),
-            onProblem(code) { queueMicrotask(() => { if (stopping) return;
-              // Recording the failure must never take down the process and every other call with it.
-              try { store.update(call.id, { failure: safeFailure(Object.assign(new Error(code), { code })) }); }
-              catch (error) { console.error(JSON.stringify({ event: 'broker_failure_record_unavailable', callId: call.id, code,
-                message: (error as Error).message })); }
-              void stop('voice_unavailable');
-            }); },
-          }) : voiceFactory(voiceOptions);
-          if (call.continuation && options.eligibleContext) selectedHosts.set(call.id, live as GenerationVoiceSession);
+          if (clip && greets && greetingClipEligible(store.get(call.id)!)) startGreetingClip(clip); else openInput();
+          if (call.inbound) void admitInbound();
+          else awaitOutboundBinding();
         } else if (frame.event === 'media') {
           if (!streamSid || frame.streamSid !== streamSid || frame.media?.track !== 'inbound'
               || typeof frame.media.payload !== 'string' || frame.media.payload.length > 32768) throw new Error('invalid_input_audio');
           const bytes = Buffer.from(frame.media.payload, 'base64');
           inputBytes += bytes.length;
           if (inputBytes > (config.maxCallSeconds + 10) * 8000) throw new Error('input_duration_exceeded');
-          // Twilio timestamps are media positions, not an authorization or a turn boundary.
-          if (inputSpeechEnergy(bytes) > 0.012) { lastSpeechAt = Date.now(); backend?.noteCallerSpeech(lastSpeechAt, inputBytes / 8); }
-          if (live?.appendAudio(frame.media.payload) === false) void stop('input_audio_refused');
+          if (inputOpenedAt === undefined) {
+            // Spoken over the greeting: never delivered. An attached Live hears the same length
+            // of silence instead, so its input clock stays aligned with the call.
+            greetingInputBytes += bytes.length;
+            if (live && !feedLive(Buffer.alloc(bytes.length, 0xff).toString('base64'))) void stop('input_audio_refused');
+            return;
+          }
+          if (!speechSentRecorded && inputSpeechEnergy(bytes) > CALLER_SPEECH_ENERGY) callerSpeechEndedAt = Date.now();
+          if (live) { if (!feedLive(frame.media.payload)) void stop('input_audio_refused'); return; }
+          heldInput.push({ payload: frame.media.payload, bytes: bytes.length }); heldInputBytes += bytes.length;
+          while (heldInputBytes > HELD_INPUT_MAX_BYTES) {
+            const dropped = heldInput.shift()!;
+            heldInputBytes -= dropped.bytes; droppedInputBytes += dropped.bytes;
+          }
         } else if (frame.event === 'mark' && frame.streamSid === streamSid && typeof frame.mark?.name === 'string') {
           const previouslyPlayed = receipts.playedBytes, previouslyAudiblePlayed = receipts.audiblePlayedBytes;
           const previouslySpeechPlayed = receipts.speechPlayedBytes;
@@ -1286,6 +1496,9 @@ export function createBrokerServer(options: BrokerServerOptions) {
     await options.sms?.close();
     await maintenance;
     await Promise.allSettled([...active.values()].map(call => call.stop('service_shutdown')));
+    // The answer route finished long ago, but Primary may still be opening its binding. A binding
+    // that lands now (accepting is false) is recorded and closed by its settlement, before the store closes.
+    await Promise.allSettled([...bindSettlements]);
     for (const call of store.list()) if (call.verificationCallback || call.restrictedSetup) {
       if (restricted) await restricted.stop(call, 'service_shutdown').catch(() => {});
     }

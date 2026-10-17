@@ -39,7 +39,7 @@ test('an inbound opening follows the person even when an outbound work brief was
   assert.match(instructions, /The person called you/);
   assert.ok(!instructions.includes(purpose));
   assert.doesNotMatch(instructions, /Call brief for Dexter|You called the person/);
-  assert.match(opening, /Immediately say in English: "Hey, it's Dexter\. What can I do for you\?"/);
+  assert.match(opening, /Immediately say: "Hey, it's Dexter\. What can I do for you\?"/);
   assert.doesNotMatch(opening, /assignment|call brief/);
 });
 
@@ -191,8 +191,62 @@ test('every voice opening fits one Live instructions append, so the speak-first 
   // 819f2af shipped a 513-byte registered outbound opening; session.ts rejected it as
   // invalid_append_content (call 6b2ef8d1) and the greeting waited for the callee to speak.
   for (const direction of ['outbound', 'inbound'] as const)
-    for (const registered of [false, true]) for (const watch of [false, true]) for (const notification of [false, true]) {
-      const bytes = Buffer.byteLength(brokerOpening(direction, registered, watch, notification));
-      assert.ok(bytes > 0 && bytes <= LIVE_APPEND_MAX_BYTES, `${direction}/${registered}/${watch}/${notification}: ${bytes} bytes`);
-    }
+    for (const registered of [false, true]) for (const watch of [false, true]) for (const notification of [false, true])
+      for (const greeted of [false, true]) for (const heard of [false, true]) {
+        const bytes = Buffer.byteLength(brokerOpening(direction, registered, watch, notification, greeted, heard));
+        assert.ok(bytes > 0 && bytes <= LIVE_APPEND_MAX_BYTES, `${direction}/${registered}/${watch}/${notification}/${greeted}/${heard}: ${bytes} bytes`);
+      }
 });
+
+test('an outbound opening after held caller words acknowledges them and offers in one reply, with no second greeting', () => {
+  for (const [registered, watch, notification] of [[false, false, false], [true, false, false], [true, true, false], [true, false, true]] as const) {
+    const heard = brokerOpening('outbound', registered, watch, notification, true, true);
+    assert.notEqual(heard, brokerOpening('outbound', registered, watch, notification, true));
+    assert.match(heard, /^The caller heard you say "Hey, it's Dexter\." and may have answered or said hello\. If so, acknowledge it briefly and, in that same reply, /);
+    assert.match(heard, /Never greet again or say your name\./);
+    assert.doesNotMatch(heard, /Immediately say|"Hey, it's Dexter\. Want/);
+    // A registered task starts from the person's answer to the offer, never from the hello before it.
+    if (registered) assert.match(heard, /Their hello is not their answer: pause, then delegate their answer to begin the registered task or honor a correction\./);
+    else assert.match(heard, /Then pause to listen\.$/);
+  }
+  assert.match(brokerOpening('outbound', true, false, false, true, true), /"Want me to pull up your portfolio\?"/);
+  assert.match(brokerOpening('outbound', true, true, false, true, true), /explain why the saved watch triggered this call/);
+  assert.match(brokerOpening('outbound', true, false, true, true, true), /explain the saved notification/);
+  // Inbound openings wait for the caller and keep their own text; without the clip Live's own greeting answers the hello.
+  assert.equal(brokerOpening('inbound', false, false, false, true, true), brokerOpening('inbound', false, false, false, true));
+  assert.equal(brokerOpening('outbound', false, false, false, false, true), brokerOpening('outbound'));
+});
+
+test('openings name no language and the instructions follow the caller into theirs', () => {
+  for (const direction of ['inbound', 'outbound'] as const)
+    for (const greeted of [false, true])
+      assert.doesNotMatch(brokerOpening(direction, direction === 'outbound', false, false, greeted), /English/);
+  assert.match(brokerInstructions({ direction: 'inbound', purpose: '' }),
+    /When the caller speaks another language, reply in that language for the rest of the call/);
+});
+
+test('spoken amounts are dollars first, taken only from results delivered during this call, and never raw units', () => {
+  for (const direction of ['inbound', 'outbound'] as const) {
+    const text = brokerInstructions({ direction, purpose: 'Read the current portfolio.' });
+    assert.match(text, /Spoken amounts:\nSay holding and trade amounts in dollars, rounded to the cent \("about three dollars of Apple"\), or "less than a cent"\./);
+    assert.match(text, /Give a token or share count only when the caller asks, as a short decimal with two significant digits/);
+    assert.match(text, /Never say "base tokens", "base units", "raw" or "lamports", or read out a long string of digits\./);
+    assert.match(text, /Speak only figures that appear in a result delivered during this call\. Never compute totals, differences or percentages, and never present a figure from startup history as current\./);
+    assert.doesNotMatch(text, /meaning and units of returned amounts/);
+    assert.match(text, /Keep the meaning of returned percentages and times\./);
+  }
+});
+
+test('after the opening a lone hello gets "I\'m here" only when nothing is pending, and Dexter never greets or asks again', () => {
+  for (const direction of ['inbound', 'outbound'] as const) {
+    const text = brokerInstructions({ direction, purpose: 'Read the current portfolio.' });
+    assert.match(text, /After the opening, answer a lone "hello\?" or "are you there\?" with a brief "I'm here\." only when nothing is pending; while work is pending, say you're on it\. Never greet the caller again or ask again what they want\./);
+  }
+});
+
+test('main instructions stay within the Live configuration limit for inbound and the longest outbound brief', () => {
+  // src/live/session.ts refuses instructions over 16,384 bytes (invalid_live_configuration).
+  assert.ok(Buffer.byteLength(brokerInstructions({ direction: 'inbound', purpose: 'The person called Dexter.' })) < 12_000);
+  assert.ok(Buffer.byteLength(brokerInstructions({ direction: 'outbound', purpose: 'x'.repeat(1500), registeredAssignment: true })) < 14_000);
+});
+

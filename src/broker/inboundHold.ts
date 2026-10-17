@@ -2,9 +2,7 @@ import Twilio from 'twilio';
 import type { BrokerStore } from './store.js';
 
 /** Inbound hold responses for the same-call attachment flow; startup selects this when BROKER_VERIFICATION_SETUP_MODEL is set. */
-export function createInboundHoldAdapter(options: { publicOrigin: string; store: Pick<BrokerStore, 'get'>;
-  /** A recorded greeting clip opens the call; a spoken hold before it only delays the greeting. */
-  greetingClipAvailable?: boolean }) {
+export function createInboundHoldAdapter(options: { publicOrigin: string; store: Pick<BrokerStore, 'get'> }) {
   const origin = new URL(options.publicOrigin);
   if (origin.protocol !== 'https:' || origin.username || origin.password || origin.search || origin.hash
     || origin.pathname !== '/' || origin.origin !== options.publicOrigin) throw new Error('Invalid inbound hold origin');
@@ -17,17 +15,11 @@ export function createInboundHoldAdapter(options: { publicOrigin: string; store:
       if (!call?.inbound || call.direction !== 'inbound' || call.inbound.localStop || call.endedAt
         || call.inbound.begin.providerProof.url !== `${origin.origin}/broker/incoming-call`)
         throw new Error('Inbound hold call unavailable');
+      // A bare redirect does not answer the leg: Twilio posts the signed continuation
+      // while the caller still hears ringing (376-449 ms after the first webhook on calls
+      // 28a563f6 and d1b57e33). The continuation answers with the media stream, so the
+      // greeting clip starts as soon as the call is picked up.
       const response = new Twilio.twiml.VoiceResponse();
-      // Say answers the first leg before its authenticated continuation when no
-      // greeting clip exists. With a clip, the redirect alone answers and the clip
-      // is the first thing the caller hears (call 2d141fec spoke "One moment." first).
-      // Only later pending holds need a pause to pace repeated redirects.
-      // Twilio does not pick up while the first verb is a pause or redirect, so the clip
-      // path answers with a silent half-second play instead of a spoken hold.
-      if (!call.inbound.continuation) {
-        if (options.greetingClipAvailable) response.play({ digits: 'w' }); else response.say('One moment.');
-      }
-      else response.pause({ length: 1 });
       response.redirect({ method: 'POST' }, input.continuationUrl);
       return response.toString();
     },

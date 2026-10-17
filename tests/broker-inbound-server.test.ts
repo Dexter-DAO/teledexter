@@ -10,13 +10,14 @@ import { inboundBillingSummary, inboundCallEndedSchema, inboundStatusEndedSchema
 import { createInboundBillingLifecycle } from '../src/broker/inboundBillingLifecycle.js';
 import Twilio from 'twilio';
 import { WebSocket } from 'ws';
-import { createBrokerServer } from '../src/broker/server.js';
+import { createBrokerServer, inboundAdmissionPollDelay } from '../src/broker/server.js';
 import { inboundBeginRef, type InboundBeginIdentity, type InboundOutcome } from '../src/broker/inboundContract.js';
 import { BrokerStore, type BrokerCall } from '../src/broker/store.js';
 import type { BrokerConfig } from '../src/broker/config.js';
 import { PrimaryApiError, type PrimaryApiClient } from '../src/broker/primaryApi.js';
 import { createInboundHoldAdapter } from '../src/broker/inboundHold.js';
 import { streamToken } from '../src/broker/phone.js';
+import { brokerOpening } from '../src/broker/instructions.js';
 import { createBrokerLiveSession, type BrokerLiveSessionOptions } from '../src/live/session.js';
 import { PreconnectTransport } from './helpers/preconnectTransport.js';
 import type { EligiblePhoneCall } from '../src/broker/eligibleContext.js';
@@ -42,8 +43,8 @@ async function billingReceiver(t: test.TestContext, loseFirstReceipt = false) {
 
 async function connectIncomingMedia(f: Awaited<ReturnType<typeof fixture>>, onMessage?: (raw: unknown) => void) {
   await (await f.webhook('/broker/incoming-call')).text();
+  // The continuation answers with the stream at once; the owner approves while it waits.
   const call = f.store.list()[0]; await f.waitForAdmission(); f.approve();
-  assert.match(await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text(), /<Stream/);
   const route = `/broker/media/${call.id}`;
   const ws = new WebSocket(f.base.replace(/^http/, 'ws') + route, { headers: {
     'x-twilio-signature': Twilio.getExpectedTwilioSignature(f.config.twilioAuthToken, f.config.publicOrigin + route, {}),
@@ -228,7 +229,7 @@ test('incoming audio timing separates sent audio, cleared marks, and confirmed p
   assert.equal(f.store.get(call.id)!.journey?.firstAudioSentAt, sentAt);
 });
 
-test('audible timing excludes silence, empty audio, cleared and duplicate marks without changing the journal', async t => {
+test('audible timing excludes silence, empty audio, cleared and duplicate marks; only first speech reaches the journal', async t => {
   const events: Array<{ event: string; callId: string; stage: string; observedAt: string }> = [];
   t.mock.method(console, 'info', (value: string) => { const event = JSON.parse(value); if (event.event === 'broker_audio_timing') events.push(event); });
   const f = await fixture(t), { call, ws } = await connectIncomingMedia(f); t.after(() => ws.close());
@@ -261,7 +262,8 @@ test('audible timing excludes silence, empty audio, cleared and duplicate marks 
     'firstSpeechAudioSentAt', 'firstSpeechPlaybackAcknowledgedAt']);
   assert.ok(events.every(event => event.callId === call.id && Number.isFinite(Date.parse(event.observedAt))));
   assert.deepEqual(Object.keys(events[0]).sort(), ['callId', 'event', 'observedAt', 'stage', 'version']);
-  assert.deepEqual(Object.keys(f.store.get(call.id)!.journey!).sort(), ['firstAudioSentAt', 'firstPlaybackConfirmedAt', 'liveReadyAt']);
+  // No caller spoke, so no callerSpeechEndedAt: the first words answer nothing the caller said.
+  assert.deepEqual(Object.keys(f.store.get(call.id)!.journey!).sort(), ['firstAudioSentAt', 'firstPlaybackConfirmedAt', 'firstSpeechAudioSentAt', 'liveReadyAt', 'streamStartedAt']);
 });
 
 // Production evidence (calls 60616be7 / 6b2ef8d1): the first "audible" chunk was a
@@ -406,7 +408,7 @@ test('an inbound call never plays the outbound-only clip; Live speaks the whole 
   for (let i = 0; i < 100 && f.seen.opening === 0; i++) await new Promise(resolve => setTimeout(resolve, 5));
   await new Promise(resolve => setTimeout(resolve, 30));
   assert.equal(media.length, 0);
-  assert.equal(f.openings[0], 'Immediately say in English: "Hey, it\'s Dexter. What can I do for you?" Then pause to listen.');
+  assert.equal(f.openings[0], 'Immediately say: "Hey, it\'s Dexter. What can I do for you?" Then pause to listen.');
   assert.equal(f.store.get(call.id)!.journey?.greetingClipStartedAt, undefined);
 });
 
@@ -414,7 +416,7 @@ test('without a clip the Live opening still speaks the whole greeting', async t 
   const f = await fixture(t);
   const { call, ws } = await connectIncomingMedia(f); t.after(() => ws.close());
   for (let i = 0; i < 100 && f.seen.opening === 0; i++) await new Promise(resolve => setTimeout(resolve, 5));
-  assert.equal(f.openings[0], 'Immediately say in English: "Hey, it\'s Dexter. What can I do for you?" Then pause to listen.');
+  assert.equal(f.openings[0], 'Immediately say: "Hey, it\'s Dexter. What can I do for you?" Then pause to listen.');
   assert.equal(f.store.get(call.id)!.journey?.greetingClipStartedAt, undefined);
 });
 
@@ -456,7 +458,7 @@ test('incoming legacy admission without frozen billing reference never posts a n
       callSid: call.callSid!, termsDigest: 'a'.repeat(64) } } as InboundOutcome }), /binding changed/);
 });
 
-async function fixture(t: test.TestContext, options: { selected?: boolean; retained?: BrokerCall; initialRemote?: InboundOutcome; eligible?: boolean; billing?: boolean; billingUrl?: string; duration?: string; preconnect?: boolean; replaceFirstGeneration?: boolean; greetingClip?: Buffer; outboundClipOnly?: Buffer } = {}) {
+async function fixture(t: test.TestContext, options: { selected?: boolean; retained?: BrokerCall; initialRemote?: InboundOutcome; eligible?: boolean; billing?: boolean; billingUrl?: string; duration?: string; preconnect?: boolean; replaceFirstGeneration?: boolean; greetingClip?: Buffer; outboundClipOnly?: Buffer; startupPageFreshMs?: number; defaultAdmissionPoll?: boolean } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-inbound-http-'));
   if (options.retained) fs.writeFileSync(path.join(dir, 'calls.json'), JSON.stringify({ version: 1, calls: { [options.retained.id]: options.retained } }));
   const store = new BrokerStore(dir);
@@ -487,17 +489,19 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
   let assertGate: Promise<void> | undefined, releaseAssert: (() => void) | undefined;
   let voiceOptions: BrokerLiveSessionOptions | undefined;
   let remote = options.initialRemote;
-  let loseConsume = false, lostBegin = false, authority = true, cancellationUnavailable = false;
+  let loseConsume = false, lostBegin = false, authority = true, cancellationUnavailable = false, generationReplaced = false;
   const lifecycle: string[] = [];
   let providerGate: Promise<void> | undefined; let releaseProvider: (() => void) | undefined;
   let providerEntered: (() => void) | undefined; let providerState = 'in-progress';
-  let providerDuration = options.duration; let providerWrongIdentity = false;
+  let providerDuration = options.duration; let providerWrongIdentity = false; let providerFailures = 0;
   let beginError: Error | undefined, pendingBeginError: Error | undefined;
   let beginGate: Promise<void> | undefined, releaseBegin: (() => void) | undefined;
   let statusGate: Promise<void> | undefined; let releaseStatus: (() => void) | undefined;
   const seen = { dial: 0, end: 0, voice: 0, begin: 0, consume: 0, context: 0, cancel: 0, close: 0, legacyClose: 0,
     startupFetch: 0, contextAssert: 0, opening: 0 };
   const openings: string[] = [];
+  const appended: string[] = [];
+  const beginTimes: number[] = [];
   const context = () => {
     seen.context++;
     if (!authority) throw new Error('authority_unavailable');
@@ -507,7 +511,7 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
   };
   const primary = {
     async beginInbound(begin: InboundBeginIdentity) {
-      seen.begin++;
+      seen.begin++; beginTimes.push(Date.now());
       if (beginGate) await beginGate;
       assert.ok(store.list()[0].inbound!.continuation || store.list()[0].inbound!.earlyAdmission);
       assert.deepEqual(begin.providerProof, store.list()[0].inbound!.begin.providerProof);
@@ -549,11 +553,24 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
     async close() { seen.legacyClose++; throw new Error('must_use_exact_inbound_closure'); },
   } as unknown as PrimaryApiClient;
   const provider = Object.assign((sid: string) => ({
-    async fetch() { if (providerGate) { providerEntered?.(); await providerGate; } return { sid, accountSid: config.twilioAccountSid, direction: 'inbound', from: params.From, to: params.To, status: providerState, ...(providerWrongIdentity ? { to: '+12025550999' } : {}),
+    async fetch() { inflight++; try { if (providerGate) { providerEntered?.(); await providerGate; } } finally { inflight--; }
+      if (providerFailures > 0) { providerFailures--; throw new Error('provider_read_unavailable'); }
+      return { sid, accountSid: config.twilioAccountSid, direction: 'inbound', from: params.From, to: params.To, status: providerState, ...(providerWrongIdentity ? { to: '+12025550999' } : {}),
       ...(providerDuration === undefined ? {} : { duration: providerDuration, startTime: new Date('2020-01-01T10:00:00Z'), endTime: new Date(1577872800000 + Number(providerDuration) * 1000) }) }; },
     async update() { seen.end++; return { sid, status: 'completed' }; },
   }), { async create() { seen.dial++; throw new Error('inbound_must_not_dial'); } });
+  // Background admission (after the continuation and while a greeting stream waits) is
+  // observed through these doubles: settle() waits until none of their calls is in flight.
+  let inflight = 0;
+  for (const key of Object.keys(primary) as Array<keyof PrimaryApiClient>) {
+    const method = (primary as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>)[key];
+    (primary as unknown as Record<string, unknown>)[key] = async (...args: unknown[]) => {
+      inflight++; try { return await method(...args); } finally { inflight--; }
+    };
+  }
   const broker = createBrokerServer({ config, store, primary, provider: { calls: provider } as unknown as ReturnType<typeof Twilio>,
+    ...(options.defaultAdmissionPoll ? {} : { inboundAdmissionPollMs: 5 }),
+    ...(options.startupPageFreshMs === undefined ? {} : { startupPageFreshMs: options.startupPageFreshMs }),
     ...(options.greetingClip ? { inboundGreetingClip: options.greetingClip } : {}),
     ...(options.outboundClipOnly ? { greetingClip: options.outboundClipOnly } : {}),
     ...(options.selected === false ? {} : { inboundAttachment: createInboundHoldAdapter({ publicOrigin: config.publicOrigin, store }) }),
@@ -566,7 +583,9 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
         seen.contextAssert++; assert.equal(binding.bindingId, bindingId); assert.equal(binding.callSid, params.CallSid);
         if (assertGate) await assertGate;
         if (!authority) throw new PrimaryApiError('http_error', 403, { code: 'binding_revoked', retryable: false });
-        if (options.replaceFirstGeneration && seen.voice === 1 && seen.contextAssert === 2) {
+        // The first assertion made after the first Live session opened (a pre-load recheck runs before it).
+        if (options.replaceFirstGeneration && seen.voice === 1 && !generationReplaced) {
+          generationReplaced = true;
           eligiblePage.context.history.version = { ...eligiblePage.context.history.version, contextEpoch: '2', digest: 'c'.repeat(64) };
           throw new PrimaryApiError('http_error', 409, { code: 'context_changed', retryable: false });
         }
@@ -584,7 +603,7 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
         }),
       });
       queueMicrotask(() => settings.onReady({ callId: settings.callId, sessionId: 'inbound-fixture' }));
-      return { appendAudio() { return true; }, async appendContext() { return { eventId: 'c', status: 'accepted' }; },
+      return { appendAudio(payload: string) { appended.push(payload); return true; }, async appendContext() { return { eventId: 'c', status: 'accepted' }; },
         async appendInstructions(text) { seen.opening++; openings.push(text); return { eventId: 'i', status: 'accepted' }; }, async interruptPlayback() { return { eventId: 'p', status: 'accepted' }; },
         resumePlayback() {}, getTranscript() { return { revision: 0, callerRevision: 0, fragments: [] }; },
         async close(reason) { lifecycle.push('live-close'); return { callId: settings.callId, sessionId: 'inbound-fixture', finalized: true,
@@ -600,16 +619,28 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
   };
   let closed = false;
   const close = async () => { if (!closed) { closed = true; await broker.close(); } };
+  async function settle() {
+    for (let quiet = 0, n = 0; quiet < 3 && n < 400; n++) {
+      await new Promise(resolve => setTimeout(resolve, 5)); quiet = inflight === 0 ? quiet + 1 : 0;
+    }
+  }
   t.after(async () => { releaseBegin?.(); await close(); fs.rmSync(dir, { recursive: true, force: true }); });
-  return { broker, store, base, config, params, seen, openings, lifecycle, webhook, close, provider, billing, transports,
+  return { broker, store, base, config, params, seen, openings, appended, lifecycle, webhook, close, provider, billing, transports, beginTimes,
     gateBegin() { beginGate = new Promise<void>(resolve => { releaseBegin = resolve; }); return () => releaseBegin!(); },
     gateConsume() { consumeGate = new Promise<void>(resolve => { releaseConsume = resolve; }); return () => releaseConsume!(); },
     gateAssert() { assertGate = new Promise<void>(resolve => { releaseAssert = resolve; }); return () => releaseAssert!(); },
     providerEnded(duration = providerDuration) { providerState = 'completed'; providerDuration = duration; },
     wrongProviderIdentity() { providerWrongIdentity = true; },
+    failProviderReads(count: number) { providerFailures = count; },
     emitAudio(bytes = Buffer.alloc(800, 0)) { voiceOptions!.onAudio(bytes.toString('base64')); },
     clearAudio() { voiceOptions!.onPlaybackClear?.(); }, eligiblePage, startupPages, remote: () => remote,
-    async waitForAdmission() { const call = store.list()[0]; await (await webhook(`/broker/inbound/${call.id}/continue`)).text(); },
+    /** The signed continuation answers with the greeting stream at once; its admission runs behind it. */
+    async waitForAdmission() {
+      const call = store.list()[0];
+      assert.match(await (await webhook(`/broker/inbound/${call.id}/continue`)).text(), /<Connect><Stream/);
+      await settle();
+    },
+    settle,
     beginError(error?: Error) { beginError = error; },
     pendingBeginError(error?: Error) { pendingBeginError = error; },
     approve() { assert.ok(remote?.state === 'pending'); remote = { ...remote, state: 'approved', approvalRef }; },
@@ -644,14 +675,35 @@ test('actual HTTP incoming waits on same leg and approved continuation enters ex
     mediaFormat: { encoding: 'audio/x-mulaw', sampleRate: 8000, channels: 1 } } }));
   await new Promise(resolve => setTimeout(resolve, 20));
   assert.equal(f.seen.voice, 1); assert.ok(f.store.get(call.id)!.mediaStartedAt);
+  // Twilio runs the trailing redirect only after the stream ends: the leg is hung up, never re-streamed.
   const repeat = await f.webhook(`/broker/inbound/${call.id}/continue`);
-  assert.equal(repeat.status, 409); await repeat.text();
+  assert.equal(repeat.status, 200); assert.equal(await repeat.text(), '<Response><Hangup/></Response>');
   assert.equal(f.seen.voice, 1);
   ws.close(); await new Promise<void>(resolve => ws.once('close', () => resolve()));
 });
 
-test('admitted eligible history reaches first voice startup without a duplicate GET and keeps both original assertions', async t => {
-  const f = await fixture(t, { eligible: true });
+test('the trailing redirect after a restart that lost an attached call hangs up instead of an application error', async t => {
+  const f = await fixture(t);
+  const { call, ws } = await connectIncomingMedia(f); t.after(() => ws.close());
+  const attached = f.store.get(call.id)!;
+  assert.ok(attached.mediaStartedAt); assert.equal(attached.endedAt, undefined);
+  // The process crashed with Live attached: a new broker reads the journal, with no stream of its own.
+  const restarted = await fixture(t, { retained: attached, initialRemote: attached.inbound!.remote });
+  const response = await restarted.webhook(`/broker/inbound/${call.id}/continue`);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('content-type'), 'text/xml');
+  assert.equal(await response.text(), '<Response><Hangup/></Response>');
+  assert.equal(restarted.seen.voice, 0); assert.equal(restarted.seen.begin, 0); assert.equal(restarted.seen.consume, 0);
+  // The ended leg's status callback then closes the attachment, as for any ended call.
+  assert.equal((await restarted.webhook('/broker/status', { CallStatus: 'completed' })).status, 200);
+  await restarted.settle();
+  const closed = restarted.store.get(call.id)!;
+  assert.equal(closed.status, 'completed'); assert.equal(closed.inbound!.closure?.state, 'closed');
+});
+
+for (const fresh of [true, false])
+test(`admitted eligible history reaches first voice startup without a duplicate GET (${fresh ? 'fresh binding response: post-open assertion only' : 'older page: pre-load and post-open assertions'})`, async t => {
+  const f = await fixture(t, { eligible: true, ...(fresh ? {} : { startupPageFreshMs: 0 }) });
   await (await f.webhook('/broker/incoming-call')).text();
   const call = f.store.list()[0]; await f.waitForAdmission(); f.approve();
   assert.match(await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text(), /<Stream/);
@@ -668,7 +720,9 @@ test('admitted eligible history reaches first voice startup without a duplicate 
     streamSid: 'MZ' + '4'.repeat(32), customParameters: { token: streamToken(f.config.controlToken, call.id, f.params.CallSid) },
     mediaFormat: { encoding: 'audio/x-mulaw', sampleRate: 8000, channels: 1 } } }));
   for (let count = 0; count < 100 && f.seen.opening === 0; count++) await new Promise(resolve => setTimeout(resolve, 10));
-  assert.equal(f.seen.opening, 1); assert.equal(f.seen.contextAssert, 2, 'pre-load and post-open checks also qualify the initial greeting');
+  assert.equal(f.seen.opening, 1);
+  assert.equal(f.seen.contextAssert, fresh ? 1 : 2, fresh ? 'the binding response qualifies the page; the post-open check qualifies the greeting'
+    : 'pre-load and post-open checks also qualify the initial greeting');
   assert.equal(f.seen.startupFetch, 0); assert.equal(f.seen.context, 1);
   assert.deepEqual(f.startupPages, [f.eligiblePage]);
   ws.close(); await new Promise<void>(resolve => ws.once('close', () => resolve()));
@@ -691,8 +745,10 @@ test('lost registration followed by terminal callback closes exact inbound bindi
 test('lost begin stays a recoverable wait and terminal callback cancels it', async t => {
   const f = await fixture(t); f.loseBegin();
   const first = await f.webhook('/broker/incoming-call'); assert.match(await first.text(), /<Redirect/);
-  const call = f.store.list()[0]; assert.equal(f.seen.begin, 1);
-  assert.equal(f.store.get(call.id)!.inbound!.remote, undefined); await f.waitForAdmission();
+  const call = f.store.list()[0]; assert.equal(f.seen.begin, 0, 'no admission contact before the signed continuation');
+  await f.waitForAdmission();
+  assert.equal(f.seen.begin, 1); assert.equal(f.store.get(call.id)!.inbound!.remote, undefined);
+  await f.broker.maintain();
   assert.equal(f.seen.begin, 2); assert.equal(f.store.get(call.id)!.inbound!.remote?.state, 'pending');
   const terminal = await f.webhook('/broker/status', { CallStatus: 'completed' }); await terminal.text();
   assert.equal(f.store.get(call.id)!.inbound!.remote?.state, 'cancelled');
@@ -770,7 +826,8 @@ test('enabling direct attachment leaves historical callback webhook retries in t
 
 test('terminal provider result arriving after media starts finalizes voice before binding closure', async t => {
   const f = await fixture(t); await (await f.webhook('/broker/incoming-call')).text(); await f.waitForAdmission(); f.approve();
-  const call = f.store.list()[0]; await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text();
+  const call = f.store.list()[0]; await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text(); await f.settle();
+  assert.equal(f.store.get(call.id)!.inbound!.remote?.state, 'bound');
   const gate = f.gateProvider(); const maintaining = f.broker.maintain(); await gate.entered;
   const route = `/broker/media/${call.id}`;
   const ws = new WebSocket(f.base.replace(/^http/, 'ws') + route, { headers: {
@@ -788,61 +845,64 @@ test('terminal provider result arriving after media starts finalizes voice befor
   if (ws.readyState !== WebSocket.CLOSED) await new Promise<void>(resolve => ws.once('close', () => resolve()));
 });
 
-test('actual HTTP hold overlaps one admission; restart and maintenance cannot repeat it before continuation', async t => {
+test('the first leg is a bare redirect; only the signed continuation starts admission, and it answers with the stream', async t => {
   const f = await fixture(t);
   const first = await f.webhook('/broker/incoming-call'); const xml = await first.text();
-  assert.match(xml, /<Say>One moment\.<\/Say><Redirect method="POST">/);
-  assert.doesNotMatch(xml, /<Pause/);
-  assert.equal(f.seen.begin, 1); assert.equal(f.seen.context, 0);
+  // No verb answers the leg: Twilio fetches the continuation while the caller still hears ringing.
+  assert.match(xml, /^<\?xml[^>]*><Response><Redirect method="POST">https:\/\/phone\.example\.test\/broker\/inbound\/[0-9a-f-]{36}\/continue<\/Redirect><\/Response>$/);
+  assert.equal(f.seen.begin, 0); assert.equal(f.seen.context, 0);
   const saved = f.store.list()[0]; const waitUntil = saved.inbound!.waitUntil;
-  assert.ok(saved.inbound!.earlyAdmission);
-  await f.broker.maintain(); assert.equal(f.seen.begin, 1);
-  const restored = await fixture(t, { retained: saved, initialRemote: f.remote() });
+  await f.broker.maintain(); assert.equal(f.seen.begin, 0, 'maintenance cannot begin admission before the continuation');
+  const restored = await fixture(t, { retained: saved });
   await restored.broker.maintain(); assert.equal(restored.seen.begin, 0);
   const bad = await restored.webhook(`/broker/inbound/${saved.id}/continue`, {}, false);
   assert.equal(bad.status, 403); await bad.text();
   assert.equal(restored.store.get(saved.id)!.inbound!.continuation, undefined);
-  const continued = await restored.webhook(`/broker/inbound/${saved.id}/continue`, { CallStatus: 'in-progress' });
-  const silent = await continued.text();
-  assert.match(silent, /<Pause length="1"\/><Redirect method="POST">/);
-  assert.doesNotMatch(silent, /<Say|<Stream|<Gather/);
-  assert.equal(restored.seen.begin, 1); assert.equal(restored.seen.context, 0);
+  const continued = await restored.webhook(`/broker/inbound/${saved.id}/continue`);
+  const stream = await continued.text();
+  assert.match(stream, /^<\?xml[^>]*><Response><Connect><Stream url="wss:\/\/phone\.example\.test\/broker\/media\/[0-9a-f-]{36}"><Parameter name="token" value="[^"]+"\/><\/Stream><\/Connect><Redirect method="POST">https:\/\/phone\.example\.test\/broker\/inbound\/[0-9a-f-]{36}\/continue<\/Redirect><\/Response>$/);
+  assert.doesNotMatch(stream, /<Say|<Play|<Pause|<Gather|<Hangup/);
+  await restored.settle();
+  assert.equal(restored.seen.begin, 1, 'admission starts once the stream answered the leg'); assert.equal(restored.seen.context, 0);
+  assert.ok(restored.store.get(saved.id)!.inbound!.continuation);
   assert.equal(restored.store.get(saved.id)!.inbound!.waitUntil, waitUntil);
   assert.deepEqual(restored.store.get(saved.id)!.inbound!.begin.providerProof, saved.inbound!.begin.providerProof);
   assert.equal(restored.seen.dial, 0);
 });
 
 for (const code of ['inbound_carrier_attestation_required', 'inbound_enrollment_required'] as const) {
-  test(`actual HTTP ${code} hangs up while unavailable cancellation remains pending`, async t => {
+  test(`actual HTTP ${code} ends the wait and the next continuation hangs up while unavailable cancellation remains pending`, async t => {
     const f = await fixture(t);
     f.beginError(new PrimaryApiError('http_error', 403, { code, retryable: false }));
     f.refuseCancellation();
     await (await f.webhook('/broker/incoming-call')).text();
     const call = f.store.list()[0];
-    const response = await f.webhook(`/broker/inbound/${call.id}/continue`); const xml = await response.text();
-    assert.match(xml, /<Hangup/); assert.doesNotMatch(xml, /<Stream|<Gather|enrollment|attestation/);
+    await f.waitForAdmission();
     const saved = f.store.get(call.id)!;
     assert.equal(saved.inbound!.admissionRefusal?.code, code);
     assert.equal(saved.inbound!.localStop?.reason, code);
     assert.ok(saved.inbound!.cancelRequestedAt); assert.equal(saved.inbound!.remote, undefined);
     assert.equal(saved.inbound!.closure, undefined); assert.equal(f.seen.context, 0); assert.equal(f.seen.consume, 0);
+    // The greeting stream hands the leg back; its trailing redirect now receives the hangup.
+    const response = await f.webhook(`/broker/inbound/${call.id}/continue`); const xml = await response.text();
+    assert.match(xml, /<Hangup/); assert.doesNotMatch(xml, /<Stream|<Gather|enrollment|attestation/);
     f.beginError(); await f.broker.maintain();
     assert.equal(f.seen.begin, 1); assert.equal(f.seen.end, 1);
     assert.equal(f.store.get(call.id)!.inbound!.remote, undefined);
   });
 }
 
-test('actual HTTP retryable carrier503 continues silently and preserves one original begin', async t => {
+test('actual HTTP retryable carrier503 keeps the wait and preserves one original begin', async t => {
   const f = await fixture(t); await (await f.webhook('/broker/incoming-call')).text();
   const call = f.store.list()[0];
   f.beginError(new PrimaryApiError('http_error', 503, { code: 'inbound_carrier_admission_unavailable', retryable: true }));
-  const wait = await f.webhook(`/broker/inbound/${call.id}/continue`);
-  assert.match(await wait.text(), /<Redirect/);
+  await f.waitForAdmission();
   const attempted = f.store.get(call.id)!;
-  assert.ok(attempted.failure, 'ordinary continuation failure remains reported');
+  assert.ok(attempted.failure, 'ordinary admission failure remains reported');
   assert.equal(attempted.inbound!.localStop, undefined); assert.equal(attempted.inbound!.admissionRefusal, undefined);
   f.beginError(); await f.broker.maintain();
-  assert.equal(f.seen.begin, 3); assert.equal(f.store.list().length, 1);
+  assert.equal(f.seen.begin, 2); assert.equal(f.store.list().length, 1);
+  assert.equal(f.store.get(call.id)!.inbound!.remote?.state, 'pending');
   assert.deepEqual(f.store.get(call.id)!.inbound!.begin, attempted.inbound!.begin);
   assert.equal(f.store.get(call.id)!.inbound!.waitUntil, call.inbound!.waitUntil);
   assert.equal(f.seen.context, 0); assert.equal(f.seen.dial, 0);
@@ -876,8 +936,9 @@ async function preconnectMedia(f: Awaited<ReturnType<typeof fixture>>, call: Bro
   return ws;
 }
 
-test('approved inbound transport overlaps context I/O and stays command-free through media and pre-start assertion', async t => {
-  const f = await fixture(t, { eligible: true, preconnect: true });
+for (const fresh of [true, false])
+test(`approved inbound transport overlaps context I/O and stays command-free through media and ${fresh ? 'the post-open' : 'the pre-start'} assertion`, async t => {
+  const f = await fixture(t, { eligible: true, preconnect: true, ...(fresh ? {} : { startupPageFreshMs: 0 }) });
   const call = await preconnectApproved(f), release = f.gateConsume();
   const response = f.webhook(`/broker/inbound/${call.id}/continue`);
   await preconnectUntil(() => f.seen.consume === 1);
@@ -888,10 +949,16 @@ test('approved inbound transport overlaps context I/O and stays command-free thr
   assert.deepEqual(transport.sent, []);
   const releaseAssert = f.gateAssert(), ws = await preconnectMedia(f, call); t.after(() => ws.close());
   await preconnectUntil(() => f.seen.contextAssert === 1);
-  assert.deepEqual(transport.sent, []); assert.equal(f.seen.voice, 0);
+  if (fresh) {
+    // The binding response just qualified the page: Live opens on it at once, but neither the
+    // opening nor any caller audio passes until the post-open assertion succeeds.
+    assert.equal(f.seen.voice, 1);
+    assert.deepEqual(transport.sent.map(event => event.type), ['session.start']);
+    assert.equal(f.store.get(call.id)!.voiceOpening, undefined);
+  } else { assert.deepEqual(transport.sent, []); assert.equal(f.seen.voice, 0); }
   releaseAssert();
   await preconnectUntil(() => f.store.get(call.id)!.voiceOpening?.status === 'accepted');
-  assert.equal(f.transports.length, 1); assert.equal(f.seen.contextAssert, 2, 'opening shares the validated activation');
+  assert.equal(f.transports.length, 1); assert.equal(f.seen.contextAssert, fresh ? 1 : 2, 'opening shares the validated activation');
   assert.equal(f.seen.startupFetch, 0); assert.equal(f.seen.context, 1);
   assert.equal(transport.sent.filter(event => event.type === 'session.start').length, 1);
   assert.deepEqual(f.startupPages, [f.eligiblePage]);
@@ -910,31 +977,81 @@ test('duplicate approved continuations share the original transport and account 
   await f.close(); assert.equal(f.transports[0].terminated, 1);
 });
 
+test('the signed continuation opens the Live socket while admission runs, and Live starts on it without a second connect', async t => {
+  const transportEvents: Array<{ stage: string; at: number }> = [];
+  t.mock.method(console, 'info', (value: string) => {
+    const event = JSON.parse(value); if (event.event === 'broker_inbound_transport') transportEvents.push({ stage: event.stage, at: Date.now() });
+  });
+  const f = await fixture(t, { eligible: true, preconnect: true });
+  await (await f.webhook('/broker/incoming-call')).text();
+  const call = f.store.list()[0];
+  assert.equal(f.transports.length, 0, 'the unanswered first leg opens nothing');
+  const release = f.gateBegin(); t.after(release);
+  assert.match(await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text(), /<Connect><Stream/);
+  assert.equal(f.transports.length, 1, 'opened with the stream response, before admission answers');
+  const transport = f.transports[0]; transport.open();
+  assert.deepEqual(transport.sent, [], 'only the socket: no session, history or audio');
+  assert.equal(f.seen.context, 0);
+  release(); await f.settle(); f.approve();
+  const ws = await preconnectMedia(f, call); t.after(() => ws.close());
+  await preconnectUntil(() => f.store.get(call.id)!.voiceOpening?.status === 'accepted');
+  assert.equal(f.transports.length, 1, 'no second connect');
+  assert.equal(transport.sent[0]?.type, 'session.start');
+  assert.equal(transport.sent.filter(event => event.type === 'session.start').length, 1);
+  assert.deepEqual(transportEvents.map(event => event.stage), ['connecting', 'open', 'adopted']);
+});
+
+test('a continuation socket that failed before approval is replaced at approval and Live starts on the replacement', async t => {
+  const f = await fixture(t, { eligible: true, preconnect: true });
+  await (await f.webhook('/broker/incoming-call')).text(); await f.waitForAdmission();
+  const call = f.store.list()[0];
+  assert.equal(f.transports.length, 1); f.transports[0].fail(); // For example, the provider closed an idle socket.
+  assert.equal(f.transports[0].terminated, 1);
+  f.approve();
+  const ws = await preconnectMedia(f, call); t.after(() => ws.close());
+  await preconnectUntil(() => f.transports.length === 2);
+  f.transports[1].open();
+  await preconnectUntil(() => f.store.get(call.id)!.voiceOpening?.status === 'accepted');
+  assert.equal(f.transports.length, 2); assert.deepEqual(f.transports[0].sent, []);
+  assert.equal(f.transports[1].sent[0]?.type, 'session.start');
+});
+
 for (const refusal of ['unapproved', 'wrong-provider', 'provider-ended'] as const)
-  test(`inbound preconnect refuses ${refusal} before opening any socket`, async t => {
+  test(`an ${refusal} admission records no context and sends no command to the Live socket`, async t => {
     const f = await fixture(t, { eligible: true, preconnect: true });
     await (await f.webhook('/broker/incoming-call')).text(); await f.waitForAdmission();
     if (refusal !== 'unapproved') f.approve();
     if (refusal === 'wrong-provider') f.wrongProviderIdentity();
     if (refusal === 'provider-ended') f.providerEnded();
     const call = f.store.list()[0]; await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text();
-    assert.equal(f.transports.length, 0); assert.equal(f.seen.consume, 0);
+    await f.settle();
+    // The broker's provider check runs alongside the API's consume; context needs both to pass.
+    assert.equal(f.seen.consume, refusal === 'unapproved' ? 0 : 1);
+    const saved = f.store.get(call.id)!;
+    assert.equal(saved.primary, undefined, 'no account context is recorded');
+    assert.equal(f.seen.voice, 0);
+    assert.equal(f.transports.length, 1, 'only the socket the continuation opened');
+    assert.deepEqual(f.transports[0].sent, [], 'no command on the Live socket');
+    if (refusal === 'unapproved') assert.equal(f.transports[0].terminated, 0, 'a waiting admission keeps it');
+    else {
+      // A leg that ended, or that Twilio describes differently from the signed one, ends the wait at once.
+      assert.equal(saved.inbound!.localStop?.reason, refusal === 'provider-ended' ? 'provider_terminal' : 'provider_identity_mismatch');
+      assert.equal(saved.inbound!.closure?.state, 'closed', 'the binding made alongside the check is closed');
+      assert.equal(f.transports[0].terminated, 1);
+    }
   });
 
-for (const failure of ['consume', 'early-error', 'early-close', 'media-token', 'revoked', 'hangup', 'shutdown'] as const)
+for (const failure of ['media-token', 'revoked', 'hangup', 'shutdown'] as const)
   test(`inbound preconnect cleans ${failure} without private commands or automatic replacement`, async t => {
-    const f = await fixture(t, { eligible: true, preconnect: true });
+    // Revocation between an older admission and media: the pre-load recheck refuses before Live opens.
+    const f = await fixture(t, { eligible: true, preconnect: true, ...(failure === 'revoked' ? { startupPageFreshMs: 0 } : {}) });
     const call = await preconnectApproved(f);
-    if (failure === 'consume') f.loseConsume();
     await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text();
     assert.equal(f.transports.length, 1); const transport = f.transports[0]; transport.open();
-    if (failure === 'early-error') transport.fail();
-    if (failure === 'early-close') transport.end();
     if (failure === 'revoked') f.refuseContext();
     if (failure === 'hangup') await (await f.webhook('/broker/status', { CallStatus: 'completed' })).text();
     else if (failure === 'shutdown') await f.close();
     else {
-      if (failure === 'consume') await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text();
       const ws = await preconnectMedia(f, call, failure === 'media-token' ? 'wrong' : undefined);
       t.after(() => ws.close());
       await preconnectUntil(() => ws.readyState === WebSocket.CLOSED);
@@ -942,6 +1059,108 @@ for (const failure of ['consume', 'early-error', 'early-close', 'media-token', '
     assert.equal(transport.terminated, 1); assert.deepEqual(transport.sent, []);
     assert.equal(f.transports.length, 1);
   });
+
+test('a lost consume reply recovers the binding and Live still starts on the continuation socket', async t => {
+  const f = await fixture(t, { eligible: true, preconnect: true });
+  const call = await preconnectApproved(f);
+  f.loseConsume();
+  await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text();
+  await f.settle();
+  assert.equal(f.transports.length, 1); const transport = f.transports[0];
+  assert.equal(transport.terminated, 0, 'a step the next poll retries keeps the socket'); transport.open();
+  const ws = await preconnectMedia(f, call); t.after(() => ws.close()); // Its admission loop recovers the committed binding.
+  await preconnectUntil(() => f.store.get(call.id)!.voiceOpening?.status === 'accepted');
+  assert.equal(f.transports.length, 1); assert.equal(f.seen.consume, 1);
+  assert.equal(transport.sent[0]?.type, 'session.start');
+});
+
+for (const opened of ['continuation', 'approval'] as const)
+  test(`two failed provider reads after the consume keep the socket opened at the ${opened}, and Live starts on it once a read passes`, async t => {
+    const f = await fixture(t, { eligible: true, preconnect: true });
+    await (await f.webhook('/broker/incoming-call')).text(); await f.waitForAdmission();
+    const call = f.store.list()[0];
+    // A socket opened at approval (the continuation's had failed) is the one held to the original rule.
+    if (opened === 'approval') f.transports[0].fail();
+    f.approve(); f.failProviderReads(2);
+    await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text();
+    await f.settle();
+    // The consume committed alongside the first failed read: bound, with no context recorded.
+    assert.equal(f.store.get(call.id)!.inbound!.remote?.state, 'bound'); assert.equal(f.store.get(call.id)!.primary, undefined);
+    const transport = f.transports.at(-1)!; transport.open();
+    assert.equal(f.transports.length, opened === 'approval' ? 2 : 1);
+    const ws = await preconnectMedia(f, call); t.after(() => ws.close()); // The next poll's read fails too; the one after passes.
+    await preconnectUntil(() => f.store.get(call.id)!.voiceOpening?.status === 'accepted');
+    assert.equal(f.transports.length, opened === 'approval' ? 2 : 1); assert.equal(transport.terminated, 0);
+    assert.equal(transport.sent[0]?.type, 'session.start'); assert.equal(f.seen.consume, 1);
+  });
+
+for (const loss of ['error', 'close'] as const)
+  test(`a continuation socket lost (${loss}) after approval leaves Live its own connection`, async t => {
+    const f = await fixture(t, { eligible: true, preconnect: true });
+    const call = await preconnectApproved(f);
+    await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text();
+    assert.equal(f.transports.length, 1); const transport = f.transports[0]; transport.open();
+    if (loss === 'error') transport.fail(); else transport.end();
+    assert.equal(transport.terminated, 1);
+    const ws = await preconnectMedia(f, call); t.after(() => ws.close());
+    await preconnectUntil(() => f.store.get(call.id)!.voiceOpening?.status === 'accepted');
+    assert.equal(f.transports.length, 2, 'one ordinary connection, no warm replacement loop');
+    assert.deepEqual(transport.sent, []); assert.equal(f.transports[1].sent[0]?.type, 'session.start');
+  });
+
+test('a socket opened at approval because the continuation socket failed keeps the original rule: lost, Live cannot start', async t => {
+  const f = await fixture(t, { eligible: true, preconnect: true });
+  await (await f.webhook('/broker/incoming-call')).text(); await f.waitForAdmission();
+  const call = f.store.list()[0];
+  f.transports[0].fail(); f.approve();
+  await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text();
+  await preconnectUntil(() => f.transports.length === 2);
+  const strict = f.transports[1]; strict.open(); strict.fail();
+  const ws = await preconnectMedia(f, call); t.after(() => ws.close());
+  await preconnectUntil(() => ws.readyState === WebSocket.CLOSED);
+  assert.equal(f.transports.length, 2, 'no automatic replacement'); assert.deepEqual(strict.sent, []);
+  assert.equal(f.seen.opening, 0);
+});
+
+test('a begin refused while Twilio picks up keeps the continuation socket: Live starts on it with no second connect', async t => {
+  const f = await fixture(t, { eligible: true, preconnect: true });
+  await (await f.webhook('/broker/incoming-call')).text();
+  const call = f.store.list()[0];
+  f.beginError(new PrimaryApiError('http_error', 403, { code: 'call_not_active', retryable: false }));
+  assert.match(await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text(), /<Stream/);
+  await f.settle();
+  assert.equal(f.transports.length, 1); assert.equal(f.transports[0].terminated, 0);
+  f.beginError(); f.transports[0].open();
+  const ws = await preconnectMedia(f, call); t.after(() => ws.close());
+  await preconnectUntil(() => f.remote()?.state === 'pending'); f.approve();
+  await preconnectUntil(() => f.store.get(call.id)!.voiceOpening?.status === 'accepted');
+  assert.equal(f.transports.length, 1, 'the socket from the continuation is the one Live starts on');
+  assert.equal(f.transports[0].sent[0]?.type, 'session.start');
+});
+
+test('an admission refusal ends the account wait and closes the continuation socket unused', async t => {
+  const f = await fixture(t, { eligible: true, preconnect: true });
+  f.beginError(new PrimaryApiError('http_error', 403, { code: 'inbound_carrier_attestation_required', retryable: false }));
+  await (await f.webhook('/broker/incoming-call')).text(); await f.waitForAdmission();
+  assert.equal(f.store.list()[0].inbound!.admissionRefusal?.code, 'inbound_carrier_attestation_required');
+  assert.equal(f.transports.length, 1); assert.equal(f.transports[0].terminated, 1); assert.deepEqual(f.transports[0].sent, []);
+});
+
+test('authority revoked just after a fresh binding response: Live opens but no opening, audio or caller input passes', async t => {
+  const f = await fixture(t, { eligible: true, preconnect: true });
+  const call = await preconnectApproved(f);
+  await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text();
+  const transport = f.transports[0]; transport.open();
+  f.refuseContext();
+  const ws = await preconnectMedia(f, call); t.after(() => ws.close());
+  await preconnectUntil(() => ws.readyState === WebSocket.CLOSED);
+  assert.equal(f.seen.contextAssert, 1, 'the post-open assertion refused');
+  assert.deepEqual(transport.sent.filter(event => event.type !== 'session.close').map(event => event.type), ['session.start'],
+    'no opening, instruction or caller audio reached the session');
+  assert.equal(f.seen.opening, 0); assert.equal(f.store.get(call.id)!.voiceOpening, undefined);
+  assert.equal(f.transports.length, 1, 'no automatic replacement');
+  assert.ok(transport.closed + transport.terminated >= 1);
+});
 
 test('inbound preconnect adoption preserves a managed generation replacement after context changes', async t => {
   const f = await fixture(t, { eligible: true, preconnect: true, replaceFirstGeneration: true });
@@ -972,63 +1191,208 @@ for (const cancellation of ['revoked', 'hangup', 'shutdown'] as const)
     }
     if (cancellation === 'shutdown') stopping = f.close();
     release(); await (await continuation).text(); await stopping;
+    if (cancellation === 'revoked') {
+      // The failed context read is a step the next poll retries: the socket waits, unused, until the wait ends.
+      await f.settle();
+      assert.equal(transport.terminated, 0); assert.deepEqual(transport.sent, []);
+      await (await f.webhook('/broker/status', { CallStatus: 'completed' })).text();
+    }
     assert.equal(transport.terminated, 1); assert.equal(f.transports.length, 1);
     assert.deepEqual(transport.sent, []); assert.equal(f.seen.voice, 0);
   });
 
 
-test('HTTP hold and duplicate return while one early admission is delayed; continuation alone releases context and transport', async t => {
-  const f = await fixture(t, { eligible: true, preconnect: true }), release = f.gateBegin();
-  t.after(release);
-  const first = await f.webhook('/broker/incoming-call');
-  assert.match(await first.text(), /<Say>One moment\.<\/Say><Redirect method="POST">/);
-  const call = f.store.list()[0]; assert.equal(f.seen.begin, 1);
-  assert.equal(f.seen.context, 0); assert.equal(f.seen.consume, 0); assert.equal(f.transports.length, 0);
+test('duplicate first webhooks contact nothing; only the continuation releases admission, context and transport', async t => {
+  const f = await fixture(t, { eligible: true, preconnect: true });
+  const first = await f.webhook('/broker/incoming-call'); const redirect = await first.text();
+  assert.match(redirect, /<Response><Redirect method="POST">/);
+  const call = f.store.list()[0]; assert.equal(f.seen.begin, 0);
   const duplicate = await f.webhook('/broker/incoming-call');
-  assert.match(await duplicate.text(), /<Say>One moment\.<\/Say><Redirect method="POST">/);
-  assert.equal(f.seen.begin, 1);
-  release(); await preconnectUntil(() => f.store.get(call.id)!.inbound!.remote?.state === 'pending');
-  f.approve(); await f.broker.maintain();
-  assert.equal(f.seen.context, 0); assert.equal(f.seen.consume, 0); assert.equal(f.transports.length, 0);
+  assert.equal(await duplicate.text(), redirect);
+  assert.equal(f.seen.begin, 0); assert.equal(f.seen.context, 0); assert.equal(f.seen.consume, 0); assert.equal(f.transports.length, 0);
   assert.equal((await f.webhook(`/broker/inbound/${call.id}/continue`, {}, false)).status, 403);
-  assert.equal(f.seen.consume, 0);
+  const release = f.gateBegin(); t.after(release);
   const continued = await f.webhook(`/broker/inbound/${call.id}/continue`);
   assert.match(await continued.text(), /<Stream/);
-  assert.equal(f.seen.begin, 1); assert.equal(f.seen.consume, 1); assert.equal(f.transports.length, 1);
-  assert.deepEqual(f.transports[0].sent, []);
+  await preconnectUntil(() => f.seen.begin === 1);
+  // The continuation opens only the Live socket: no session, history or audio while admission runs.
+  assert.equal(f.seen.consume, 0); assert.equal(f.transports.length, 1); assert.deepEqual(f.transports[0].sent, []);
+  release(); await f.settle();
+  assert.equal(f.store.get(call.id)!.inbound!.remote?.state, 'pending');
+  f.approve(); await f.broker.maintain();
+  assert.equal(f.seen.begin, 1); assert.equal(f.seen.consume, 1);
+  assert.equal(f.transports.length, 1, 'approval keeps the socket the continuation opened');
+  assert.deepEqual(f.transports[0].sent, []); assert.equal(f.transports[0].terminated, 0);
 });
 
-test('shutdown during the early contact settles its same attachment without starting voice', async t => {
+test('shutdown during the first admission contact settles its same attachment without starting voice', async t => {
   const f = await fixture(t, { eligible: true, preconnect: true }), release = f.gateBegin();
   t.after(release);
   await (await f.webhook('/broker/incoming-call')).text();
-  const call = f.store.list()[0]; assert.equal(f.seen.begin, 1);
+  const call = f.store.list()[0];
+  assert.match(await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text(), /<Stream/);
+  await preconnectUntil(() => f.seen.begin === 1);
   const closing = f.close();
   await preconnectUntil(() => Boolean(f.store.get(call.id)!.inbound!.localStop));
   release(); await closing;
   assert.equal(f.seen.begin, 1); assert.equal(f.seen.cancel, 1);
   assert.equal(f.store.get(call.id)!.inbound!.remote?.state, 'cancelled');
-  assert.equal(f.seen.voice, 0); assert.equal(f.seen.context, 0); assert.equal(f.transports.length, 0);
+  assert.equal(f.seen.voice, 0); assert.equal(f.seen.context, 0);
+  assert.equal(f.transports.length, 1, 'only the continuation socket');
+  assert.deepEqual(f.transports[0].sent, []); assert.equal(f.transports[0].terminated, 1);
+});
+
+async function greetingMedia(f: Awaited<ReturnType<typeof fixture>>, call: BrokerCall) {
+  const route = `/broker/media/${call.id}`;
+  const ws = new WebSocket(f.base.replace(/^http/, 'ws') + route, { headers: {
+    'x-twilio-signature': Twilio.getExpectedTwilioSignature(f.config.twilioAuthToken, f.config.publicOrigin + route, {}),
+  } });
+  const frames: Array<{ event: string; payload?: string; name?: string }> = [];
+  ws.on('message', raw => { const frame = JSON.parse(String(raw));
+    frames.push({ event: frame.event, ...(frame.media ? { payload: frame.media.payload } : {}), ...(frame.mark ? { name: frame.mark.name } : {}) }); });
+  await new Promise<void>((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
+  const streamSid = 'MZ' + '4'.repeat(32);
+  ws.send(JSON.stringify({ event: 'start', start: { accountSid: f.config.twilioAccountSid, callSid: f.params.CallSid, streamSid,
+    customParameters: { token: streamToken(f.config.controlToken, call.id, f.params.CallSid) },
+    mediaFormat: { encoding: 'audio/x-mulaw', sampleRate: 8000, channels: 1 } } }));
+  const caller = (bytes: Buffer) => ws.send(JSON.stringify({ event: 'media', streamSid, media: { track: 'inbound', payload: bytes.toString('base64') } }));
+  const ackClip = () => { for (const frame of frames.filter(value => value.event === 'mark')) ws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: frame.name } })); };
+  const clipFrames = () => frames.filter(frame => frame.event === 'media').length;
+  return { ws, frames, caller, ackClip, clipFrames };
+}
+
+test('the greeting plays at stream start while admission waits; words over it are dropped and later words reach Live first, in order', async t => {
+  const media: Array<Record<string, unknown>> = [];
+  t.mock.method(console, 'info', (value: string) => { const event = JSON.parse(value); if (event.event === 'broker_account_media') media.push(event); });
+  const f = await fixture(t, { greetingClip: greetingFixtureClip });
+  await (await f.webhook('/broker/incoming-call')).text();
+  const call = f.store.list()[0]; await f.waitForAdmission();
+  assert.equal(f.remote()?.state, 'pending', 'the owner has not approved yet');
+  const g = await greetingMedia(f, call); t.after(() => g.ws.close());
+  for (let i = 0; i < 200 && g.clipFrames() < 15; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(g.clipFrames(), 15, 'the whole clip is sent before admission binds');
+  let saved = f.store.get(call.id)!;
+  assert.ok(saved.journey!.streamStartedAt && saved.journey!.greetingClipStartedAt);
+  assert.equal(saved.mediaStartedAt, undefined); assert.equal(saved.primary, undefined); assert.equal(f.seen.voice, 0);
+  g.caller(Buffer.alloc(800, 0x10)); // "Hello?" over the greeting
+  await new Promise(resolve => setTimeout(resolve, 20));
+  g.ackClip();
+  for (let i = 0; i < 100 && !f.store.get(call.id)!.journey?.greetingClipPlayedAt; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  const first = Buffer.alloc(800, 0x21), second = Buffer.alloc(800, 0x22);
+  g.caller(first); g.caller(second);
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(f.seen.voice, 0); assert.equal(f.seen.consume, 0);
+  f.approve();
+  for (let i = 0; i < 200 && f.appended.length < 2; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.deepEqual(f.appended, [first.toString('base64'), second.toString('base64')]);
+  const third = Buffer.alloc(800, 0x23); g.caller(third);
+  for (let i = 0; i < 100 && f.appended.length < 3; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(f.appended[2], third.toString('base64'));
+  for (let i = 0; i < 100 && f.seen.opening === 0; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.deepEqual(f.openings, [brokerOpening('inbound', false, false, false, true)]);
+  saved = f.store.get(call.id)!;
+  assert.equal(saved.inbound!.remote?.state, 'bound');
+  assert.ok(saved.mediaStartedAt! >= saved.journey!.greetingClipPlayedAt!);
+  assert.ok(Date.parse(saved.mediaStartedAt!) >= Date.parse((saved.inbound!.remote as { consumedAt: string }).consumedAt));
+  assert.deepEqual(media.map(({ heldInputMs, droppedInputMs, greetingInputMs }) => ({ heldInputMs, droppedInputMs, greetingInputMs })),
+    [{ heldInputMs: 200, droppedInputMs: 0, greetingInputMs: 100 }]);
+});
+
+test('in the greeting-stream order Live opens on the binding response with only its post-open assertion; the wait after the caller\'s words is journaled', async t => {
+  const f = await fixture(t, { eligible: true, greetingClip: greetingFixtureClip });
+  await (await f.webhook('/broker/incoming-call')).text();
+  const call = f.store.list()[0]; await f.waitForAdmission();
+  const g = await greetingMedia(f, call); t.after(() => g.ws.close());
+  for (let i = 0; i < 200 && g.clipFrames() < 15; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  g.ackClip();
+  for (let i = 0; i < 100 && !f.store.get(call.id)!.journey?.greetingClipPlayedAt; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  g.caller(Buffer.alloc(800, 0x21)); g.caller(Buffer.alloc(800, 0xff)); // A question, then silence, while admission runs.
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(f.seen.voice, 0);
+  f.approve();
+  for (let i = 0; i < 200 && f.seen.opening === 0; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(f.seen.opening, 1);
+  assert.equal(f.seen.contextAssert, 1, 'no second eligibility read between the binding response and Live');
+  assert.equal(f.seen.startupFetch, 0); assert.equal(f.seen.context, 1);
+  assert.deepEqual(f.startupPages, [f.eligiblePage]);
+  f.emitAudio(Buffer.alloc(800, 0x20)); // Dexter's first words.
+  for (let i = 0; i < 100 && !f.store.get(call.id)!.journey?.firstSpeechAudioSentAt; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  const journey = f.store.get(call.id)!.journey!;
+  assert.ok(journey.callerSpeechEndedAt && journey.firstSpeechAudioSentAt);
+  assert.ok(journey.greetingClipPlayedAt! <= journey.callerSpeechEndedAt && journey.callerSpeechEndedAt <= journey.firstSpeechAudioSentAt);
+});
+
+test('held caller audio keeps the newest 15 s while admission waits', async t => {
+  const f = await fixture(t);
+  await (await f.webhook('/broker/incoming-call')).text();
+  const call = f.store.list()[0]; await f.waitForAdmission();
+  const g = await greetingMedia(f, call); t.after(() => g.ws.close());
+  for (let i = 0; i < 100 && !f.store.get(call.id)!.streamSid; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  const frames = Array.from({ length: 160 }, (_value, index) => Buffer.alloc(800, index)); // 16 s
+  for (const frame of frames) g.caller(frame);
+  await new Promise(resolve => setTimeout(resolve, 50));
+  f.approve();
+  for (let i = 0; i < 400 && f.appended.length < 150; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(f.appended.length, 150);
+  assert.deepEqual(f.appended, frames.slice(10).map(frame => frame.toString('base64')));
+});
+
+test('a refusal while the greeting plays hands the leg back after the greeting; the continuation then hangs up', async t => {
+  const f = await fixture(t, { greetingClip: greetingFixtureClip }), release = f.gateBegin(); t.after(release);
+  await (await f.webhook('/broker/incoming-call')).text();
+  const call = f.store.list()[0];
+  const answer = await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text();
+  assert.match(answer, /<\/Connect><Redirect method="POST">https:\/\/phone\.example\.test\/broker\/inbound\/[0-9a-f-]{36}\/continue<\/Redirect>/);
+  const g = await greetingMedia(f, call);
+  for (let i = 0; i < 200 && g.clipFrames() < 15; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  f.beginError(new PrimaryApiError('http_error', 403, { code: 'inbound_carrier_attestation_required', retryable: false }));
+  release(); await f.settle();
+  assert.equal(f.store.get(call.id)!.inbound!.admissionRefusal?.code, 'inbound_carrier_attestation_required');
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(g.ws.readyState, WebSocket.OPEN, 'the caller hears the whole greeting first');
+  const closed = new Promise<void>(resolve => g.ws.once('close', () => resolve()));
+  g.ackClip(); await closed;
+  const released = f.store.get(call.id)!;
+  assert.equal(released.endedAt, undefined, 'releasing the stream does not end the call');
+  assert.equal(f.seen.end, 0); assert.equal(f.seen.voice, 0); assert.equal(f.seen.consume, 0);
+  const next = await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text();
+  assert.match(next, /<Hangup/); assert.doesNotMatch(next, /<Stream/);
 });
 
 
-for (const failure of ['ringing', 'lost-reply'] as const) test(`early ${failure} then successful continuation has no persisted failed-call diagnostic`, async t => {
-  const f = await fixture(t);
-  if (failure === 'ringing') f.pendingBeginError(new PrimaryApiError('http_error', 403, { code: 'call_not_active', retryable: false }));
-  else f.loseBegin();
-  const first = await f.webhook('/broker/incoming-call');
-  assert.match(await first.text(), /<Say>One moment\.<\/Say><Redirect/);
-  const call = f.store.list()[0]; assert.equal(f.seen.begin, 1);
-  assert.ok(call.inbound!.earlyAdmission); assert.equal(call.inbound!.remote, undefined);
-  assert.equal(f.remote()?.state, 'pending'); assert.equal(call.failure, undefined);
-  f.pendingBeginError(); f.approve();
-  assert.match(await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text(), /<Stream/);
-  assert.equal(f.seen.begin, 1); assert.equal(f.seen.consume, 1);
-  const saved = f.store.get(call.id)!;
-  assert.equal(saved.inbound!.remote?.state, 'bound'); assert.equal(saved.failure, undefined);
-  const response = await fetch(f.base + '/internal/broker/calls', { headers: { authorization: `Bearer ${f.config.controlToken}` } });
-  assert.equal(response.status, 200);
-  const result = await response.json() as { calls: Array<{ id: string; failure?: unknown }> };
-  assert.equal(result.calls.find(value => value.id === call.id)?.failure, undefined);
-  assert.ok(result.calls.some(value => value.id === call.id));
+test('a stream that starts after a refusal plays no greeting and hands the leg straight back', async t => {
+  const f = await fixture(t, { greetingClip: greetingFixtureClip });
+  f.beginError(new PrimaryApiError('http_error', 403, { code: 'inbound_enrollment_required', retryable: false }));
+  await (await f.webhook('/broker/incoming-call')).text();
+  const call = f.store.list()[0]; await f.waitForAdmission();
+  assert.equal(f.store.get(call.id)!.inbound!.admissionRefusal?.code, 'inbound_enrollment_required');
+  const g = await greetingMedia(f, call);
+  await new Promise<void>(resolve => { if (g.ws.readyState === WebSocket.CLOSED) resolve(); else g.ws.once('close', () => resolve()); });
+  assert.equal(g.clipFrames(), 0);
+  assert.equal(f.store.get(call.id)!.endedAt, undefined); assert.equal(f.seen.end, 0); assert.equal(f.seen.voice, 0);
+  assert.equal(f.store.get(call.id)!.failure, undefined);
+  const next = await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text();
+  assert.match(next, /<Hangup/);
+});
+
+test('a begin that races the pickup is retried after 100 ms, then 200 and 400 ms, then every second', async t => {
+  assert.deepEqual([0, 1, 2, 3, 4, 9].map(inboundAdmissionPollDelay), [100, 200, 400, 1_000, 1_000, 1_000]);
+  const f = await fixture(t, { greetingClip: greetingFixtureClip, defaultAdmissionPoll: true });
+  await (await f.webhook('/broker/incoming-call')).text();
+  const call = f.store.list()[0];
+  // The API's begin refuses a leg Twilio has not picked up yet (call 28a563f6's continuation arrived while it rang).
+  f.beginError(new PrimaryApiError('http_error', 403, { code: 'call_not_active', retryable: false }));
+  assert.match(await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text(), /<Connect><Stream/);
+  const g = await greetingMedia(f, call); t.after(() => g.ws.close());
+  for (let i = 0; i < 800 && f.beginTimes.length < 5; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  f.beginError();
+  assert.equal(f.beginTimes.length, 5, 'one refused begin from the continuation, then one per poll');
+  const gaps = f.beginTimes.slice(1).map((at, index) => at - f.beginTimes[index]);
+  // Each gap is the poll wait (plus, for the first, the media start that begins the loop).
+  // Upper bounds leave room for a loaded box; a fixed 1 s poll (the old pace) could never meet the first two.
+  for (const [index, [low, high]] of [[95, 900], [195, 950], [395, 1_300], [995, 2_000]].entries())
+    assert.ok(gaps[index] >= low && gaps[index] <= high, `gap ${index + 1} was ${gaps[index]} ms`);
+  for (let i = 0; i < 400 && f.remote()?.state !== 'pending'; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(f.remote()?.state, 'pending', 'the next begin admits the answered leg');
+  assert.equal(f.store.get(call.id)!.inbound!.localStop, undefined);
 });
