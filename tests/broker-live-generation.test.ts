@@ -114,6 +114,22 @@ function harness(initial?: LiveGenerationJournal, overrides: Partial<LiveGenerat
 
 const temporarilyUnavailable = () => new PrimaryApiError('http_error', 503, { code: 'temporarily_unavailable', retryable: true });
 
+test('an optional activation hook cannot tear down the active voice when it throws', async t => {
+  let activations = 0;
+  const h = harness(undefined, { onActivated(current) {
+    activations++; assert.equal(current.sessionId, 'session_1'); throw new Error('optional context failed');
+  } });
+  t.after(() => h.controller.stop());
+  const current = await h.controller.start();
+  assert.equal(current.sessionId, 'session_1');
+  assert.equal(activations, 1);
+  assert.equal(h.controller.snapshot().phase, 'active');
+  assert.deepEqual(h.sessions[0].closes, []);
+  assert.deepEqual(h.problems, []);
+  h.sessions[0].input.callbacks.onAudio('voice-still-active');
+  assert.deepEqual(h.audio, [{ payload: 'voice-still-active', sessionId: 'session_1' }]);
+});
+
 test('a transient refresh failure recovers the same call and saved result without publishing stale audio', async () => {
   const h = harness(); await h.controller.start(); h.advanceVersion();
   const fetch = h.api.fetch; let attempts = 0;

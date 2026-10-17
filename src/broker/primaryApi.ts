@@ -2,6 +2,7 @@ import { callbackProviderProofSchema } from './verificationCallbackContract.js';
 import { phoneVerificationCallbackErrorSchema, PHONE_VERIFICATION_CALLBACK_PROOF_MAX_BYTES, PHONE_VERIFICATION_CALLBACK_COMMAND_MAX_BYTES } from './verificationCallbackContract.js';
 import { createHmac } from 'node:crypto';
 import { z } from 'zod';
+import { phonePortfolioSchema, type PhonePortfolio } from './portfolio.js';
 import { phoneResultSmsAdmissionSchema, phoneResultSmsAdmissionReceiptSchema,
   type PhoneResultSmsAdmission, type PhoneResultSmsAdmissionReceipt } from './resultSmsContract.js';
 import { phoneInboundBillingRefSchema, type PhoneInboundBillingRef } from './inboundBilling.js';
@@ -176,6 +177,7 @@ export interface PrimaryClosedCall {
 }
 
 export interface PrimaryApiClient {
+  portfolio?(bindingId: string, signal?: AbortSignal): Promise<PhonePortfolio>;
   admitResultSms?(bindingId: string, input: PhoneResultSmsAdmission): Promise<PhoneResultSmsAdmissionReceipt>;
   readiness(callerNumber: string): Promise<PrimaryReadiness>;
   openCall(providerProof: PrimaryProviderProof, callAssignment?: PhoneCallAssignment): Promise<PrimaryCall>;
@@ -255,7 +257,7 @@ function createTransport(options: PrimaryApiOptions) {
   return async (method: 'GET' | 'POST', path: string,
     body?: unknown, headers?: Record<string, string>, expectedStatus: number | readonly number[] = 200,
     harkCallAssignment = false, control?: {
-      signal?: AbortSignal; validateResponse?: (status: number, body: unknown) => void; callbackPrivateCall?: true;
+      signal?: AbortSignal; timeoutMs?: number; validateResponse?: (status: number, body: unknown) => void; callbackPrivateCall?: true;
     }): Promise<unknown> => {
     if (control?.signal?.aborted) throw new PrimaryApiError('request_failed');
     const callbackId = '[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
@@ -305,7 +307,7 @@ function createTransport(options: PrimaryApiOptions) {
         controller.abort();
         void reader?.cancel().catch(() => {});
         reject(new PrimaryApiError('request_timeout'));
-      }, timeoutMs);
+      }, Math.min(timeoutMs, control?.timeoutMs ?? timeoutMs));
     });
     const request = async () => {
       // One attempt. In particular, an uncertain POST must be recovered by its
@@ -843,6 +845,14 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
       const call = parseCall(await request('GET', `/calls/${bindingId}/context`, undefined, { ...bindingHeaders(bindingId), ...contextHeaders }));
       same(call.bindingId, bindingId);
       return remember(call);
+    },
+    async portfolio(bindingId, signal) {
+      const headers = bindingHeaders(bindingId);
+      const portfolio = parse(phonePortfolioSchema,
+        await request('GET', `/calls/${bindingId}/portfolio`, undefined, headers, 200, false,
+          { signal, timeoutMs: 2_000 }), 'invalid_response');
+      same(portfolio.bindingId, bindingId);
+      return portfolio;
     },
     async submit(bindingId, requestId, input) {
       const headers = bindingHeaders(bindingId);

@@ -12,6 +12,7 @@ import Twilio from 'twilio';
 import { createBrokerLiveSession, type BrokerLiveSession, type BrokerLiveSessionOptions } from '../live/session.js';
 import type { LiveTranscriptSnapshot } from '../live/session.js';
 import { createPrimaryApiClient, type PrimaryApiClient } from './primaryApi.js';
+import { createPortfolioContext, type PortfolioContext } from './portfolioContext.js';
 import { createPrimaryBackend, type BrokerDelegationRecord } from './backend.js';
 import { eligiblePhoneCallSchema, type EligibleContextClient } from './eligibleContext.js';
 import { createGenerationVoice, type GenerationVoiceOptions, type GenerationVoiceSession } from './generationVoice.js';
@@ -195,6 +196,14 @@ export function createBrokerServer(options: BrokerServerOptions) {
     event => console.info(JSON.stringify(event))) : undefined;
   const startupContexts = options.eligibleContext ? createInboundStartupContexts(options.eligibleContext,
     options.startupPageFreshMs === undefined ? {} : { freshMs: options.startupPageFreshMs }) : undefined;
+  const portfolios = new Map<string, PortfolioContext>();
+  const portfolioFor = (call: BrokerCall) => {
+    if (call.direction !== 'inbound' || !call.primary || call.endedAt || !primary.portfolio) return;
+    let context = portfolios.get(call.id);
+    if (!context) { context = createPortfolioContext(call.id, call.primary.bindingId, primary); portfolios.set(call.id, context); }
+    return context;
+  };
+  const stopPortfolio = (callId: string) => { portfolios.get(callId)?.stop(); portfolios.delete(callId); };
   const resolveHarkAssignment = options.resolveHarkAssignment ?? (config.harkApiBaseUrl
     ? createHarkAssignmentResolver({ apiBaseUrl: config.harkApiBaseUrl }) : undefined);
   const resolveNotificationAssignment = options.resolveNotificationAssignment ?? (config.harkApiBaseUrl
@@ -303,7 +312,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
     onApprovedTransport: call => preconnect?.begin(call),
     onTransportDiscard: (id, terminal) => terminal ? preconnect?.forget(id)
       : preconnect?.afterAdmissionError(id, store.get(id)?.inbound?.remote?.state === 'bound'),
-    onContext: (call, context, receivedAt) => startupContexts?.remember(call, context, receivedAt),
+    onContext: (call, context, receivedAt) => { startupContexts?.remember(call, context, receivedAt); portfolioFor(call); },
     fetchCall: sid => provider.calls(sid).fetch(), closeBound: async call => {
       // Media may have started while a provider/account read was in flight.
       // Its owner must finalize Live and capture before closing account admission.
@@ -317,6 +326,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
 
   function closePrimary(call: BrokerCall): Promise<void> {
     startupContexts?.discard(call.id);
+    stopPortfolio(call.id);
     preconnect?.forget(call.id);
     const inboundBound = call.inbound?.remote?.state === 'bound' ? call.inbound.remote : undefined;
     const bindingId = call.primary?.bindingId ?? inboundBound?.bindingId;
@@ -987,6 +997,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
     let live: BrokerLiveSession | undefined;
     let connectedSessionId: string | undefined;
     let backend: ReturnType<typeof createPrimaryBackend> | undefined;
+    let portfolioContext: PortfolioContext | undefined;
     let stopping = false;
     let stopPromise: Promise<void> | undefined;
     // Inbound admission ended without account media: the stream was handed back to its TwiML.
@@ -1158,6 +1169,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
     function stop(reason: string): Promise<void> {
       if (stopPromise) return stopPromise;
       stopping = true;
+      stopPortfolio(call.id);
       preconnect?.discard(call.id);
       clearTimeout(startTimer); clearTimeout(durationTimer);
       greeting?.cancel(); clearTimeout(greetingReleaseTimer); greetingHold = undefined;
@@ -1210,6 +1222,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
       if (!accepting) { void stop('service_shutdown'); return; }
       const bound = store.get(call.id)!;
       if (!bound.primary || (bound.inbound && !inbound.mediaAllowed(bound))) throw new Error('media_binding_unavailable');
+      portfolioContext = portfolioFor(bound);
       pendingBinds.delete(call.id);
       // Input sample 0 is the first caller frame Live receives: the greeting's end (now, if the
       // greeting is still playing), moved past any dropped held audio, and never before an
@@ -1281,6 +1294,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
         },
       };
       live = options.eligibleContext ? createGenerationVoice({ call: store.get(call.id)!, callDeadlineAt,
+        portfolioContext,
         apiKey: config.apiKey, voice: config.voice, store, primary,
         playbackState: () => carrierPlaybackState(!stopping && ws.readyState === WebSocket.OPEN,
           receipts.audibleSentBytes, receipts.audiblePlayedBytes, receipts.audibleClearedBytes),
@@ -1497,6 +1511,8 @@ export function createBrokerServer(options: BrokerServerOptions) {
     accepting = false;
     options.sms?.stop();
     startupContexts?.clear();
+    for (const context of portfolios.values()) context.stop();
+    portfolios.clear();
     preconnect?.close();
     // Freeze every saved wait before awaiting any in-flight begin/consume operation.
     for (const call of store.list()) if (call.inbound && !call.inbound.closure) inbound.stopLocal(call.id, 'service_shutdown');

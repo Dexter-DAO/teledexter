@@ -23,7 +23,7 @@ const speech = Buffer.alloc(160, 0x21).toString('base64');
 
 /** Live started while the person was talking: the frames are queued in the generation controller,
  * then replayed at 1.5x once Live is live. Returns the order of what reached the Live socket. */
-async function opening(t: TestContext, direction: 'inbound' | 'outbound', held: string[], greeted = true) {
+async function opening(t: TestContext, direction: 'inbound' | 'outbound', held: string[], greeted = true, onFrame?: () => void) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-opening-order-'));
   const store = new BrokerStore(directory);
   const reserved = direction === 'outbound'
@@ -47,6 +47,7 @@ async function opening(t: TestContext, direction: 'inbound' | 'outbound', held: 
   const timeline: Array<{ type: string; audio?: string; content?: string; at: number }> = [];
   const send = transport.send.bind(transport);
   transport.send = event => {
+    if (event.type === 'session.input_audio.append') onFrame?.();
     const record = event as { type: string; audio?: string; content?: string };
     timeline.push({ type: record.type, ...(record.audio ? { audio: record.audio } : {}), ...(record.content ? { content: record.content } : {}), at: Date.now() });
     send(event);
@@ -95,6 +96,14 @@ test('outbound: held silence never delays the opening, and the opening keeps its
   assert.equal(f.instructions[0].content, brokerOpening('outbound', false, false, false, true));
   assert.ok(f.framesBefore <= 3, `the opening went out at activation (${f.framesBefore} frames before it)`);
   assert.equal(f.logs.some(event => event.event === 'broker_opening_after_caller_speech'), false);
+});
+
+test('slow synchronous frame handling cannot consume the silence backlog before the opening', async t => {
+  const realNow = Date.now; let frameTime = 0;
+  t.mock.method(Date, 'now', () => realNow() + frameTime);
+  const f = await opening(t, 'outbound', Array(50).fill(silence), true, () => { frameTime += 50; });
+  assert.ok(f.framesBefore <= 3, `opening preceded by ${f.framesBefore} frames`);
+  assert.equal(f.instructions.length, 1);
 });
 
 test('outbound without the clip: held speech still reaches Live first, and the spoken greeting answers it', async t => {

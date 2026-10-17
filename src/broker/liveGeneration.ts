@@ -130,6 +130,8 @@ export interface LiveGenerationOptions {
   /** One initial greeting, inside the post-open assertion operation. Must not call queued controller
    * methods; it may await inputDelivered() to let held caller input reach Live first. */
   onInitialActivation?(attachment: LiveGenerationAttachment): Promise<void>;
+  /** Optional context starts after activation and opening dispatch, without blocking input. */
+  onActivated?(attachment: LiveGenerationAttachment): void;
   /** Drain only source admissions already observed on this generation; the host deadline remains independent. */
   beforeRetire?(generationId: string): Promise<void>;
   onAudio(payload: string, attachment: LiveGenerationAttachment): void;
@@ -374,10 +376,11 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
   /** Sends the queued backlog in order at no more than paceRate x real time. Live
    * frames that arrive meanwhile join the tail (appendAudio), so order and the
    * contiguous sample accounting are unchanged; direct sends resume once empty. */
-  const drainInput = (check: () => void) => {
+  const drainInput = (check: () => void, maxFrames = Infinity) => {
     clearTimeout(pacer); pacer = undefined;
     pacing ??= { startedAt: now(), sentMs: 0 };
-    while (queued.length) {
+    let frames = 0;
+    while (queued.length && frames < maxFrames) {
       const frame = queued[0];
       const frameMs = frame.bytes / 8;
       // The first frame of a window is always allowed; afterwards stay within real time.
@@ -387,6 +390,7 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
       queued.shift(); queuedBytes -= frame.bytes;
       if (!sendInput(frame)) { stopPacing(); throw new LiveGenerationError('input_transport_refused'); }
       pacing.sentMs += frameMs;
+      frames++;
     }
     if (!queued.length) { stopPacing(); save(); return; }
     const wait = Math.max(1, Math.ceil((pacing.sentMs + queued[0].bytes / 8) / paceRate - (now() - pacing.startedAt)));
@@ -399,9 +403,9 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
     }, wait);
     pacer.unref?.();
   };
-  const flushInput = (check: () => void) => {
+  const flushInput = (check: () => void, maxFrames = Infinity) => {
     if (!queued.length) { stopPacing(); save(); return; }
-    drainInput(check);
+    drainInput(check, maxFrames);
   };
   const transient = (error: unknown): error is PrimaryApiError => error instanceof PrimaryApiError
     && (error.code === 'request_timeout' || error.code === 'request_failed'
@@ -530,14 +534,17 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
         current.state = 'active'; activeId = current.generationId; state.phase = 'active'; activated = true;
         state.deliveryAttachment = { generationId: current.generationId, sessionId: current.sessionId };
         save();
-        // No await between attachment and the complete replay. Publications
-        // queued behind this operation observe the entire input frontier.
-        flushInput(checkTransition);
+        // Dispatch the opening after at most one frame, even when synchronous
+        // persistence takes long enough to earn more pacing allowance. Held
+        // speech still drains through inputDelivered() before an outbound offer.
+        flushInput(checkTransition, allowOpening && options.onInitialActivation ? 1 : Infinity);
         // The assert, activation, input flush and initial append dispatch share one
         // operation. Later publications still perform their own current-context check.
         if (allowOpening && options.onInitialActivation)
           await wait(() => options.onInitialActivation!(attachment()));
-        return attachment();
+        const activeAttachment = attachment();
+        try { options.onActivated?.(activeAttachment); } catch { /* Optional context. */ }
+        return activeAttachment;
       }
       throw new LiveGenerationError('context_unavailable');
     } catch (error) {
