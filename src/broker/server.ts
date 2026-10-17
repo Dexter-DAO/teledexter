@@ -67,9 +67,15 @@ const GREETING_ACK_GRACE_MS = 1_500;
 const HELD_INPUT_MAX_BYTES = 120_000;
 /** Caller frame energy above this is speech (the threshold every caller-speech observation uses). */
 const CALLER_SPEECH_ENERGY = 0.012;
-/** Admission poll interval while a greeting stream waits for inbound approval: the pace of the
- * Pause-and-redirect hold loop it replaces, so the API sees the same status and begin rate. */
-const INBOUND_ADMISSION_POLL_MS = 1_000;
+/** Admission poll intervals while a greeting stream waits for inbound approval. Admission starts as
+ * the stream response leaves, which can race Twilio's pickup: the API's begin then refuses the
+ * still-ringing leg (call_not_active). Quick first retries make that miss cost 0.1-0.3 s instead of
+ * a full second; a longer wait settles at the 1 s pace of the hold redirects the stream replaced. */
+const INBOUND_ADMISSION_POLL_MS = [100, 200, 400, 1_000] as const;
+/** The wait before admission poll `poll` (0-based) of one greeting stream. */
+export function inboundAdmissionPollDelay(poll: number): number {
+  return INBOUND_ADMISSION_POLL_MS[Math.min(Math.max(0, poll), INBOUND_ADMISSION_POLL_MS.length - 1)];
+}
 /** Spoken before the provider hangup for stops the caller should hear explained. */
 const SPOKEN_STOPS: Record<string, string> = {
   voice_unavailable: 'My voice connection stopped working. Please try me again shortly.',
@@ -162,7 +168,8 @@ export interface BrokerServerOptions {
   /** Pre-rendered "Hey, it's Dexter. What can I do for you?" for inbound calls: the whole
    * opening; Live then waits for the caller. Omission retains the Live-spoken greeting. */
   inboundGreetingClip?: Buffer;
-  /** Admission poll interval for a greeting stream waiting on inbound approval (default 1 s). */
+  /** A fixed admission poll interval for a greeting stream waiting on inbound approval. The default
+   * backs off 100, 200 and 400 ms, then polls every 1 s (`inboundAdmissionPollDelay`). */
   inboundAdmissionPollMs?: number;
   /** Age up to which a binding response seeds Live without a second eligibility read
    * (default STARTUP_PAGE_FRESH_MS); 0 rechecks every page first. */
@@ -1299,7 +1306,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
      * redirect loop used to drive it). Live attaches when the binding and its context exist. */
     async function admitInbound(): Promise<void> {
       // The continuation's own admission counts as the first poll.
-      let polled = true;
+      let polled = true, waits = 0;
       for (;;) {
         if (stopping || released || live) return;
         const current = store.get(call.id)!;
@@ -1308,7 +1315,8 @@ export function createBrokerServer(options: BrokerServerOptions) {
         if (inbound.busy(call.id)) { await inbound.idle(call.id); continue; }
         if (polled) {
           polled = false;
-          await new Promise<void>(resolve => { setTimeout(resolve, options.inboundAdmissionPollMs ?? INBOUND_ADMISSION_POLL_MS).unref(); });
+          const delay = options.inboundAdmissionPollMs ?? inboundAdmissionPollDelay(waits++);
+          await new Promise<void>(resolve => { setTimeout(resolve, delay).unref(); });
           continue;
         }
         polled = true;

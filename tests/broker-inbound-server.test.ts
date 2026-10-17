@@ -10,7 +10,7 @@ import { inboundBillingSummary, inboundCallEndedSchema, inboundStatusEndedSchema
 import { createInboundBillingLifecycle } from '../src/broker/inboundBillingLifecycle.js';
 import Twilio from 'twilio';
 import { WebSocket } from 'ws';
-import { createBrokerServer } from '../src/broker/server.js';
+import { createBrokerServer, inboundAdmissionPollDelay } from '../src/broker/server.js';
 import { inboundBeginRef, type InboundBeginIdentity, type InboundOutcome } from '../src/broker/inboundContract.js';
 import { BrokerStore, type BrokerCall } from '../src/broker/store.js';
 import type { BrokerConfig } from '../src/broker/config.js';
@@ -458,7 +458,7 @@ test('incoming legacy admission without frozen billing reference never posts a n
       callSid: call.callSid!, termsDigest: 'a'.repeat(64) } } as InboundOutcome }), /binding changed/);
 });
 
-async function fixture(t: test.TestContext, options: { selected?: boolean; retained?: BrokerCall; initialRemote?: InboundOutcome; eligible?: boolean; billing?: boolean; billingUrl?: string; duration?: string; preconnect?: boolean; replaceFirstGeneration?: boolean; greetingClip?: Buffer; outboundClipOnly?: Buffer; startupPageFreshMs?: number } = {}) {
+async function fixture(t: test.TestContext, options: { selected?: boolean; retained?: BrokerCall; initialRemote?: InboundOutcome; eligible?: boolean; billing?: boolean; billingUrl?: string; duration?: string; preconnect?: boolean; replaceFirstGeneration?: boolean; greetingClip?: Buffer; outboundClipOnly?: Buffer; startupPageFreshMs?: number; defaultAdmissionPoll?: boolean } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-inbound-http-'));
   if (options.retained) fs.writeFileSync(path.join(dir, 'calls.json'), JSON.stringify({ version: 1, calls: { [options.retained.id]: options.retained } }));
   const store = new BrokerStore(dir);
@@ -501,6 +501,7 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
     startupFetch: 0, contextAssert: 0, opening: 0 };
   const openings: string[] = [];
   const appended: string[] = [];
+  const beginTimes: number[] = [];
   const context = () => {
     seen.context++;
     if (!authority) throw new Error('authority_unavailable');
@@ -510,7 +511,7 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
   };
   const primary = {
     async beginInbound(begin: InboundBeginIdentity) {
-      seen.begin++;
+      seen.begin++; beginTimes.push(Date.now());
       if (beginGate) await beginGate;
       assert.ok(store.list()[0].inbound!.continuation || store.list()[0].inbound!.earlyAdmission);
       assert.deepEqual(begin.providerProof, store.list()[0].inbound!.begin.providerProof);
@@ -566,7 +567,7 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
     };
   }
   const broker = createBrokerServer({ config, store, primary, provider: { calls: provider } as unknown as ReturnType<typeof Twilio>,
-    inboundAdmissionPollMs: 5,
+    ...(options.defaultAdmissionPoll ? {} : { inboundAdmissionPollMs: 5 }),
     ...(options.startupPageFreshMs === undefined ? {} : { startupPageFreshMs: options.startupPageFreshMs }),
     ...(options.greetingClip ? { inboundGreetingClip: options.greetingClip } : {}),
     ...(options.outboundClipOnly ? { greetingClip: options.outboundClipOnly } : {}),
@@ -622,7 +623,7 @@ async function fixture(t: test.TestContext, options: { selected?: boolean; retai
     }
   }
   t.after(async () => { releaseBegin?.(); await close(); fs.rmSync(dir, { recursive: true, force: true }); });
-  return { broker, store, base, config, params, seen, openings, appended, lifecycle, webhook, close, provider, billing, transports,
+  return { broker, store, base, config, params, seen, openings, appended, lifecycle, webhook, close, provider, billing, transports, beginTimes,
     gateBegin() { beginGate = new Promise<void>(resolve => { releaseBegin = resolve; }); return () => releaseBegin!(); },
     gateConsume() { consumeGate = new Promise<void>(resolve => { releaseConsume = resolve; }); return () => releaseConsume!(); },
     gateAssert() { assertGate = new Promise<void>(resolve => { releaseAssert = resolve; }); return () => releaseAssert!(); },
@@ -1224,4 +1225,25 @@ test('a stream that starts after a refusal plays no greeting and hands the leg s
   assert.equal(f.store.get(call.id)!.failure, undefined);
   const next = await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text();
   assert.match(next, /<Hangup/);
+});
+
+test('a begin that races the pickup is retried after 100 ms, then 200 and 400 ms, then every second', async t => {
+  assert.deepEqual([0, 1, 2, 3, 4, 9].map(inboundAdmissionPollDelay), [100, 200, 400, 1_000, 1_000, 1_000]);
+  const f = await fixture(t, { greetingClip: greetingFixtureClip, defaultAdmissionPoll: true });
+  await (await f.webhook('/broker/incoming-call')).text();
+  const call = f.store.list()[0];
+  // The API's begin refuses a leg Twilio has not picked up yet (call 28a563f6's continuation arrived while it rang).
+  f.beginError(new PrimaryApiError('http_error', 403, { code: 'call_not_active', retryable: false }));
+  assert.match(await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text(), /<Connect><Stream/);
+  const g = await greetingMedia(f, call); t.after(() => g.ws.close());
+  for (let i = 0; i < 800 && f.beginTimes.length < 5; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  f.beginError();
+  assert.equal(f.beginTimes.length, 5, 'one refused begin from the continuation, then one per poll');
+  const gaps = f.beginTimes.slice(1).map((at, index) => at - f.beginTimes[index]);
+  // Each gap is the poll wait (plus, for the first, the media start that begins the loop).
+  for (const [index, [low, high]] of [[95, 600], [195, 600], [395, 900], [995, 1_600]].entries())
+    assert.ok(gaps[index] >= low && gaps[index] <= high, `gap ${index + 1} was ${gaps[index]} ms`);
+  for (let i = 0; i < 400 && f.remote()?.state !== 'pending'; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(f.remote()?.state, 'pending', 'the next begin admits the answered leg');
+  assert.equal(f.store.get(call.id)!.inbound!.localStop, undefined);
 });
