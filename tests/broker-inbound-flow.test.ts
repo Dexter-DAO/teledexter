@@ -35,6 +35,8 @@ async function fixture(t: test.TestContext) {
   let remote: InboundOutcome | undefined;
   let beginIdentity: InboundBeginIdentity | undefined;
   let providerStatus = 'in-progress';
+  let providerGate: ReturnType<typeof deferred<void>> | undefined;
+  let providerFailure: Error | undefined;
   let contextAllowed = true;
   let loseBegin = false, loseConsume = false, loseClose = false;
   let includeOutcome = false;
@@ -104,7 +106,10 @@ async function fixture(t: test.TestContext) {
   function build() {
     return createInboundFlow({ config, store, primary: primary as unknown as PrimaryApiClient, now: () => clock,
       onTiming: event => timings.push(event),
-      async fetchCall(sid) { counts.provider++; assert.equal(sid, params.CallSid); return { sid, accountSid: config.twilioAccountSid,
+      async fetchCall(sid) { counts.provider++; assert.equal(sid, params.CallSid);
+        if (providerGate) await providerGate.promise;
+        if (providerFailure) { const failure = providerFailure; providerFailure = undefined; throw failure; }
+        return { sid, accountSid: config.twilioAccountSid,
         direction: 'inbound', from: params.From, to: params.To, status: providerStatus }; },
       async closeBound(call) {
         counts.closeout++;
@@ -119,7 +124,7 @@ async function fixture(t: test.TestContext) {
     });
   }
   let flow = build();
-  t.after(async () => { beginGate?.resolve(); contextGate?.resolve(); await flow.drain(); store.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  t.after(async () => { beginGate?.resolve(); contextGate?.resolve(); providerGate?.resolve(); await flow.drain(); store.close(); fs.rmSync(directory, { recursive: true, force: true }); });
   return {
     get flow() { return flow; }, get store() { return store; }, config, params, original, proof, counts, timings, directory,
     clock: () => clock, advance: (ms: number) => { clock += ms; },
@@ -140,6 +145,8 @@ async function fixture(t: test.TestContext) {
     gateBegin() { beginGate = deferred<void>(); return beginGate; },
     gateContext() { contextGate = deferred<void>(); return contextGate; },
     providerStatus(status: string) { providerStatus = status; },
+    gateProvider() { providerGate = deferred<void>(); return providerGate; },
+    failProviderOnce(error: Error) { providerFailure = error; },
     restart() { store.close(); store = new BrokerStore(directory); flow = build(); },
   };
 }
@@ -307,12 +314,61 @@ test('signed continuation cannot move caller or replace original proof', async t
   assert.equal(f.counts.consume, 0);
 });
 
-test('provider terminal before consumption closes waiting without account access', async t => {
+test('a leg that ended while its approval is consumed: the API refuses the consume and the wait is cancelled', async t => {
+  const f = await fixture(t); const first = await f.begin(); f.approve(); f.providerStatus('completed');
+  // The API's consume makes its own active-call check and refuses before binding.
+  f.consumeError(new PrimaryApiError('http_error', 403, { code: 'call_not_active', retryable: false }), true);
+  const ended = await f.flow.tick(first.id);
+  assert.equal(ended.status, 'completed'); assert.equal(ended.inbound!.localStop?.reason, 'provider_terminal');
+  assert.equal(ended.inbound!.remote?.state, 'cancelled');
+  assert.equal(f.counts.consume, 1); assert.equal(f.counts.context, 0); assert.equal(ended.primary, undefined);
+});
+
+test('a leg that ended while a consume still committed closes that binding without recording its context', async t => {
   const f = await fixture(t); const first = await f.begin(); f.approve(); f.providerStatus('completed');
   const ended = await f.flow.tick(first.id);
-  assert.equal(ended.status, 'completed');
-  assert.equal(ended.inbound!.remote?.state, 'cancelled');
-  assert.equal(f.counts.consume, 0); assert.equal(f.counts.context, 0);
+  assert.equal(ended.status, 'completed'); assert.equal(ended.inbound!.localStop?.reason, 'provider_terminal');
+  assert.equal(ended.inbound!.remote?.state, 'bound'); assert.equal(ended.inbound!.closure?.state, 'closed');
+  assert.equal(ended.primary, undefined, 'context is recorded only when the provider check passes too');
+  assert.equal(f.flow.mediaAllowed(ended), false);
+  assert.equal(f.counts.consume, 1); assert.equal(f.counts.close, 1);
+});
+
+test('the provider check runs alongside the consume; context is recorded only once both pass', async t => {
+  const f = await fixture(t); f.includeOutcome();
+  const first = await f.begin(); f.approve();
+  const gate = f.gateProvider();
+  const ticking = f.flow.tick(first.id);
+  for (let i = 0; i < 100 && f.store.get(first.id)!.inbound!.remote?.state !== 'bound'; i++) await new Promise(resolve => setImmediate(resolve));
+  // The consume returned (bound, context in hand) while the provider read is still out.
+  assert.equal(f.counts.provider, 1); assert.equal(f.counts.consume, 1);
+  assert.equal(f.store.get(first.id)!.inbound!.remote?.state, 'bound');
+  assert.equal(f.store.get(first.id)!.primary, undefined);
+  assert.equal(f.flow.mediaAllowed(f.store.get(first.id)!), false);
+  gate.resolve();
+  const admitted = await ticking;
+  assert.ok(f.flow.mediaAllowed(admitted)); assert.equal(admitted.primary?.bindingId, (admitted.inbound!.remote as { bindingId: string }).bindingId);
+  assert.equal(f.counts.provider, 1); assert.equal(f.counts.consume, 1); assert.equal(f.counts.context, 1);
+  const started = f.timings.filter(event => event.phase === 'started').map(event => event.stage);
+  assert.ok(started.indexOf('open_context') >= 0 && started.indexOf('provider_identity') >= 0);
+  const providerDone = f.timings.findIndex(event => event.stage === 'provider_identity' && event.phase === 'completed');
+  const consumeStart = f.timings.findIndex(event => event.stage === 'open_context' && event.phase === 'started');
+  assert.ok(consumeStart < providerDone, 'the consume starts before the provider read finishes');
+});
+
+test('a failed provider read after the consume leaves the binding unused until the next poll passes the check', async t => {
+  const f = await fixture(t); f.includeOutcome();
+  const first = await f.begin(); f.approve();
+  f.failProviderOnce(new Error('provider_read_unavailable'));
+  const unused = await f.flow.tick(first.id);
+  assert.equal(unused.inbound!.remote?.state, 'bound'); assert.equal(unused.primary, undefined);
+  assert.equal(f.flow.mediaAllowed(unused), false);
+  assert.equal(unused.failure?.message, 'provider_read_unavailable');
+  assert.equal(unused.inbound!.localStop, undefined, 'a provider read failure does not end the wait');
+  const admitted = await f.flow.tick(first.id);
+  assert.ok(f.flow.mediaAllowed(admitted));
+  assert.equal(f.counts.consume, 1); assert.equal(f.counts.provider, 2);
+  assert.equal(f.counts.context, 2, 'the next poll reads context again after its own provider check');
 });
 
 test('a local stop during context retrieval wins over the late private reply', async t => {

@@ -975,14 +975,30 @@ test('duplicate approved continuations share the original transport and account 
 });
 
 for (const refusal of ['unapproved', 'wrong-provider', 'provider-ended'] as const)
-  test(`inbound preconnect refuses ${refusal} before opening any socket`, async t => {
+  test(`an ${refusal} admission records no context and sends no command to any Live socket`, async t => {
     const f = await fixture(t, { eligible: true, preconnect: true });
     await (await f.webhook('/broker/incoming-call')).text(); await f.waitForAdmission();
     if (refusal !== 'unapproved') f.approve();
     if (refusal === 'wrong-provider') f.wrongProviderIdentity();
     if (refusal === 'provider-ended') f.providerEnded();
     const call = f.store.list()[0]; await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text();
-    assert.equal(f.transports.length, 0); assert.equal(f.seen.consume, 0);
+    await f.settle();
+    // The broker's provider check runs alongside the API's consume; context needs both to pass.
+    assert.equal(f.seen.consume, refusal === 'unapproved' ? 0 : 1);
+    const saved = f.store.get(call.id)!;
+    assert.equal(saved.primary, undefined, 'no account context is recorded');
+    assert.equal(f.seen.voice, 0);
+    assert.ok(f.transports.every(transport => transport.sent.length === 0), 'no command on any Live socket');
+    if (refusal === 'provider-ended') {
+      assert.equal(saved.inbound!.localStop?.reason, 'provider_terminal');
+      assert.equal(saved.inbound!.closure?.state, 'closed', 'the binding made alongside the check is closed');
+      assert.ok(f.transports.every(transport => transport.terminated === 1));
+    }
+    if (refusal === 'wrong-provider') {
+      assert.equal(saved.inbound!.remote?.state, 'bound'); assert.equal(saved.failure?.message, 'inbound_provider_identity_mismatch');
+      await f.broker.maintain(); // The next poll checks the provider again before any context read.
+      assert.equal(f.store.get(call.id)!.primary, undefined); assert.equal(f.seen.context, 1);
+    }
   });
 
 for (const failure of ['consume', 'early-error', 'early-close', 'media-token', 'revoked', 'hangup', 'shutdown'] as const)

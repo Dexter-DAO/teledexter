@@ -2,7 +2,7 @@ import type { BrokerConfig } from './config.js';
 import { PrimaryApiError, type PrimaryApiClient, type PrimaryCall } from './primaryApi.js';
 import type { InboundOutcome } from './inboundContract.js';
 import { BrokerStore, type BrokerCall, terminalCallStatuses } from './store.js';
-import { verifyTwilio, type ProviderCallProof } from './phone.js';
+import { safeFailure, verifyTwilio, type ProviderCallProof } from './phone.js';
 import { createHash } from 'node:crypto';
 import { createInboundAttemptTiming, type InboundTimingSink } from './inboundTiming.js';
 import { INBOUND_ENROLLMENT_RESPONSE_PATH, enrollmentCompletionInputSchema, enrollmentCommand,
@@ -209,28 +209,25 @@ export function createInboundFlow(options: InboundFlowOptions) {
     }
     if (now() >= Date.parse(call.inbound!.waitUntil) && !bound(call)) { stopLocal(id, 'broker_cancelled'); return settle(id); }
     if (call.inbound!.remote?.state === 'pending') return call;
-    const observed = await timing.measure('provider_identity', () => observe(call));
-    call = saved(id);
-    if (terminalCallStatuses.has(observed.status as BrokerCall['status'])) {
-      store.update(id, { status: observed.status as BrokerCall['status'], endedAt: call.endedAt ?? timestamp() });
+    // The broker's own provider check: a leg that ended stops the wait (and closes any binding);
+    // account context is recorded only for a leg in progress.
+    const providerEnded = (observed: InboundProviderCall): Promise<BrokerCall> => {
+      store.update(id, { status: observed.status as BrokerCall['status'], endedAt: saved(id).endedAt ?? timestamp() });
       stopLocal(id, 'provider_terminal'); return settle(id);
-    }
-    if (stopped(call)) return settle(id);
-    if (call.mediaStartedAt) return call;
-    if (observed.status !== 'in-progress') return call;
+    };
+    const ended = (observed: InboundProviderCall) => terminalCallStatuses.has(observed.status as BrokerCall['status']);
     let context: PrimaryCall;
-    try {
-      const receipt = bound(call);
-      if (receipt) {
-        if (receipt.callState === 'closed' || now() >= Date.parse(call.inbound!.mediaStartBy!)) {
-          stopLocal(id, receipt.callState === 'closed' ? 'binding_closed' : 'media_start_expired'); return settle(id);
-        }
-        context = await timing.measure('refresh_context', () => primary.getContext(receipt.bindingId));
-      } else if (call.inbound!.remote?.state === 'approved') {
-        options.onApprovedTransport?.(call);
-        store.transitionInbound(id, { type: 'consume_attempted', observedAt: timestamp() });
-        const approvalRef = call.inbound!.remote.approvalRef;
-        context = await timing.measure('open_context', () => primary.openInboundCall!(call.inbound!.begin.providerProof, approvalRef));
+    const approved = !bound(call) && call.inbound!.remote?.state === 'approved' ? call.inbound!.remote : undefined;
+    if (approved) {
+      // The API's consume makes the same active-call check (it refuses a leg that is not in progress),
+      // so the broker's own provider read runs alongside it rather than before it. The context is
+      // recorded, and Live can attach, only when both pass.
+      const providerCheck = timing.measure('provider_identity', () => observe(call));
+      void providerCheck.catch(() => {}); // Awaited on every path below.
+      options.onApprovedTransport?.(call);
+      store.transitionInbound(id, { type: 'consume_attempted', observedAt: timestamp() });
+      try {
+        context = await timing.measure('open_context', () => primary.openInboundCall!(call.inbound!.begin.providerProof, approved.approvalRef));
         // The negotiated response carries the same persisted outcome as recovery.
         // Older APIs and uncertain replies retain the original recovery path.
         const recovered = context.inboundOutcome
@@ -238,11 +235,41 @@ export function createInboundFlow(options: InboundFlowOptions) {
         if (recovered.state === 'absent') throw new Error('inbound_binding_outcome_unavailable');
         call = record(id, recovered);
         if (!bound(call)) throw new Error('inbound_binding_outcome_unavailable');
-      } else return call;
-    } catch (error) {
-      // A lost consume/context reply can hide a committed binding. Retain the attempt and
-      // recover its context-free outcome on the next iteration before any further action.
-      throw error;
+      } catch (error) {
+        // A lost consume/context reply can hide a committed binding. Retain the attempt and
+        // recover its context-free outcome on the next iteration before any further action.
+        // A leg that ended meanwhile stops the wait, as when the provider check ran first.
+        const observed = await providerCheck.catch(() => undefined);
+        if (observed && ended(observed)) return providerEnded(observed);
+        throw error;
+      }
+      let observed: InboundProviderCall;
+      try { observed = await providerCheck; }
+      catch (error) {
+        // The new binding stays unused: no context is recorded, so Live cannot attach. The next
+        // poll reads the provider again before reading this binding's context.
+        store.update(id, { failure: safeFailure(error) });
+        return saved(id);
+      }
+      if (ended(observed)) return providerEnded(observed);
+      call = saved(id);
+      if (stopped(call)) return settle(id);
+      if (call.mediaStartedAt) return call;
+      // Bound but not yet in progress: the next poll checks again and refreshes its context.
+      if (observed.status !== 'in-progress') return call;
+    } else {
+      const observed = await timing.measure('provider_identity', () => observe(call));
+      call = saved(id);
+      if (ended(observed)) return providerEnded(observed);
+      if (stopped(call)) return settle(id);
+      if (call.mediaStartedAt) return call;
+      if (observed.status !== 'in-progress') return call;
+      const receipt = bound(call);
+      if (!receipt) return call;
+      if (receipt.callState === 'closed' || now() >= Date.parse(call.inbound!.mediaStartBy!)) {
+        stopLocal(id, receipt.callState === 'closed' ? 'binding_closed' : 'media_start_expired'); return settle(id);
+      }
+      context = await timing.measure('refresh_context', () => primary.getContext(receipt.bindingId));
     }
     call = saved(id);
     if (stopped(call)) return settle(id);
