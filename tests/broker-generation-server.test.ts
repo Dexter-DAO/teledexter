@@ -68,7 +68,7 @@ test('successor registration/context crosses actual HTTP with negotiated full me
   const legacy = createPrimaryApiClient(options);
   await legacy.openCall(proof);
   assert.equal(requests.at(-1)!.headers['x-dexter-phone-context-version'], undefined);
-  assert.throws(() => createPrimaryApiClient({ ...options, contextProtocol: { version: 'unknown', parse: value => value } } as never));
+  assert.throws(() => createPrimaryApiClient({ ...options, contextProtocol: { version: 'unknown', parse: (value: unknown) => value } } as never));
 });
 
 async function host(t: test.TestContext, slowClose = false, questionMode = false, boundedCleanup = false,
@@ -257,6 +257,26 @@ test('a temporary context failure during a completed request preserves the call,
   assert.notEqual(f.posts[1].requestId, original.requestId);
   assert.equal(f.providerEnds(), 0);
   assert.equal(f.opening.length, 1);
+});
+
+test('call transcript logs once after generation cleanup, including its final fragments', async t => {
+  const logs: string[] = [];
+  t.mock.method(console, 'info', (message: string) => { if (message.startsWith('CALL ')) logs.push(message); });
+  const f = await host(t, true);
+  f.ws.close();
+  await until(() => f.providerEnds() === 1);
+  assert.deepEqual(logs, [], 'the final transcript is not saved while cleanup is stalled');
+  const voice = f.voices[0]!;
+  voice.captions.revision = 1;
+  voice.captions.fragments = [{ eventId: 'last-words', role: 'assistant', text: ' Goodbye.', startMs: 1, endMs: 20, sequence: 1 }];
+  voice.options.onTranscript(voice.captions);
+  f.finishSlow();
+  await until(() => logs.length === 1);
+  const { formatCallTranscript } = await import('../src/broker/callTranscript.js');
+  assert.equal(logs[0], formatCallTranscript(f.store.get(f.callId)!));
+  assert.match(logs[0], /\nDEXTER: Goodbye\.$/);
+  await f.broker.maintain();
+  assert.equal(logs.length, 1);
 });
 
 test('actual host hangup starts before a deliberately stalled generation cleanup', async t => {

@@ -2,15 +2,32 @@ import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import dotenv from 'dotenv';
 import { callContinuationPatch } from '../src/broker/callContinuation.js';
+import { formatCallTranscript } from '../src/broker/callTranscript.js';
+import type { BrokerCall } from '../src/broker/store.js';
 
 dotenv.config({ path: process.env.BROKER_ENV_FILE || '.env' });
 const [command = 'status', ...args] = process.argv.slice(2);
 const value = (flag: string) => { const index = args.indexOf(flag); return index < 0 ? undefined : args[index + 1]; };
+if (command === 'transcript') {
+  const id = value('--id');
+  const stateDir = process.env.BROKER_STATE_DIR;
+  const journal = value('--journal') ?? (stateDir ? `${stateDir}/calls.json` : undefined);
+  if (!id || !journal) throw new Error('Use transcript --id UUID [--journal /path/to/calls.json]');
+  // Read-only, like the journey report: never acquire the broker writer lock.
+  const state = JSON.parse(fs.readFileSync(journal, 'utf8')) as { version: number; calls: Record<string, BrokerCall> };
+  if (state.version !== 1 || !state.calls || Array.isArray(state.calls)) throw new Error('Invalid broker call journal');
+  const call = Object.hasOwn(state.calls, id) ? state.calls[id] : undefined;
+  if (!call || call.id !== id) throw new Error(`Call not found: ${id}`);
+  await new Promise<void>((resolve, reject) => {
+    process.stdout.write(formatCallTranscript(call) + '\n', error => error ? reject(error) : resolve());
+  });
+  process.exit(0);
+}
 const token = process.env.BROKER_CONTROL_TOKEN;
 if (!token) throw new Error('Configure BROKER_CONTROL_TOKEN');
 const origin = `http://127.0.0.1:${Number(process.env.BROKER_PORT || 3213)}`;
 const routes: Record<string, string> = { status: 'calls', call: 'calls', preflight: 'preflight', end: 'end', reconcile: 'reconcile' };
-if (!routes[command]) throw new Error('Use status, preflight, call --purpose TEXT, end --id UUID, or reconcile --id UUID');
+if (!routes[command]) throw new Error('Use status, preflight, call --purpose TEXT, end --id UUID, reconcile --id UUID, or transcript --id UUID [--journal PATH]');
 let body: Record<string, unknown> | undefined;
 if (command === 'call') {
   const purpose = value('--purpose');
