@@ -8,6 +8,7 @@ import { randomUUID } from 'node:crypto';
 import Twilio from 'twilio';
 import { WebSocket } from 'ws';
 import { createBrokerServer } from '../src/broker/server.js';
+import { formatCallTranscript } from '../src/broker/callTranscript.js';
 import { streamToken } from '../src/broker/phone.js';
 import { brokerOpening } from '../src/broker/instructions.js';
 import { beginBrokerPublication, settleBrokerPublication } from '../src/broker/publications.js';
@@ -18,6 +19,25 @@ import type { BrokerLiveSessionOptions } from '../src/live/session.js';
 import type { BrokerDependencyHealth } from '../src/broker/dependencyHealth.js';
 import { factFreshnessScenarios, historicalAccountMessages } from './fixtures/broker-fact-freshness.js';
 import { loadSharedAssignmentParser, sharedAssignmentParserConfigured } from './helpers/shared-assignment-parser.js';
+
+test('repeated terminal callbacks log one transcript for a call without media', async t => {
+  const logs: string[] = [];
+  t.mock.method(console, 'info', (message: string) => { if (message.startsWith('CALL ')) logs.push(message); });
+  const f = await fixture(t);
+  const response = await f.post('/internal/broker/calls', { requestId: randomUUID(), purpose: 'Fixture' });
+  assert.equal(response.status, 201);
+  await response.text();
+  const call = f.broker.store.list()[0];
+  const params = { AccountSid: f.config.twilioAccountSid, CallSid: f.sid, CallStatus: 'completed',
+    From: f.config.from, To: f.config.allowedTo[0] };
+  for (let i = 0; i < 2; i++) {
+    const status = await f.webhook(`/broker/status/${call.id}`, params);
+    assert.equal(status.status, 200);
+    await status.text();
+    if (i === 0) assert.deepEqual(logs, [formatCallTranscript(f.broker.store.get(call.id)!)]);
+  }
+  assert.equal(logs.length, 1);
+});
 
 async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; failVoice?: boolean; ambiguousDial?: boolean; deferVoiceReady?: boolean; history?: PrimaryContextMessage[]; assignmentResponse?: 'missing' | 'wrong'; assignmentParser?: { parse(value: unknown): unknown }; retainedCall?: BrokerCall; dependencyHealth?: () => Promise<BrokerDependencyHealth>; greetingClip?: Buffer; gateBind?: boolean } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-server-test-'));

@@ -138,6 +138,16 @@ A financial-action claim needs the corresponding Primary result and transaction 
 
 ## Close and recovery
 
+Ended calls print one readable transcript to the broker log after voice cleanup and the Primary closeout attempt. To print the same transcript from an existing journal without contacting the broker or taking its writer lock:
+
+```sh
+npm run broker -- transcript --id "$BROKER_CALL_ID"
+```
+
+It reads `$BROKER_STATE_DIR/calls.json` from the broker env file; pass `--journal /path/to/calls.json` to read a copy instead.
+
+The header uses the call's creation and end times. Consecutive fragments from the same speaker become one turn, including across Live generations. Each Primary line includes the submitted text, saved status, and elapsed time from first save to last status update (including delivery). Missing timing is shown as `unknown`. Logs are not replayed for calls already ended when the broker starts; the command can still read them. No transcript storage is added.
+
 These commands use the broker call UUID returned by `status`, not the Twilio SID:
 
 ```sh
