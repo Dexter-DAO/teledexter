@@ -31,7 +31,7 @@ function harness(verdict: (sentence: string, tasks: string) => JudgeVerdict | un
     record: trigger => triggers.push(trigger) });
   return { guardrail, judged, corrections, triggers };
 }
-const contradiction: JudgeVerdict = { contradicts: 0.97, kind: 'false_success', kindProbability: 0.9 };
+const contradiction: JudgeVerdict = { contradicts: 0.99, kind: 'false_success', kindProbability: 0.9 };
 const fine: JudgeVerdict = { contradicts: 0.02, kind: 'none', kindProbability: 0.95 };
 
 test('only sentences that can concern a request reach the judge', () => {
@@ -62,7 +62,7 @@ test('a false claim is corrected at once, tied to its delegation, in application
 });
 
 test('true sentences, unsure verdicts and judge failures never correct', async () => {
-  const verdicts: Array<JudgeVerdict | undefined | Error> = [fine, { contradicts: 0.85, kind: 'false_success', kindProbability: 0.9 },
+  const verdicts: Array<JudgeVerdict | undefined | Error> = [fine, { contradicts: 0.97, kind: 'false_success', kindProbability: 0.9 },
     { contradicts: 0.99, kind: 'stale_pending', kindProbability: 0.9 }, undefined, new Error('timeout')];
   const h = harness(() => { const next = verdicts.shift(); if (next instanceof Error) throw next; return next; });
   const t = transcript();

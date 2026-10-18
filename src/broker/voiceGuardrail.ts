@@ -68,7 +68,9 @@ export function createVoiceGuardrail(options: {
   now?: () => number;
 }) {
   const now = options.now ?? Date.now;
-  const threshold = options.threshold ?? 0.9;
+  // Calibrated offline on 402 scored bench sentences (evals/guardrail-calibrate.ts): at 0.98 no
+  // true sentence was corrected; at 0.9 two were. False corrections are failures.
+  const threshold = options.threshold ?? 0.98;
   const cursors = new Map<string, number>();
   let buffer: { sessionId: string; text: string; endMs: number } | undefined;
   let flushTimer: ReturnType<typeof setTimeout> | undefined;
