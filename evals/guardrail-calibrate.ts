@@ -122,19 +122,22 @@ await Promise.all(Array.from({ length: 8 }, async () => {
 fs.writeFileSync(cacheFile, JSON.stringify(cache));
 
 const kinds = new Set(['false_success', 'false_failure', 'phantom_step']);
-const fires = (verdict: JudgeVerdict | undefined, threshold: number, minKind: number) => Boolean(verdict
-  && verdict.contradicts >= threshold && kinds.has(verdict.kind) && verdict.kindProbability >= minKind);
+// Mirrors createVoiceGuardrail: a claimed success is let go when the judge finds it matches a
+// finished request's result (an open cancel beside a finished sale confused the contradiction).
+const fires = (verdict: JudgeVerdict | undefined, threshold: number, minKind: number, tasks = '') => Boolean(verdict
+  && verdict.contradicts >= threshold && kinds.has(verdict.kind) && verdict.kindProbability >= minKind
+  && !(verdict.kind === 'false_success' && /^\d+\. finished/m.test(tasks) && (verdict.supported ?? 0) >= 0.5));
 const positives = items.filter(item => item.label === 'false').length;
 console.log(`${items.length} task sentences (${positives} labelled false claims) from ${labels.join(', ')}; ${calls} new judge calls`);
 console.log('| contradicts >= | kind p >= | caught false claims | false corrections |');
 console.log('|---|---|---|---|');
 for (const threshold of [0.5, 0.7, 0.8, 0.9, 0.95, 0.98]) for (const minKind of [0, 0.6, 0.8]) {
-  const fired = items.filter(item => fires(item.verdict, threshold, minKind));
+  const fired = items.filter(item => fires(item.verdict, threshold, minKind, item.tasks));
   console.log(`| ${threshold} | ${minKind} | ${fired.filter(item => item.label === 'false').length}/${positives} | ${fired.filter(item => item.label === 'ok').length} |`);
 }
 const show = (item: Item) => `  [${item.run} S${item.s}] "${item.sentence}" -> ${item.verdict ? `${item.verdict.contradicts.toFixed(2)} ${item.verdict.kind} ${item.verdict.kindProbability.toFixed(2)}` : 'no verdict'}\n    tasks: ${item.tasks.replace(/\n/g, ' | ')}${item.why ? `\n    scorer: ${item.why}` : ''}`;
 console.log(`\nFalse corrections at ${chosen}:`);
-for (const item of items.filter(value => value.label === 'ok' && fires(value.verdict, chosen, 0))) console.log(show(item));
+for (const item of items.filter(value => value.label === 'ok' && fires(value.verdict, chosen, 0, value.tasks))) console.log(show(item));
 console.log(`\nMissed false claims at ${chosen}:`);
-for (const item of items.filter(value => value.label === 'false' && !fires(value.verdict, chosen, 0))) console.log(show(item));
+for (const item of items.filter(value => value.label === 'false' && !fires(value.verdict, chosen, 0, value.tasks))) console.log(show(item));
 console.log(`\njudge calls ${calls}, approx input tokens ${Math.round(inputChars / 4)}, approx $${(inputChars / 4 / 1e6 * 0.1).toFixed(3)}`);

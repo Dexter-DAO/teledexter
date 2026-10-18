@@ -61,17 +61,66 @@ test('a false claim is corrected at once, tied to its delegation, in application
   h.guardrail.stop();
 });
 
-test('true sentences, unsure verdicts and judge failures never correct', async () => {
-  const verdicts: Array<JudgeVerdict | undefined | Error> = [fine, { contradicts: 0.97, kind: 'false_success', kindProbability: 0.9 },
-    { contradicts: 0.99, kind: 'stale_pending', kindProbability: 0.9 }, undefined, new Error('timeout')];
-  const h = harness(() => { const next = verdicts.shift(); if (next instanceof Error) throw next; return next; });
+test('true sentences and unsure verdicts never correct; a judge failure on talk that is not about money is let go', async () => {
+  const bySentence = new Map<string, () => JudgeVerdict | undefined>([
+    ['It is still being placed.', () => fine],
+    ['It went through.', () => ({ contradicts: 0.97, kind: 'false_success', kindProbability: 0.9 })],
+    ['Still waiting on it.', () => ({ contradicts: 0.99, kind: 'stale_pending', kindProbability: 0.9 })],
+    ['I am on it.', () => undefined],
+    ['I am checking now.', () => { throw new Error('timeout'); }],
+  ]);
+  const h = harness(sentence => bySentence.get(sentence)!());
   const t = transcript();
   let at = 0;
-  for (const sentence of ['It is still being placed.', 'It went through.', 'Still waiting on it.', 'It sold.', 'It is done.'])
-    h.guardrail.observe(t.say('assistant', sentence, at += 5000), 'live_1');
-  await wait(30);
-  assert.equal(h.judged.length, 5);
+  for (const sentence of bySentence.keys()) h.guardrail.observe(t.say('assistant', sentence, at += 5000), 'live_1');
+  await wait(1400);
+  assert.equal(h.judged.length, 3 + 3 + 3, 'each failed judge call is retried twice');
   assert.deepEqual(h.corrections, []); assert.deepEqual(h.triggers, []);
+  h.guardrail.stop();
+});
+
+test('no verdict on a money claim while a request is open: retried, then a neutral correction goes out', async () => {
+  const h = harness(() => undefined);
+  const t = transcript();
+  h.guardrail.observe(t.say('assistant', 'Got it, canceling that.', 0), 'live_1');
+  await wait(1400);
+  assert.equal(h.judged.length, 3, 'one call and two retries');
+  assert.equal(h.corrections.length, 1);
+  assert.equal(h.corrections[0]!.delegationId, 'item_1');
+  assert.match(h.corrections[0]!.text, /^Correction: whether the caller's request went through comes only from Primary's result, which will be given to you as soon as it lands\./);
+  assert.ok(!h.corrections[0]!.text.includes(CALLER_WORDS));
+  assert.deepEqual(h.triggers.map(value => [value.kind, value.correction]), [['unverified', 'accepted']]);
+  h.guardrail.stop();
+});
+
+test('no verdict once every request has its result: nothing is open, so nothing is corrected', async () => {
+  const done: VoiceTask = { ...pending, status: 'finished', outcome: 'You sold about $4.00 of Apple.', progress: undefined };
+  const h = harness(() => undefined, () => [done]);
+  const t = transcript();
+  h.guardrail.observe(t.say('assistant', 'You sold about four dollars of Apple.', 0), 'live_1');
+  await wait(1400);
+  assert.deepEqual(h.corrections, []);
+  h.guardrail.stop();
+});
+
+test('a claimed success that matches a finished result is not corrected, even beside an open cancel', async () => {
+  const sale: VoiceTask = { ...pending, status: 'finished', outcome: 'You sold about $2.00 of Amazon stock. The sale is confirmed.', progress: undefined };
+  const cancel: VoiceTask = { ...pending, requestId: 'r2', delegationId: 'item_2', status: 'waiting_to_start', request: 'Cancel that.', progress: undefined };
+  const h = harness(() => ({ contradicts: 0.99, kind: 'false_success', kindProbability: 0.75, supported: 0.9 }), () => [sale, cancel]);
+  const t = transcript();
+  h.guardrail.observe(t.say('assistant', 'The sale did go through.', 0), 'live_1');
+  await wait(20);
+  assert.deepEqual(h.corrections, [], 'call 2 of the final bench: this correction was false');
+  h.guardrail.stop();
+});
+
+test('a judge that answers on retry is used normally', async () => {
+  let calls = 0;
+  const h = harness(() => (++calls === 1 ? undefined : fine));
+  const t = transcript();
+  h.guardrail.observe(t.say('assistant', 'Your Apple sale is being placed.', 0), 'live_1');
+  await wait(600);
+  assert.equal(calls, 2); assert.deepEqual(h.corrections, []);
   h.guardrail.stop();
 });
 
@@ -156,17 +205,19 @@ test('corrections stay within one append and carry statuses only', () => {
     'a finished request whose result is on its way is never called in progress');
 });
 
-test('the Decisions judge asks one predicate and one choice and reads both answers', async () => {
+test('the Decisions judge asks two predicates and one choice and reads every answer', async () => {
   let body: any;
   const judge = createDecisionsJudge('sk-test', (async (_url: string, init: RequestInit) => {
     body = JSON.parse(String(init.body));
     return new Response(JSON.stringify({ answers: [{ name: 'contradicts', type: 'predicate', probability: 0.93 },
+      { name: 'supported', type: 'predicate', probability: 0.04 },
       { name: 'kind', type: 'choice', choice: 'phantom_step', probabilities: [{ value: 'phantom_step', probability: 0.81 }] }] }), { status: 200 });
   }) as typeof fetch);
   assert.deepEqual(await judge({ tasks: '1. pending.', conversation: '', sentence: 'Buying it back now.' }),
-    { contradicts: 0.93, kind: 'phantom_step', kindProbability: 0.81 });
+    { contradicts: 0.93, kind: 'phantom_step', kindProbability: 0.81, supported: 0.04 });
   assert.equal(body.model, 'gpt-6-luna');
-  assert.deepEqual(body.questions.map((question: { type: string; name: string }) => [question.type, question.name]), [['predicate', 'contradicts'], ['choice', 'kind']]);
+  assert.deepEqual(body.questions.map((question: { type: string; name: string }) => [question.type, question.name]),
+    [['predicate', 'contradicts'], ['predicate', 'supported'], ['choice', 'kind']]);
   const failing = createDecisionsJudge('sk-test', (async () => new Response('{}', { status: 500 })) as unknown as typeof fetch);
   assert.equal(await failing({ tasks: '', conversation: '', sentence: 'x' }), undefined);
 });

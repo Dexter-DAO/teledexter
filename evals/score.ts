@@ -100,9 +100,10 @@ Also answer:
     }
     // Full provider evidence for every failed attempt: status, Date header and error body.
     process.stderr.write(`judge attempt ${attempt} failed: status=${response.status} date=${response.headers.get('date')} body=${JSON.stringify(body)}\n`);
-    if (attempt >= 5 || body?.error?.code === 'credit_balance_exhausted' || body?.error?.type === 'insufficient_quota')
-      throw new Error(`judge_failed_${response.status}_${body?.error?.code ?? ''}`);
-    await new Promise(resolve => setTimeout(resolve, 3000 * attempt));
+    // credit_balance_exhausted has shown up for a few minutes after a refill while other calls
+    // succeed: transient, retried with backoff like any 429 or 5xx.
+    if (attempt >= 6) throw new Error(`judge_failed_${response.status}_${body?.error?.code ?? ''}`);
+    await new Promise(resolve => setTimeout(resolve, 5000 * attempt));
   }
 }
 

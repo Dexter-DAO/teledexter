@@ -7,8 +7,10 @@ import type { VoiceTask } from './voiceTasks.js';
  * connection, asks a judge whether a sentence contradicts the application's task list, and
  * appends an application-authored correction. It never touches audio, playback or the call.
  */
-export type GuardrailKind = 'false_success' | 'false_failure' | 'phantom_step';
-export interface JudgeVerdict { contradicts: number; kind: GuardrailKind | 'none' | 'stale_pending'; kindProbability: number }
+export type GuardrailKind = 'false_success' | 'false_failure' | 'phantom_step' | 'unverified';
+export interface JudgeVerdict { contradicts: number; kind: GuardrailKind | 'none' | 'stale_pending'; kindProbability: number;
+  /** Whether the sentence matches the status or result of any listed request (absent: not asked). */
+  supported?: number }
 export type GuardrailJudge = (input: { tasks: string; conversation: string; sentence: string }) => Promise<JudgeVerdict | undefined>;
 export interface GuardrailTrigger {
   at: string; sessionId: string; delegationId: string | null; kind: GuardrailKind; probability: number;
@@ -17,6 +19,14 @@ export interface GuardrailTrigger {
 
 /** Words that can carry a claim about a request's progress or outcome. Anything else is ordinary conversation. */
 const TASK_TERMS = /\b(?:sell|sold|sale|selling|buy|bought|buying|purchase[ds]?|order(?:ed|s)?|trade[ds]?|trading|swap(?:ped|s)?|send|sent|sending|transfer(?:red|s)?|deposit(?:ed)?|withdr[ae]w\w*|cancel\w*|done|complete[ds]?|completing|finished|through|placed|placing|submitted|confirmed|executed|filled|failed|fail|started|starting|on it|working|in progress|pending|back|went|go ahead|checking)\b/i;
+/** A sentence about money moving: a trade, cancellation, transfer or balance. A judge that cannot
+ * answer about one of these must not let it stand while a request is unresolved. */
+const MONEY_STATE = /\b(?:sell|sold|sale|selling|buy|bought|buying|purchase[ds]?|order(?:ed|s)?|trade[ds]?|trading|swap(?:ped|s)?|send|sent|sending|transfer(?:red|s)?|deposit(?:ed)?|withdr[ae]w\w*|cancel\w*|balance|went through|confirmed|executed|filled)\b/i;
+export const concernsMoney = (sentence: string) => MONEY_STATE.test(sentence);
+const UNRESOLVED = new Set<VoiceTask['status']>(['starting', 'pending', 'waiting_to_start', 'waiting_for_answer', 'arriving']);
+/** Retries for a judge call that returned nothing (timeout, refusal, unreadable answer). */
+const JUDGE_RETRY_MS = [300, 900] as const;
+
 /** Whether a sentence can carry a claim about a request; only these reach the judge. */
 export const concernsTasks = (sentence: string) => TASK_TERMS.test(sentence);
 const CORRECTION_COOLDOWN_MS = 4_000;
@@ -33,6 +43,8 @@ const statusLine = (task: VoiceTask) => `${state[task.status]}${task.outcome ? `
 
 /** Application-authored and within one append: no caller words, only statuses and Primary's results. */
 export function correctionText(kind: GuardrailKind, tasks: readonly VoiceTask[]): string {
+  // No verdict on a money sentence while a request is open: neutral, it accuses nothing.
+  if (kind === 'unverified') return "Correction: whether the caller's request went through comes only from Primary's result, which will be given to you as soon as it lands. Until then, do not say or imply that it went through, failed, or was cancelled. If you just did, say in one short sentence that you don't have the result yet.";
   const what = kind === 'phantom_step' ? 'You described a step or request that has not been started.'
     : kind === 'false_success' ? 'You said something finished or went through that has not.'
       : 'You said something failed or did not happen that the task list shows otherwise.';
@@ -83,21 +95,37 @@ export function createVoiceGuardrail(options: {
     if (!concernsTasks(sentence)) return;
     const conversation = recent.slice(-8, -1).join('\n');
     const started = now();
-    let verdict: JudgeVerdict | undefined, tasks = truth(), described = describeTasks(tasks);
+    // A judge call that returns nothing (timeout, provider refusal, unreadable answer) is retried.
+    const ask = async (described: string): Promise<JudgeVerdict | undefined> => {
+      for (let attempt = 0; ; attempt++) {
+        try { const value = await options.judge({ tasks: described, conversation, sentence }); if (value) return value; }
+        catch { /* Retried below. */ }
+        if (stopped || attempt >= JUDGE_RETRY_MS.length) return undefined;
+        await new Promise<void>(resolve => { const timer = setTimeout(resolve, JUDGE_RETRY_MS[attempt]); timer.unref?.(); });
+      }
+    };
+    let verdict: JudgeVerdict | undefined, tasks = truth(), described = describeTasks(tasks), unanswered = false;
     // A result that lands while the judge runs makes its verdict stale: judge again on the new truth.
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try { verdict = await options.judge({ tasks: described, conversation, sentence }); }
-      catch { verdict = undefined; }
+    for (let round = 0; round < 2; round++) {
+      verdict = await ask(described);
+      unanswered = !verdict;
       tasks = truth();
       const latest = describeTasks(tasks);
       if (latest === described) break;
-      described = latest; verdict = undefined;
+      described = latest; verdict = undefined; unanswered = false;
     }
     const judgeMs = now() - started;
     options.onJudged?.({ sessionId, sentence, verdict, judgeMs });
-    if (stopped || !verdict || verdict.contradicts < threshold
-      || !['false_success', 'false_failure', 'phantom_step'].includes(verdict.kind)) return;
-    const kind = verdict.kind as GuardrailKind;
+    if (stopped) return;
+    // No verdict at all on a sentence about money while a request is open: never let it stand.
+    const fallback = !verdict && unanswered && concernsMoney(sentence) && tasks.some(task => UNRESOLVED.has(task.status));
+    // A claimed success that matches a finished request's result is never corrected: with an open
+    // cancel beside a finished sale, "the sale went through" was judged a contradiction.
+    const matchesResult = verdict?.kind === 'false_success' && tasks.some(task => task.status === 'finished')
+      && (verdict.supported ?? 0) >= 0.5;
+    if (!fallback && (!verdict || verdict.contradicts < threshold || matchesResult
+      || !['false_success', 'false_failure', 'phantom_step'].includes(verdict.kind))) return;
+    const kind: GuardrailKind = fallback ? 'unverified' : verdict!.kind as GuardrailKind;
     // The most recent request started on this provider session is the one being discussed.
     const task = [...tasks].reverse().find(value => value.sessionId === sessionId && value.delegationId);
     const delegationId = task?.delegationId ?? null;
@@ -109,7 +137,7 @@ export function createVoiceGuardrail(options: {
       try { status = (await options.correct(text, delegationId, sessionId)).status; } catch { status = 'unconfirmed'; }
     }
     const trigger: GuardrailTrigger = { at: new Date().toISOString(), sessionId, delegationId, kind,
-      probability: verdict.contradicts, sentence: sentence.slice(0, 300), judgeMs, correction: status };
+      probability: verdict?.contradicts ?? 0, sentence: sentence.slice(0, 300), judgeMs, correction: status };
     try { console.info(JSON.stringify({ event: 'broker_voice_guardrail', callId: options.callId, ...trigger })); } catch { /* Telemetry only. */ }
     try { options.record?.(trigger); } catch { /* Evidence only; never affects the call. */ }
   };
@@ -152,29 +180,46 @@ export type VoiceGuardrail = ReturnType<typeof createVoiceGuardrail>;
 
 export const JUDGE_INSTRUCTIONS = "Judge only DEXTER'S LATEST SENTENCE against the TASK LIST. True if it states or clearly implies something about one of the caller's requests that the task list does not support: that a request finished, succeeded, went through, was placed, sold, bought, sent or cancelled while the list shows it in progress, failed or never started; that it failed or did not happen while the list shows it succeeded; or that a step or request is running or has started that is not on the list (for example a buy-back that was never started). False for: conversation unrelated to the caller's requests; accurate restatements of the list or of a listed result; saying a listed request is in progress, being placed, being checked, or will be reported; promises to report back; questions or confirmation prompts to the caller; and portfolio or history facts that are not claimed as the result of a request on this call.";
 
+const SUPPORTED_INSTRUCTIONS = "True if DEXTER'S LATEST SENTENCE agrees with the TASK LIST: what it says about the caller's requests matches the status or the result of at least one listed request (any request on the list, not only the latest), or it makes no claim about a request. For example, \"the sale went through\" agrees when any listed request's result says the sale went through, even while a later request, such as a cancellation, is still in progress.";
+
 /** A small, fast judge: OpenAI Decisions API (gpt-6-luna), bounded by a short timeout. */
 export function createDecisionsJudge(apiKey: string, fetchImpl: typeof fetch = fetch, timeoutMs = 2_500,
   instructions = JUDGE_INSTRUCTIONS): GuardrailJudge {
   return async ({ tasks, conversation, sentence }) => {
-    const response = await fetchImpl('https://api.openai.com/v1/decisions', { method: 'POST',
+    let response: Response;
+    try { response = await fetchImpl('https://api.openai.com/v1/decisions', { method: 'POST',
       headers: { authorization: `Bearer ${apiKey}`, 'content-type': 'application/json' }, signal: AbortSignal.timeout(timeoutMs),
       body: JSON.stringify({ model: 'gpt-6-luna',
         input: `TASK LIST (application state; the only truth about the caller's requests on this call):\n${tasks}\n\nRECENT CONVERSATION:\n${conversation || '(none)'}\n\nDEXTER'S LATEST SENTENCE:\n"${sentence}"`,
         questions: [
           { type: 'predicate', name: 'contradicts', instructions },
+          { type: 'predicate', name: 'supported', instructions: SUPPORTED_INSTRUCTIONS },
           { type: 'choice', name: 'kind', instructions: "Classify DEXTER'S LATEST SENTENCE against the TASK LIST.", choices: [
             { value: 'none', description: 'No claim about a request, or a claim the task list supports.' },
             { value: 'false_success', description: 'Says a request finished, succeeded, went through or was cancelled, but the list does not show that.' },
             { value: 'false_failure', description: 'Says a request failed or did not happen, but the list shows it succeeded or still in progress.' },
             { value: 'phantom_step', description: 'Says a step or request is running or has started that the list does not contain.' },
-            { value: 'stale_pending', description: 'Says a request is still in progress, but the list shows it has finished.' }] }] }) });
-    if (!response.ok) return undefined;
+            { value: 'stale_pending', description: 'Says a request is still in progress, but the list shows it has finished.' }] }] }) }); }
+    catch (error) {
+      try { console.error(JSON.stringify({ event: 'broker_voice_guardrail_judge_failed', status: null,
+        error: (error as Error)?.name === 'TimeoutError' ? 'timeout' : 'request_failed' })); } catch { /* Telemetry only. */ }
+      return undefined;
+    }
+    if (!response.ok) {
+      let body = '';
+      try { body = (await response.text()).slice(0, 2000); } catch { /* Unreadable. */ }
+      try { console.error(JSON.stringify({ event: 'broker_voice_guardrail_judge_failed', status: response.status,
+        date: response.headers.get('date'), body })); } catch { /* Telemetry only. */ }
+      return undefined;
+    }
     const body = await response.json() as { answers?: Array<{ name?: string; type?: string; probability?: number; choice?: string;
       probabilities?: Array<{ value: string; probability: number }> }> };
     const contradicts = body.answers?.find(answer => answer.name === 'contradicts');
+    const supported = body.answers?.find(answer => answer.name === 'supported');
     const kind = body.answers?.find(answer => answer.name === 'kind');
     if (typeof contradicts?.probability !== 'number' || typeof kind?.choice !== 'string') return undefined;
     return { contradicts: contradicts.probability, kind: kind.choice as JudgeVerdict['kind'],
-      kindProbability: kind.probabilities?.find(value => value.value === kind.choice)?.probability ?? 0 };
+      kindProbability: kind.probabilities?.find(value => value.value === kind.choice)?.probability ?? 0,
+      ...(typeof supported?.probability === 'number' ? { supported: supported.probability } : {}) };
   };
 }
