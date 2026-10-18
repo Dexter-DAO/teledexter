@@ -20,7 +20,8 @@ import type { InboundBeginIdentity } from './inboundContract.js';
 import type { PrimaryCall } from './primaryApi.js';
 import { primaryHarkReceiptBindingFromCall, reducePrimaryHarkReceiptOutbox, validatePrimaryHarkReceiptOutbox,
   type PrimaryHarkReceiptBinding, type PrimaryHarkReceiptCommand, type PrimaryHarkReceiptOutbox } from './harkPrimaryReceiptOutbox.js';
-import { validateBrokerAdmissionRefusals, type BrokerDelegationRecord } from './backend.js';
+import { validateBrokerAdmissionRefusals, terminal as terminalDelegation, type BrokerDelegationRecord } from './backend.js';
+import { createOverlayWriter, nodeOverlayFileSystem, type OverlayBody, type OverlayFileSystem, type OverlayWriter } from './journalOverlay.js';
 import { liveGenerationJournalSchema, type LiveGenerationJournal, type ContextReadFailure, type StatusContextRefresh } from './liveGeneration.js';
 import { historyVersionSchema } from './eligibleContext.js';
 import { callContinuationPatch, assertCallContinuationReplay, requestDeliveryRequestForContinuation, validateCallContinuation, type CallContinuation } from './callContinuation.js';
@@ -395,6 +396,36 @@ function assertHarkReceiptUpdate(previous: BrokerCall, next: BrokerCall): void {
 }
 
 interface State { version: 1; calls: Record<string, BrokerCall> }
+type GenerationTranscript = LiveGenerationJournal['segments'][number]['transcript'];
+/** Live transcripts newer than the journal: in memory at once, on disk within one coalesced write. */
+interface Observation { seq: number; transcript?: unknown; transcriptRevision?: number; generations: Map<string, GenerationTranscript> }
+
+/** How long an ended call must be quiet before it can leave calls.json. */
+export const SETTLED_QUIET_MS = 30 * 60_000;
+/** A call no later work will change: ended and quiet, its Primary binding closed, its transcript
+ * captured, and nothing left to deliver or retry. Anything that does change it later simply
+ * returns it to calls.json. */
+export function settledCall(call: BrokerCall, now: number, quietMs = SETTLED_QUIET_MS): boolean {
+  if (!call.endedAt || now - Date.parse(call.endedAt) < quietMs || now - Date.parse(call.updatedAt) < quietMs) return false;
+  if (call.verificationCallback || call.restrictedSetup || (call.inbound && !call.inbound.closure)) return false;
+  if (call.primaryClosePending || (call.primary && !call.primaryClosed)) return false;
+  if (call.transcriptCapture && call.transcriptCapture.state !== 'complete') return false;
+  if (call.retryOf || call.retrySuccessor) return false;
+  if (call.liveGenerations && call.liveGenerations.phase !== 'stopped') return false;
+  // Once the Primary binding is closed nothing updates its requests; an open binding can.
+  if (!call.primaryClosed && Object.values(call.delegations).some(entry => !terminalDelegation(entry.status))) return false;
+  if (call.harkJournal && Object.values(call.harkJournal.events).some(event => event.state === 'pending')) return false;
+  if (call.harkReceiptOutbox && Object.values(call.harkReceiptOutbox.entries).some(entry => entry.state === 'pending')) return false;
+  if (call.inboundBilling && (!call.inboundBilling.terminal || call.inboundBilling.event?.state === 'pending'
+    || call.inboundBilling.statusEvent?.state === 'pending')) return false;
+  return true;
+}
+
+export interface BrokerStoreOptions {
+  /** Disk used for live observations; tests make it slow or blocked. */
+  observationFs?: OverlayFileSystem;
+  observationIntervalMs?: number;
+}
 
 const journeySchema = z.object({ streamStartedAt: z.iso.datetime({ offset: true }).optional(), liveReadyAt: z.iso.datetime({ offset: true }).optional(),
   firstAudioSentAt: z.iso.datetime({ offset: true }).optional(), firstPlaybackConfirmedAt: z.iso.datetime({ offset: true }).optional(),
@@ -451,11 +482,27 @@ export class BrokerStore {
   private closed = false;
   private persistenceUncertain = false;
   private pendingWrite: { body: string; next: State } | undefined;
+  /** Exact bytes of calls.json as last written or read. */
+  private diskBody: string | undefined;
+  /** Live transcripts newer than the journal, per call (see observeTranscript). */
+  private readonly observed = new Map<string, Observation>();
+  private observationSeq = 0;
+  private readonly overlay: OverlayWriter;
+  private readonly observationDirectory: string;
+  /** Settled calls kept in calls.d/<id>.json, so calls.json holds only calls still in progress. */
+  private readonly settled = new Set<string>();
+  private readonly settledDirectory: string;
+  private settling = false;
 
-  constructor(readonly directory: string) {
+  constructor(readonly directory: string, options: BrokerStoreOptions = {}) {
     fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
     this.file = path.join(directory, 'calls.json');
     this.lock = path.join(directory, 'writer.lock');
+    this.observationDirectory = path.join(directory, 'live.d');
+    this.settledDirectory = path.join(directory, 'calls.d');
+    this.overlay = createOverlayWriter({ directory: this.observationDirectory, body: id => this.observationBody(id),
+      ...(options.observationFs ? { fs: options.observationFs } : {}),
+      ...(options.observationIntervalMs !== undefined ? { minIntervalMs: options.observationIntervalMs } : {}) });
     this.parent = bindDurableFileParent(this.file);
     try { this.acquire(); } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
@@ -468,11 +515,186 @@ export class BrokerStore {
     }
     try {
       const existing = fs.existsSync(this.file);
-      this.state = existing ? JSON.parse(fs.readFileSync(this.file, 'utf8')) : { version: 1, calls: {} };
+      this.diskBody = existing ? fs.readFileSync(this.file, 'utf8') : undefined;
+      this.state = this.diskBody !== undefined ? JSON.parse(this.diskBody) : { version: 1, calls: {} };
+      this.loadSettled();
       validateBrokerState(this.state);
       // An empty store must have a durable journal before it can prove absence.
       if (!existing) this.persist(this.state);
+      this.loadObservations();
     } catch (error) { this.close(); throw error; }
+  }
+
+  /** Settled calls join the journal from their own files; a copy in calls.json is newer and wins. */
+  private loadSettled() {
+    let names: string[];
+    try { names = fs.readdirSync(this.settledDirectory); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return; throw error; }
+    if (!this.state || this.state.version !== 1 || !this.state.calls || typeof this.state.calls !== 'object') throw new Error('Invalid broker call store');
+    for (const name of names) {
+      if (!name.endsWith('.json') || name.startsWith('.')) continue;
+      const id = name.slice(0, -'.json'.length);
+      if (Object.hasOwn(this.state.calls, id)) continue;
+      const saved = JSON.parse(fs.readFileSync(path.join(this.settledDirectory, name), 'utf8')) as { version?: unknown; call?: BrokerCall };
+      if (saved?.version !== 1 || !saved.call || saved.call.id !== id) throw new Error('Invalid settled call record');
+      this.state.calls[id] = saved.call;
+      this.settled.add(id);
+    }
+  }
+
+  /** Transcripts observed after the last journal write (a crash or stop mid-call) are folded into
+   * calls.json at startup. An overlay that does not extend its call's saved transcript is discarded. */
+  private loadObservations() {
+    let names: string[];
+    try { names = fs.readdirSync(this.observationDirectory); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return; throw error; }
+    const merged: Record<string, BrokerCall> = {};
+    for (const name of names) {
+      if (!name.endsWith('.json') || name.startsWith('.')) continue;
+      try {
+        const value = JSON.parse(fs.readFileSync(path.join(this.observationDirectory, name), 'utf8')) as {
+          version?: unknown; callId?: string; transcript?: unknown; transcriptRevision?: number; generations?: Record<string, GenerationTranscript> };
+        const call = value.callId === undefined ? undefined : this.state.calls[value.callId];
+        if (value.version !== 1 || !call || name !== `${call.id}.json`) throw new Error('observation_call_unknown');
+        let next: BrokerCall = call;
+        if (Number.isSafeInteger(value.transcriptRevision) && value.transcriptRevision! > (call.transcriptRevision ?? -1))
+          next = { ...next, transcript: value.transcript, transcriptRevision: value.transcriptRevision };
+        const generations = value.generations ?? {};
+        if (next.liveGenerations && Object.keys(generations).length) next = { ...next, liveGenerations: { ...next.liveGenerations,
+          segments: next.liveGenerations.segments.map(segment => {
+            const transcript = generations[segment.generationId];
+            return transcript && transcript.revision > segment.transcript.revision ? { ...segment, transcript } : segment;
+          }) } };
+        validateGenerations(next, call);
+        if (next !== call) merged[call.id] = next;
+      } catch (error) {
+        console.error(JSON.stringify({ event: 'broker_observation_discarded', file: name, message: (error as Error).message }));
+      }
+    }
+    if (Object.keys(merged).length) this.persist({ version: 1, calls: { ...this.state.calls, ...merged } });
+    for (const name of names) fs.rmSync(path.join(this.observationDirectory, name), { force: true });
+  }
+
+  private observation(id: string): Observation {
+    let entry = this.observed.get(id);
+    if (!entry) { entry = { seq: 0, generations: new Map() }; this.observed.set(id, entry); }
+    return entry;
+  }
+  private observationBody(id: string): OverlayBody | undefined {
+    const entry = this.observed.get(id);
+    if (!entry) return undefined;
+    return { seq: entry.seq, text: JSON.stringify({ version: 1, callId: id, seq: entry.seq,
+      ...(entry.transcriptRevision === undefined ? {} : { transcript: entry.transcript, transcriptRevision: entry.transcriptRevision }),
+      generations: Object.fromEntries(entry.generations) }) };
+  }
+  /** Drops observations the journal now holds; their overlay file goes with them. */
+  private foldObservations() {
+    for (const [id, entry] of this.observed) {
+      const call = this.state.calls[id];
+      if (entry.transcriptRevision !== undefined && (!call || (call.transcriptRevision ?? -1) >= entry.transcriptRevision)) {
+        entry.transcript = undefined; entry.transcriptRevision = undefined;
+      }
+      for (const [generationId, transcript] of entry.generations) {
+        const segment = call?.liveGenerations?.segments.find(value => value.generationId === generationId);
+        if (!segment || segment.transcript.revision >= transcript.revision) entry.generations.delete(generationId);
+      }
+      if (entry.transcriptRevision === undefined && !entry.generations.size) { this.observed.delete(id); this.overlay.schedule(id); }
+    }
+  }
+  /** The call as readers see it: its journal record with any newer live transcript. */
+  private view(call: BrokerCall): BrokerCall {
+    const entry = this.observed.get(call.id);
+    if (!entry) return call;
+    let next: BrokerCall = entry.transcriptRevision === undefined ? call
+      : { ...call, transcript: entry.transcript, transcriptRevision: entry.transcriptRevision };
+    if (entry.generations.size && next.liveGenerations) next = { ...next, liveGenerations: { ...next.liveGenerations,
+      segments: next.liveGenerations.segments.map(segment => {
+        const transcript = entry.generations.get(segment.generationId);
+        return transcript ? { ...segment, transcript } : segment;
+      }) } };
+    return next;
+  }
+  /** The call a durable write builds on: its journal record with any newer live transcript, so
+   * every write validates against what readers see and carries the observations into calls.json. */
+  private current(id: string): BrokerCall | undefined { const call = this.state.calls[id]; return call && this.view(call); }
+  /** The newest matching call, as list().find would return it, without cloning every call. */
+  private find(predicate: (call: BrokerCall) => boolean): BrokerCall | undefined {
+    let found: BrokerCall | undefined;
+    for (const call of Object.values(this.state.calls))
+      if (predicate(call) && (!found || call.createdAt.localeCompare(found.createdAt) > 0)) found = call;
+    return found && structuredClone(this.view(found));
+  }
+
+  /**
+   * Live transcript observations. They are evidence, not call state: memory and readers have
+   * them at once, and they reach disk asynchronously in a per-call file (live.d/<id>.json),
+   * coalesced, so a slow or blocked disk never holds up call audio. The next journal write
+   * carries them into calls.json; a crash loses at most the observations of one write interval.
+   */
+  observeTranscript(id: string, snapshot: { revision: number }): void {
+    if (this.closed) return;
+    const call = this.state.calls[id];
+    if (!call) throw new Error('Unknown broker call');
+    if (!Number.isSafeInteger(snapshot?.revision)) throw new Error('Invalid transcript observation');
+    if (snapshot.revision < (this.observed.get(id)?.transcriptRevision ?? call.transcriptRevision ?? -1)) return;
+    const entry = this.observation(id);
+    entry.transcript = structuredClone(snapshot); entry.transcriptRevision = snapshot.revision;
+    entry.seq = ++this.observationSeq;
+    this.overlay.schedule(id);
+  }
+  observeGenerationTranscript(id: string, generationId: string, transcript: GenerationTranscript): void {
+    if (this.closed) return;
+    const segment = this.state.calls[id]?.liveGenerations?.segments.find(value => value.generationId === generationId);
+    if (!segment) throw new Error('Unknown live generation');
+    const known = this.observed.get(id)?.generations.get(generationId) ?? segment.transcript;
+    if (transcript.revision < known.revision || transcript.fragments.length < known.fragments.length) return;
+    const entry = this.observation(id);
+    entry.generations.set(generationId, structuredClone(transcript));
+    entry.seq = ++this.observationSeq;
+    this.overlay.schedule(id);
+  }
+
+  /** calls.json as written: every call except those kept settled in their own file. */
+  private journalBody(state: State): string {
+    if (!this.settled.size) return JSON.stringify(state);
+    const calls: Record<string, BrokerCall> = {};
+    for (const [id, call] of Object.entries(state.calls)) if (!this.settled.has(id)) calls[id] = call;
+    return JSON.stringify({ version: 1, calls });
+  }
+
+  /**
+   * Moves settled calls (see settledCall) out of calls.json into calls.d/<id>.json, so the
+   * journal rewritten on each durable update stays the size of the calls in progress rather than
+   * the whole history. Each file is durable before calls.json stops carrying its call; a call
+   * that changes later returns to calls.json. File writes run off the event loop.
+   */
+  async settle(finished: (call: BrokerCall) => boolean, now = Date.now(), fileSystem: OverlayFileSystem = nodeOverlayFileSystem): Promise<number> {
+    if (this.closed || this.settling || this.persistenceUncertain) return 0;
+    this.settling = true;
+    try {
+      const candidates = Object.values(this.state.calls).filter(call => !this.settled.has(call.id) && !this.observed.has(call.id)
+        && settledCall(call, now) && finished(structuredClone(call))).slice(0, 100);
+      if (!candidates.length) return 0;
+      const created = !fs.existsSync(this.settledDirectory);
+      await fileSystem.mkdir(this.settledDirectory);
+      if (created) await fileSystem.syncDirectory(this.directory);
+      for (const call of candidates) {
+        const temporary = path.join(this.settledDirectory, `.${call.id}.tmp`);
+        await fileSystem.writeFile(temporary, JSON.stringify({ version: 1, call }));
+        await fileSystem.rename(temporary, path.join(this.settledDirectory, `${call.id}.json`));
+      }
+      await fileSystem.syncDirectory(this.settledDirectory);
+      if (this.closed || this.persistenceUncertain) return 0;
+      // Only a call unchanged since its file was written leaves calls.json.
+      const moving = candidates.filter(call => this.state.calls[call.id] === call && !this.observed.has(call.id));
+      if (!moving.length) return 0;
+      for (const call of moving) this.settled.add(call.id);
+      try { this.persist({ version: 1, calls: this.state.calls }); }
+      catch (error) { for (const call of moving) this.settled.delete(call.id); throw error; }
+      try { console.info(JSON.stringify({ event: 'broker_calls_settled', count: moving.length, settled: this.settled.size,
+        inJournal: Object.keys(this.state.calls).length - this.settled.size })); } catch { /* Telemetry only. */ }
+      return moving.length;
+    } finally { this.settling = false; }
   }
 
   private acquire() {
@@ -486,8 +708,8 @@ export class BrokerStore {
   private reconcileFromDisk(): boolean {
     try {
       const disk = fs.readFileSync(this.file, 'utf8');
-      if (this.pendingWrite && disk === this.pendingWrite.body) this.state = this.pendingWrite.next;
-      else if (disk !== JSON.stringify(this.state)) return false;
+      if (this.pendingWrite && disk === this.pendingWrite.body) { this.state = this.pendingWrite.next; this.diskBody = disk; }
+      else if (disk !== this.diskBody) return false;
       this.persistenceUncertain = false;
       this.pendingWrite = undefined;
       return true;
@@ -502,7 +724,9 @@ export class BrokerStore {
     if (this.closed) throw new Error('Broker store is closed');
     if (this.persistenceUncertain && !this.reconcileFromDisk()) throw new Error('Broker journal write outcome is uncertain');
     // All write paths share this guard, including selected replies and ordinary queue updates.
+    // A call whose record is the same object as before has no transition to check.
     for (const [id, call] of Object.entries(next.calls)) {
+      if (this.state?.calls[id] === call) continue;
       validateCallerRouting(call, this.state?.calls[id]);
       validateBrokerAdmissionRefusals(call, this.state?.calls[id]);
       validateSelectedOutboundObservation(call, this.state?.calls[id]);
@@ -513,12 +737,16 @@ export class BrokerStore {
       validateRestrictedSetupCall(call, this.state?.calls[id]);
     }
     validateOutboundRetries(next.calls, this.state?.calls);
-    const body = JSON.stringify(next);
+    // A settled call that changes returns to calls.json; its old file is superseded there.
+    for (const id of this.settled) if (next.calls[id] !== this.state?.calls[id]) this.settled.delete(id);
+    const body = this.journalBody(next);
     let lastError: unknown;
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       try {
         durablyReplaceJsonFile(this.file, body, fs, this.parent);
         this.state = next;
+        this.diskBody = body;
+        this.foldObservations();
         return;
       } catch (error) {
         lastError = error;
@@ -529,7 +757,7 @@ export class BrokerStore {
         this.persistenceUncertain = true;
         this.pendingWrite = { body, next };
         if (!this.reconcileFromDisk()) throw error;
-        if (this.state === next) return;
+        if (this.state === next) { this.foldObservations(); return; }
       }
     }
     throw lastError;
@@ -549,15 +777,27 @@ export class BrokerStore {
       const file = fs.lstatSync(this.file);
       if (!file.isFile() || file.isSymbolicLink()) return { state: 'unavailable' };
       const disk: State = JSON.parse(fs.readFileSync(this.file, 'utf8'));
+      // The journal is calls.json plus each settled call's own file.
+      for (const id of this.settled) {
+        if (!disk.calls || Object.hasOwn(disk.calls, id)) return { state: 'unavailable' };
+        const saved = JSON.parse(fs.readFileSync(path.join(this.settledDirectory, `${id}.json`), 'utf8')) as { version?: unknown; call?: BrokerCall };
+        if (saved?.version !== 1 || saved.call?.id !== id) return { state: 'unavailable' };
+        disk.calls[id] = saved.call;
+      }
       validateBrokerState(disk);
       if (canonicalJson(disk) !== canonicalJson(this.state) || !owned()) return { state: 'unavailable' };
       return { state: 'available', journal: structuredClone(disk) };
     } catch { return { state: 'unavailable' }; }
   }
 
-  get(id: string): BrokerCall | undefined { const call = this.state.calls[id]; return call && structuredClone(call); }
-  bySid(sid: string): BrokerCall | undefined { return this.list().find(call => call.callSid === sid); }
-  list(): BrokerCall[] { return structuredClone(Object.values(this.state.calls)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
+  get(id: string): BrokerCall | undefined { const call = this.state.calls[id]; return call && structuredClone(this.view(call)); }
+  bySid(sid: string): BrokerCall | undefined { return this.find(call => call.callSid === sid); }
+  list(): BrokerCall[] { return structuredClone(Object.values(this.state.calls).map(call => this.view(call))).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
+  /** Calls still in calls.json: every call except settled ones, which no later work changes. */
+  listInProgress(): BrokerCall[] {
+    return structuredClone(Object.values(this.state.calls).filter(call => !this.settled.has(call.id)).map(call => this.view(call)))
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
 
   reserveInbound(input: { requestId: string; purpose: string; providerProof: InboundBeginIdentity['providerProof'] },
     policy: InboundWaitPolicy, now = new Date().toISOString(), enrollmentMode = false): { call: BrokerCall; existing: boolean } {
@@ -566,7 +806,7 @@ export class BrokerStore {
     const callSid = proof.params.CallSid;
     if (input.requestId !== inboundRequestId(callSid) || typeof input.purpose !== 'string'
         || !input.purpose || input.purpose.length > 1500) throw new Error('Invalid inbound reservation');
-    const existing = this.list().find(call => call.requestId === input.requestId || call.callSid === callSid);
+    const existing = this.find(call => call.requestId === input.requestId || call.callSid === callSid);
     if (existing) {
       if (!existing.inbound || existing.requestId !== input.requestId || existing.callSid !== callSid
           || existing.purpose !== input.purpose || canonicalJson(existing.inbound.begin.providerProof) !== canonicalJson(proof))
@@ -603,7 +843,7 @@ export class BrokerStore {
   }
 
   transitionInbound(id: string, event: InboundJournalEvent): BrokerCall {
-    const previous = this.state.calls[id];
+    const previous = this.current(id);
     if (!previous) throw new Error('Unknown broker call');
     const next = reduceInboundJournal(previous, event, new Date().toISOString());
     if (next === previous) return structuredClone(previous);
@@ -618,7 +858,7 @@ export class BrokerStore {
     if (Object.prototype.hasOwnProperty.call(input, 'selectedQuestion') || Object.prototype.hasOwnProperty.call(input, 'selectedQuestionVoice')) throw new Error('Selected question requires an admitted call');
     const { continuation, ...ordinary } = input;
     const savedInput = { ...ordinary, ...callContinuationPatch(continuation) };
-    const existing = this.list().find(call => call.requestId === input.requestId || (input.callSid && call.callSid === input.callSid));
+    const existing = this.find(call => call.requestId === input.requestId || Boolean(input.callSid && call.callSid === input.callSid));
     if (existing) {
       assertCallContinuationReplay(existing.continuation, continuation);
       if (existing.callAssignment && existing.callAssignment.origin !== 'authenticated_broker_control') throw new Error('Call origin conflicts with its saved record');
@@ -677,7 +917,7 @@ export class BrokerStore {
   /** No provider operation is authorized until this transition's durable write succeeds. */
   observeSelectedOutbound(id: string, event: OutboundObservationEvent): BrokerCall {
     if (this.readCallRequestJournal().state !== 'available') throw new OutboundRetryError('call_request_unavailable');
-    const previous = this.state.calls[id];
+    const previous = this.current(id);
     if (!previous) throw new OutboundRetryError('call_request_unavailable');
     const observation = reduceOutboundObservation(previous, event);
     if (observation.accepted && Object.values(this.state.calls).some(call => call.id !== id
@@ -695,7 +935,7 @@ export class BrokerStore {
     const resolved = resolvedHarkAssignmentSchema.parse(value);
     const assignment = resolved.callAssignment;
     const id = assignment.brokerCallId;
-    const existing = this.list().find(call => call.id === id || call.requestId === id);
+    const existing = this.find(call => call.id === id || call.requestId === id);
     if (existing) {
       if (existing.id !== id || existing.requestId !== id || existing.direction !== 'outbound'
           || existing.number !== resolved.to || existing.purpose !== assignment.purpose
@@ -722,7 +962,7 @@ export class BrokerStore {
   /** Caller authentication is separate; this only checks the saved notification identity. */
   byHarkNotification(deliveryId: string, notificationDigest: string): BrokerCall | undefined {
     dispatchDigest.parse(notificationDigest);
-    const call = this.list().find(item => item.id === deliveryId || item.requestId === deliveryId);
+    const call = this.find(item => item.id === deliveryId || item.requestId === deliveryId);
     if (!call) return undefined;
     if (call.id !== deliveryId || call.requestId !== deliveryId || call.callAssignment?.origin !== 'authenticated_hark_delivery')
       throw new Error('Hark delivery conflicts with its saved record');
@@ -738,7 +978,7 @@ export class BrokerStore {
     const resolved = resolvedNotificationAssignmentSchema.parse(value);
     const assignment = resolved.callAssignment;
     const id = assignment.brokerCallId;
-    const existing = this.list().find(call => call.id === id || call.requestId === id);
+    const existing = this.find(call => call.id === id || call.requestId === id);
     if (existing) {
       if (existing.id !== id || existing.requestId !== id || existing.direction !== 'outbound'
           || existing.number !== resolved.to || existing.purpose !== assignment.purpose
@@ -765,7 +1005,7 @@ export class BrokerStore {
   /** Caller authentication is separate; this only checks the saved notification identity. */
   byNotification(deliveryId: string, notificationDigest: string): BrokerCall | undefined {
     dispatchDigest.parse(notificationDigest);
-    const call = this.list().find(item => item.id === deliveryId || item.requestId === deliveryId);
+    const call = this.find(item => item.id === deliveryId || item.requestId === deliveryId);
     if (!call) return undefined;
     if (call.id !== deliveryId || call.requestId !== deliveryId || call.callAssignment?.origin !== 'authenticated_notification_delivery')
       throw new Error('Notification delivery conflicts with its saved record');
@@ -777,7 +1017,7 @@ export class BrokerStore {
 
   beginHarkDispatch(id: string, observedAt: string): BrokerCall {
     dispatchTime.parse(observedAt);
-    const previous = this.state.calls[id];
+    const previous = this.current(id);
     if (!previous) throw new Error('Unknown broker call');
     validateHarkDispatch(previous);
     if (!previous.harkDispatch) throw new Error('Hark dispatch history unavailable');
@@ -791,7 +1031,7 @@ export class BrokerStore {
   acceptHarkDispatch(id: string, sid: string, observedAt: string): BrokerCall {
     dispatchTime.parse(observedAt);
     if (!/^CA[0-9a-fA-F]{32}$/.test(sid)) throw new Error('Invalid call SID');
-    const previous = this.state.calls[id];
+    const previous = this.current(id);
     if (!previous) throw new Error('Unknown broker call');
     validateHarkDispatch(previous);
     if (!previous.harkDispatch) throw new Error('Hark dispatch history unavailable');
@@ -806,7 +1046,7 @@ export class BrokerStore {
   }
 
   recordRestrictedSetup(id: string, value: RestrictedSetupJournal): BrokerCall {
-    const previous = this.state.calls[id];
+    const previous = this.current(id);
     if (!previous) throw new Error('Unknown restricted setup call');
     const call = { ...previous, restrictedSetup: restrictedSetupJournalSchema.parse(value), updatedAt: new Date().toISOString() };
     validateRestrictedSetupCall(call, previous);
@@ -836,7 +1076,7 @@ export class BrokerStore {
   }
 
   recordVerificationCallback(id: string, value: VerificationCallbackJournal): BrokerCall {
-    const previous = this.state.calls[id];
+    const previous = this.current(id);
     if (!previous?.verificationCallback) throw new Error('Unknown verification callback');
     const journal = parseVerificationCallbackJournal(value);
     const sid = journal.provider?.callSid ?? journal.answer?.proof.params.CallSid;
@@ -853,7 +1093,7 @@ export class BrokerStore {
 
   /** The IDs come from the authenticated API binding response, never caller input. */
   recordPrimaryBinding(id: string, response: PrimaryCall): BrokerCall {
-    const previous = this.state.calls[id];
+    const previous = this.current(id);
     if (!previous) throw new Error('Unknown broker call');
     if (previous.inbound) throw new Error('Inbound context requires an explicit transition');
     const binding = structuredClone(response);
@@ -875,7 +1115,7 @@ export class BrokerStore {
 
   /** The host saves the seed before association, then each captured/reconciled transition atomically. */
   recordSelectedQuestion(id: string, value: SelectedQuestionJournal): SelectedQuestionJournal {
-    const previous = this.state.calls[id];
+    const previous = this.current(id);
     if (!previous) throw new Error('Unknown broker call');
     const selectedQuestion = parseSelectedQuestionJournal(structuredClone(value));
     const call = { ...previous, selectedQuestion, updatedAt: new Date().toISOString() };
@@ -888,7 +1128,7 @@ export class BrokerStore {
 
   /** Source/presentation evidence is persisted independently before answer admission. */
   recordSelectedQuestionVoice(id: string, value: SelectedQuestionVoiceEvidence): SelectedQuestionVoiceEvidence {
-    const previous = this.state.calls[id];
+    const previous = this.current(id);
     if (!previous) throw new Error('Unknown broker call');
     const selectedQuestionVoice = parseSelectedQuestionVoiceEvidence(structuredClone(value));
     const call = { ...previous, selectedQuestionVoice, updatedAt: new Date().toISOString() };
@@ -900,7 +1140,7 @@ export class BrokerStore {
 
   /** Exact frozen source and resolver inputs are durable before classification. */
   prepareCallerRoute(id: string, input: CallerRoutePreparation): CallerRouteRecord {
-    const previous = this.state.calls[id];
+    const previous = this.current(id);
     if (!previous) throw new Error('Unknown broker call');
     const { journal, record } = prepareCallerRouting(previous, structuredClone(input));
     if (canonicalJson(previous.callerRouting) !== canonicalJson(journal))
@@ -910,7 +1150,7 @@ export class BrokerStore {
 
   decideCallerRoute(id: string, ref: CallerRouteRef,
     response: { inputDigest: string; decision: CallerRouteDecision }): CallerRouteRecord {
-    const previous = this.state.calls[id];
+    const previous = this.current(id);
     if (!previous) throw new Error('Unknown broker call');
     const journal = decideCallerRouting(previous, ref, structuredClone(response));
     if (canonicalJson(previous.callerRouting) !== canonicalJson(journal))
@@ -920,7 +1160,7 @@ export class BrokerStore {
 
   prepareCallerIntent(id: string, ref: CallerRouteRef,
     operation: { operationId: string; input: CallerIntentInput }): CallerRouteRecord {
-    const previous = this.state.calls[id];
+    const previous = this.current(id);
     if (!previous) throw new Error('Unknown broker call');
     const journal = prepareCallerIntent(previous, ref, structuredClone(operation));
     if (canonicalJson(previous.callerRouting) !== canonicalJson(journal))
@@ -931,7 +1171,7 @@ export class BrokerStore {
   }
 
   recordCallerIntentResponse(id: string, ref: CallerRouteRef, response: CallerIntentResponse): CallerRouteRecord {
-    const previous = this.state.calls[id];
+    const previous = this.current(id);
     if (!previous) throw new Error('Unknown broker call');
     const journal = recordCallerIntentResponse(previous, ref, structuredClone(response));
     if (canonicalJson(previous.callerRouting) !== canonicalJson(journal))
@@ -942,7 +1182,7 @@ export class BrokerStore {
   }
 
   captureCallerRoute(id: string, ref: CallerRouteRef, receipt: PrimaryTurnReceipt): CallerRouteRecord {
-    const previous = this.state.calls[id];
+    const previous = this.current(id);
     if (!previous) throw new Error('Unknown broker call');
     const journal = captureCallerRouting(previous, ref, structuredClone(receipt));
     if (canonicalJson(previous.callerRouting) !== canonicalJson(journal))
@@ -951,7 +1191,7 @@ export class BrokerStore {
   }
 
   update(id: string, patch: Partial<Omit<BrokerCall, 'id' | 'requestId' | 'number' | 'direction' | 'purpose' | 'createdAt' | 'callAssignment' | 'continuation' | 'selectedQuestion' | 'selectedQuestionVoice' | 'callerRouting' | 'harkJournal' | 'harkDispatch' | 'inbound' | 'inboundBilling' | 'outboundObservation' | 'retryOf' | 'retrySuccessor' | 'verificationCallback' | 'restrictedSetup'>>): BrokerCall {
-    const previous = this.state.calls[id];
+    const previous = this.current(id);
     if (!previous) throw new Error('Unknown broker call');
     // Runtime callers can bypass Omit. Check the same property snapshot that
     // will be persisted, so accessors cannot change a value after validation.
@@ -1076,7 +1316,7 @@ export class BrokerStore {
   }
 
   private saveHarkCall(call: BrokerCall): BrokerCall {
-    const previous = this.state.calls[call.id];
+    const previous = this.current(call.id);
     if (previous) assertCallContinuationReplay(previous.continuation, call.continuation);
     if (previous) assertPrimaryIdentityUnchanged(previous, call);
     validatePrimaryIdentity(call);
@@ -1097,7 +1337,7 @@ export class BrokerStore {
   }
 
   observeHarkProvider(id: string, status: HarkProviderStatus, observedAt: string, endedTiming?: HarkEndedTiming): BrokerCall {
-    const previous = this.state.calls[id];
+    const previous = this.current(id);
     if (!previous) throw new Error('Unknown broker call');
     const mapped = status === 'in-progress' ? 'answered' : status;
     const harkJournal = observeHark(previous, mapped, observedAt, endedTiming);
@@ -1108,7 +1348,7 @@ export class BrokerStore {
   }
 
   observeHarkMediaStarted(id: string, observedAt: string): BrokerCall {
-    const previous = this.state.calls[id];
+    const previous = this.current(id);
     if (!previous) throw new Error('Unknown broker call');
     const harkJournal = observeHark(previous, 'streaming', observedAt);
     // A late/replayed media callback cannot reopen a terminal provider call.
@@ -1165,6 +1405,15 @@ export class BrokerStore {
 
   close() {
     if (this.closed) return;
+    // A clean stop carries live observations into calls.json; if that write fails they stay in
+    // their overlay files and are folded at the next start.
+    if (this.observed.size && this.state) {
+      try { this.persist({ version: 1, calls: { ...this.state.calls,
+        ...Object.fromEntries([...this.observed.keys()].filter(id => this.state.calls[id]).map(id => [id, this.view(this.state.calls[id]!)])) } }); }
+      catch { /* Overlays below. */ }
+    }
+    this.overlay?.flushSync();
+    this.overlay?.stop();
     this.closed = true;
     try { const lock = JSON.parse(fs.readFileSync(this.lock, 'utf8')); if (lock.id === this.lockId) fs.unlinkSync(this.lock); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }

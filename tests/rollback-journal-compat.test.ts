@@ -63,7 +63,7 @@ test('a journal written by this release becomes one the previous release accepts
   assert.equal(result.status, 0, result.stderr);
   const summary = JSON.parse(result.stdout);
   assert.deepEqual({ ...summary, backup: path.dirname(summary.backup) }, { stateDir: f.directory, calls: 5, changedCalls: 3,
-    journeysDropped: 2, journeyKeysRemoved: 4, backup: f.directory, written: true, dryRun: false });
+    journeysDropped: 2, journeyKeysRemoved: 4, settledCallsFolded: 0, observationsFolded: 0, backup: f.directory, written: true, dryRun: false });
   const before = JSON.parse(original).calls, after = read(f.file).calls;
   assert.ok(Object.values(after).every(previousReleaseAccepts));
   assert.equal(after[f.ids.greeting].journey, undefined, 'a call that ended during the greeting keeps no journey');
@@ -114,7 +114,7 @@ test('a dry run reports the change without the lock and writes nothing', t => {
   const result = run(f.directory, '--dry-run');
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(JSON.parse(result.stdout), { stateDir: f.directory, calls: 5, changedCalls: 3, journeysDropped: 2,
-    journeyKeysRemoved: 4, backup: null, written: false, dryRun: true });
+    journeyKeysRemoved: 4, settledCallsFolded: 0, observationsFolded: 0, backup: null, written: false, dryRun: true });
   assert.equal(fs.readFileSync(f.file, 'utf8'), original);
   assert.deepEqual(fs.readdirSync(f.directory).sort(), ['calls.json', 'writer.lock']);
   for (const args of [[], ['relative/state'], [f.directory, '--force']]) {

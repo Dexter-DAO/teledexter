@@ -596,6 +596,10 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       ? preparePrimaryHarkOutcomePatch({ binding: harkBinding, outbox: call.harkReceiptOutbox,
         canonicalRequestId: next.reconciliation?.outcome === 'admitted' ? next.reconciliation.canonicalRequestId : next.requestId,
         result: next.primaryResult, observedAt: next.updatedAt }) : undefined;
+    // A poll that changed nothing but the clock is not a journal write: each one rewrote the
+    // durable journal while the caller was talking (every 750 ms per open request).
+    if (previous && !harkPatch && canonicalJson({ ...next, updatedAt: previous.updatedAt }) === canonicalJson(previous)
+      && canonicalJson(canonicalTurns) === canonicalJson(call.canonicalTurns ?? {})) return previous;
     validateBrokerAdmissionRefusals({ ...call, delegations: { ...call.delegations, [entry.requestId]: next } }, call);
     options.store.update(call.id, { delegations: { ...call.delegations, [entry.requestId]: next }, canonicalTurns,
       ...(harkPatch ? { harkReceiptOutbox: harkPatch.harkReceiptOutbox } : {}) });

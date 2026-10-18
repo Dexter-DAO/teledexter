@@ -124,6 +124,8 @@ export interface LiveGenerationOptions {
   initial?: LiveGenerationJournal;
   context: EligibleContextClient;
   persist(journal: LiveGenerationJournal): void;
+  /** A segment's newer transcript: evidence persisted off the media path. Absent: persist the journal. */
+  observeTranscript?(generationId: string, transcript: LiveGenerationJournal['segments'][number]['transcript']): void;
   /** Adapter startup/close/publication promises retain their bounded Live timeouts. */
   open(input: { generationId: string; ordinal: number; context: EligiblePhoneCall;
     allowOpening: boolean; signal: AbortSignal; callbacks: GenerationCallbacks }): Promise<GenerationHandle>;
@@ -302,7 +304,10 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
         rejectSourceCallback(generationId, 'generation_transcript_changed'); return;
       }
       current.transcript = parsed.data;
-      save();
+      // Every transcript fragment lands here; rewriting the journal for each one stalled call
+      // audio (call of Oct 17). Fragments are observations, written asynchronously.
+      if (options.observeTranscript) options.observeTranscript(generationId, parsed.data);
+      else save();
     },
     onClosed(result) {
       const current = segment(generationId);

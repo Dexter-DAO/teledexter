@@ -415,6 +415,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
       options.store.update(initialCall.id, { liveGenerations: journal,
         ...(journal.deliveryAttachment ? { liveSessionId: journal.deliveryAttachment.sessionId } : {}) });
     },
+    observeTranscript(generationId, transcript) { options.store.observeGenerationTranscript(initialCall.id, generationId, transcript); },
     onAudio(payload) { if (!playbackPaused) {
       if (hasAudiblePcmu(Buffer.from(payload, 'base64'))) lastOutputAt = Date.now();
       options.onAudio(payload);

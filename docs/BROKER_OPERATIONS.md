@@ -22,6 +22,18 @@ The Primary client uses `/internal/primary-dexter/channels/phone`. Its bearer to
 
 The private journal contains phone numbers, transcripts, and account context. Its directory is created with mode `0700`; the writer lock uses `0600`. Preserve the directory and its ownership across releases. The operator call list returns only the recipient's last four digits, but purpose and failure text can still contain personal information.
 
+## Journal files
+
+The state directory holds three kinds of journal file. Together they are the journal; reads, request deduplication and call request receipts cover all of them.
+
+- **`calls.json`**: every call still in progress or still owed work. Each durable update (call identity, billing references, requests, publications, terminal results) rewrites it with fsync before the broker acts on it.
+- **`calls.d/<call id>.json`**: a settled call. Every 10 minutes, maintenance moves calls that no later work will change out of `calls.json`. A call qualifies when it ended at least 30 minutes ago and has a final provider status, a closed Primary binding and a captured transcript. It must also have no pending Hark, receipt or billing delivery and no retry link. Each durable write then stays the size of the calls in progress, not the whole history. Settling the 18 October production journal took `calls.json` from 1.8 MB to 143 KB, and one durable write from about 33 ms to about 8 ms on this host. A settled call that changes goes back into `calls.json`, and that copy wins over its file. Each file is fsynced before `calls.json` drops its call. Log: `broker_calls_settled`.
+- **`live.d/<call id>.json`**: live transcripts that are not in `calls.json` yet. Transcript fragments arrive several times a second, so they never cause a journal write. Readers see them at once in memory. They reach this file asynchronously, coalesced, with at most one write in flight per call. A slow or blocked disk delays only this file, never call audio (`tests/broker-audio-blocked-disk.test.ts`). The next durable update carries them into `calls.json`, and so does a clean stop. Startup folds any left by a crash and removes the file. A crash loses at most the transcript since the last completed write. Logs: `broker_observation_write_failed`, `broker_observation_discarded`.
+
+Measured on a copy of the 18 October production journal (1.8 MB, 50 calls), on this host under `nice`/`ionice`: before, a transcript fragment held the event loop for 41 ms at the median and 59 ms at p90, with a 108 ms worst case. After, it holds the loop for 0.7 ms (p90 1.3 ms). The event loop's p99 delay went from 43 ms to 2 ms.
+
+Releases before this one read only `calls.json`. Run `scripts/rollback-journal-compat.mjs` before rolling back (see below); it folds `calls.d` and `live.d` back into `calls.json`.
+
 ## Deployment
 
 Prepare an immutable release directory containing the reviewed source, lockfile, compiled `dist`, and installed dependencies. Build and validate that exact release before starting it:
@@ -42,6 +54,12 @@ pm2 start "$BROKER_RELEASE_DIR/deploy/ecosystem.config.cjs" --only dexter-broker
 ```
 
 The configuration starts one forked process and gives shutdown 65 seconds; the application has a 60-second shutdown deadline. The journal permits one writer, so an upgrade must stop the previous broker process before the replacement starts. Avoid a rolling overlap against the same state directory. A rollback selects the previous release and retains the same journal; verify journal compatibility first. Preserve the current journal; restoring an earlier snapshot could erase evidence of an accepted answer or an outbound call.
+
+### Rolling back
+
+Releases before this one read only `calls.json`, so a rollback first folds the settled calls (`calls.d`) and live transcripts (`live.d`) back into it. Use the same script and steps as below. It folds those files and backs up the original `calls.json`. It then renames both directories to `*.rollback-<time>.bak`, which earlier releases ignore. Rolling forward again needs no step, because this release reads a folded `calls.json` as is.
+
+The call records this release adds (`endReason`, `voiceCloses`, `voiceGuardrail`) are plain fields. Production's `6e23b1b` store loads a journal written by this release and keeps those fields across its own writes.
 
 ### Rolling back to prod-2026-10-13
 
@@ -144,7 +162,7 @@ Ended calls print one readable transcript to the broker log after voice cleanup 
 npm run broker -- transcript --id "$BROKER_CALL_ID"
 ```
 
-It reads `$BROKER_STATE_DIR/calls.json` from the broker env file; pass `--journal /path/to/calls.json` to read a copy instead.
+It reads `$BROKER_STATE_DIR/calls.json` from the broker env file, with the settled calls and live transcripts beside it (`calls.d`, `live.d`); pass `--journal /path/to/calls.json` to read a copy instead.
 
 The header uses the call's creation and end times. Consecutive fragments from the same speaker become one turn, including across Live generations. Each Primary line includes the submitted text, saved status, and elapsed time from first save to last status update (including delivery). Missing timing is shown as `unknown`. Logs are not replayed for calls already ended when the broker starts; the command can still read them. No transcript storage is added.
 
@@ -185,6 +203,6 @@ Maintenance also reconciles inactive, unresolved calls older than 60 seconds by 
 npm run calls -- journey --journal /absolute/path/to/state/calls.json --log /absolute/path/to/broker.log
 ```
 
-Add `--call-id <broker-call-uuid>` to select an earlier call. The JSON report joins admission and consumption times, stream start, the greeting clip, Live attaching (`mediaStartedAt`), provider readiness, first audio and carrier playback acknowledgment. `createdToStream` approximates time to pickup plus stream setup, `greetingClipPlayedToMedia` is how long the caller waited after the greeting before Live attached, and `callerSpeechEndToFirstSpeech` is the silence between the caller's last words after the greeting and Dexter's first words (null when the caller said nothing first). It also shows each saved request's dispatch, answer availability and publication acceptance. Publication acceptance means the answer entered the voice session; the journal has no per-answer playback or individual tool spans. Missing timestamps remain null.
+Add `--call-id <broker-call-uuid>` to select an earlier call; a settled call is read from `calls.d` beside the journal. The JSON report joins admission and consumption times, stream start, the greeting clip, Live attaching (`mediaStartedAt`), provider readiness, first audio and carrier playback acknowledgment. `createdToStream` approximates time to pickup plus stream setup, `greetingClipPlayedToMedia` is how long the caller waited after the greeting before Live attached, and `callerSpeechEndToFirstSpeech` is the silence between the caller's last words after the greeting and Dexter's first words (null when the caller said nothing first). It also shows each saved request's dispatch, answer availability and publication acceptance. Publication acceptance means the answer entered the voice session; the journal has no per-answer playback or individual tool spans. Missing timestamps remain null.
 
 The report reads at most 32 MiB of journal data and the final 8 MiB of the supplied log. Its coverage fields report truncation and omitted rows. It emits timing, status and broker request IDs, excluding phone numbers, transcripts, provider proofs and raw errors. It opens neither the writer lock nor a network connection.

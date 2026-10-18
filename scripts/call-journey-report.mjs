@@ -157,6 +157,16 @@ export function runCallJourneyReport(args) {
   if (!parsed.has('--journal')) throw new Error('journey_journal_required');
   const source = readBounded(parsed.get('--journal'), MAX_JOURNAL_BYTES);
   let journal; try { journal = JSON.parse(source.text); } catch { throw new Error('journey_journal_invalid'); }
+  // A settled call lives beside calls.json in calls.d/<id>.json (see BrokerStore.settle).
+  const selectedId = parsed.get('--call-id');
+  if (selectedId && /^[0-9a-f-]{36}$/i.test(selectedId) && journal?.calls && typeof journal.calls === 'object' && !Object.hasOwn(journal.calls, selectedId)) {
+    const settled = path.join(path.dirname(parsed.get('--journal')), 'calls.d', `${selectedId}.json`);
+    if (fs.existsSync(settled)) {
+      let saved; try { saved = JSON.parse(readBounded(settled, MAX_JOURNAL_BYTES).text); } catch { throw new Error('journey_journal_invalid'); }
+      if (saved?.version !== 1 || saved.call?.id !== selectedId) throw new Error('journey_journal_invalid');
+      journal = { ...journal, calls: { ...journal.calls, [selectedId]: saved.call } };
+    }
+  }
   const log = parsed.has('--log') ? readBounded(parsed.get('--log'), MAX_LOG_BYTES, true) : { text: '', truncated: false };
   return createCallJourneyReport(journal, log.text, { callId: parsed.get('--call-id'),
     logProvided: parsed.has('--log'), logTailTruncated: log.truncated });

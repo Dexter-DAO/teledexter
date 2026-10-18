@@ -174,6 +174,8 @@ export interface BrokerServerOptions {
   inboundGreetingClip?: Buffer;
   /** Judge for the transcript guardrail (production: the Decisions API). Absent: no guardrail. */
   guardrailJudge?: GuardrailJudge;
+  /** How often settled calls move out of calls.json (default 10 minutes). */
+  settleIntervalMs?: number;
   /** A fixed admission poll interval for a greeting stream waiting on inbound approval. The default
    * backs off 100, 200 and 400 ms, then polls every 1 s (`inboundAdmissionPollDelay`). */
   inboundAdmissionPollMs?: number;
@@ -1291,7 +1293,8 @@ export function createBrokerServer(options: BrokerServerOptions) {
           forwardLiveAudio(payload);
         },
         onTranscript(snapshot) {
-          store.update(call.id, { transcript: snapshot, transcriptRevision: snapshot.revision });
+          // Evidence, written off the media path (see BrokerStore.observeTranscript).
+          store.observeTranscript(call.id, snapshot);
           backend?.observeTranscript(snapshot);
           if (connectedSessionId) guardrail?.observe(snapshot, connectedSessionId);
         },
@@ -1480,12 +1483,17 @@ export function createBrokerServer(options: BrokerServerOptions) {
   }
 
   let maintenance: Promise<void> | undefined;
+  // Settled calls leave calls.json (BrokerStore.settle) so each durable write stays small.
+  let lastSettledAt = Date.now();
+  const settledHere = (call: BrokerCall) => providerFinished(call) && !needsHarkTiming(call)
+    && !active.has(call.id) && !claimed.has(call.id);
   function maintain(): Promise<void> {
     if (!accepting) return Promise.resolve();
     if (maintenance) return maintenance;
     maintenance = (async () => {
       await callbacks.dispatchPending();
-      for (const call of store.list()) {
+      // Settled calls need no maintenance; anything that changes one returns it to this list.
+      for (const call of store.listInProgress()) {
         if (call.verificationCallback || call.restrictedSetup) {
           try { if (restricted) await restricted.maintain(call); } catch (error) { store.update(call.id, { failure: safeFailure(error) }); }
           continue;
@@ -1541,6 +1549,11 @@ export function createBrokerServer(options: BrokerServerOptions) {
         } catch (error) { store.update(call.id, { failure: safeFailure(error) }); }
       }
       await flushHark();
+      if (Date.now() - lastSettledAt >= (options.settleIntervalMs ?? 10 * 60_000)) {
+        lastSettledAt = Date.now();
+        try { await store.settle(settledHere); }
+        catch (error) { console.error(JSON.stringify({ event: 'broker_settle_failed', code: safeFailure(error).code })); }
+      }
     })().finally(() => { maintenance = undefined; });
     return maintenance;
   }
