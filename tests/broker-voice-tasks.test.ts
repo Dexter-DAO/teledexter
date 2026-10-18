@@ -49,6 +49,9 @@ test('a completed result enters the voice list only once delivered; the truth vi
   assert.equal(voiceView[0]!.progress, 'The sale was being placed.', 'same as before completion, so no new list is sent');
   const truth = callTasks(call(completed), { truth: true });
   assert.deepEqual([truth[0]!.status, truth[0]!.outcome], ['finished', 'The sale failed. Nothing was sold. Holdings are unchanged.']);
+  const forCorrection = callTasks(call(completed), { arriving: true });
+  assert.deepEqual([forCorrection[0]!.status, forCorrection[0]!.outcome], ['arriving', undefined],
+    'a correction may say the result is on its way, never "in progress" and never its words');
   const delivered = callTasks(call({ ...completed, delivery: 'accepted' }));
   assert.deepEqual([delivered[0]!.status, delivered[0]!.outcome], ['finished', 'The sale failed. Nothing was sold. Holdings are unchanged.']);
 });

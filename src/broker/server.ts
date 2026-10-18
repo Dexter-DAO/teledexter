@@ -1259,7 +1259,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
       if (!options.eligibleContext) {
         voiceTasks = createVoiceTasks(() => store.get(call.id));
         guardrail = options.guardrailJudge ? createVoiceGuardrail({ callId: call.id, judge: options.guardrailJudge,
-          tasks: () => voiceTasks?.tasks(false, true) ?? [], truth: () => voiceTasks?.tasks(true) ?? [],
+          tasks: () => voiceTasks?.correctable() ?? [], truth: () => voiceTasks?.tasks(true) ?? [],
           correct: (text, delegationId, sessionId) => live && sessionId === connectedSessionId
             ? live.appendInstructions(text, delegationId) : Promise.resolve({ eventId: '', status: 'closed' as const }),
           record: trigger => recordGuardrailTrigger(store, call.id, trigger) }) : undefined;

@@ -98,6 +98,8 @@ Also answer:
       const text = body.output?.flatMap((item: any) => item.content ?? []).find((part: any) => part.type === 'output_text')?.text;
       return { ...JSON.parse(text), prompt };
     }
+    // Full provider evidence for every failed attempt: status, Date header and error body.
+    process.stderr.write(`judge attempt ${attempt} failed: status=${response.status} date=${response.headers.get('date')} body=${JSON.stringify(body)}\n`);
     if (attempt >= 5 || body?.error?.code === 'credit_balance_exhausted' || body?.error?.type === 'insufficient_quota')
       throw new Error(`judge_failed_${response.status}_${body?.error?.code ?? ''}`);
     await new Promise(resolve => setTimeout(resolve, 3000 * attempt));

@@ -151,6 +151,9 @@ test('corrections stay within one append and carry statuses only', () => {
   const justDelegated: VoiceTask = { requestId: 'r9', sessionId: 'live_1', delegationId: 'item_9', sourceEventId: '', status: 'starting', request: '' };
   assert.match(correctionText('false_success', [justDelegated]), /The task list says: The latest request is just passed on to Primary, not started yet\./,
     'a correction right after a delegation never says nothing was requested');
+  const arriving: VoiceTask = { ...pending, status: 'arriving', progress: undefined };
+  assert.match(correctionText('false_success', [arriving]), /The latest request is finished, and its result is being given to you now \(you do not have it yet\)\./,
+    'a finished request whose result is on its way is never called in progress');
 });
 
 test('the Decisions judge asks one predicate and one choice and reads both answers', async () => {

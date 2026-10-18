@@ -23,6 +23,7 @@ const CORRECTION_COOLDOWN_MS = 4_000;
 const clipText = (text: string, limit: number) => text.length <= limit ? text : `${text.slice(0, limit - 1).trimEnd()}…`;
 const state: Record<VoiceTask['status'], string> = {
   starting: 'just passed on to Primary, not started yet', pending: 'in progress with no result yet',
+  arriving: 'finished, and its result is being given to you now (you do not have it yet)',
   waiting_to_start: 'waiting to start after the earlier request', waiting_for_answer: "waiting for the caller's answer",
   finished: 'finished',
   failed: 'failed', cancelled: 'cancelled', not_started: 'not started',

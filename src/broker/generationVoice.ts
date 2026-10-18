@@ -110,7 +110,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
   // A saved-question continuation presents its own question journal instead, so it gets neither.
   const tasks = createVoiceTasks(() => continuation ? undefined : options.store.get(initialCall.id));
   const guardrail = options.guardrailJudge && !continuation ? createVoiceGuardrail({ callId: initialCall.id, judge: options.guardrailJudge,
-    tasks: () => tasks.tasks(false, true), truth: () => tasks.tasks(true),
+    tasks: () => tasks.correctable(), truth: () => tasks.tasks(true),
     correct: (text, delegationId, sessionId) => {
       const current = controller.snapshot().deliveryAttachment;
       const voice = current?.sessionId === sessionId ? sessions.get(sessionId)?.voice : undefined;
