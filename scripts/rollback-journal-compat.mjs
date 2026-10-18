@@ -2,7 +2,11 @@
 // Prepares the broker journal for a rollback to the release before the greeting stream
 // (teledexter-50e476cb88d7, tag prod-2026-10-13).
 //
-//   node scripts/rollback-journal-compat.mjs /var/lib/dexter-broker/state [--dry-run]
+//   node scripts/rollback-journal-compat.mjs /var/lib/dexter-broker/state [--dry-run] [--target <release revision>]
+//
+// --target names the release being rolled back to. Releases from 6e23b1be9103 on read every journey
+// key this release writes, so for them the journey is left as saved; without --target (or for
+// teledexter-50e476cb88d7) the journey is converted as below.
 //
 // That release checks every saved call when it starts and refuses the whole journal over one
 // call it cannot read. Two things this release writes trip it:
@@ -75,6 +79,12 @@ export function rollbackJournal(state) {
 }
 
 /** Folds settled call files and newer live transcripts into the journal. The input is not modified. */
+/** Releases that read every journey key this release writes. */
+const JOURNEY_AWARE_TARGETS = ['6e23b1be9103', 'a01ed763b3e7'];
+export function journeyAwareTarget(target) {
+  return typeof target === 'string' && JOURNEY_AWARE_TARGETS.some(revision => target.includes(revision.slice(0, 7)));
+}
+
 export function foldJournalFiles(state, directory) {
   if (!record(state) || state.version !== 1 || !record(state.calls)) throw new Error('rollback_journal_invalid');
   const next = structuredClone(state);
@@ -197,9 +207,13 @@ export function runRollbackJournalCompat(args, options = {}) {
   const fileSystem = options.fileSystem ?? fs;
   const now = options.now ?? (() => new Date());
   const dryRun = args.includes('--dry-run');
-  const positional = args.filter(arg => arg !== '--dry-run');
-  if (positional.length !== 1 || !path.isAbsolute(positional[0]) || args.some(arg => arg.startsWith('--') && arg !== '--dry-run'))
-    throw new Error('rollback_usage');
+  const targetIndex = args.indexOf('--target');
+  const target = targetIndex >= 0 ? args[targetIndex + 1] : undefined;
+  if (targetIndex >= 0 && (!target || target.startsWith('--'))) throw new Error('rollback_usage');
+  const targetArgs = targetIndex >= 0 ? new Set([targetIndex, targetIndex + 1]) : new Set();
+  const positional = args.filter((arg, index) => arg !== '--dry-run' && !targetArgs.has(index));
+  if (positional.length !== 1 || !path.isAbsolute(positional[0])
+    || args.some((arg, index) => arg.startsWith('--') && arg !== '--dry-run' && index !== targetIndex)) throw new Error('rollback_usage');
   const directory = path.resolve(positional[0]);
   const binding = bindParent(directory);
   const file = path.join(directory, 'calls.json');
@@ -214,10 +228,16 @@ export function runRollbackJournalCompat(args, options = {}) {
     let state;
     try { state = JSON.parse(original); } catch { throw new Error('rollback_journal_invalid'); }
     const { journal: whole, folded } = foldJournalFiles(state, directory);
-    const { journal, changes } = rollbackJournal(whole);
+    // A journey-aware target keeps every journey key; only the side files are folded.
+    const { journal, changes } = journeyAwareTarget(target)
+      ? { journal: whole, changes: { calls: Object.keys(whole.calls).length, changedCalls: [], journeysDropped: 0, journeyKeysRemoved: 0 } }
+      : rollbackJournal(whole);
+    const settledFiles = (() => { try { return fs.readdirSync(path.join(directory, 'calls.d')).filter(name => name.endsWith('.json') && !name.startsWith('.')).length; }
+      catch (error) { if (error?.code === 'ENOENT') return 0; throw error; } })();
     const summary = { stateDir: directory, calls: changes.calls, changedCalls: changes.changedCalls.length,
       journeysDropped: changes.journeysDropped, journeyKeysRemoved: changes.journeyKeysRemoved,
-      settledCallsFolded: folded.settledCalls, observationsFolded: folded.observations, backup: null, written: false, dryRun };
+      settledCallsFolded: folded.settledCalls, settledFiles, observationsFolded: folded.observations,
+      ...(target ? { target } : {}), backup: null, written: false, dryRun };
     const sideFiles = ['calls.d', 'live.d'].filter(folder => fs.existsSync(path.join(directory, folder)));
     if (dryRun || (changes.changedCalls.length === 0 && !folded.settledCalls && !folded.observations && !sideFiles.length)) return summary;
     const backup = path.join(directory, `calls.json.rollback-${now().toISOString().replace(/[:.]/g, '-')}.bak`);
@@ -250,7 +270,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(fs.realpathSync(process
   catch (error) {
     const code = error instanceof Error && /^(rollback|durable)_[a-z_]+$/.test(error.message) ? error.message : 'rollback_failed';
     console.error(`[rollback-journal-compat] ${code}${code === 'rollback_failed' ? `: ${error instanceof Error ? error.message : String(error)}` : ''}`);
-    if (code === 'rollback_usage') console.error('usage: node scripts/rollback-journal-compat.mjs /absolute/state/dir [--dry-run]');
+    if (code === 'rollback_usage') console.error('usage: node scripts/rollback-journal-compat.mjs /absolute/state/dir [--dry-run] [--target <release revision>]');
     process.exitCode = 1;
   }
 }

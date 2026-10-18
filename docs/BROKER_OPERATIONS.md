@@ -51,15 +51,37 @@ The release includes `tsx` because `npm run broker` uses the operator script. `n
 
 ```sh
 pm2 start "$BROKER_RELEASE_DIR/deploy/ecosystem.config.cjs" --only dexter-broker
+pm2 save
 ```
+
+`pm2 save` records the running release so a reboot resurrects the same one.
 
 The configuration starts one forked process and gives shutdown 65 seconds; the application has a 60-second shutdown deadline. The journal permits one writer, so an upgrade must stop the previous broker process before the replacement starts. Avoid a rolling overlap against the same state directory. A rollback selects the previous release and retains the same journal; verify journal compatibility first. Preserve the current journal; restoring an earlier snapshot could erase evidence of an accepted answer or an outbound call.
 
 ### Rolling back
 
-Releases before this one read only `calls.json`, so a rollback first folds the settled calls (`calls.d`) and live transcripts (`live.d`) back into it. Use the same script and steps as below. It folds those files and backs up the original `calls.json`. It then renames both directories to `*.rollback-<time>.bak`, which earlier releases ignore. Rolling forward again needs no step, because this release reads a folded `calls.json` as is.
+Releases before this one read only `calls.json`, so a rollback first folds the settled calls (`calls.d`) and live transcripts (`live.d`) back into it. **Use this release's copy of `scripts/rollback-journal-compat.mjs`, the release being rolled back from.** The previous release's copy exits 0 but folds nothing, and that release would then see only the calls still in `calls.json`. The script folds both directories and backs up the original `calls.json`. It then renames the directories to `*.rollback-<time>.bak`, which earlier releases ignore.
 
-The call records this release adds (`endReason`, `voiceCloses`, `voiceGuardrail`) are plain fields. Production's `6e23b1b` store loads a journal written by this release and keeps those fields across its own writes.
+`--target` names the release being rolled back to. `6e23b1be9103` and later read every journey key, so their journeys are left as saved. Without `--target`, the journey conversion for `prod-2026-10-13` (below) also runs.
+
+```sh
+REL=/var/lib/dexter-broker/releases/teledexter-<this release>
+node "$REL/scripts/rollback-journal-compat.mjs" /var/lib/dexter-broker/state --dry-run --target 6e23b1be9103
+```
+
+The dry run must report `settledCallsFolded` equal to `settledFiles`, the number of files in `calls.d`. Then:
+
+```sh
+pm2 stop dexter-broker
+node "$REL/scripts/rollback-journal-compat.mjs" /var/lib/dexter-broker/state --target 6e23b1be9103
+pm2 delete dexter-broker
+BROKER_RELEASE_DIR=/var/lib/dexter-broker/releases/teledexter-6e23b1be9103 pm2 start /var/lib/dexter-broker/releases/teledexter-6e23b1be9103/deploy/ecosystem.config.cjs --only dexter-broker
+pm2 save
+```
+
+Run `pm2 save` after every start and every rollback. A reboot resurrects whatever `~/.pm2/dump.pm2` names. An old dump would start the previous release on a journal that was never folded.
+
+Rolling forward again needs no step, because this release reads a folded `calls.json` as is. The call records this release adds (`endReason`, `voiceCloses`, `voiceGuardrail`) are plain fields. Production's `6e23b1b` store loads a folded journal written by this release and keeps those fields across its own writes.
 
 ### Rolling back to prod-2026-10-13
 
