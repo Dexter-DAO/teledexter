@@ -2,8 +2,6 @@ import type { ClientEvent } from 'openai/resources/live/live';
 
 /** One provider connection. Tests inject this boundary without opening a socket. */
 export interface BrokerLiveConnection {
-  onReflectionUnavailable?(listener: () => void): void;
-  onReflectedAudio?(listener: (event: unknown) => void): void;
   onOpen(listener: () => void): void;
   onEvent(listener: (event: unknown) => void): void;
   onError(listener: (error: unknown) => void): void;
@@ -53,9 +51,9 @@ export interface LiveBackendUpdate {
   /** Backend-owned update identity, retained with the durable work record. */
   id: string;
   kind: 'progress' | 'result';
-  /** A delivered partial is still an observation of pending work. */
+  /** Still an observation of pending work (a partial or a question), not the task's final result. */
   pending?: boolean;
-  /** Only the last chunk may finish a delegated request. */
+  /** Only the last chunk of a final result finishes the task; later progress is outdated. */
   terminal?: boolean;
   text: string;
   /** Caller revision the backend reviewed. Required for a result. */
@@ -65,8 +63,6 @@ export interface LiveBackendUpdate {
 }
 
 export interface LiveBackendChannel {
-  /** Release only this provisional delegation when no durable request was admitted. */
-  release?(): void;
   getContext(): LiveTranscriptSnapshot;
   subscribeContext(listener: (snapshot: LiveTranscriptSnapshot) => void): () => void;
   publish(update: LiveBackendUpdate): Promise<LiveDelivery>;
@@ -88,6 +84,8 @@ export interface LiveSessionClosed {
   /** Any output audio suppressed by interruption or teardown makes heard-text proof incomplete. */
   outputAudioDiscarded: boolean;
   reason: string;
+  /** The provider error that ended the session, when one did. Codes only; provider text never leaves the session. */
+  providerError?: { code: string };
   usageSeconds?: number;
 }
 
@@ -97,8 +95,6 @@ export interface BrokerLiveEvent {
 }
 
 export interface BrokerLiveSessionOptions {
-  pendingRequests?: Array<{ id: string; aliases?: string[] }>;
-  speechGate?: boolean;
   apiKey: string;
   callId: string;
   instructions: string;
@@ -110,7 +106,7 @@ export interface BrokerLiveSessionOptions {
   /** Restricted setup only; absent preserves the original client delegation protocol. */
   restrictedSetupTools?: import('./restrictedSetupTools.js').RestrictedSetupTools;
   /** Ordered audio deliveries use connection-local IDs, never provider event IDs. */
-  onAudio(base64: string, metadata: { deliveryId: string; onPlayed?: (heard: boolean) => void }): void;
+  onAudio(base64: string, metadata: { deliveryId: string }): void;
   onTranscript(snapshot: LiveTranscriptSnapshot): void | Promise<void>;
   onReady(metadata: { callId: string; sessionId: string }): void;
   onClosed(result: LiveSessionClosed): void;
@@ -124,13 +120,11 @@ export interface BrokerLiveSessionOptions {
 }
 
 export interface BrokerLiveSession {
-  hasPendingRequest?(id: string): boolean;
-  trackRequest?(id: string, aliases?: readonly string[]): void;
-  speakRequest?(update: LiveBackendUpdate, request: { id: string; aliases?: readonly string[]; terminal: boolean }): Promise<LiveDelivery>;
   appendAudio(base64: string): boolean;
   appendContext(text: string): Promise<LiveDelivery>;
   publishDelegation?(delegationId:string,update:LiveBackendUpdate):Promise<LiveDelivery>;
-  appendInstructions(text: string): Promise<LiveDelivery>;
+  /** Application-authored instructions; a known delegation ties them to that task. */
+  appendInstructions(text: string, delegationId?: string | null): Promise<LiveDelivery>;
   /** Unaddressed spoken result publication; never resumes an earlier delegation. */
   appendCommentary?(text: string): Promise<LiveDelivery>;
   /** Drops queued/new output until the application explicitly resumes playback. */

@@ -579,26 +579,26 @@ test('actual generation retains the failed financial request and speaks bounded 
   assert.equal(f.posts.length, 1); assert.equal(saved.primaryResult?.assistant, undefined);
 });
 
-test('actual default backend work progress keeps its existing voice and persists a separate immutable-source audit', async t => {
+test('pending work keeps one voice, and the task list rather than a waiting line reaches it', async t => {
   const f = await host(t, false, false, false, { sameEpoch: true }); const work = f.delegate();
   await until(() => f.posts.length === 1);
   const original = structuredClone(f.store.get(f.callId)!.liveGenerations!.segments[0].version);
   f.advanceWork();
-  await until(() => Boolean(f.store.get(f.callId)!.statusContextRefreshes?.length), 21000);
+  await until(() => f.voices[0].quiet.some(text => /^Task list \d+, task 1: In progress, no result yet\./.test(text)));
+  await wait(400);
   assert.equal(f.voices.length, 1); assert.equal(f.voices[0].closed.length, 0);
-  assert.deepEqual(f.voices[0].quiet, ['Still working on it.']);
   assert.deepEqual(f.voices[0].spoken, []);
+  assert.ok(!f.voices[0].published.some(text => /Still working on it/.test(text)), 'no waiting lines');
   assert.deepEqual(f.store.get(f.callId)!.liveGenerations!.segments[0].version, original);
-  assert.equal(f.store.get(f.callId)!.statusContextRefreshes![0].version.threadEventSequence, '281');
   assert.equal(f.posts.length, 1);
   const source = f.voices[0];
   source.captions.revision++; source.captions.callerRevision++;
   source.captions.fragments.push({ eventId: 'suggestion_topic', role: 'user', text: 'What are your suggestions?',
     startMs: 21, endMs: 40, sequence: source.captions.revision });
   source.options.onTranscript(source.captions); f.advanceWork();
-  await wait(18500);
-  assert.equal(f.voices.length, 1, 'later conversation cannot be reset by old waiting notices');
-  assert.deepEqual(source.quiet, ['Still working on it.'], 'caller speech does not repeat an unchanged waiting status');
+  await wait(1500);
+  assert.equal(f.voices.length, 1, 'later conversation cannot be reset by pending work');
+  assert.deepEqual(source.spoken, []);
   f.ws.close(); await work;
 });
 
@@ -783,7 +783,7 @@ for (const outcome of ['cancelled', 'failed', 'financial_unknown'] as const) {
       .deferredTurns?.some(turn => turn.status === 'queued') === true, [work, followup]);
     const queueSpeech = /queued|later request|not started/i;
     await wait(500);
-    assert.ok(!f.voices.flatMap(voice => voice.published).some(text => queueSpeech.test(text)), 'queue mechanics stay internal');
+    assert.ok(!f.voices.flatMap(voice => voice.spoken).some(text => queueSpeech.test(text)), 'queue mechanics stay out of speech');
     const expected = 'For your earlier request: ' + (outcome === 'cancelled' ? 'The request was cancelled.'
       : outcome === 'financial_unknown' ? "I couldn't confirm the trade request. We need to check that same request before continuing."
       : 'I could not get an answer to that request.');
@@ -792,7 +792,7 @@ for (const outcome of ['cancelled', 'failed', 'financial_unknown'] as const) {
     f.primary.submit = async (...args) => {
       // Capture the boundary; assertions inside this transport would fabricate
       // a dispatch-unknown response if legitimate progress had also been spoken.
-      beforeSecondSubmit = { speech: f.voices.flatMap(voice => voice.published),
+      beforeSecondSubmit = { speech: f.voices.flatMap(voice => voice.spoken),
         delivery: (f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord).delivery };
       return submit(...args);
     };
@@ -811,7 +811,7 @@ for (const outcome of ['cancelled', 'failed', 'financial_unknown'] as const) {
 }
 
 
-test('recorded pending sale and queued buy deliver truthful status through the actual voice path', async t => {
+test('recorded pending sale and queued buy keep truthful task state through the actual voice path', async t => {
   const f = await host(t, false, false, false, { sameEpoch: true,
     callerText: 'Um, I probably want to sell four dollars of the Apple stock that I just bought recently' });
   const work = observedWork(f.delegate());
@@ -821,15 +821,15 @@ test('recorded pending sale and queued buy deliver truthful status through the a
   await boundary('buy admission started', later.entered, [work, next]); later.release();
   await boundary('buy queued', () => (f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord)
     .deferredTurns?.some(turn => turn.status === 'queued') === true, [work, next]);
-  assert.ok(!f.voices.flatMap(v => v.published).some(text => /queued|later request|not started/i.test(text)), 'queue mechanics stay internal');
+  await boundary('task list shows the buy waiting behind the sale', () => f.voices.flatMap(v => v.quiet)
+    .some(text => /task 2: Not started yet; it starts after the earlier request finishes/.test(text)), [work, next]);
   assert.equal(f.posts.length, 1, 'queueing does not submit the buy');
   f.primary.result = async () => { throw new PrimaryApiError('http_error', 503,
     { code: 'temporarily_unavailable', retryable: true }); };
-  await boundary('status error spoken', () => f.voices.flatMap(v => v.published).includes(
-    "I can't confirm how that's going yet, so I don't know the outcome."), [work, next]);
+  await boundary('read error reaches the task list', () => f.voices.flatMap(v => v.quiet)
+    .some(text => /task 1: In progress.*status check failed/.test(text)), [work, next]);
   const call = f.store.get(f.callId)!;
-  assert.deepEqual(f.voices.flatMap(v => v.spoken), [], 'pending status is quiet context, not an unsolicited spoken claim');
-  assert.ok(f.voices.flatMap(v => v.quiet).includes("I can't confirm how that's going yet, so I don't know the outcome."));
+  assert.deepEqual(f.voices.flatMap(v => v.spoken), [], 'pending status is quiet task state, never an unsolicited spoken claim');
   assert.equal((call.delegations[f.posts[0].requestId] as BrokerDelegationRecord).resultReadUnavailable, true);
   assert.equal(call.liveGenerations!.segments.length, 1);
   assert.equal((call.delegations[f.posts[0].requestId] as BrokerDelegationRecord).primaryResult?.state, 'running');
@@ -876,52 +876,6 @@ test('continuous digital silence does not starve a saved result, while audible f
   assert.deepEqual(f.voices.flatMap(v => v.spoken), ['For your earlier request: '+incidentResult]);
   assert.equal(f.posts.length, 1);
 });
-
-
-for (const change of ['queued', 'recovered'] as const) {
-  test(`pending error speech is discarded when ${change} facts change during eligible-context I/O`, async t => {
-    const f = await host(t, false, false, false, { sameEpoch: true, callerText: 'Sell four dollars of Apple.' });
-    f.primary.result = async () => { throw new PrimaryApiError('http_error', 503,
-      { code: 'temporarily_unavailable', retryable: true }); };
-    const fetch = f.eligible.fetch;
-    let entered = false, gateOpen = false, release!: () => void;
-    const gate = new Promise<void>(resolve => { release = () => { gateOpen = true; resolve(); }; });
-    f.eligible.fetch = async (...args) => { entered = true; if (!gateOpen) await gate; return fetch(...args); };
-    const work = observedWork(f.delegate());
-    const workers = [work];
-    try {
-      await boundary('status context read begins', () => entered, workers);
-      assert.deepEqual(f.voices.flatMap(v => v.spoken), []);
-      if (change === 'queued') {
-        const later = await preparedFollowup(f, workers, 'How about you buy a dollar worth');
-        const next = observedWork(later.start()); workers.push(next);
-        await boundary('later admission begins', later.entered, workers); later.release();
-        await boundary('queue saved during context read', () => (f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord)
-          .deferredTurns?.some(turn => turn.status === 'queued') === true, workers);
-      } else {
-        f.primary.result = async (_binding, requestId) => ({ bindingId, requestId, state: 'running' });
-        await boundary('GET recovery saved during context read', () =>
-          (f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord).resultReadUnavailable === false, workers);
-      }
-      release();
-      const unavailable = "I can't confirm how that's going yet, so I don't know the outcome.";
-      if (change === 'queued') {
-        await boundary('current status error is published quietly', () => f.voices.flatMap(v => v.quiet).includes(unavailable), workers);
-        await wait(1000);
-        assert.equal(f.voices.flatMap(v => v.published).filter(text => text === unavailable).length, 1,
-          'the discarded publication is replaced once, not repeated');
-      } else {
-        await wait(1000);
-        assert.ok(!f.voices.flatMap(v => v.published).includes(unavailable),
-          'the obsolete error facts must not be published after context returns');
-      }
-      assert.equal(f.posts.length, 1);
-    } finally {
-      release(); f.ws.close();
-      await boundary('observers close after test', () => workers.every(w => w.settled()), workers);
-    }
-  });
-}
 
 
 test('latest account dialogue keeps one generation and publishes one contextualized answer on its original delegation',async t=>{
@@ -1000,13 +954,14 @@ test('failed result after a genuine replacement keeps its own ambiguous caller s
   assert.deepEqual(contexts.map(value => value.requestId), [f.posts[0].requestId]);
   assert.equal(contexts.map(value => value.requestText).join(''), original);
   assert.ok(target.published.indexOf(JSON.stringify(contexts[0])) < target.published.indexOf(target.spoken[0]));
-  assert.match(target.spoken.join(''), /^An unsigned Apple purchase/);
-  assert.match(target.spoken.join(''), /AI response failed/);
+  // The failure leads; the quiet preparation follows once, clearly not an execution.
+  assert.match(target.spoken.join(''), /^The AI response failed/);
+  assert.match(target.spoken.join(''), /The last observed step before that: An unsigned Apple purchase was prepared\. It has not executed\./);
   assert.equal(f.posts.length, 1); assert.equal(f.posts[0].input.text, original);
   assert.equal((f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord).status, 'failed');
 });
 
-test('confirmed facts are spoken during provider cooldown and final failure uses the same request after replacement', async t => {
+test('a tool fact during provider cooldown is quiet progress, and the final failure carries it once after replacement', async t => {
   const f = await host(t, false, false, false, { failed: true, failureCode: 'provider_request_budget_exceeded' });
   const result = f.primary.result;
   const partialResult = { kind: 'portfolio' as const, text: 'Your portfolio observation lists 8 SOL.', toolInvocationId: eventId, observedAt: at };
@@ -1017,14 +972,15 @@ test('confirmed facts are spoken during provider cooldown and final failure uses
       : { kind: 'provider_request_budget' as const } };
   };
   const work = f.delegate();
-  await until(() => f.voices.flatMap(voice => voice.spoken).includes(partialResult.text));
+  await until(() => f.voices.flatMap(voice => voice.quiet).some(text => text.startsWith('Progress on this task, not its result: ' + partialResult.text)));
   await wait(850);
   assert.equal(f.posts.length, 1); assert.equal(f.voices.length, 1);
+  assert.deepEqual(f.voices.flatMap(voice => voice.spoken), [], 'progress is never spoken on arrival');
   assert.equal((f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord).status, 'running');
   f.release(); await work;
   const speech = f.voices.flatMap(voice => voice.spoken);
-  assert.equal(speech.filter(text => text === partialResult.text).length, 1);
-  assert.match(speech.at(-1)!, /processing limit/);
+  assert.match(speech.at(-1)!, /^The AI response exceeded the processing limit/);
+  assert.equal(speech.filter(text => text.includes(partialResult.text)).length, 1);
   assert.equal(f.posts.length, 1); assert.equal(f.voices.length, 2);
   assert.equal((f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord).partialDelivery?.status, 'accepted');
 });
@@ -1077,39 +1033,4 @@ test('a confirmed financial receipt survives a later model failure and voice rep
   const saved = f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord;
   assert.equal(saved.status, 'failed'); assert.deepEqual(saved.primaryResult?.partialResult, partialResult);
   assert.equal(saved.primaryResult?.assistant, undefined);
-});
-
-
-test('money result retries unconfirmed speech on the current generation without re-executing', async t => {
-  const f = await host(t, false, false, true, { sameEpoch: true, callerText: 'Sell $1 of SpaceX.',
-    resultText: 'Nothing was sold.', unconfirmedSpeech: true });
-  const work = observedWork(f.delegate());
-  await boundary('money request submitted', () => f.posts.length === 1, [work]);
-  f.release();
-  await boundary('terminal speech retried', () => work.settled() &&
-    (f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord).delivery === 'accepted', [work]);
-  assert.equal(f.voices.flatMap(voice => voice.spoken).filter(text => text === 'Nothing was sold.').length, 2);
-  assert.equal(f.posts.length, 1);
-  const publications = f.store.get(f.callId)!.publications!.records.filter(record => record.ordinaryDelivery?.response.delivery.state === 'ready');
-  assert.deepEqual(publications.map(record => record.outcome?.status), ['unconfirmed', 'accepted']);
-});
-
-
-test('reflection loss replaces the voice without ending the Twilio leg or resubmitting pending work', async t => {
-  const f = await host(t);
-  const work = observedWork(f.delegate());
-  await boundary('request accepted', () => f.posts.length === 1, [work]);
-  const original = structuredClone(f.posts[0]);
-  const first = f.voices[0];
-  first.options.onEvent?.({ type: 'live.error', code: 'reflection_unavailable' });
-  first.options.onClosed({ callId: f.callId, sessionId: 'generation_1', reason: 'reflection_unavailable',
-    finalized: false, transcriptPersisted: true, outputAudioDiscarded: true });
-  await boundary('replacement active', () => f.voices.length === 2
-    && f.store.get(f.callId)?.liveGenerations?.phase === 'active', [work]);
-  assert.equal(f.providerEnds(), 0); assert.equal(f.ws.readyState, WebSocket.OPEN);
-  assert.ok(f.voices[1].options.pendingRequests?.some(request => request.id === original.requestId));
-  f.release();
-  await boundary('saved result delivered', () => f.voices.some(voice => voice.spoken.join('') === f.eligibleText) && work.settled(), [work]);
-  assert.deepEqual(f.posts, [original]); assert.equal(f.providerEnds(), 0);
-  assert.equal(f.opening.length, 1);
 });

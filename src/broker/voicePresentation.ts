@@ -53,14 +53,6 @@ export function hasNewerCallerWork(call: BrokerCall, entry: BrokerDelegationReco
   });
 }
 
-/** Only local observation and queue facts; none of these states authorize an action. */
-export function pendingRequestState(entry: BrokerDelegationRecord): string {
-  return JSON.stringify([entry.status, entry.resultReadUnavailable === true, entry.submitError?.code ?? null,
-    (entry.deferredTurns ?? []).filter(turn => turn.status === 'queued').map(turn => turn.sourceEventId),
-    entry.currentQuestionId ?? null, entry.primaryResult?.failure?.kind ?? null,
-    entry.primaryResult?.failure?.retryAt ?? null]);
-}
-
 /** Correlate the task using only source text admitted into this provider session. */
 export function requestPresentationContext(entry: BrokerDelegationRecord, messages: readonly EligiblePhoneMessage[]): string[] {
   const source = messages.find(message => message.role === 'user'
@@ -95,27 +87,6 @@ export function requestFailureSpeech(entry: BrokerDelegationRecord): string | un
   return 'The AI response failed before I could finish explaining this request.';
 }
 
-/** Spoken pending status. Queue state stays internal; the caller hears one plain line. */
-export function pendingRequestSpeech(entry: BrokerDelegationRecord, earlier: boolean): string {
-  if (entry.resultReadUnavailable) return "I can't confirm how that's going yet, so I don't know the outcome.";
-  const failure = requestFailureSpeech(entry);
-  if (failure) return failure;
-  if (['prepared', 'dispatching', 'dispatch_unknown'].includes(entry.status)) {
-    if (entry.status === 'dispatch_unknown' && entry.submitError?.code === 'http_error')
-      return 'My connection to your account tools returned an error. I am checking whether your request was saved.';
-    return earlier ? 'I am still checking whether your earlier request was saved.'
-      : 'I have not confirmed whether your request was saved. I am checking the original request.';
-  }
-  return 'Still working on it.';
-}
-
-export function isFixedPendingStatus(entry: BrokerDelegationRecord, update?: LiveBackendUpdate): boolean {
-  return !!update && update.kind === 'progress'
-    && [pendingRequestSpeech(entry, false), pendingRequestSpeech(entry, true)].includes(update.text)
-    && ['prepared', 'dispatching', 'dispatch_unknown', 'queued', 'running'].includes(entry.status)
-    && update.id.startsWith(`${entry.requestId}_`);
-}
-
 export function failedRequestSpeech(entry: BrokerDelegationRecord): string {
   const code=entry.primaryResult?.error?.code;
   const provider:Record<string,string>={
@@ -128,20 +99,21 @@ export function failedRequestSpeech(entry: BrokerDelegationRecord): string {
   const failure = code === 'primary_financial_result_unknown'
     ? "I couldn't confirm the trade request. We need to check that same request before continuing."
     : requestFailureSpeech(entry) ?? (code && provider[code] || 'I could not get an answer to that request.');
+  // Outcome first. A settled action (confirmed, failed, refused) is the outcome and leads; other
+  // progress was quiet context, so the caller hears it once, after the failure.
   const partial = entry.primaryResult?.partialResult;
-  return partial && !(entry.partialDelivery?.toolInvocationId === partial.toolInvocationId
-    && entry.partialDelivery.text === partial.text && entry.partialDelivery.status === 'accepted')
-    ? `${partial.text}\n${failure}` : failure;
+  if (!partial) return failure;
+  return partial.kind === 'action_status' && ['confirmed', 'failed', 'refused'].includes(partial.actionState)
+    ? `${partial.text} ${failure}` : `${failure} The last observed step before that: ${partial.text}`;
 }
 
+/** A partial is progress: quiet context for the voice, tied to its task, never a result. */
 export function partialResultUpdate(entry: BrokerDelegationRecord): LiveBackendUpdate | undefined {
   const partial = entry.primaryResult?.partialResult;
   if (!partial || !['running', 'queued'].includes(entry.status)) return;
-  return { id: `${entry.requestId}_partial_${partial.toolInvocationId}`, kind: 'result', pending: true, speak: true, text: partial.text };
-}
-
-export function isPartialResultUpdate(entry: BrokerDelegationRecord, update?: LiveBackendUpdate): boolean {
-  const expected = partialResultUpdate(entry);
-  return !!expected && !!update && update.id === expected.id && update.kind === expected.kind
-    && update.speak === true && update.text === expected.text;
+  const settled = partial.kind === 'action_status' && ['confirmed', 'failed', 'refused'].includes(partial.actionState);
+  return { id: `${entry.requestId}_partial_${partial.toolInvocationId}`, kind: 'progress', pending: true, speak: false,
+    text: `Progress on this task, not its result: ${partial.text} ${settled
+      ? 'That step is settled; the final result for the task will follow.'
+      : 'The task is still pending; report no outcome until its final result arrives.'}` };
 }

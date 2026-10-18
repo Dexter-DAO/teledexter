@@ -105,8 +105,8 @@ test('registered call opening starts its assigned work from the real first respo
   assert.match(opening, /"Hey, it's Dexter\." and offer the useful task you called to do as one short question/);
   assert.match(opening, /"Hey, it's Dexter\. Want me to pull up your portfolio\?"/);
   assert.doesNotMatch(opening, /Invite their question|What would you like|What can I do for you/);
-  assert.match(instructions, /finishes a new task or correction while earlier work is still pending/);
-  assert.match(instructions, /Ordinary acknowledgments such as thank-you stay conversational/);
+  assert.match(instructions, /A correction changes or cancels work already requested\. Delegate it even while that work is in progress\./);
+  assert.match(instructions, /acknowledges, or thanks you, as in "okay", "cool" or "I'm good", or makes waiting statements/);
   assert.doesNotMatch(brokerInstructions({ ...call, registeredAssignment: false }), /task is registered with Primary/);
   assert.equal(brokerOpening('inbound', true), brokerOpening('inbound'));
 });
@@ -133,13 +133,30 @@ test('an oversized escaped watch summary is omitted whole while its name and obs
 });
 
 
-test('trade language distinguishes preparing, confirmation and execution while pending work allows a topic change', () => {
+test('trade language distinguishes preparing, confirmation and execution while pending work allows any topic', () => {
   const instructions = brokerInstructions({ direction: 'inbound', purpose: '' });
-  assert.match(instructions, /request to buy or sell starts by preparing an order for review/);
-  assert.match(instructions, /only when Primary reports that exact execution stage/);
-  assert.match(instructions, /Read the prepared quote and obtain the required confirmation before execution/);
-  assert.match(instructions, /Acknowledge a change of topic and answer the new question/);
-  assert.match(instructions, /leave internal debugging details in the saved record/);
+  assert.match(instructions, /A request to buy or sell starts with Primary preparing the order and usually asking the caller to confirm/);
+  assert.match(instructions, /only when Primary's result reports that exact stage/);
+  assert.match(instructions, /Read the prepared quote and get that confirmation before execution/);
+  assert.match(instructions, /Answer unrelated questions and chat fully; a request in progress never limits what you can talk about/);
+  assert.match(instructions, /leave internal debugging details and mechanics such as queues out of speech/);
+});
+
+test('the template headings, the delegation rules and the task list are the only truth about requests', () => {
+  for (const direction of ['inbound', 'outbound'] as const) {
+    const text = brokerInstructions({ direction, purpose: 'Read the current portfolio.' });
+    for (const heading of ['Backchannel policy:', 'Interruption policy:', 'Delegation policy:', 'Backend tools:',
+      'Delegate to the backend when:', 'Do not delegate to the backend when:', 'Task list:'])
+      assert.ok(text.includes(heading), heading);
+    assert.match(text, /Delegate before giving an answer that depends on backend work\.\nDo not guess the result while waiting\./);
+    assert.match(text, /Delegate the caller's whole request in one delegation, including a multi-step request such as "sell it, then buy it back"\. Primary performs and sequences every step\. Never promise, schedule or narrate a step yourself/);
+    assert.match(text, /It is the only truth about those requests/);
+    assert.match(text, /A step or request that is not on the task list has not started\./);
+    assert.match(text, /In progress: you have no outcome yet\. Never say it is done, placed, confirmed, sold, bought, sent or cancelled/);
+    assert.match(text, /Say an action succeeded only when its result says it succeeded\./);
+    assert.match(text, /If the application sends you a correction, say right away that you misspoke/);
+    assert.doesNotMatch(text, /Truth rule|neutral hold|holding line/, 'no gate-era hold scripts');
+  }
 });
 
 test('capability and conversational questions are answered by voice without delegation or recaps', () => {
@@ -151,7 +168,7 @@ test('capability and conversational questions are answered by voice without dele
     assert.match(instructions, /Do not delegate to the backend when:[\s\S]*The caller asks what you can do, what they can do/);
     assert.match(instructions, /Repeat numbers only when the caller asks for them/);
     assert.match(instructions, /Refer only to requests the caller actually made during this call/);
-    assert.match(instructions, /A repeat of the request already pending is not a new task/);
+    assert.match(instructions, /A repeat is not a new task; say you're on it/);
   }
   for (const capability of ['portfolio', 'wallet history', 'tokenized stocks', 'buy and sell for you under the permissions you\'ve set',
     'paid data services', 'price or market-cap watches'])
@@ -172,19 +189,13 @@ test('call 039b39cd: the capability answer is two short sentences from the list 
   }
 });
 
-test('call 039b39cd: pending speech never claims an available result has not come back', () => {
-  const instructions = brokerInstructions({ direction: 'outbound', purpose: 'Read the current portfolio.', registeredAssignment: true });
-  assert.doesNotMatch(instructions, /say that the result has not arrived/);
-  assert.match(instructions, /If no stage is available, say only that you're on it/);
-  assert.match(instructions, /Never say a result has not come back, is still loading, or is taking long/);
-});
-
-test('pending work gets one short acknowledgment and no spoken queue mechanics', () => {
+test('pending work gets one short acknowledgment, no repeated waiting lines and no queue mechanics', () => {
   const instructions = brokerInstructions({ direction: 'inbound', purpose: '' });
-  assert.match(instructions, /never say "queued", "follow-ups", or "later requests"/);
-  assert.match(instructions, /When a request is first delegated, you may say "On it\." once/);
-  assert.match(instructions, /stay quiet until the result arrives unless the caller speaks; do not say you are still waiting/);
-  assert.match(instructions, /A queued receipt means the later request has not started/);
+  assert.match(instructions, /After one short acknowledgment such as "On it\.", don't keep repeating that you're working on it or thank them for holding/);
+  assert.match(instructions, /Never invent a completion estimate or timeout/);
+  assert.match(instructions, /Waiting to start: it begins after the earlier request finishes/);
+  assert.match(instructions, /mechanics such as queues out of speech/);
+  assert.match(instructions, /When a result arrives, tell the caller at the next natural pause, outcome first/);
 });
 
 test('every voice opening fits one Live instructions append, so the speak-first greeting is never rejected locally', () => {
@@ -237,16 +248,16 @@ test('spoken amounts are dollars first, taken only from results delivered during
   }
 });
 
-test('after the opening a lone hello gets "I\'m here" only when nothing is pending, and Dexter never greets or asks again', () => {
+test('after the opening a lone hello gets "I\'m here", and Dexter never greets or asks again', () => {
   for (const direction of ['inbound', 'outbound'] as const) {
     const text = brokerInstructions({ direction, purpose: 'Read the current portfolio.' });
-    assert.match(text, /After the opening, answer a lone "hello\?" or "are you there\?" with a brief "I'm here\." only when nothing is pending; while work is pending, say you're on it\. Never greet the caller again or ask again what they want\./);
+    assert.match(text, /After the opening, answer a lone "hello\?" or "are you there\?" with a brief "I'm here\." Never greet the caller again or ask again what they want\./);
   }
 });
 
 test('main instructions stay within the Live configuration limit for inbound and the longest outbound brief', () => {
   // src/live/session.ts refuses instructions over 16,384 bytes (invalid_live_configuration).
-  assert.ok(Buffer.byteLength(brokerInstructions({ direction: 'inbound', purpose: 'The person called Dexter.' })) < 12_000);
+  assert.ok(Buffer.byteLength(brokerInstructions({ direction: 'inbound', purpose: 'The person called Dexter.' })) < 13_000);
   assert.ok(Buffer.byteLength(brokerInstructions({ direction: 'outbound', purpose: 'x'.repeat(1500), registeredAssignment: true })) < 14_000);
 });
 

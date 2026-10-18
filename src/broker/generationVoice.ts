@@ -1,6 +1,9 @@
 import { terminal as terminalRequest, createPrimaryBackend, liveResultChunks, withCallerAdmission, type BrokerDelegationRecord, type PrimaryBackend } from './backend.js';
 import { createLiveGenerationController, LiveGenerationError, LiveGenerationStartupError, LIVE_GENERATION_STARTUP_MS, type GenerationHandle, type GenerationPublication, type LiveGenerationAttachment } from './liveGeneration.js';
-import { callerPresentationFrontier, failedRequestSpeech, hasLaterCallerSpeech, hasNewerCallerWork, isFixedPendingStatus, isPartialResultUpdate, pendingRequestState, requestPresentationContext } from './voicePresentation.js';
+import { callerPresentationFrontier, failedRequestSpeech, hasLaterCallerSpeech, hasNewerCallerWork, requestPresentationContext } from './voicePresentation.js';
+import { createVoiceTasks } from './voiceTasks.js';
+import { createVoiceGuardrail, type GuardrailJudge } from './voiceGuardrail.js';
+import { recordGuardrailTrigger, recordVoiceClose } from './voiceEvidence.js';
 import { prepareEligibleHistory } from './eligibleHistory.js';
 import { eligibleAssociatedDeliveryResponseSchema, eligibleDeliveryResponseSchema,
   type EligibleContextClient, type EligibleContextBinding, type EligiblePhoneMessage } from './eligibleContext.js';
@@ -18,7 +21,7 @@ import type { SelectedQuestionAssociationClient, SelectedQuestionSeed } from './
 import type { RequestDeliveryClient } from './requestDelivery.js';
 import { createSelectedQuestionVoiceAdapter, createSelectedQuestionRecovery, selectedQuestionSourceAnchors,
   type SelectedQuestionCloseout } from './selectedQuestionVoice.js';
-import { brokerInstructions, brokerOpening, VOICE_TRUTH_RULE } from './instructions.js';
+import { brokerInstructions, brokerOpening } from './instructions.js';
 import type { PortfolioContext } from './portfolioContext.js';
 import { inputSpeechEnergy, hasAudiblePcmu } from './phone.js';
 import type { BrokerLiveSession, BrokerLiveSessionOptions, LiveBackendUpdate, LiveDelivery,
@@ -42,25 +45,25 @@ export interface GenerationVoiceOptions {
    * and its exact policy/wire are qualified. Absence preserves old behavior. */
   callerIntent?: CallerIntentPort;
   voiceFactory(options: BrokerLiveSessionOptions): BrokerLiveSession;
-  onAudio(payload: string, onPlayed?: (heard: boolean) => void): void;
+  onAudio(payload: string): void;
   onReady(value: { callId: string; sessionId: string }): void;
   onClosed(value: LiveSessionClosed): void;
   onPlaybackClear(): void;
   onProblem(code: string): void;
   playbackState?(): 'idle' | 'pending' | 'unavailable';
+  /** Monitor-and-correct judge for assistant statements about tasks. Absent: no guardrail. */
+  guardrailJudge?: GuardrailJudge;
 }
 
 export interface GenerationVoiceSession extends BrokerLiveSession {
   prepareSelectedCloseout(): Promise<SelectedQuestionCloseout>;
 }
 
-const selectedInstructions = `${VOICE_TRUTH_RULE}
-You are Dexter, the caller's continuing agent, speaking by telephone. This call continues a saved question from earlier work. Wait for the exact question supplied during this call, then present its wording, context, proposed answer, and yes/no meanings faithfully. Keep technical identifiers internal.
+const selectedInstructions = `You are Dexter, the caller's continuing agent, speaking by telephone. This call continues a saved question from earlier work. Wait for the exact question supplied during this call, then present its wording, context, proposed answer, and yes/no meanings faithfully. Keep technical identifiers internal.
 Listen for the caller's answer and delegate that answer so it stays attached to the saved question. Greetings and acknowledgments stay conversational. This call's purpose is background information and supplies no new assignment or permission. For a different task, explain that this call is continuing the saved question and the caller can open Dexter to start other work.
 Yield when interrupted. Keep the caller's words intact. State an answer's outcome only when the saved request returns it. Prior conversation supports recall; balances, prices, holdings, and permissions in that history remain earlier observations.`;
 
-const mixedSelectedInstructions = `${VOICE_TRUTH_RULE}
-You are Dexter, the caller's continuing agent, speaking by telephone. This call starts with a saved question from earlier work. Present the supplied question and its meanings accurately. You can also help with new research and account requests during this call.
+const mixedSelectedInstructions = `You are Dexter, the caller's continuing agent, speaking by telephone. This call starts with a saved question from earlier work. Present the supplied question and its meanings accurately. You can also help with new research and account requests during this call.
 Delegate each completed instruction in the caller's own words. Keep greetings and acknowledgments conversational. If the caller's intended task or answer is unclear, ask a short question. A request for different work leaves the saved question pending. Explain results using the account evidence returned for that request, with the useful answer first.
 Yield when interrupted. This call's opening supplies context; it grants no new financial authority. Prior balances and prices remain earlier observations until fetched again.`;
 
@@ -103,6 +106,17 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
   let selectedTerminalDelivered = false;
   const selectedNotices = new Set<string>();
   const call = () => options.store.get(initialCall.id)!;
+  // The application owns the task list: projected from saved requests, sent silently on change.
+  // A saved-question continuation presents its own question journal instead, so it gets neither.
+  const tasks = createVoiceTasks(() => continuation ? undefined : options.store.get(initialCall.id));
+  const guardrail = options.guardrailJudge && !continuation ? createVoiceGuardrail({ callId: initialCall.id, judge: options.guardrailJudge,
+    tasks: () => tasks.tasks(false, true), truth: () => tasks.tasks(true),
+    correct: (text, delegationId, sessionId) => {
+      const current = controller.snapshot().deliveryAttachment;
+      const voice = current?.sessionId === sessionId ? sessions.get(sessionId)?.voice : undefined;
+      return voice ? voice.appendInstructions(text, delegationId) : Promise.resolve({ eventId: '', status: 'closed' as const });
+    },
+    record: trigger => recordGuardrailTrigger(options.store, initialCall.id, trigger) }) : undefined;
   const current = () => {
     const attachment = controller.snapshot().deliveryAttachment;
     return attachment ? { attachment, session: sessions.get(attachment.sessionId) } : undefined;
@@ -113,26 +127,32 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
   const quiet = () => (options.playbackState?.() ?? 'idle') === 'idle'
     && Date.now() - Math.max(lastSpeechAt, lastOutputAt) >= 500;
   const blocksEarlierPresentation = (entry: BrokerDelegationRecord) =>
-    !(terminalRequest(entry.status) && entry.primaryResult?.state === entry.status)
+    !(['completed', 'failed', 'cancelled'].includes(entry.status) && entry.primaryResult?.state === entry.status)
       && hasNewerCallerWork(call(), entry);
-  const atSpeechBoundary = async (entry: BrokerDelegationRecord, fixedStatus = false) => {
+  const atSpeechBoundary = async (entry: BrokerDelegationRecord) => {
     const deadline = Date.now() + 5_000;
     while (!stopped && !observer.signal.aborted && !call().endedAt && Date.now() < deadline) {
-      if ((!fixedStatus && blocksEarlierPresentation(entry)) || options.playbackState?.() === 'unavailable') return false;
+      if (blocksEarlierPresentation(entry) || options.playbackState?.() === 'unavailable') return false;
       if (quiet()) return true;
       await new Promise<void>(resolve => setTimeout(resolve, 50));
     }
     return false;
   };
+  // A confirmed result goes to Live as soon as it is saved (live-delegation: stream verified
+  // results as commentary); GPT-Live fits it into its own speech. Holding it for Dexter to fall
+  // silent left the task list and the spoken result out of step for seconds. Only a caller who
+  // is mid-sentence holds it, briefly, so the result is not appended on top of their words.
+  // A generation that must be replaced to admit the result still waits for a full pause:
+  // replacing the Live session mid-sentence would cut Dexter off.
+  const callerPause = async () => {
+    const deadline = Date.now() + 2_000;
+    while (!stopped && !observer.signal.aborted && !call().endedAt && Date.now() < deadline && Date.now() - lastSpeechAt < 500)
+      await new Promise<void>(resolve => setTimeout(resolve, 50));
+  };
 
   const selectedActive = () => !stopped && !selectedClosing && !observer.signal.aborted && !call().endedAt
     && !call().primaryClosed && !terminalCallStatuses.has(call().status)
     && Date.now() < Date.parse(initialCall.liveGenerations?.clocks.callDeadlineAt ?? options.callDeadlineAt);
-  const selectedSpeechRequest = (requestId: string, voice?: BrokerLiveSession) => {
-    const slots = call().selectedQuestion?.questions.filter(slot => slot.seed.request.originalRequestId === requestId) ?? [];
-    const aliases = slots.flatMap(slot => slot.admissions.map(value => value.answer.delegationId));
-    return { id: requestId, aliases };
-  };
   const selectedNotice = async (state: 'failed' | 'cancelled' | 'unconfirmed') => {
     if (!selectedActive() || selectedNotices.has(state)) return;
     selectedNotices.add(state);
@@ -140,16 +160,9 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
       if (!selectedActive()) return;
       const session = sessions.get(attachment.sessionId);
       if (!session?.voice.appendCommentary) return;
-      const text = state === 'failed' ? 'I could not get an answer to that request.'
-        : state === 'cancelled' ? 'The request was cancelled.' : 'I could not check the saved request yet.';
-      const request = selectedSpeechRequest(continuation!.originalRequestId, session.voice);
-      const result = session.voice.speakRequest
-        ? await session.voice.speakRequest({ id: `selected_notice_${state}`, kind: 'result', text, pending: state === 'unconfirmed' },
-          { ...request, terminal: state !== 'unconfirmed' }) : await session.voice.appendCommentary(text);
-      if (state !== 'unconfirmed') {
-        if (result.status === 'accepted') selectedTerminalDelivered = true;
-        else selectedNotices.delete(state);
-      }
+      const result = await session.voice.appendCommentary(state === 'failed' ? 'I could not get an answer to that request.'
+        : state === 'cancelled' ? 'The request was cancelled.' : 'I could not check the saved request yet.');
+      if (state !== 'unconfirmed' && result.status === 'accepted') selectedTerminalDelivered = true;
     });
   };
 
@@ -158,12 +171,10 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
       requestId: result.requestId, version: result.version, delivery: result.delivery, deliveryAssociation: result.deliveryAssociation });
     const session = sessions.get(attachment.sessionId);
     if (!session?.voice.appendCommentary) throw new Error('commentary_transport_unavailable');
-    const request = selectedSpeechRequest(response.deliveryAssociation.execution.requestId, session.voice);
-    const terminalDelivery = !('question' in result.delivery);
     const start = session.voice.getTranscript(), spokenAt = lastSpeechAt;
     const interrupted = (): LiveDelivery['status'] | undefined => !selectedActive() ? 'closed'
       : controller.snapshot().deliveryAttachment?.generationId !== attachment.generationId
-        || !terminalDelivery && (session.voice.getTranscript().callerRevision !== start.callerRevision || lastSpeechAt !== spokenAt)
+        || session.voice.getTranscript().callerRevision !== start.callerRevision || lastSpeechAt !== spokenAt
         || ('question' in result.delivery && Boolean(selected?.pendingSourceCount() || mixed?.pendingSourceCount())) ? 'stale' : undefined;
     let chunks: string[];
     try { chunks = liveResultChunks(result.delivery.text); }
@@ -183,7 +194,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
       && record.updateId.startsWith(`${prefix}_attempt_`)) ?? [];
     let attempt = Number(previous.at(-1)?.updateId.match(/_attempt_(\d+)_\d+$/)?.[1] ?? 1);
     if (previous.some(record => record.updateId.startsWith(`${prefix}_attempt_${attempt}_`) && record.outcome
-      && (record.outcome.status === 'rejected' || terminalDelivery && record.outcome.status === 'unconfirmed' || call().publications?.rejections.some(rejection =>
+      && (record.outcome.status === 'rejected' || call().publications?.rejections.some(rejection =>
         rejection.sessionId === record.sessionId && rejection.eventId === record.outcome!.eventId)))) attempt++;
     let receipt: LiveDelivery = { eventId: '', status: 'unconfirmed' };
     const receipts: BrokerPublicationReceipt[] = [];
@@ -199,10 +210,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
           observedCallerRevision: intent.record.outcome.callerRevision, observedTranscriptSequence: intent.record.outcome.transcriptSequence }
         : { eventId: '', status: 'unconfirmed' };
       else {
-        try { receipt = session.voice.speakRequest
-          ? await session.voice.speakRequest({ id: intent.record.updateId, kind: 'result', text, pending: 'question' in result.delivery },
-            { ...request, terminal: chunkIndex === chunks.length - 1 && !('question' in result.delivery) })
-          : await session.voice.appendCommentary(text); }
+        try { receipt = await session.voice.appendCommentary(text); }
         catch { receipt = { eventId: '', status: 'unconfirmed' }; }
         settleBrokerPublication(options.store, intent.record, receipt, session.voice.getTranscript(), !selectedActive());
       }
@@ -220,12 +228,14 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
     evidence?: OrdinaryPublicationEvidence['response'], historical=false, speak=true): Promise<GenerationPublication> => {
     const session = sessions.get(attachment.sessionId);
     if (!session?.voice.appendCommentary) throw new Error('commentary_transport_unavailable');
-    const terminalDelivery = terminalRequest(entry.status);
     const start = session.voice.getTranscript();
     const spokenAt = lastSpeechAt;
+    // Caller speech defers only spoken non-final text (a question or notice). Quiet progress and a
+    // confirmed final result go out regardless: Live decides when to say the result.
+    const awaitsTurn = speak && !terminalRequest(entry.status);
     const interrupted = (): LiveDelivery['status'] | undefined => stopped || observer.signal.aborted || call().endedAt ? 'closed'
       : controller.snapshot().deliveryAttachment?.generationId !== attachment.generationId
-        || !terminalDelivery && (session.voice.getTranscript().callerRevision !== start.callerRevision || lastSpeechAt !== spokenAt) ? 'stale' : undefined;
+        || awaitsTurn && (session.voice.getTranscript().callerRevision !== start.callerRevision || lastSpeechAt !== spokenAt) ? 'stale' : undefined;
     let receipt: LiveDelivery = { eventId: '', status: 'unconfirmed' };
     const publicationReceipts: BrokerPublicationReceipt[] = [];
     const prefix = `${updateId}_caller_${start.callerRevision}`;
@@ -234,7 +244,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
     const lastAttempt = previous.at(-1)?.updateId.match(/_attempt_(\d+)_\d+$/)?.[1];
     let attempt = lastAttempt === undefined ? 1 : Number(lastAttempt);
     if (previous.some(value => value.updateId.startsWith(`${prefix}_attempt_${attempt}_`)
-      && value.outcome && (value.outcome.status === 'rejected' || terminalDelivery && value.outcome.status === 'unconfirmed'
+      && value.outcome && (value.outcome.status === 'rejected'
         || call().publications?.rejections.some(rejection => rejection.sessionId === value.sessionId
           && rejection.eventId === value.outcome!.eventId)))) attempt++;
 
@@ -263,7 +273,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
       if (halted) return { eventId: receipt.eventId, status: halted };
       const snapshot = session.voice.getTranscript();
       const update: LiveBackendUpdate = { id: `${prefix}_attempt_${attempt}_${index}`, kind, text: chunk, speak,
-        pending: !terminalRequest(entry.status),
+        pending: !terminalRequest(entry.status), terminal: index === chunks.length - 1,
         expectedCallerRevision: start.callerRevision };
       const identity = { callId: initialCall.id, callSid: binding.callSid, bindingId: binding.bindingId,
         sessionId: attachment.sessionId, ...(entry.sessionId !== attachment.sessionId ? { sourceSessionId: entry.sessionId } : {}) };
@@ -275,10 +285,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
           observedCallerRevision: intent.record.outcome.callerRevision, observedTranscriptSequence: intent.record.outcome.transcriptSequence }
         : { eventId: '', status: 'unconfirmed' };
       else {
-        try { receipt = session.voice.speakRequest
-          ? await session.voice.speakRequest(update, { id: entry.requestId, aliases: entry.delegationIds,
-            terminal: index === chunks.length - 1 && terminalRequest(entry.status) })
-          : entry.sessionId===attachment.sessionId && session.voice.publishDelegation
+        try { receipt = entry.sessionId===attachment.sessionId && session.voice.publishDelegation
           ? await session.voice.publishDelegation(entry.delegationIds[0]!,update)
           : speak ? await session.voice.appendCommentary(chunk) : await session.voice.appendContext(chunk); }
         catch { receipt = { eventId: '', status: 'unconfirmed' }; }
@@ -297,29 +304,24 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
 
   const publish = async (entry: BrokerDelegationRecord, update?: LiveBackendUpdate) => {
     if (stopped || observer.signal.aborted || call().endedAt) return { delivery: closedDelivery() };
-    const pendingStatus = isFixedPendingStatus(entry, update);
-    const ordinaryResult = isPartialResultUpdate(entry, update)
-      || !update && ['completed', 'failed', 'cancelled', 'waiting_for_reply'].includes(entry.status);
+    // Quiet progress is context, not speech: it never waits for a pause or a turn.
+    const progressOnly = update?.speak === false;
+    const ordinaryResult = !update && ['completed', 'failed', 'cancelled', 'waiting_for_reply'].includes(entry.status);
     // A terminal outcome for this exact request is what the caller is waiting for. Once
     // a pause admits it, caller speech during the context read ("Hello?", "What are you
     // on?") is a prompt to hear it, not a reason to withhold it (call 039b39cd). Request
     // identity, the "For your earlier request" label and per-chunk barge-in still apply.
-    const availableResult = !update && terminalRequest(entry.status)
+    const availableResult = !update && ['completed', 'failed', 'cancelled'].includes(entry.status)
       && entry.primaryResult?.state === entry.status;
     const deferred = () => ({ delivery: { eventId: '', status: 'stale' as const, reason: 'caller_presentation_deferred' } });
-    if ((ordinaryResult || pendingStatus) && !await atSpeechBoundary(entry, pendingStatus)) return deferred();
-    const statusCurrent = () => {
-      const latest = call().delegations[entry.requestId] as BrokerDelegationRecord | undefined;
-      return !!latest && pendingRequestState(latest) === pendingRequestState(entry)
-        && isFixedPendingStatus(latest, update);
-    };
+    if (availableResult && controller.admitsSources()) await callerPause();
+    else if (ordinaryResult && !await atSpeechBoundary(entry)) return deferred();
     // Freeze before context I/O. A successor's empty transcript cannot make an
     // old answer current after the caller has started another turn.
     const frontier = presentationFrontier();
     const stillRelevant = () => !stopped && !observer.signal.aborted && !call().endedAt
-      && (availableResult || (frontier === presentationFrontier()
-        && (!ordinaryResult || (!blocksEarlierPresentation(entry) && quiet()))
-        && (!pendingStatus || (statusCurrent() && quiet()))));
+      && (availableResult || progressOnly || (frontier === presentationFrontier()
+        && (!ordinaryResult || (!blocksEarlierPresentation(entry) && quiet()))));
     const canonicalRequestId = entry.reconciliation?.outcome === 'admitted' ? entry.reconciliation.canonicalRequestId : entry.requestId;
     let attachment: LiveGenerationAttachment;
     let delivery: GenerationPublication;
@@ -345,11 +347,10 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
         && hasLaterCallerSpeech(call(), entry) ? `For your earlier request: ${outcomeText}` : outcomeText;
       const present = async (currentAttachment: LiveGenerationAttachment) => ({ attachment: currentAttachment,
         delivery: stillRelevant()
-          ? await publishText(entry, currentAttachment, text(), update?.kind ?? 'result', update?.id ?? `${entry.requestId}_${entry.status}`,undefined,false,!pendingStatus)
+          ? await publishText(entry, currentAttachment, text(), update?.kind ?? 'result', update?.id ?? `${entry.requestId}_${entry.status}`, undefined, false, update?.speak ?? true)
           : { eventId: '', status: 'stale' as const, reason: 'caller_context_changed' } });
       let published: Awaited<ReturnType<typeof present>>;
-      try { published = pendingStatus ? await controller.withStatusAttachment(stillRelevant, present)
-        : await controller.withCurrentAttachment(present, stillRelevant); }
+      try { published = await controller.withCurrentAttachment(present, stillRelevant); }
       catch (error) {
         if (error instanceof LiveGenerationError && error.code === 'presentation_deferred') return deferred();
         throw error;
@@ -366,8 +367,13 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
   // without a lasting lag; unpaced bursts tripped input_audio_rate_limit_exceeded.
   const controller = createLiveGenerationController({ callId: initialCall.id, binding, inputPaceRate: 1.5,
     onActivated(attachment) {
-      const voice = sessions.get(attachment.sessionId)?.voice;
-      if (voice) options.portfolioContext?.attach(voice);
+      const record = sessions.get(attachment.sessionId), voice = record?.voice;
+      if (voice) {
+        options.portfolioContext?.attach(voice);
+        // A replacement session sees a request's words only when its eligible history admitted that source.
+        tasks.attach(voice, task => task.sessionId === attachment.sessionId || record!.eligibleMessages.some(message =>
+          message.role === 'user' && message.canonicalSource?.sourceEventId === task.sourceEventId));
+      }
     },
     clocks: initialCall.liveGenerations?.clocks ?? { callDeadlineAt: options.callDeadlineAt, mediaStartedAt: initialCall.mediaStartedAt,
       ...(initialCall.inbound?.remote?.state === 'bound' ? { consumedAt: initialCall.inbound.remote.consumedAt,
@@ -409,10 +415,10 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
       options.store.update(initialCall.id, { liveGenerations: journal,
         ...(journal.deliveryAttachment ? { liveSessionId: journal.deliveryAttachment.sessionId } : {}) });
     },
-    onAudio(payload, _attachment, onPlayed) { if (!playbackPaused) {
+    onAudio(payload) { if (!playbackPaused) {
       if (hasAudiblePcmu(Buffer.from(payload, 'base64'))) lastOutputAt = Date.now();
-      options.onAudio(payload, onPlayed);
-    } else onPlayed?.(false); },
+      options.onAudio(payload);
+    } },
     clearPlayback: options.onPlaybackClear,
     onProblem(code) { options.onProblem(code); },
     onContextReadFailure(failure) {
@@ -473,11 +479,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
         input.signal.addEventListener('abort', cancelStart, { once: true });
         if (input.signal.aborted) { cancelStart(); return; }
         try {
-          voice = options.voiceFactory({ speechGate: true,
-            pendingRequests: [...(Object.values(call().delegations) as BrokerDelegationRecord[]).filter(entry => (!terminalRequest(entry.status) || entry.delivery !== 'accepted') &&
-              entry.submission)
-              .map(entry => ({ id: entry.requestId, aliases: entry.delegationIds })),
-              ...(continuation && !selectedTerminalDelivered ? [selectedSpeechRequest(continuation.originalRequestId)] : [])], apiKey: options.apiKey, callId: initialCall.id, voice: options.voice,
+          voice = options.voiceFactory({ apiKey: options.apiKey, callId: initialCall.id, voice: options.voice,
             eligibleHistory: prepared,
             instructions: continuation ? (options.callerIntent ? mixedSelectedInstructions : selectedInstructions) : brokerInstructions({ direction: initialCall.direction, purpose: initialCall.purpose,
               registeredAssignment: input.allowOpening && !initialCall.voiceOpening && Boolean(initialCall.callAssignment),
@@ -491,6 +493,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
               let resolveAdmission!: () => void;
               const promise = new Promise<void>(resolve => { resolveAdmission = resolve; });
               pending.set(request, { promise, resolve: resolveAdmission });
+              if (!continuation) tasks.starting(request);
               try {
                 if (continuation) {
                   if (!selected || !selectedActive()) throw new Error('selected_question_not_ready');
@@ -498,10 +501,13 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
                   else await selected.delegate(request, channel);
                 } else await backend.delegate(request, channel);
               }
-              finally { pending.get(request)?.resolve(); pending.delete(request); }
+              finally { pending.get(request)?.resolve(); pending.delete(request); tasks.settled(request); }
             } },
-            onAudio(payload, metadata) { input.callbacks.onAudio(payload, metadata?.onPlayed); },
-            onTranscript(snapshot) { input.callbacks.onTranscript(snapshot); backend?.observeTranscript(snapshot); },
+            onAudio(payload) { input.callbacks.onAudio(payload); },
+            onTranscript(snapshot) {
+              input.callbacks.onTranscript(snapshot); backend?.observeTranscript(snapshot);
+              if (sessionId) guardrail?.observe(snapshot, sessionId);
+            },
             onReady(value) {
               if (ready) return;
               if (startCancelled || input.signal.aborted || stopped) {
@@ -515,12 +521,9 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
               sessionId = value.sessionId;
               backend = createPrimaryBackend({ callId: initialCall.id, callSid: binding.callSid, bindingId: binding.bindingId,
                 onResult: result => options.portfolioContext?.observe(result),
-                onRequest: entry => {
-                  if ((!terminalRequest(entry.status) || entry.delivery !== 'accepted') && entry.submission)
-                    voice.trackRequest?.(entry.requestId, entry.delegationIds);
-                },
+                onRequest: () => tasks.refresh(),
                 api: options.primary, store: options.store, sourceSessionId: sessionId, watchUntilCallEnds: true,
-                admissionSettled(request) { pending.get(request)?.resolve(); pending.delete(request); mixed?.admissionSettled(request); },
+                admissionSettled(request) { pending.get(request)?.resolve(); pending.delete(request); mixed?.admissionSettled(request); tasks.settled(request); },
                 lastCallerSpeechAt: () => sourceSpeechAt,
                 ...(continuation ? { selectedQuestionSources: () => selectedQuestionSourceAnchors(call()) } : {}),
                 ...(continuation && options.callerIntent ? { callerRouteSources: () => callerRouteSources(call()) } : {}),
@@ -578,7 +581,8 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
               });
             },
             onClosed(result) {
-              options.portfolioContext?.detach(voice);
+              options.portfolioContext?.detach(voice); tasks.detach(voice);
+              recordVoiceClose(options.store, initialCall.id, result, input.generationId);
               clearTimeout(startTimer); input.signal.removeEventListener('abort', cancelStart); finalResult = result;
               input.callbacks.onClosed(result);
               if (!ready) { startCancelled = true; reject(new LiveGenerationStartupError(result.reason)); }
@@ -590,7 +594,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
               if (event.type === 'live.append.late_rejection' && sessionId && typeof event.eventId === 'string')
                 rejectBrokerPublication(options.store, { callId: initialCall.id, callSid: binding.callSid,
                   bindingId: binding.bindingId, sessionId }, event.eventId, typeof event.code === 'string' ? event.code : 'provider_error');
-              if (event.type === 'live.error' && event.code !== 'reflection_unavailable' && controller.snapshot().deliveryAttachment?.generationId === input.generationId)
+              if (event.type === 'live.error' && controller.snapshot().deliveryAttachment?.generationId === input.generationId)
                 options.onProblem(String(event.code ?? 'live_error'));
             },
           });
@@ -788,7 +792,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
     getTranscript() { return current()?.session?.voice.getTranscript() ?? emptyTranscript(); },
     close(reason = 'call_stopped') {
       if (closing) return closing;
-      stopped = true; observer.abort();
+      stopped = true; observer.abort(); tasks.stop(); guardrail?.stop();
       // stop gates output synchronously. The server performs provider hangup before awaiting this promise.
       const cleanup = controller.stop();
       stopSelected();

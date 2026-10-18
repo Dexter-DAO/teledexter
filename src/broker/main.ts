@@ -11,6 +11,7 @@ import { createPrimaryCallerIntentClient } from './callerIntentClient.js';
 import { safeFailure } from './phone.js';
 import { createOpenAILiveConnection } from '../live/session.js';
 import { INBOUND_GREETING_CLIP_ASSET, loadGreetingClip } from './greetingClip.js';
+import { createDecisionsJudge } from './voiceGuardrail.js';
 
 dotenv.config({ path: process.env.BROKER_ENV_FILE || '.env' });
 let sms: BrokerSmsBridge | undefined;
@@ -27,6 +28,8 @@ try {
     ...(greetingClip ? { greetingClip } : {}),
     ...(inboundGreetingClip ? { inboundGreetingClip } : {}),
     inboundPreconnect: () => createOpenAILiveConnection(config.apiKey),
+    // Transcript guardrail judge: OpenAI Decisions API, same project key as Live.
+    guardrailJudge: createDecisionsJudge(config.apiKey),
     ...(setup && setupStore ? { store: setupStore,
       inboundAttachment: createInboundHoldAdapter({ publicOrigin: config.publicOrigin, store: setupStore }),
       restrictedSetup: { model: setup.model, receiptTransport: { apiBaseUrl: setup.apiBaseUrl, signingSecret: setup.signingSecret } },

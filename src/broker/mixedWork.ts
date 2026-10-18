@@ -120,16 +120,13 @@ export function createMixedWorkRouter(options: MixedWorkOptions) {
         clearTimeout(timer); channel.signal.removeEventListener('abort', stopped); resolutionAborts.delete(abort);
       }
     }
-    if (!record.decision || stopping || channel.signal.aborted || !options.active(request.sessionId)) { channel.release?.(); return; }
+    if (!record.decision || stopping || channel.signal.aborted || !options.active(request.sessionId)) return;
     if (record.decision.kind === 'task' || record.decision.kind === 'answer' || record.decision.kind === 'deliver_result') {
       // Each admission port rechecks current presentation/authority or requires
       // its own durable downstream record before recovery. No route is retargeted.
       await options.admit(request, callerRouteRef(record), record.decision, channel);
     } else {
       settle(request);
-      // Conversation and clarify decisions start no work: release the speech gate first, so the
-      // gate cannot stay on for the call and Live can speak the clarification.
-      channel.release?.();
       try { if (record.decision.kind === 'clarify') await notice(request, record, record.decision.reason); }
       finally { try { await capture(record); } catch { /* Closeout retains the exact source. */ } }
     }

@@ -810,7 +810,7 @@ test('ended-call closeout settles a definitely-undispatched answer locally and p
 // The accepted tool observation on Oct 18 was followed by a different terminal outcome.
 for (const partialStatus of ['accepted', 'unconfirmed'] as const) {
   test(`call truth: a ${partialStatus} partial never suppresses the final money result after later speech`, async t => {
-    const recorded = JSON.parse(await readFile(new URL('./fixtures/call-truth-oct18.json', import.meta.url), 'utf8')).sale;
+    const recorded = JSON.parse(await readFile(new URL('./fixtures/voice-incident.json', import.meta.url), 'utf8')).sale;
     const sale = recorded.requests[1];
     const f = await fixture(t), backend = f.backend(oldSession, 1000);
     let reads = 0;
@@ -839,22 +839,30 @@ for (const partialStatus of ['accepted', 'unconfirmed'] as const) {
   });
 }
 
-test('call truth: a status question gets the saved final result even after a partial was marked delivered', async t => {
-  const recorded = JSON.parse(await readFile(new URL('./fixtures/call-truth-oct18.json', import.meta.url), 'utf8')).sale.requests[1];
-  const f = await fixture(t), backend = f.backend(oldSession);
-  f.behavior.result = async id => ({ ...f.completed(id), assistant: { ...f.completed(id).assistant!, text: recorded.result } });
+test('call truth: the task list carries the final outcome, never the earlier progress, and no status question resubmits work', async t => {
+  const recorded = JSON.parse(await readFile(new URL('./fixtures/voice-incident.json', import.meta.url), 'utf8')).sale.requests[1];
+  const f = await fixture(t), backend = f.backend(oldSession, 1000);
+  let reads = 0;
+  f.behavior.result = async id => ++reads === 1
+    ? { bindingId, requestId: id, state: 'running', partialResult: { kind: 'prepared_action', toolInvocationId: eventId,
+      observedAt: '2026-10-18T02:04:05.919Z', text: recorded.partial } } as PrimaryResult
+    : { ...f.completed(id), assistant: { ...f.completed(id).assistant!, text: recorded.result } };
   f.speak(backend, oldSession, recorded.text);
   await f.delegate(backend, oldSession, 'sale');
-  const before = f.publications.length;
+  const { callTasks } = await import('../src/broker/voiceTasks.js');
+  const tasks = callTasks(f.store().get(f.call.id)!);
+  assert.equal(tasks.length, 1);
+  assert.equal(tasks[0].status, 'finished');
+  assert.match(tasks[0].outcome!, /^The SpaceX sale didn't go through, and nothing was sold\./);
+  assert.equal(tasks[0].progress, undefined, 'progress is superseded by the result');
   f.speak(backend, oldSession, "How's that buy going", 60000, 61000);
-  await until(() => f.publications.length > before);
-  assert.equal(f.publications.at(-1)!.entry.primaryResult?.assistant?.text, recorded.result);
-  assert.equal(f.publications.at(-1)!.update, undefined, 'the waiting result outranks a holding line');
-  assert.equal(f.posts.length, 1);
+  await new Promise(resolve => setTimeout(resolve, 900));
+  assert.equal(f.posts.length, 1, 'a status question never submits the sale again');
+  assert.ok(f.trackedRequests.length > 0, 'every saved change reaches the task list observer');
 });
 
-test('call truth: Primary receives the toilet conversation separately from the exact follow-up words', async t => {
-  const recorded = JSON.parse(await readFile(new URL('./fixtures/call-truth-oct18.json', import.meta.url), 'utf8')).toilet;
+test('call truth: Primary receives this call\'s conversation separately from the exact follow-up words', async t => {
+  const recorded = JSON.parse(await readFile(new URL('./fixtures/voice-incident.json', import.meta.url), 'utf8')).followup;
   const f = await fixture(t), backend = f.backend(oldSession);
   const source = recorded.requests.at(-1);
   const fragments = recorded.fragments.filter((fragment: { sequence: number }) => fragment.sequence < source.firstSequence);
@@ -867,22 +875,8 @@ test('call truth: Primary receives the toilet conversation separately from the e
   f.rotate();
   const next = f.backend(newSession);
   f.speak(next, newSession, source.text, 60000, 61000);
-  await f.delegate(next, newSession, 'toilet_followup');
+  await f.delegate(next, newSession, 'followup');
   assert.equal(f.posts.length, 1);
   assert.equal(f.posts[0].input.text, source.text, 'caller words stay unchanged');
-  assert.ok(f.posts[0].input.voiceContext?.recentSpeech.some(turn => turn.role === 'dexter' && /toilet/i.test(turn.text)), 'current call context travels to Primary');
-});
-
-test('RV gate leak: every delegation id is tracked under some request', async t => {
-  const f = await fixture(t);
-  f.behavior.result = async id => ({ requestId: id, bindingId, state: 'running' } as PrimaryResult);
-  const old = f.backend(oldSession); f.speak(old, oldSession, 'Check my balance.');
-  await f.delegate(old, oldSession, 'task');
-  f.speak(old, oldSession, 'Thanks.', 3000, 3200);
-  await f.delegate(old, oldSession, 'thanks');
-  const seen = f.trackedRequests;
-  const tracked = new Set(seen.flatMap(e => [...e.delegationIds, ...(e.delegationAliases ?? []).map(a => a.delegationId)]));
-  t.diagnostic(`tracked delegation ids=${JSON.stringify([...tracked])}; saved deferred=${JSON.stringify(f.saved().map(e => (e.deferredTurns ?? []).map(d => [d.delegationId, d.status])))}`);
-  assert.ok(tracked.has('task'));
-  assert.ok(tracked.has('thanks'), 'ack delegation never re-keyed onto a request: gate keeps it pending forever');
+  assert.ok(f.posts[0].input.voiceContext?.recentSpeech.some(turn => turn.role === 'dexter' && /basil|soil|buds/i.test(turn.text)), 'current call context travels to Primary');
 });
