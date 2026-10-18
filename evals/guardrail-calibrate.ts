@@ -6,9 +6,10 @@
  * corrections the guardrail would send for true sentences, for each trigger threshold.
  *
  *   node --import tsx evals/guardrail-calibrate.ts --runs-root /abs/dir --labels baseline,new \
- *     --config-file /abs/production.env --cache /abs/judge-cache.json [--threshold 0.9]
+ *     --config-file /abs/eval.env --cache /abs/judge-cache.json [--threshold 0.98] [--offline 1]
  *
  * Verdicts are cached by request body, so an unchanged judge prompt costs nothing to re-run.
+ * --offline replays the cache only and never calls the API. Use an eval key, not production's.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -30,9 +31,11 @@ for (const line of fs.readFileSync(args.get('--config-file')!, 'utf8').split(/\r
   if (match) apiKey = match[1]!.replace(/^(['"])(.*)\1$/, '$2');
 }
 const cache: Record<string, unknown> = fs.existsSync(cacheFile) ? JSON.parse(fs.readFileSync(cacheFile, 'utf8')) : {};
-let calls = 0, inputChars = 0;
+let calls = 0, inputChars = 0, misses = 0;
+const offline = args.has('--offline');
 const cachedFetch = (async (url: string, init: RequestInit) => {
   const key = createHash('sha256').update(String(init.body)).digest('hex');
+  if (!(key in cache) && offline) { misses++; return new Response('{"error":"offline: not cached"}', { status: 599 }); }
   if (!(key in cache)) {
     calls++; inputChars += String(init.body).length;
     for (let attempt = 1; ; attempt++) {
@@ -119,25 +122,32 @@ await Promise.all(Array.from({ length: 8 }, async () => {
     catch { item.verdict = undefined; }
   }
 }));
-fs.writeFileSync(cacheFile, JSON.stringify(cache));
+if (!offline) fs.writeFileSync(cacheFile, JSON.stringify(cache));
 
+// Mirrors createVoiceGuardrail: a contradiction is corrected outright ("you misspoke") unless the
+// judge also found a listed status or result the sentence matches; then the list is restated
+// neutrally. A restatement retracts nothing, so only a misspoke correction of a true sentence is a
+// false correction.
 const kinds = new Set(['false_success', 'false_failure', 'phantom_step']);
-// Mirrors createVoiceGuardrail: a claimed success is let go when the judge finds it matches a
-// finished request's result (an open cancel beside a finished sale confused the contradiction).
-const fires = (verdict: JudgeVerdict | undefined, threshold: number, minKind: number, tasks = '') => Boolean(verdict
-  && verdict.contradicts >= threshold && kinds.has(verdict.kind) && verdict.kindProbability >= minKind
-  && !(verdict.kind === 'false_success' && /^\d+\. finished/m.test(tasks) && (verdict.supported ?? 0) >= 0.5));
-const positives = items.filter(item => item.label === 'false').length;
-console.log(`${items.length} task sentences (${positives} labelled false claims) from ${labels.join(', ')}; ${calls} new judge calls`);
-console.log('| contradicts >= | kind p >= | caught false claims | false corrections |');
-console.log('|---|---|---|---|');
-for (const threshold of [0.5, 0.7, 0.8, 0.9, 0.95, 0.98]) for (const minKind of [0, 0.6, 0.8]) {
-  const fired = items.filter(item => fires(item.verdict, threshold, minKind, item.tasks));
-  console.log(`| ${threshold} | ${minKind} | ${fired.filter(item => item.label === 'false').length}/${positives} | ${fired.filter(item => item.label === 'ok').length} |`);
+type Action = 'misspoke' | 'restate' | 'none';
+const action = (verdict: JudgeVerdict | undefined, threshold: number): Action => !verdict
+  || verdict.contradicts < threshold || !kinds.has(verdict.kind) ? 'none' : (verdict.supported ?? 0) >= 0.5 ? 'restate' : 'misspoke';
+const judged = items.filter(item => item.verdict);
+const positives = judged.filter(item => item.label === 'false').length;
+console.log(`${items.length} task sentences, ${judged.length} with a verdict (${positives} labelled false claims) from ${labels.join(', ')}; ${calls} new judge calls${offline ? `, ${misses} not cached (offline)` : ''}`);
+console.log('| contradicts >= | false claims corrected | false claims restated | false claims missed | true sentences told "misspoke" | true sentences restated |');
+console.log('|---|---|---|---|---|---|');
+for (const threshold of [0.5, 0.7, 0.8, 0.9, 0.95, 0.98]) {
+  const count = (label: Item['label'], wanted: Action) => judged.filter(item => item.label === label && action(item.verdict, threshold) === wanted).length;
+  console.log(`| ${threshold} | ${count('false', 'misspoke')} | ${count('false', 'restate')} | ${count('false', 'none')} | ${count('ok', 'misspoke')} | ${count('ok', 'restate')} |`);
 }
-const show = (item: Item) => `  [${item.run} S${item.s}] "${item.sentence}" -> ${item.verdict ? `${item.verdict.contradicts.toFixed(2)} ${item.verdict.kind} ${item.verdict.kindProbability.toFixed(2)}` : 'no verdict'}\n    tasks: ${item.tasks.replace(/\n/g, ' | ')}${item.why ? `\n    scorer: ${item.why}` : ''}`;
-console.log(`\nFalse corrections at ${chosen}:`);
-for (const item of items.filter(value => value.label === 'ok' && fires(value.verdict, chosen, 0, value.tasks))) console.log(show(item));
-console.log(`\nMissed false claims at ${chosen}:`);
-for (const item of items.filter(value => value.label === 'false' && !fires(value.verdict, chosen, 0, value.tasks))) console.log(show(item));
+const show = (item: Item) => `  [${item.run} S${item.s}] "${item.sentence}" -> ${item.verdict ? `${item.verdict.contradicts.toFixed(2)} ${item.verdict.kind} ${item.verdict.kindProbability.toFixed(2)} supported=${item.verdict.supported?.toFixed(2) ?? '-'}` : 'no verdict'}\n    tasks: ${item.tasks.replace(/\n/g, ' | ')}${item.why ? `\n    scorer: ${item.why}` : ''}`;
+console.log(`\nTrue sentences told "misspoke" at ${chosen}:`);
+for (const item of judged.filter(value => value.label === 'ok' && action(value.verdict, chosen) === 'misspoke')) console.log(show(item));
+console.log(`\nTrue sentences restated at ${chosen}:`);
+for (const item of judged.filter(value => value.label === 'ok' && action(value.verdict, chosen) === 'restate')) console.log(show(item));
+console.log(`\nFalse claims caught at ${chosen}:`);
+for (const item of judged.filter(value => value.label === 'false' && action(value.verdict, chosen) !== 'none')) console.log(`${action(item.verdict, chosen)} ${show(item)}`);
+console.log(`\nFalse claims missed at ${chosen}:`);
+for (const item of judged.filter(value => value.label === 'false' && action(value.verdict, chosen) === 'none')) console.log(show(item));
 console.log(`\njudge calls ${calls}, approx input tokens ${Math.round(inputChars / 4)}, approx $${(inputChars / 4 / 1e6 * 0.1).toFixed(3)}`);
