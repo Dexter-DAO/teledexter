@@ -1,0 +1,68 @@
+{
+ "_comment": "Neutral stand-in for the Oct 17 incident: a sell-then-buy-back request whose progress said the sale was being placed and whose final result was a failure, and a follow-up that depends on this call's own conversation. No real call, account, balance or personal phrasing.",
+ "sale": {
+  "requests": [
+   {
+    "text": " I want to sell one dollar of my SpaceX stock.",
+    "partial": null,
+    "result": "To confirm: sell $1 of your SpaceX stock for cash at market price. Should I run it?"
+   },
+   {
+    "text": " Yes. And once that's done, buy it right back.",
+    "partial": "The sale of about $1.00 of SpaceX was being placed.",
+    "result": "The SpaceX sale didn't go through, and nothing was sold. SpaceX matched more than one stock product, so I didn't pick one. I haven't started the buy-back either, since it depends on the sale. Your SpaceX stock and cash are unchanged."
+   }
+  ]
+ },
+ "followup": {
+  "fragments": [
+   {
+    "eventId": "evt_1",
+    "role": "user",
+    "text": " Do you have a good tip for keeping a basil plant alive?",
+    "startMs": 1000,
+    "endMs": 3400,
+    "sequence": 1
+   },
+   {
+    "eventId": "evt_2",
+    "role": "assistant",
+    "text": " Give it six hours of sun and water when the top of the soil is dry.",
+    "startMs": 4200,
+    "endMs": 7200,
+    "sequence": 2
+   },
+   {
+    "eventId": "evt_3",
+    "role": "user",
+    "text": " I keep it on a windowsill in the kitchen.",
+    "startMs": 8000,
+    "endMs": 9800,
+    "sequence": 3
+   },
+   {
+    "eventId": "evt_4",
+    "role": "assistant",
+    "text": " That works if the window faces south. Pinch off flower buds so it keeps growing leaves.",
+    "startMs": 10200,
+    "endMs": 13800,
+    "sequence": 4
+   },
+   {
+    "eventId": "evt_5",
+    "role": "user",
+    "text": " Okay, then look for it",
+    "startMs": 14400,
+    "endMs": 15600,
+    "sequence": 5
+   }
+  ],
+  "requests": [
+   {
+    "text": " Okay, then look for it",
+    "firstSequence": 5,
+    "lastSequence": 5
+   }
+  ]
+ }
+}

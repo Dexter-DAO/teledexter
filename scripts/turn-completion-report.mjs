@@ -1,12 +1,16 @@
 // Read-only journal analysis. Usage: node scripts/turn-completion-report.mjs calls.json AS_OF_ISO
 import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { createHash } from 'node:crypto';
+import { foldJournalFiles } from './rollback-journal-compat.mjs';
 
 const [file, asOf] = process.argv.slice(2);
 const end = Date.parse(asOf), start = end - 14 * 86400_000;
 if (!file || !Number.isFinite(end)) throw new Error('Provide calls.json and an explicit ISO window end');
 const bytes = readFileSync(file);
-const calls = Object.values(JSON.parse(bytes).calls).filter(call => Date.parse(call.createdAt) >= start && Date.parse(call.createdAt) <= end);
+// Settled calls (calls.d) and live transcripts (live.d) sit beside calls.json.
+const calls = Object.values(foldJournalFiles(JSON.parse(bytes), path.dirname(file)).journal.calls)
+  .filter(call => Date.parse(call.createdAt) >= start && Date.parse(call.createdAt) <= end);
 const rows = [], missing = [];
 let callerGroups = 0;
 for (const call of calls) {

@@ -18,7 +18,7 @@ import { orderedAssociatedResultReference } from './associatedResult.js';
 import { callerIntentDecisionSchema, type CallerIntentDecision } from './callerIntentContract.js';
 import { resultSmsAcknowledgement, resultSmsResearchRefusal } from './resultSmsAcknowledgement.js';
 import { phoneResultSmsAdmissionReceiptSchema, type PhoneResultSmsAdmissionReceipt } from './resultSmsContract.js';
-import { failedRequestSpeech, pendingRequestSpeech, pendingRequestState, partialResultUpdate } from './voicePresentation.js';
+import { cancelledRequestSpeech, failedRequestSpeech, partialResultUpdate } from './voicePresentation.js';
 
 export interface CallerSourceAnchor {
   frozen: FrozenCallerTurn;
@@ -31,6 +31,7 @@ export type ResolvedCallerTaskReference = NonNullable<Extract<CallerIntentDecisi
 
 export interface PrimaryBackendOptions {
   onResult?(result: PrimaryResult): void;
+  /** Every saved change to this call's requests: the voice's task list follows them. */
   onRequest?(entry: BrokerDelegationRecord): void;
   callId: string;
   callSid: string;
@@ -43,7 +44,6 @@ export interface PrimaryBackendOptions {
   maxPollMs?: number;
   /** Live media owns cancellation; keep observing accepted work until the call ends. */
   watchUntilCallEnds?: boolean;
-  progressIntervalMs?: number;
   now?: () => number;
   lastCallerSpeechAt?: () => number | undefined;
   mediaStartedAt?: string;
@@ -66,8 +66,17 @@ export interface PrimaryBackendOptions {
       delivery: LiveDelivery; sessionId?: string; snapshot?: LiveTranscriptSnapshot;
       inputThroughMs?: number; publicationReceipts?: BrokerPublicationReceipt[];
     }>;
+    /** Speaks a plain notice on the current voice without the journal, for when the journal
+     * itself cannot be written. */
+    notice?(text: string): Promise<LiveDelivery>;
   };
 }
+
+/** Re-sends of a terminal result whose delivery was rejected, unconfirmed or closed before the caller
+ * is told plainly to check the app. */
+export const MAX_RESULT_REDELIVERIES = 3;
+export const RESULT_UNDELIVERABLE_NOTICE = "I couldn't pass on the result of that request. Please check the Dexter app for it.";
+export const TRACKING_FAILED_NOTICE = "I can't track that request right now. Please check the Dexter app for its result.";
 
 export interface PrimaryBackend extends BrokerLiveBackend {
   deliverFrozenResult(request: LiveDelegationRequest, route: CallerRouteRef, channel: LiveBackendChannel): Promise<void>;
@@ -227,11 +236,6 @@ export function isConversationalAcknowledgement(text: string): boolean {
   return waitPattern.test(normalized) || !softPattern.test(normalized);
 }
 
-/** A status check reads saved work; it never submits that work again. */
-export function isRequestStatusQuestion(text: string): boolean {
-  return /^(?:(?:hey|okay|ok|so)[, ]+)?(?:how(?:'s| is| are) (?:it|that|the|my|things)\b.{0,60}(?:going|coming|doing)|any (?:news|update|luck)|no luck|(?:is|did|has) (?:it|that|the (?:buy|sale|trade|send|swap|purchase))\b.{0,50}(?:done|finish|complete|through)|(?:what(?:'s| is)|check) the status)[?.!\s]*$/i.test(text.trim());
-}
-
 /** Every chunk of this exact result was appended to the voice provider (it holds a provider event
  * id), so the caller heard it, even when caller speech advanced the transcript during the append
  * and the journal marked it stale (call 2d141fec: "Bought..." spoken at 05:56:58, journaled stale,
@@ -388,12 +392,6 @@ export async function withCallerAdmission<T>(store: object, callId: string, fn: 
 // One live worker delivers results and drains a call's queue. Admission remains
 // independently locked so caller turns can be saved while a result GET waits.
 const storeWorkers = new WeakMap<object, Map<string, Promise<void>>>();
-// Concurrent Live delegations can observe the same saved request. Share notice
-// reservations without changing its admission or transcript journal.
-const storeNotices = new WeakMap<object, Map<string, {
-  submitAnnounced: boolean; progressCount: number; lastAt: number; inFlight: boolean;
-  stateKey?: string; attempt?: number; deferred?: boolean; uncertainKey?: string; wake?: () => void; spokenText?: string;
-}>>();
 
 /** Timestamp grouping is application presentation state, not a provider turn-complete event. */
 function callerGroups(snapshot: LiveTranscriptSnapshot) {
@@ -450,8 +448,13 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
   const stabilityMs = positive(options.stabilityMs, 700, 10_000);
   const maxWaitMs = positive(options.maxWaitMs, 30_000, 60_000);
   const pollIntervalMs = positive(options.pollIntervalMs, 750, 10_000);
+  // Re-sends per request of a result whose delivery failed, and requests whose caller was already told.
+  const redeliveries = new Map<string, number>();
+  const undeliverableNoticed = new Set<string>();
+  // A result the API will not present in this voice (its source is outside the eligible projection)
+  // is never re-sent: that is a refusal, not a failed delivery.
+  const notRedeliverable = new Set<string>();
   const maxPollMs = positive(options.maxPollMs, 90_000, 300_000);
-  const progressIntervalMs = positive(options.progressIntervalMs, 18_000, 60_000);
   if (maxWaitMs < stabilityMs || !options.callId || !options.callSid || !uuidPattern.test(options.bindingId))
     throw new Error('invalid_backend_configuration');
   let lastSpeechAt: number | undefined;
@@ -463,8 +466,6 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     return { ...span };
   }) : [];
   const speechListeners = new Set<() => void>();
-  let notices = storeNotices.get(options.store);
-  if (!notices) { notices = new Map(); storeNotices.set(options.store, notices); }
   let workers = storeWorkers.get(options.store);
   if (!workers) { workers = new Map(); storeWorkers.set(options.store, workers); }
   const locked = <T>(fn: () => Promise<T>): Promise<T> => withCallerAdmission(options.store, options.callId, fn);
@@ -570,6 +571,10 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       return entry;
     }).filter(entry => all || entry.sessionId === sessionId);
   };
+  // The task list is an observer: it can never fail or delay the write that changed a request.
+  const notifyTaskList = (entry: BrokerDelegationRecord) => {
+    if (options.onRequest) queueMicrotask(() => { try { options.onRequest!(entry); } catch { /* Observer only. */ } });
+  };
   const save = (entry: BrokerDelegationRecord,
     apiErrors: Pick<BrokerDelegationRecord, 'submitError' | 'lastResultReadError'> = {}): BrokerDelegationRecord => {
     const call = boundCall(entry.sessionId);
@@ -606,9 +611,14 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       ? preparePrimaryHarkOutcomePatch({ binding: harkBinding, outbox: call.harkReceiptOutbox,
         canonicalRequestId: next.reconciliation?.outcome === 'admitted' ? next.reconciliation.canonicalRequestId : next.requestId,
         result: next.primaryResult, observedAt: next.updatedAt }) : undefined;
+    // A poll that changed nothing but the clock is not a journal write: each one rewrote the
+    // durable journal while the caller was talking (every 750 ms per open request).
+    if (previous && !harkPatch && canonicalJson({ ...next, updatedAt: previous.updatedAt }) === canonicalJson(previous)
+      && canonicalJson(canonicalTurns) === canonicalJson(call.canonicalTurns ?? {})) return previous;
     validateBrokerAdmissionRefusals({ ...call, delegations: { ...call.delegations, [entry.requestId]: next } }, call);
     options.store.update(call.id, { delegations: { ...call.delegations, [entry.requestId]: next }, canonicalTurns,
       ...(harkPatch ? { harkReceiptOutbox: harkPatch.harkReceiptOutbox } : {}) });
+    notifyTaskList(next);
     return next;
   };
   const load = (entry: BrokerDelegationRecord) => entries(entry.sessionId).find(value => value.requestId === entry.requestId)!;
@@ -871,30 +881,8 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     });
   };
   let observedTranscript: LiveTranscriptSnapshot | undefined;
-  // A caller status turn and the result observer may reach the same answer together.
-  // Share that publication; a later caller turn may explicitly ask to hear it again.
-  const observedPublications = new Map<string, { key: string; promise: ReturnType<NonNullable<PrimaryBackendOptions['observation']>['publish']> }>();
-  const publishObserved = (entry: BrokerDelegationRecord, update?: LiveBackendUpdate) => {
-    if (update || !['completed', 'failed', 'cancelled'].includes(entry.status))
-      return options.observation!.publish(entry, update);
-    const key = JSON.stringify([entry.status, entry.primaryResult?.assistant?.messageId,
-      boundCall(entry.sessionId).liveSessionId, observedTranscript?.callerRevision]);
-    const previous = observedPublications.get(entry.requestId);
-    if (previous?.key === key) return previous.promise;
-    const promise = options.observation!.publish(entry).then(receipt => {
-      if (receipt.delivery.status !== 'accepted' && observedPublications.get(entry.requestId)?.promise === promise)
-        observedPublications.delete(entry.requestId);
-      return receipt;
-    }, error => {
-      if (observedPublications.get(entry.requestId)?.promise === promise) observedPublications.delete(entry.requestId);
-      throw error;
-    });
-    observedPublications.set(entry.requestId, { key, promise });
-    return promise;
-  };
   let transcriptChangedAt = 0;
   let completionTimer: ReturnType<typeof setTimeout> | undefined;
-  let statusSource: string | undefined;
   const scheduleCallerCompletion = () => {
     clearTimeout(completionTimer);
     if (!observedTranscript || options.store.get(options.callId)?.endedAt) return;
@@ -925,25 +913,6 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
           changed = true;
         }
         if (changed) options.store.update(call.id, { callerCompletions: checkpoints });
-        const latest = completedCallerGroups(snapshot).at(-1);
-        if (options.observation && latest && latest.sourceEventId !== statusSource
-          && isRequestStatusQuestion(latest.fragments.map(fragment => fragment.text).join(''))) {
-          statusSource = latest.sourceEventId;
-          // Terminal results outrank a holding line, including records written by
-          // an older broker that incorrectly marked a partial as final delivery.
-          const saved = entries(sessionId, true);
-          const ready = (value: BrokerDelegationRecord) => ['completed', 'failed', 'cancelled'].includes(value.status)
-            && value.primaryResult?.state === value.status;
-          const waiting = saved.filter(value => ready(value) && (value.delivery !== 'accepted'
-            || value.status === 'completed' && !resultAlreadyPresented(call, value))).at(-1);
-          const latestRequest = saved.at(-1);
-          const result = waiting ?? (latestRequest && ready(latestRequest) ? latestRequest : undefined);
-          const pending = latestRequest && !terminal(latestRequest.status) ? latestRequest : undefined;
-          if (result || pending) void publishObserved(result ?? pending!, result ? undefined : {
-            id: `${pending!.requestId}_status_${latest.sourceEventId}`, kind: 'progress', speak: true,
-            text: 'Still working on it.',
-          }).catch(() => console.error('broker_status_delivery_failed', { callId: options.callId }));
-        }
       } catch {
         // The optional checkpoint must not crash an active call. Closeout will
         // report unqualified text when no durable completion evidence exists.
@@ -1381,7 +1350,6 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       entry = save(entry); // This source and exact request survive a crash before POST.
       settleAdmission(request);
       entry = save({ ...entry, status: 'dispatching' });
-      options.onRequest?.(entry);
       try {
         const result = await options.api.submit(options.bindingId, entry.requestId, structuredClone(entry.submission));
         entry = applyResult(entry, result);
@@ -1412,7 +1380,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       ...(reconciliation ? { reconciliation: structuredClone(reconciliation) } : {}),
       ...(result.question ? { currentQuestionId: result.question.id } : {}),
       ...(result.assistant ? { result: result.assistant.text } : {}) });
-    try { options.onRequest?.(saved); options.onResult?.(result); } catch { /* Optional background reads cannot affect work. */ }
+    try { options.onResult?.(result); } catch { /* Optional background reads cannot affect work. */ }
     return saved;
   };
   const captureRevision = async (entry: BrokerDelegationRecord, channel: LiveBackendChannel): Promise<BrokerDelegationRecord> => {
@@ -1446,7 +1414,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
   const publishRequest = (entry: BrokerDelegationRecord, channel: LiveBackendChannel, update: LiveBackendUpdate): Promise<LiveDelivery> => {
     update = { ...update, pending: update.pending ?? !terminal(entry.status) };
     if (options.observation) return options.observation.signal.aborted
-      ? Promise.resolve({ eventId: '', status: 'closed' }) : publishObserved(entry, update).then(value => value.delivery);
+      ? Promise.resolve({ eventId: '', status: 'closed' }) : options.observation.publish(entry, update).then(value => value.delivery);
     if (channel.signal.aborted) return Promise.resolve({ eventId: '', status: 'closed' });
     const intent = beginBrokerPublication(options.store, { callId: options.callId, callSid: options.callSid,
       bindingId: options.bindingId, sessionId: entry.sessionId }, entry.requestId, update, channel.getContext());
@@ -1551,7 +1519,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       let state = load(entry);
       const question = state.currentQuestionId ? state.questions?.[state.currentQuestionId] : undefined;
       const tell = async (text: string, suffix: string) => {
-        const result = await publishObserved(state, { id: `${entry.requestId}_${state.currentQuestionId ?? 'question'}_${suffix}`,
+        const result = await options.observation!.publish(state, { id: `${entry.requestId}_${state.currentQuestionId ?? 'question'}_${suffix}`,
           kind: 'progress', speak: true, text });
         save({ ...load(entry), delivery: result.delivery.status });
         return result.delivery.status;
@@ -1589,12 +1557,12 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
         save({ ...state, delivery: 'accepted' });
         return;
       }
-      const receipt = await publishObserved(load(entry));
+      const receipt = await options.observation.publish(load(entry));
+      if (receipt.delivery.reason === 'source_not_in_projection') notRedeliverable.add(entry.requestId);
       let current = load(entry);
       if (options.observation.signal.aborted || boundCall(entry.sessionId).endedAt) return;
       current = save({ ...current, delivery: receipt.delivery.reason === 'result_format_unsupported'
-        ? `format_unsupported:${receipt.delivery.status}`
-        : receipt.delivery.reason === 'speech_not_confirmed' ? 'speech_unconfirmed' : receipt.delivery.status });
+        ? `format_unsupported:${receipt.delivery.status}` : receipt.delivery.status });
       const questionId = current.currentQuestionId;
       const deliveredQuestion = questionId ? current.questions?.[questionId] : undefined;
       const snapshot = receipt.snapshot;
@@ -1624,9 +1592,10 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     if (channel.signal.aborted || boundCall(entry.sessionId).endedAt) return;
     const current = channel.getContext();
     const spokenAt = speechTime();
+    // A question waits for a quiet turn; a final result is never withheld for caller speech.
     const interrupted = (): 'closed' | 'stale' | undefined => {
       if (channel.signal.aborted || boundCall(entry.sessionId).endedAt) return 'closed';
-      if (channel.getContext().callerRevision !== current.callerRevision || speechTime() !== spokenAt) return 'stale';
+      if (!terminal(entry.status) && (channel.getContext().callerRevision !== current.callerRevision || speechTime() !== spokenAt)) return 'stale';
       return undefined;
     };
     const reviewedRevision = Math.max(entry.frozenCallerRevision, ...Object.values(entry.questions ?? {})
@@ -1637,7 +1606,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     else if (entry.status === 'admission_refused') text = taskAdmissionRefusalText(entry);
     else if (entry.status === 'admission_expired') text = 'The request took too long to confirm. Please tell me what you want me to do now.';
     else if (entry.status === 'failed') text = failedRequestSpeech(entry);
-    else if (entry.status === 'cancelled') text = 'The request was cancelled.';
+    else if (entry.status === 'cancelled') text = cancelledRequestSpeech(entry);
     else if (['dispatching', 'dispatch_unknown', 'prepared'].includes(entry.status))
       text = 'I could not confirm the outcome. Please check the request status before trying again.';
     else text = 'Your request is still pending. I can check its status again.';
@@ -1741,6 +1710,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     const owner = { ...next.owner, updatedAt: timestamp, deferredTurns: next.owner.deferredTurns!.map(turn =>
       turn.sourceEventId === next.turn.sourceEventId ? { ...turn, status: 'promoted' as const } : turn) };
     options.store.update(call.id, { delegations: { ...call.delegations, [owner.requestId]: owner, [child.requestId]: child } });
+    notifyTaskList(child);
     return dispatchPreparedTask(child);
   });
   const observeDelegation = async (request: LiveDelegationRequest, channel: LiveBackendChannel,
@@ -1751,7 +1721,6 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       const observationSignal = options.observation?.signal ?? channel.signal;
       if (observationSignal.aborted) return;
       if (!entry) {
-        channel.release?.();
         console.info(JSON.stringify({ event: 'broker_delegation_unadmitted', callId: options.callId,
           sessionId: request.sessionId, delegationId: request.delegationId,
           reason: unadmittedReasons.get(request) ?? 'no_qualified_caller_source' }));
@@ -1760,13 +1729,6 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
           expectedCallerRevision: channel.getContext().callerRevision });
         return;
       }
-      // A duplicate delegation can refer to a result that has already played.
-      // It owns no remaining work and must not leave a new provisional gate.
-      if (terminal(entry.status) && entry.delivery === 'accepted') channel.release?.();
-      options.onRequest?.(entry);
-      // The active observer owns status speech; queue admission can wake it
-      // without waiting for the earlier result GET or starting the queued task.
-      notices!.get(`${options.callId}:${entry.requestId}`)?.wake?.();
       const workerKey = options.observation ? options.callId : `${options.callId}:${request.sessionId}`;
       while (workers!.has(workerKey)) {
         await workers!.get(workerKey);
@@ -1776,19 +1738,36 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
         if (terminal(entry.status)
             && !saved.some(value => value.deferredTurns?.some(turn => turn.status === 'queued'))) return;
       }
+      // A plain notice on the current voice that needs no journal write.
+      const notice = (text: string, id: string) => options.observation?.notice ? options.observation.notice(text)
+        : channel.publish({ id, kind: 'progress', speak: true, text, expectedCallerRevision: channel.getContext().callerRevision });
       const run = async () => {
         let lastDeferredResult: string | undefined;
+        // A terminal result whose delivery was deferred (stale) waits for its turn; one whose delivery
+        // was rejected, unconfirmed or closed is re-sent a few times, then the caller hears a plain
+        // notice instead of a list that says "in progress" forever.
         const deferredResult = (exceptRequestId?: string) => {
           if (!options.observation || !options.watchUntilCallEnds || observationSignal.aborted
               || boundCall(request.sessionId).endedAt) return;
-          const pending = entries(request.sessionId, true).filter(value => value.requestId !== exceptRequestId
-            && ['completed', 'failed', 'cancelled'].includes(value.status)
-            && value.primaryResult?.state === value.status && (value.delivery === 'stale'
-              || value.delivery === 'speech_unconfirmed'));
+          const terminalResults = entries(request.sessionId, true).filter(value => value.requestId !== exceptRequestId
+            && ['completed', 'failed', 'cancelled'].includes(value.status) && value.primaryResult?.state === value.status);
+          const failed = (value: BrokerDelegationRecord) => ['rejected', 'unconfirmed', 'closed'].includes(value.delivery ?? '')
+            && !notRedeliverable.has(value.requestId);
+          for (const value of terminalResults) if (failed(value) && (redeliveries.get(value.requestId) ?? 0) >= MAX_RESULT_REDELIVERIES
+            && !undeliverableNoticed.has(value.requestId)) {
+            undeliverableNoticed.add(value.requestId);
+            console.info(JSON.stringify({ event: 'broker_result_undeliverable', callId: options.callId, requestId: value.requestId }));
+            void notice(RESULT_UNDELIVERABLE_NOTICE, `${value.requestId}_undeliverable`).catch(() => {});
+          }
+          const pending = terminalResults.filter(value => value.delivery === 'stale'
+            || (failed(value) && (redeliveries.get(value.requestId) ?? 0) < MAX_RESULT_REDELIVERIES));
           if (!pending.length) return;
           const last = pending.findIndex(value => value.requestId === lastDeferredResult);
           const next = pending[(last + 1) % pending.length];
-          if (next) lastDeferredResult = next.requestId;
+          if (next) {
+            lastDeferredResult = next.requestId;
+            if (failed(next)) redeliveries.set(next.requestId, (redeliveries.get(next.requestId) ?? 0) + 1);
+          }
           return next;
         };
         while (!observationSignal.aborted) {
@@ -1796,64 +1775,6 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
           const alreadyDelivered = terminal(entry.status) && entry.delivery === 'accepted';
           if (!alreadyDelivered) {
             const deadline = now() + maxPollMs;
-            const noticeKey = `${options.callId}:${entry.requestId}`;
-            let notice = notices!.get(noticeKey);
-            if (!notice) {
-              notice = { submitAnnounced: false, progressCount: 0, lastAt: now(), inFlight: false };
-              notices!.set(noticeKey, notice);
-            }
-            const publishStatus = (immediate: boolean) => {
-              if (observationSignal.aborted || options.store.get(options.callId)?.endedAt || notice!.inFlight) return;
-              const current = load(entry!);
-              if (terminal(current.status) || current.status === 'waiting_for_reply'
-                  || Object.values(current.questions ?? {}).some(record => unresolvedReply(record.reply))) return;
-              // A result the caller can hear outranks a waiting line: never say "Still working on it"
-              // once this request has a partial result or any request on the call has an unspoken answer.
-              if (current.primaryResult?.partialResult || entries(request.sessionId, true).some(value =>
-                ['completed', 'failed', 'cancelled'].includes(value.status) && value.primaryResult?.state === value.status
-                && value.delivery !== 'accepted')) return;
-              const reviewedRevision = Math.max(current.frozenCallerRevision, ...Object.values(current.questions ?? {})
-                .filter(record => record.reply?.status === 'accepted').map(record => record.reply!.callerRevision));
-              const revision = channel.getContext().callerRevision;
-              const lastSpeech = speechTime();
-              if (lastSpeech !== undefined && now() - lastSpeech < stabilityMs) return;
-              const stateKey = JSON.stringify([pendingRequestState(current), revision]);
-              const changed = notice!.stateKey !== undefined && notice!.stateKey !== stateKey;
-              const text = pendingRequestSpeech(current, revision !== reviewedRevision);
-              // Caller speech and queued turns are not news for the caller; only an unreadable status is.
-              const urgent = (changed || notice!.stateKey === undefined) && current.resultReadUnavailable === true;
-              const announceSubmit = immediate && current.status === 'dispatch_unknown' && !notice!.submitAnnounced;
-              const retryAfter = notice!.deferred ? Math.min(progressIntervalMs, 1000) : progressIntervalMs;
-              if (notice!.uncertainKey === stateKey) return; // An unknown append is not authority to speak it again.
-              if (!announceSubmit && !urgent && (immediate || now() - notice!.lastAt < retryAfter)) return;
-              if (!options.watchUntilCallEnds && now() >= deadline) return;
-              if (changed) notice!.deferred = false;
-              // Speak each distinct status line once; repeated waiting lines only interrupt the caller.
-              if (text !== notice!.spokenText) notice!.progressCount = 0;
-              if (notice!.progressCount >= 1) return;
-              notice!.stateKey = stateKey;
-              notice!.lastAt = now();
-              notice!.inFlight = true;
-              const attempt = notice!.attempt = (notice!.attempt ?? 0) + 1;
-              // Receipt acceptance consumes the budget. Deferred speech remains
-              // eligible at a later quiet boundary, without blocking result reads.
-              void Promise.resolve().then(() => publishRequest(current, channel, { id: `${current.requestId}_${revision}_${announceSubmit ? 'submit_unknown' : `pending_${attempt}`}`,
-                kind: 'progress', speak: true, text, expectedCallerRevision: revision }))
-                .then(delivery => {
-                  if (delivery.status === 'accepted') {
-                    if (announceSubmit) notice!.submitAnnounced = true;
-                    else notice!.progressCount++;
-                    notice!.spokenText = text;
-                    notice!.deferred = false;
-                  } else if (delivery.status === 'unconfirmed') notice!.uncertainKey = stateKey;
-                  else notice!.deferred = delivery.status === 'stale' || delivery.status === 'rejected';
-                }, () => { notice!.uncertainKey = stateKey; })
-                .finally(() => { notice!.inFlight = false; });
-            };
-            notice.wake = () => publishStatus(false);
-            publishStatus(true);
-            const progressTimer = setInterval(() => publishStatus(false), progressIntervalMs);
-            progressTimer.unref();
             // Preserve caller changes in the local journal immediately. Only stable snapshots
             // go to the source-revision API; revisions never create another run here.
             const unsubscribe = channel.subscribeContext(snapshot => {
@@ -1881,7 +1802,6 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
                 if (observationSignal.aborted) return;
                 if (terminal(entry.status)) break;
                 await deliverPartial(entry, channel);
-                publishStatus(false);
                 // A terminal answer can wait across later work without replaying
                 // that work. Questions keep control of their own reply boundary.
                 if (entry.status !== 'waiting_for_reply') {
@@ -1901,7 +1821,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
                 if (!(await delay(pollIntervalMs, observationSignal))) return;
               }
               await deliver(load(entry), channel);
-            } finally { notice.wake = undefined; clearInterval(progressTimer); unsubscribe(); }
+            } finally { unsubscribe(); }
           }
           const next = await promoteDeferred(entry.sessionId, { ...channel, signal: observationSignal });
           if (next && next.requestId !== entry.requestId) { entry = next; continue; }
@@ -1910,7 +1830,14 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
           entry = deferred;
         }
       };
-      const work = run();
+      // A journal that can no longer be written stops this worker; the caller hears it plainly
+      // rather than waiting on a request the broker can no longer follow.
+      const work = run().catch(async error => {
+        if (observationSignal.aborted) return;
+        try { console.error(JSON.stringify({ event: 'broker_request_tracking_failed', callId: options.callId,
+          requestId: entry?.requestId ?? null, message: (error as Error)?.message ?? String(error) })); } catch { /* Telemetry only. */ }
+        try { await notice(TRACKING_FAILED_NOTICE, `${request.requestId}_tracking_failed`); } catch { /* The call continues. */ }
+      });
       workers!.set(workerKey, work);
       try { await work; }
       finally { if (workers!.get(workerKey) === work) workers!.delete(workerKey); }

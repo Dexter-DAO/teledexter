@@ -1,9 +1,11 @@
 import fs from 'node:fs';
+import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import dotenv from 'dotenv';
 import { callContinuationPatch } from '../src/broker/callContinuation.js';
 import { formatCallTranscript } from '../src/broker/callTranscript.js';
 import type { BrokerCall } from '../src/broker/store.js';
+import { foldJournalFiles } from './rollback-journal-compat.mjs';
 
 dotenv.config({ path: process.env.BROKER_ENV_FILE || '.env' });
 const [command = 'status', ...args] = process.argv.slice(2);
@@ -14,8 +16,10 @@ if (command === 'transcript') {
   const journal = value('--journal') ?? (stateDir ? `${stateDir}/calls.json` : undefined);
   if (!id || !journal) throw new Error('Use transcript --id UUID [--journal /path/to/calls.json]');
   // Read-only, like the journey report: never acquire the broker writer lock.
-  const state = JSON.parse(fs.readFileSync(journal, 'utf8')) as { version: number; calls: Record<string, BrokerCall> };
-  if (state.version !== 1 || !state.calls || Array.isArray(state.calls)) throw new Error('Invalid broker call journal');
+  const saved = JSON.parse(fs.readFileSync(journal, 'utf8')) as { version: number; calls: Record<string, BrokerCall> };
+  if (saved.version !== 1 || !saved.calls || Array.isArray(saved.calls)) throw new Error('Invalid broker call journal');
+  // Settled calls (calls.d) and live transcripts (live.d) sit beside calls.json.
+  const state = foldJournalFiles(saved, path.dirname(journal)).journal as { version: number; calls: Record<string, BrokerCall> };
   const call = Object.hasOwn(state.calls, id) ? state.calls[id] : undefined;
   if (!call || call.id !== id) throw new Error(`Call not found: ${id}`);
   await new Promise<void>((resolve, reject) => {

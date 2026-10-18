@@ -2,7 +2,11 @@
 // Prepares the broker journal for a rollback to the release before the greeting stream
 // (teledexter-50e476cb88d7, tag prod-2026-10-13).
 //
-//   node scripts/rollback-journal-compat.mjs /var/lib/dexter-broker/state [--dry-run]
+//   node scripts/rollback-journal-compat.mjs /var/lib/dexter-broker/state [--dry-run] [--target <release revision>]
+//
+// --target names the release being rolled back to. Releases from 6e23b1be9103 on read every journey
+// key this release writes, so for them the journey is left as saved; without --target (or for
+// teledexter-50e476cb88d7) the journey is converted as below.
 //
 // That release checks every saved call when it starts and refuses the whole journal over one
 // call it cannot read. Two things this release writes trip it:
@@ -13,6 +17,12 @@
 // This script removes exactly those three keys and drops the journey of calls without
 // mediaStartedAt (a journey left empty is dropped too). Every other field is kept as saved.
 // The journey is timing evidence only; no call, request or binding state depends on it.
+//
+// This release also keeps parts of the journal outside calls.json, which earlier releases never
+// read: settled calls in calls.d/<id>.json (moved there so each durable write stays small) and
+// live transcripts not yet written to calls.json in live.d/<id>.json. The script folds both back
+// into calls.json first (a calls.json copy of a call wins over its settled file; a transcript is
+// taken only when it is newer), then renames those directories to *.rollback-<time>.bak.
 //
 // Run it after the current broker has stopped and before the previous release starts. It takes
 // the broker's writer lock, so it refuses while a live broker owns the state directory.
@@ -66,6 +76,48 @@ export function rollbackJournal(state) {
     if (!previousReleaseAccepts(call)) throw new Error('rollback_journey_unsupported');
   }
   return { journal: next, changes };
+}
+
+/** Folds settled call files and newer live transcripts into the journal. The input is not modified. */
+/** Releases that read every journey key this release writes. */
+const JOURNEY_AWARE_TARGETS = ['6e23b1be9103', 'a01ed763b3e7'];
+export function journeyAwareTarget(target) {
+  return typeof target === 'string' && JOURNEY_AWARE_TARGETS.some(revision => target.includes(revision.slice(0, 7)));
+}
+
+export function foldJournalFiles(state, directory) {
+  if (!record(state) || state.version !== 1 || !record(state.calls)) throw new Error('rollback_journal_invalid');
+  const next = structuredClone(state);
+  const folded = { settledCalls: 0, observations: 0 };
+  const names = folder => { try { return fs.readdirSync(path.join(directory, folder)).filter(name => name.endsWith('.json') && !name.startsWith('.')); }
+    catch (error) { if (error?.code === 'ENOENT') return []; throw error; } };
+  for (const name of names('calls.d')) {
+    const id = name.slice(0, -'.json'.length);
+    if (Object.hasOwn(next.calls, id)) continue;
+    let saved;
+    try { saved = JSON.parse(fs.readFileSync(path.join(directory, 'calls.d', name), 'utf8')); } catch { throw new Error('rollback_settled_call_invalid'); }
+    if (saved?.version !== 1 || !record(saved.call) || saved.call.id !== id) throw new Error('rollback_settled_call_invalid');
+    next.calls[id] = saved.call; folded.settledCalls++;
+  }
+  for (const name of names('live.d')) {
+    let value;
+    try { value = JSON.parse(fs.readFileSync(path.join(directory, 'live.d', name), 'utf8')); } catch { continue; }
+    const call = record(value) && typeof value.callId === 'string' && name === `${value.callId}.json` ? next.calls[value.callId] : undefined;
+    if (!record(call) || value.version !== 1) continue;
+    let changed = false;
+    if (Number.isSafeInteger(value.transcriptRevision) && value.transcriptRevision > (call.transcriptRevision ?? -1)) {
+      call.transcript = value.transcript; call.transcriptRevision = value.transcriptRevision; changed = true;
+    }
+    for (const segment of call.liveGenerations?.segments ?? []) {
+      const transcript = value.generations?.[segment.generationId];
+      if (record(transcript) && Number.isSafeInteger(transcript.revision) && transcript.revision > segment.transcript.revision
+        && Array.isArray(transcript.fragments) && transcript.fragments.length >= segment.transcript.fragments.length) {
+        segment.transcript = transcript; changed = true;
+      }
+    }
+    if (changed) folded.observations++;
+  }
+  return { journal: next, folded };
 }
 
 /** Mirrors bindDurableFileParent / assertDurableFileParent in src/outbound/DurableFile.ts. */
@@ -155,9 +207,13 @@ export function runRollbackJournalCompat(args, options = {}) {
   const fileSystem = options.fileSystem ?? fs;
   const now = options.now ?? (() => new Date());
   const dryRun = args.includes('--dry-run');
-  const positional = args.filter(arg => arg !== '--dry-run');
-  if (positional.length !== 1 || !path.isAbsolute(positional[0]) || args.some(arg => arg.startsWith('--') && arg !== '--dry-run'))
-    throw new Error('rollback_usage');
+  const targetIndex = args.indexOf('--target');
+  const target = targetIndex >= 0 ? args[targetIndex + 1] : undefined;
+  if (targetIndex >= 0 && (!target || target.startsWith('--'))) throw new Error('rollback_usage');
+  const targetArgs = targetIndex >= 0 ? new Set([targetIndex, targetIndex + 1]) : new Set();
+  const positional = args.filter((arg, index) => arg !== '--dry-run' && !targetArgs.has(index));
+  if (positional.length !== 1 || !path.isAbsolute(positional[0])
+    || args.some((arg, index) => arg.startsWith('--') && arg !== '--dry-run' && index !== targetIndex)) throw new Error('rollback_usage');
   const directory = path.resolve(positional[0]);
   const binding = bindParent(directory);
   const file = path.join(directory, 'calls.json');
@@ -171,10 +227,19 @@ export function runRollbackJournalCompat(args, options = {}) {
     const original = fs.readFileSync(file, 'utf8');
     let state;
     try { state = JSON.parse(original); } catch { throw new Error('rollback_journal_invalid'); }
-    const { journal, changes } = rollbackJournal(state);
+    const { journal: whole, folded } = foldJournalFiles(state, directory);
+    // A journey-aware target keeps every journey key; only the side files are folded.
+    const { journal, changes } = journeyAwareTarget(target)
+      ? { journal: whole, changes: { calls: Object.keys(whole.calls).length, changedCalls: [], journeysDropped: 0, journeyKeysRemoved: 0 } }
+      : rollbackJournal(whole);
+    const settledFiles = (() => { try { return fs.readdirSync(path.join(directory, 'calls.d')).filter(name => name.endsWith('.json') && !name.startsWith('.')).length; }
+      catch (error) { if (error?.code === 'ENOENT') return 0; throw error; } })();
     const summary = { stateDir: directory, calls: changes.calls, changedCalls: changes.changedCalls.length,
-      journeysDropped: changes.journeysDropped, journeyKeysRemoved: changes.journeyKeysRemoved, backup: null, written: false, dryRun };
-    if (dryRun || changes.changedCalls.length === 0) return summary;
+      journeysDropped: changes.journeysDropped, journeyKeysRemoved: changes.journeyKeysRemoved,
+      settledCallsFolded: folded.settledCalls, settledFiles, observationsFolded: folded.observations,
+      ...(target ? { target } : {}), backup: null, written: false, dryRun };
+    const sideFiles = ['calls.d', 'live.d'].filter(folder => fs.existsSync(path.join(directory, folder)));
+    if (dryRun || (changes.changedCalls.length === 0 && !folded.settledCalls && !folded.observations && !sideFiles.length)) return summary;
     const backup = path.join(directory, `calls.json.rollback-${now().toISOString().replace(/[:.]/g, '-')}.bak`);
     if (fs.existsSync(backup)) throw new Error('rollback_backup_exists');
     // The untouched journal is durable beside the original before the original is replaced.
@@ -182,6 +247,16 @@ export function runRollbackJournalCompat(args, options = {}) {
     const body = JSON.stringify(journal);
     durablyReplace(file, body, fileSystem, binding);
     if (fs.readFileSync(file, 'utf8') !== body || fs.readFileSync(backup, 'utf8') !== original) throw new Error('rollback_write_unverified');
+    // calls.json now holds everything; the side directories are kept as backups the previous release ignores.
+    const stamp = now().toISOString().replace(/[:.]/g, '-');
+    for (const folder of sideFiles) {
+      assertParent(binding);
+      fileSystem.renameSync(path.join(directory, folder), path.join(directory, `${folder}.rollback-${stamp}.bak`));
+    }
+    if (sideFiles.length) {
+      const descriptor = fileSystem.openSync(directory, 'r');
+      try { fileSystem.fsyncSync(descriptor); } finally { fileSystem.closeSync(descriptor); }
+    }
     return { ...summary, backup, written: true };
   } catch (error) { failed = true; throw error; }
   finally {
@@ -195,7 +270,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(fs.realpathSync(process
   catch (error) {
     const code = error instanceof Error && /^(rollback|durable)_[a-z_]+$/.test(error.message) ? error.message : 'rollback_failed';
     console.error(`[rollback-journal-compat] ${code}${code === 'rollback_failed' ? `: ${error instanceof Error ? error.message : String(error)}` : ''}`);
-    if (code === 'rollback_usage') console.error('usage: node scripts/rollback-journal-compat.mjs /absolute/state/dir [--dry-run]');
+    if (code === 'rollback_usage') console.error('usage: node scripts/rollback-journal-compat.mjs /absolute/state/dir [--dry-run] [--target <release revision>]');
     process.exitCode = 1;
   }
 }

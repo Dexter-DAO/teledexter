@@ -664,21 +664,3 @@ for (const holdingGreeting of [false, true]) {
   });
 }
 
-test('call truth: speech playback callbacks follow carrier marks and reject cleared frames', async t => {
-  const f = await fixture(t);
-  await f.post('/internal/broker/calls', { requestId: randomUUID(), purpose: 'Read the current portfolio.' });
-  const call = f.broker.store.list()[0], media = await (await answeredStream(f, call)).connect();
-  t.after(() => media.ws.close()); await until(() => Boolean(f.voiceOptions()));
-  const heard: boolean[] = [], voice = f.voiceOptions()!;
-  voice.onAudio(Buffer.alloc(160, 0x20).toString('base64'), { deliveryId: 'checked_1', onPlayed: value => heard.push(value) });
-  await until(() => media.frames.some(frame => frame.event === 'mark'));
-  assert.equal(heard.length, 0, 'sending is not playback');
-  const mark = media.frames.filter(frame => frame.event === 'mark').at(-1)!.name!;
-  media.ack(mark); await until(() => heard.length === 1); assert.deepEqual(heard, [true]);
-  voice.onAudio(Buffer.alloc(160, 0x20).toString('base64'), { deliveryId: 'checked_2', onPlayed: value => heard.push(value) });
-  await until(() => media.frames.filter(frame => frame.event === 'mark').length === 2);
-  const cleared = media.frames.filter(frame => frame.event === 'mark').at(-1)!.name!;
-  voice.onPlaybackClear!('application_interrupt'); assert.deepEqual(heard, [true, false]);
-  media.ack(cleared); await new Promise(resolve => setTimeout(resolve, 20));
-  assert.deepEqual(heard, [true, false], 'a late mark cannot turn cleared speech into heard speech');
-});

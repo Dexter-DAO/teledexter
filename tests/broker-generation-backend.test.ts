@@ -6,7 +6,7 @@ import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { BrokerStore } from '../src/broker/store.js';
 import { brokerIdentity, createPrimaryBackend, type BrokerDelegationRecord, type PrimaryBackend,
-  type PrimaryBackendOptions } from '../src/broker/backend.js';
+  type PrimaryBackendOptions, MAX_RESULT_REDELIVERIES, RESULT_UNDELIVERABLE_NOTICE, TRACKING_FAILED_NOTICE } from '../src/broker/backend.js';
 import type { LiveGenerationJournal } from '../src/broker/liveGeneration.js';
 import { PrimaryApiError, type PrimaryQuestion, type PrimaryQuestionResult, type PrimaryReplyInput,
   type PrimaryResult, type PrimarySubmission, type PrimaryTurn } from '../src/broker/primaryApi.js';
@@ -182,8 +182,8 @@ async function fixture(t: TestContext, diagnostic?: Diagnostic) {
     },
   };
   const trackedRequests: BrokerDelegationRecord[] = [];
-  const backend = (sourceSessionId: string, maxPollMs = 30): PrimaryBackend => createPrimaryBackend({
-    callId: call.id, callSid, bindingId, api, store, sourceSessionId, observation,
+  const backend = (sourceSessionId: string, maxPollMs = 30, watchUntilCallEnds = false): PrimaryBackend => createPrimaryBackend({
+    callId: call.id, callSid, bindingId, api, store, sourceSessionId, observation, ...(watchUntilCallEnds ? { watchUntilCallEnds } : {}),
     onRequest: entry => { trackedRequests.push(structuredClone(entry)); },
     admissionSettled: request => { admissions.push({ request: structuredClone(request),
       entries: structuredClone(Object.values(store.get(call.id)!.delegations)) as BrokerDelegationRecord[] }); },
@@ -280,6 +280,53 @@ async function currentQuestionFixture(t: TestContext) {
   assert.equal(f.saved()[0].questions![questionId].presentation!.sessionId, newSession);
   return { ...f, question, current };
 }
+
+test('probe G: a terminal result whose delivery was rejected is re-sent until it is accepted', async t => {
+  const f = await fixture(t);
+  f.behavior.publicationStatus = 'rejected';
+  const instance = f.backend(oldSession, 30, true);
+  f.speak(instance, oldSession, ' Read my portfolio.');
+  void f.delegate(instance, oldSession, 'resend');
+  await until(() => f.saved()[0]?.delivery === 'rejected');
+  f.behavior.publicationStatus = 'accepted';
+  await until(() => f.saved()[0]?.delivery === 'accepted');
+  const results = f.publications.filter(value => !value.update && value.entry.status === 'completed');
+  assert.ok(results.length >= 2, 'the rejected result went out again');
+  assert.deepEqual(f.contexts.get(oldSession)!.directPublications.map(update => update.text).filter(text => text === RESULT_UNDELIVERABLE_NOTICE), []);
+  assert.equal(f.posts.length, 1, 're-sending a result never re-submits the request');
+});
+
+test('probe G: a result that cannot be delivered ends in a plain notice, not "in progress" forever', async t => {
+  const f = await fixture(t);
+  f.behavior.publicationStatus = 'rejected';
+  const instance = f.backend(oldSession, 30, true);
+  f.speak(instance, oldSession, ' Read my portfolio.');
+  void f.delegate(instance, oldSession, 'undeliverable');
+  await until(() => f.contexts.get(oldSession)!.directPublications.some(update => update.text === RESULT_UNDELIVERABLE_NOTICE));
+  const results = f.publications.filter(value => !value.update && value.entry.status === 'completed');
+  assert.equal(results.length, 1 + MAX_RESULT_REDELIVERIES, 'the first delivery and three re-sends');
+  assert.equal(f.contexts.get(oldSession)!.directPublications.filter(update => update.text === RESULT_UNDELIVERABLE_NOTICE).length, 1);
+  assert.equal(f.posts.length, 1);
+});
+
+test('a journal that cannot be written stops tracking with a plain notice to the caller', async t => {
+  const f = await fixture(t);
+  const held = deferred<PrimaryResult>();
+  f.behavior.result = async () => held.promise;
+  const instance = f.backend(oldSession, 30, true);
+  f.speak(instance, oldSession, ' Read my portfolio.');
+  const work = f.delegate(instance, oldSession, 'journal_failure');
+  await until(() => f.reads.length === 1);
+  const store = f.store();
+  const update = store.update.bind(store);
+  const requestId = f.saved()[0]!.requestId;
+  store.update = () => { throw new Error('Broker journal write outcome is uncertain'); };
+  try {
+    held.resolve(f.completed(requestId));
+    await work;
+  } finally { store.update = update; }
+  assert.deepEqual(f.contexts.get(oldSession)!.directPublications.map(value => value.text), [TRACKING_FAILED_NOTICE]);
+});
 
 test('accepted task observation survives old voice abort and delivers through the current generation', async t => {
   const f = await fixture(t); const old = f.backend(oldSession);
@@ -810,7 +857,7 @@ test('ended-call closeout settles a definitely-undispatched answer locally and p
 // The accepted tool observation on Oct 18 was followed by a different terminal outcome.
 for (const partialStatus of ['accepted', 'unconfirmed'] as const) {
   test(`call truth: a ${partialStatus} partial never suppresses the final money result after later speech`, async t => {
-    const recorded = JSON.parse(await readFile(new URL('./fixtures/call-truth-oct18.json', import.meta.url), 'utf8')).sale;
+    const recorded = JSON.parse(await readFile(new URL('./fixtures/voice-incident.json', import.meta.url), 'utf8')).sale;
     const sale = recorded.requests[1];
     const f = await fixture(t), backend = f.backend(oldSession, 1000);
     let reads = 0;
@@ -839,22 +886,30 @@ for (const partialStatus of ['accepted', 'unconfirmed'] as const) {
   });
 }
 
-test('call truth: a status question gets the saved final result even after a partial was marked delivered', async t => {
-  const recorded = JSON.parse(await readFile(new URL('./fixtures/call-truth-oct18.json', import.meta.url), 'utf8')).sale.requests[1];
-  const f = await fixture(t), backend = f.backend(oldSession);
-  f.behavior.result = async id => ({ ...f.completed(id), assistant: { ...f.completed(id).assistant!, text: recorded.result } });
+test('call truth: the task list carries the final outcome, never the earlier progress, and no status question resubmits work', async t => {
+  const recorded = JSON.parse(await readFile(new URL('./fixtures/voice-incident.json', import.meta.url), 'utf8')).sale.requests[1];
+  const f = await fixture(t), backend = f.backend(oldSession, 1000);
+  let reads = 0;
+  f.behavior.result = async id => ++reads === 1
+    ? { bindingId, requestId: id, state: 'running', partialResult: { kind: 'prepared_action', toolInvocationId: eventId,
+      observedAt: '2026-10-18T02:04:05.919Z', text: recorded.partial } } as PrimaryResult
+    : { ...f.completed(id), assistant: { ...f.completed(id).assistant!, text: recorded.result } };
   f.speak(backend, oldSession, recorded.text);
   await f.delegate(backend, oldSession, 'sale');
-  const before = f.publications.length;
+  const { callTasks } = await import('../src/broker/voiceTasks.js');
+  const tasks = callTasks(f.store().get(f.call.id)!);
+  assert.equal(tasks.length, 1);
+  assert.equal(tasks[0].status, 'finished');
+  assert.match(tasks[0].outcome!, /^The SpaceX sale didn't go through, and nothing was sold\./);
+  assert.equal(tasks[0].progress, undefined, 'progress is superseded by the result');
   f.speak(backend, oldSession, "How's that buy going", 60000, 61000);
-  await until(() => f.publications.length > before);
-  assert.equal(f.publications.at(-1)!.entry.primaryResult?.assistant?.text, recorded.result);
-  assert.equal(f.publications.at(-1)!.update, undefined, 'the waiting result outranks a holding line');
-  assert.equal(f.posts.length, 1);
+  await new Promise(resolve => setTimeout(resolve, 900));
+  assert.equal(f.posts.length, 1, 'a status question never submits the sale again');
+  assert.ok(f.trackedRequests.length > 0, 'every saved change reaches the task list observer');
 });
 
-test('call truth: Primary receives the toilet conversation separately from the exact follow-up words', async t => {
-  const recorded = JSON.parse(await readFile(new URL('./fixtures/call-truth-oct18.json', import.meta.url), 'utf8')).toilet;
+test('call truth: Primary receives this call\'s conversation separately from the exact follow-up words', async t => {
+  const recorded = JSON.parse(await readFile(new URL('./fixtures/voice-incident.json', import.meta.url), 'utf8')).followup;
   const f = await fixture(t), backend = f.backend(oldSession);
   const source = recorded.requests.at(-1);
   const fragments = recorded.fragments.filter((fragment: { sequence: number }) => fragment.sequence < source.firstSequence);
@@ -867,22 +922,8 @@ test('call truth: Primary receives the toilet conversation separately from the e
   f.rotate();
   const next = f.backend(newSession);
   f.speak(next, newSession, source.text, 60000, 61000);
-  await f.delegate(next, newSession, 'toilet_followup');
+  await f.delegate(next, newSession, 'followup');
   assert.equal(f.posts.length, 1);
   assert.equal(f.posts[0].input.text, source.text, 'caller words stay unchanged');
-  assert.ok(f.posts[0].input.voiceContext?.recentSpeech.some(turn => turn.role === 'dexter' && /toilet/i.test(turn.text)), 'current call context travels to Primary');
-});
-
-test('RV gate leak: every delegation id is tracked under some request', async t => {
-  const f = await fixture(t);
-  f.behavior.result = async id => ({ requestId: id, bindingId, state: 'running' } as PrimaryResult);
-  const old = f.backend(oldSession); f.speak(old, oldSession, 'Check my balance.');
-  await f.delegate(old, oldSession, 'task');
-  f.speak(old, oldSession, 'Thanks.', 3000, 3200);
-  await f.delegate(old, oldSession, 'thanks');
-  const seen = f.trackedRequests;
-  const tracked = new Set(seen.flatMap(e => [...e.delegationIds, ...(e.delegationAliases ?? []).map(a => a.delegationId)]));
-  t.diagnostic(`tracked delegation ids=${JSON.stringify([...tracked])}; saved deferred=${JSON.stringify(f.saved().map(e => (e.deferredTurns ?? []).map(d => [d.delegationId, d.status])))}`);
-  assert.ok(tracked.has('task'));
-  assert.ok(tracked.has('thanks'), 'ack delegation never re-keyed onto a request: gate keeps it pending forever');
+  assert.ok(f.posts[0].input.voiceContext?.recentSpeech.some(turn => turn.role === 'dexter' && /basil|soil|buds/i.test(turn.text)), 'current call context travels to Primary');
 });

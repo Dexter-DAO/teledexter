@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { WebSocketError } from 'openai/resources/live/internal-base';
 import type {
@@ -10,7 +9,7 @@ import type {
 } from 'openai/resources/live/live';
 import {
   createBrokerLiveSession, type BrokerLiveConnection, type BrokerLiveSessionOptions,
-  type BrokerLiveEvent, type LiveBackendChannel, type LiveBackendUpdate, type LiveDelegationRequest,
+  type BrokerLiveEvent, type LiveBackendChannel, type LiveDelegationRequest,
   type LiveSessionClosed, type LiveTranscriptSnapshot,
 } from '../src/live/session.js';
 
@@ -50,10 +49,6 @@ class Connection implements BrokerLiveConnection {
   event: (event: unknown) => void = () => {};
   error: (error: unknown) => void = () => {};
   ended: () => void = () => {};
-  reflectionLost: () => void = () => {};
-  onReflectionUnavailable(fn: () => void) { this.reflectionLost = fn; }
-  reflected: (event: unknown) => void = () => {};
-  onReflectedAudio(fn: (event: unknown) => void) { this.reflected = fn; }
   onOpen(fn: () => void) { this.opened = fn; }
   onEvent(fn: (event: unknown) => void) { this.event = fn; }
   onError(fn: (error: unknown) => void) { this.error = fn; }
@@ -285,19 +280,26 @@ test('backend progress/results preserve delegation identity, correlate acknowled
   await f.finish();
 });
 
-test('a caller correction suppresses stale results while assistant backchannels do not', async () => {
+test('caller speech defers a stale question but never withholds a final result; later progress is outdated', async () => {
   const f = fixture(); f.transport.start(); f.transcript('u1', 'Friday', 800); f.delegate(); await flush();
   const channel = f.requests[0].channel;
   f.transcript('a1', 'Let me check.', 1100, 'output'); await flush();
-  const fresh = channel.publish({ id: 'first', kind: 'result', text: 'Here is the result.', expectedCallerRevision: 1 });
-  const sent = f.transport.sent.at(-1)!;
-  f.transport.receive(appendAck('commentary', sent.event_id));
-  assert.equal((await fresh).status, 'accepted');
-  f.transcript('u2', 'Actually Thursday.', 1500); // Even before persistence completes, reject the old answer.
-  const stale = await channel.publish({ id: 'old', kind: 'result', text: 'Friday is booked.', expectedCallerRevision: 1 });
-  assert.equal(stale.status, 'stale');
+  const question = { id: 'question', kind: 'result' as const, pending: true, text: 'Should I book Friday?', expectedCallerRevision: 1 };
+  f.transcript('u2', 'Actually Thursday.', 1500); // Even before persistence completes, the question waits for a later turn.
+  assert.equal((await channel.publish(question)).status, 'stale');
+  const sent = f.transport.sent.length;
+  const final = channel.publish({ id: 'final', kind: 'result', text: 'Friday is booked.', expectedCallerRevision: 1 });
+  const commentary = f.transport.sent.at(-1)!;
+  assert.equal(f.transport.sent.length, sent + 1);
+  assert.equal(commentary.type, 'session.commentary.append');
+  assert.equal('delegation_id' in commentary && commentary.delegation_id, 'del_1');
+  f.transport.receive(appendAck('commentary', commentary.event_id));
+  assert.equal((await final).status, 'accepted', 'a confirmed outcome is what happened; Live chooses when to say it');
+  const late = await channel.publish({ id: 'late_progress', kind: 'progress', speak: false, text: 'Still booking Friday.' });
+  assert.equal(late.status, 'stale'); assert.equal(late.reason, 'outdated_progress');
+  assert.equal(f.transport.sent.length, sent + 1, 'progress after the final result never reaches the voice');
+  assert.ok(f.events.some(event => event.type === 'live.update.outdated' && event.updateId === 'late_progress'));
   assert.equal((await channel.publish({ id: 'missing', kind: 'result', text: 'Done.' })).reason, 'caller_revision_required');
-  assert.equal(f.transport.sent.at(-1), sent);
   await f.finish();
 });
 
@@ -337,6 +339,7 @@ test('uncorrelated SDK protocol errors end the call once while preserving the pr
   f.transport.receive(errorEvent('server_error', undefined));
   await flush();
   assert.equal(f.closed[0].reason, 'server_error');
+  assert.deepEqual(f.closed[0].providerError, { code: 'server_error' }, 'the real provider error code is kept; its text is not');
   assert.equal(f.transport.terminated, 1);
   assert.deepEqual(f.events.filter(event => event.type === 'live.error').map(event => event.code), ['server_error']);
 });
@@ -446,248 +449,23 @@ test('composed publisher uses original delegation for quiet progress and exactly
   } finally {await f.finish();}
 });
 
-
-function gatedFixture(t: test.TestContext, pendingRequests?: BrokerLiveSessionOptions['pendingRequests']) {
-  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 0 });
-  const played: Array<{ at: number; audio: string }> = [];
-  const f = fixture({ speechGate: true, pendingRequests, onAudio(value, metadata) {
-    played.push({ at: Date.now(), audio: value });
-    if (metadata.onPlayed) setTimeout(() => metadata.onPlayed!(true), 100);
-  } });
-  t.after(() => f.finish()); f.transport.start();
-  const advance = async (ms: number) => {
-    for (let left = ms; left > 0;) { const step = Math.min(20, left); t.mock.timers.tick(step); left -= step; await flush(); }
-  };
-  let serial = 0;
-  const segment = async (text: string, duration = 400, transcriptDelay = 0, missing = false) => {
-    const start = Date.now(), pcm = Buffer.alloc(960);
-    for (let i = 0; i < pcm.length; i += 2) pcm.writeInt16LE(1000, i);
-    const provideText = () => f.transport.receive({ type: 'session.output_transcript.delta',
-      event_id: `gated_${++serial}`, delta: text, start_ms: start, end_ms: start + duration });
-    if (!missing && transcriptDelay === 0) provideText();
-    for (let ms = 0; ms < duration + 300; ms += 20) {
-      f.transport.receive(outputAudioEvent(audio)); // Untimestamped primary copy must not bypass the gate.
-      f.transport.reflected({ type: 'session.output_audio.delta', start_ms: start + ms, end_ms: start + ms + 20,
-        delta: (ms < duration ? pcm : Buffer.alloc(960)).toString('base64') });
-      await advance(20);
-    }
-    if (!missing && transcriptDelay > 0) { await advance(transcriptDelay); provideText(); await flush(); }
-    return start;
-  };
-  const publish = async (id: string, text: string, terminal: boolean) => {
-    const promise = f.session.speakRequest!({ id, kind: 'result', pending: !terminal, text },
-      { id: 'sale', aliases: ['del_sale'], terminal });
-    const sent = f.transport.sent.at(-1)!; assert.equal(sent.type, 'session.commentary.append');
-    f.transport.receive(appendAck('commentary', sent.event_id)); await flush();
-    return { promise };
-  };
-  return { ...f, played, advance, segment, publish };
-}
-
-test('call truth: 72dec725 discards the recorded false completion, speaks the real result in Live audio, then opens the gate', async t => {
-  const sale = JSON.parse(readFileSync(new URL('./fixtures/call-truth-oct18.json', import.meta.url), 'utf8')).sale;
-  const f = gatedFixture(t);
-  await f.advance(49000);
-  f.transcript('sale_user', sale.requests[1].text, 41200); f.delegate('del_sale', 49000); await flush();
-  await f.advance(5000);
-  const hold = f.transport.sent.filter(value => value.type === 'session.instructions.append').at(-1)!;
-  assert.match('content' in hold ? hold.content : '', /Say exactly "On it\."/);
-  await f.segment('On it.'); await f.advance(700);
-  await f.advance(55518 - Date.now());
-  const spokenPartial = sale.requests[1].partial.replace(/^At [^,]+, the /, 'The ');
-  const partial = await f.publish('partial', spokenPartial, false); assert.equal((await partial.promise).status, 'accepted');
-  await f.segment(spokenPartial, 1000); await f.advance(1300);
-  await f.advance(60000 - Date.now());
-  const beforeFinal = f.played.length;
-  await f.segment("The sale's done.");
-  assert.equal(f.played.length, beforeFinal, 'an outcome before Primary returns a result is also discarded');
-  await f.advance(61798 - Date.now());
-  assert.match(f.transport.sent.filter(value => value.type === 'session.instructions.append').map(value => value.content).join(' '), /Still working on it/);
-  await f.segment('Still working on it.', 600); await f.advance(900);
-  await f.advance(64099 - Date.now());
-  const final = await f.publish('final', sale.requests[1].result, true);
-  await f.advance(67200 - Date.now());
-  const before = f.played.length;
-  await f.segment("The sale's done. Buying it back now.", 2200);
-  assert.equal(f.played.length, before, 'recorded unsupported completion never reaches Twilio');
-  assert.ok(f.events.some(value => value.type === 'live.speech_gate.discarded' && value.reason === 'unsupported_speech'), 'false claim is explicitly rejected');
-  // Corrected output is synthesized as PCM events, not generated by a live provider.
-  // Each sentence has a pause, matching the gate's application-owned VAD boundary.
-  const sentences = sale.requests[1].result.split(/(?<=[.!?])\s+(?=[A-Z"'])/);
-  for (const sentence of sentences) await f.segment(sentence, 600);
-  await f.advance(2000);
-  assert.equal((await final.promise).status, 'accepted', 'terminal result requires its carrier playback acknowledgment');
-  const released = f.events.filter(value => value.type === 'live.speech_gate.released');
-  assert.equal(released.some(value => String(value.text).includes("sale's done")), false);
-  assert.equal(released.filter(value => value.source === 'primary').slice(1).map(value => value.text).join(' '), sale.requests[1].result);
-  assert.ok(f.events.some(value => value.type === 'live.speech_gate.opened'), 'hold ends after the result is heard');
-  const after = f.played.length; f.transport.receive(outputAudioEvent(audio));
-  assert.equal(f.played.length, after + 1, 'Live is free immediately after terminal playback');
-  const onset = f.played.filter(value => Buffer.from(value.audio, 'base64').some(byte => byte !== 255));
-  const maxGap = Math.max(...onset.slice(1).map((value, i) => value.at - onset[i].at - 20));
-  t.diagnostic(`72dec725 synthetic replay (scripted response to both due holds): max outbound speech gap=${maxGap}ms; per-segment gate latency=${JSON.stringify(released.map(value => ({ text: value.text, latencyMs: value.latencyMs, firstSendLatencyMs: f.events.find(e => e.type === 'live.speech_gate.playback_started' && e.segmentId === value.segmentId)?.latencyMs, transcriptWaitMs: value.transcriptWaitMs })))}. Actual provider fidelity is unmeasured.`);
-});
-
-test('call truth: without a delegation small talk stays on the direct audio path with zero added latency', async t => {
-  const f = gatedFixture(t);
-  f.transcript('question', 'Hello there.', 0); await flush();
-  await f.advance(1000); f.transcript('greeting', 'How are you?', 1000);
-  await f.advance(450); // Caller ends at 1200; scripted model starts after 250 ms.
-  const at = Date.now(), spoken = Buffer.alloc(160, 0x20).toString('base64');
-  f.transcript('smalltalk', "I'm here!", at, 'output');
-  for (let i = 0; i < 20; i++) {
-    const before = Date.now(); f.transport.receive(outputAudioEvent(spoken));
-    assert.deepEqual(f.played.at(-1), { at: before, audio: spoken }); await f.advance(20);
-  }
-  assert.equal(f.events.some(value => value.type.startsWith('live.speech_gate.')), false);
-  assert.equal(at - 1200, 250);
-  t.diagnostic('no-delegation small-talk replay: added gate latency=0ms on all 20 voiced frames; caller-end to first audio=250ms, the scripted model delay, unchanged from the direct base path.');
-});
-
-test('call truth: pending money checks amounts and names, times out missing transcripts, and alternates quiet-period holds', async t => {
-  const f = gatedFixture(t);
-  f.transcript('sale_user', 'Sell one dollar of SpaceX.', 0); f.delegate('del_sale'); await flush();
-  const partial = await f.publish('partial', 'The SpaceX sale was submitted for $1.00.', false); await partial.promise;
-  for (const wrong of ['The SpaceX sale was submitted for $10.00.', 'The Apple sale was submitted for $1.00.', 'The sale is done.']) {
-    await f.segment(wrong); assert.equal(f.played.length, 0);
-  }
-  await f.segment('The SpaceX sale was submitted for $1.00.', 400, 0, true); await f.advance(2800);
-  assert.equal(f.played.length, 0, 'untranscribed audio is discarded');
-  await f.advance(Math.max(0, 5000 - Date.now()));
-  await f.segment('On it.'); await f.advance(1000);
-  await f.advance(5000);
-  assert.match(f.transport.sent.filter(value => value.type === 'session.instructions.append').map(value => value.content).join(' '), /Still working on it/);
-  const before = f.played.length; await f.segment('On it.'); assert.equal(f.played.length, before, 'same holding line cannot repeat');
-  assert.equal(f.closed.length, 0, 'missing speech never hangs up');
-});
-
-test('call truth: reflected speech waits for its delayed transcript and interruption prevents late release', async t => {
-  const f = gatedFixture(t);
-  f.transcript('money', 'Transfer a dollar.', 0); f.delegate('del_sale'); await flush();
-  const partial = await f.publish('p', 'The transfer is being attempted.', false); await partial.promise;
-  await f.segment('The transfer is being attempted.', 400, 600);
-  assert.ok(f.played.length > 0, 'aligned evidence releases original Live audio');
-  const release = f.events.find(value => value.type === 'live.speech_gate.released')!;
-  assert.equal(release.latencyMs, 1300);
-  await f.advance(1000);
-  const before = f.played.length;
-  await f.segment('The transfer is being attempted.', 400, 0, true);
-  f.session.pausePlayback!();
-  f.transport.receive({ type: 'session.output_transcript.delta', event_id: 'late', delta: 'The transfer is being attempted.', start_ms: 2300, end_ms: 2700 });
-  await f.advance(2000);
-  assert.equal(f.played.length, before, 'interrupted approval cannot release later');
-});
-
-
-test('call truth: a confirmation question and early result chunks do not release the money gate', async t => {
-  const f = gatedFixture(t);
-  f.transcript('sell', 'Sell a dollar of SpaceX.', 0); f.delegate('del_sale'); await flush();
-  const channel = f.requests[0].channel;
-  const publish = async (update: LiveBackendUpdate) => {
-    const promise = channel.publish(update), command = f.transport.sent.at(-1)!;
-    assert.equal(command.type, 'session.commentary.append');
-    f.transport.receive(appendAck('commentary', command.event_id)); await flush(); return { promise };
-  };
-  const question = await publish({ id: 'question', kind: 'result', text: 'Should I sell $1 of SpaceX?', pending: true, expectedCallerRevision: 1 });
-  assert.equal((await question.promise).status, 'accepted');
-  await f.segment('Should I sell $1 of SpaceX?'); await f.advance(1000);
-  assert.equal(f.session.hasPendingRequest!('del_sale'), true);
-  f.transcript('later', 'Yes, please.', 1500);
-  const first = await publish({ id: 'first', kind: 'result', text: 'Nothing was sold.', pending: false, terminal: false, expectedCallerRevision: 1 });
-  await f.segment('Nothing was sold.'); await f.advance(1000); assert.equal((await first.promise).status, 'accepted');
-  assert.equal(f.session.hasPendingRequest!('del_sale'), true);
-  const last = await publish({ id: 'last', kind: 'result', text: 'Your cash is unchanged.', pending: false, terminal: true, expectedCallerRevision: 1 });
-  await f.segment('Your cash is unchanged.'); await f.advance(1000); assert.equal((await last.promise).status, 'accepted');
-  assert.equal(f.session.hasPendingRequest!('del_sale'), false);
-});
-
-
-test('all delegations gate even context-free confirmations, slang and research; successor registration is immediate', async t => {
-  const f = gatedFixture(t);
-  for (const [index, text] of ['Yes please', 'Yeah go ahead', 'Dump it', 'Cash out my BONK', 'Get me out of SpaceX', 'Find a toilet guide'].entries()) {
-    f.transcript(`request_${index}`, text, Date.now()); f.delegate(`delegation_${index}`, Date.now()); await flush();
-    assert.equal(f.session.hasPendingRequest!(`delegation_${index}`), true, text);
-    const before = f.played.length;
-    await f.segment("The sale's done. Buying it back now.");
-    assert.equal(f.played.length, before, text);
-  }
-});
-
-
-test('successor restores all pending requests before direct output and B progress preserves A playback', async t => {
-  const f = gatedFixture(t, [{ id: 'sale', aliases: ['del_sale'] }, { id: 'research' }]);
-  f.transport.receive(outputAudioEvent(audio)); assert.equal(f.played.length, 0);
-  assert.equal(f.session.hasPendingRequest!('del_sale'), true);
-  const final = await f.publish('final', 'Nothing was sold.', true);
-  await f.segment('Nothing was sold.');
-  const count = f.played.length;
-  const progress = f.session.speakRequest!({ id: 'research-progress', kind: 'result', pending: true, text: 'I found the guide.' },
-    { id: 'research', terminal: false });
-  const command = f.transport.sent.at(-1)!; f.transport.receive(appendAck('commentary', command.event_id));
-  await flush(); assert.equal((await progress).status, 'accepted');
-  await f.advance(1000);
-  assert.equal((await final.promise).status, 'accepted'); assert.ok(f.played.length >= count);
-  assert.equal(f.session.hasPendingRequest!('sale'), false); assert.equal(f.session.hasPendingRequest!('research'), true);
-  const released = f.events.filter(e => e.type === 'live.speech_gate.released' && e.text === 'Nothing was sold.');
-  assert.equal(released.length, 1, 'B did not replay A');
-});
-
-test('portable regression: Yes please after Primary confirmation cannot forward a free outcome', async () => {
-  const f = fixture({ speechGate: true }); f.transport.start();
+test('an application correction is tied to its known delegation and falls back to session-wide', async () => {
+  const f = fixture(); f.transport.start(); f.delegate('task_1'); await flush();
   try {
-    f.transcript('confirmation', 'To confirm: sell $1 of your SpaceX stock. Should I run it?', 0, 'output');
-    f.transcript('yes', 'Yes please', 2000); f.delegate('confirmed_sale', 2200); await flush();
-    f.transcript('invented', "The sale's done. Buying it back now.", 3000, 'output');
-    f.transport.receive(outputAudioEvent(audio));
-    assert.equal(f.outputs.length, 0, 'free outcome audio escaped before Primary supplied a result');
+    void f.session.appendInstructions('Correction: the sale is still in progress.', 'task_1');
+    const tied = f.transport.sent.at(-1)!;
+    assert.equal(tied.type, 'session.instructions.append');
+    assert.equal('delegation_id' in tied && tied.delegation_id, 'task_1');
+    void f.session.appendInstructions('Correction: nothing has been started.', 'other_session_task');
+    const general = f.transport.sent.at(-1)!;
+    assert.equal('delegation_id' in general && general.delegation_id, null, 'an unknown delegation never loses the correction');
   } finally { await f.finish(); }
 });
 
-test('RV stuck gate: unadmitted delegation (speak:false only) keeps the gate on forever', async t => {
-  const f = gatedFixture(t);
-  f.transcript('u', 'Hmm.', 0); f.delegate('del_unadmitted', 1000); await flush();
-  f.requests[0].channel.release!();
-  const p = f.session.publishDelegation!('del_unadmitted', { id: 'del_unadmitted_unadmitted', kind: 'progress', speak: false,
-    text: 'No new completed caller turn was admitted by this delegation.', expectedCallerRevision: 1 });
-  const sent = f.transport.sent.at(-1)!; f.transport.receive(appendAck('thinking', sent.event_id)); await p;
-  await f.advance(60_000);
-  const holds = f.transport.sent.filter(v => v.type === 'session.instructions.append' && /Say exactly/.test((v as any).content)).length;
-  const before = f.played.length;
-  f.transport.receive(outputAudioEvent(audio));
-  t.diagnostic(`after 60 s with nothing pending: gate active=${f.session.hasPendingRequest!('del_unadmitted')}, hold steers=${holds}, direct small-talk frame played=${f.played.length > before}`);
-  assert.equal(f.played.length, before + 1, 'small talk muted 60 s after an unadmitted delegation');
-});
-
-for (const phrase of ['Yes please.', 'Yeah go ahead.', 'Dump it.', 'Cash out my BONK.', 'Get me out of SpaceX.', 'Find me a toilet.']) {
-  test(`RV M1 phrase: ${phrase}`, async t => {
-    const f = gatedFixture(t);
-    f.transcript('u', phrase, 0); f.delegate('del_p', 800); await flush();
-    const before = f.played.length;
-    await f.segment("The sale's done.", 600);
-    f.transport.receive(outputAudioEvent(audio));
-    await f.advance(2000);
-    t.diagnostic(`${phrase} gate=${f.session.hasPendingRequest!('del_p')} played=${f.played.length - before}`);
-    assert.equal(f.played.length, before);
-  });
-}
-
-for (const when of ['active', 'shutting down'] as const) test(`reflection loss ${when} closes once or permits shutdown`, async () => {
-  const f = fixture({ speechGate: true }); f.transport.start();
-  if (when === 'shutting down') {
-    const closing = f.session.close(); f.transport.reflectionLost();
-    f.transport.receive(closedEvent()); await closing;
-    assert.equal(f.closed[0].reason, 'close_requested');
-  } else {
-    f.transport.reflectionLost(); f.transport.reflectionLost(); await flush();
-    assert.equal(f.closed.length, 1); assert.equal(f.closed[0].reason, 'reflection_unavailable');
-    assert.equal(f.events.filter(e => e.type === 'live.error').length, 1);
-  }
-});
-
-
-test('an ungated session does not depend on an unused reflection socket', async () => {
+test('a provider connection error is kept as its code without the error text', async () => {
   const f = fixture(); f.transport.start();
-  f.transport.reflectionLost(); f.transport.receive(outputAudioEvent(audio));
-  assert.equal(f.closed.length, 0); assert.equal(f.outputs.length, 1);
-  await f.finish();
+  f.transport.error(new Error('socket hang up near Bearer sk-abcdefghijklmnop'));
+  await flush();
+  assert.equal(f.closed[0].reason, 'provider_connection_error');
+  assert.deepEqual(f.closed[0].providerError, { code: 'provider_connection_error' });
 });
