@@ -63,7 +63,7 @@ test('a journal written by this release becomes one the previous release accepts
   assert.equal(result.status, 0, result.stderr);
   const summary = JSON.parse(result.stdout);
   assert.deepEqual({ ...summary, backup: path.dirname(summary.backup) }, { stateDir: f.directory, calls: 5, changedCalls: 3,
-    journeysDropped: 2, journeyKeysRemoved: 4, settledCallsFolded: 0, settledFiles: 0, observationsFolded: 0, backup: f.directory, written: true, dryRun: false });
+    journeysDropped: 2, journeyKeysRemoved: 4, settledCallsFolded: 0, settledSuperseded: 0, settledFiles: 0, observationsFolded: 0, backup: f.directory, written: true, dryRun: false });
   const before = JSON.parse(original).calls, after = read(f.file).calls;
   assert.ok(Object.values(after).every(previousReleaseAccepts));
   assert.equal(after[f.ids.greeting].journey, undefined, 'a call that ended during the greeting keeps no journey');
@@ -114,7 +114,7 @@ test('a dry run reports the change without the lock and writes nothing', t => {
   const result = run(f.directory, '--dry-run');
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(JSON.parse(result.stdout), { stateDir: f.directory, calls: 5, changedCalls: 3, journeysDropped: 2,
-    journeyKeysRemoved: 4, settledCallsFolded: 0, settledFiles: 0, observationsFolded: 0, backup: null, written: false, dryRun: true });
+    journeyKeysRemoved: 4, settledCallsFolded: 0, settledSuperseded: 0, settledFiles: 0, observationsFolded: 0, backup: null, written: false, dryRun: true });
   assert.equal(fs.readFileSync(f.file, 'utf8'), original);
   assert.deepEqual(fs.readdirSync(f.directory).sort(), ['calls.json', 'writer.lock']);
   for (const args of [[], ['relative/state'], [f.directory, '--force']]) {
@@ -182,7 +182,7 @@ test('rolling back to 6e23b1b keeps every journey key, and only the side files a
   const summary = run(f.directory, '--target', '6e23b1be9103', '--dry-run');
   assert.equal(summary.status, 0, summary.stderr);
   assert.deepEqual(JSON.parse(summary.stdout), { stateDir: f.directory, calls: 5, changedCalls: 0, journeysDropped: 0, journeyKeysRemoved: 0,
-    settledCallsFolded: 0, settledFiles: 0, observationsFolded: 0, target: '6e23b1be9103', backup: null, written: false, dryRun: true });
+    settledCallsFolded: 0, settledSuperseded: 0, settledFiles: 0, observationsFolded: 0, target: '6e23b1be9103', backup: null, written: false, dryRun: true });
   const written = runRollbackJournalCompat([f.directory, '--target', '6e23b1be9103'], { now: () => new Date(Date.UTC(2026, 9, 18)) });
   assert.equal(written.written, false, 'nothing to fold and nothing to convert: the journal is left as saved');
   assert.deepEqual(read(f.file), original);
@@ -209,11 +209,32 @@ test('the dry run counts settled files, and the fold puts every settled call bac
   assert.deepEqual(ids.filter(id => read(path.join(directory, 'calls.json')).calls[id]), []);
   const dry = JSON.parse(run(directory, '--dry-run', '--target', '6e23b1be9103').stdout);
   assert.equal(dry.settledFiles, 3);
-  assert.equal(dry.settledCallsFolded, dry.settledFiles, 'the runbook check: every settled file folds');
+  assert.equal(dry.settledCallsFolded + dry.settledSuperseded, dry.settledFiles, 'the runbook check: every settled file folds or is superseded');
   const summary = runRollbackJournalCompat([directory, '--target', '6e23b1be9103'], { now: () => new Date(Date.UTC(2026, 9, 18)) });
   assert.equal(summary.written, true);
   const journal = read(path.join(directory, 'calls.json'));
   assert.deepEqual(ids.filter(id => journal.calls[id]?.status === 'completed'), ids);
   assert.equal(journal.calls[live.id]!.endReason, 'caller_disconnected', 'new fields are plain fields the previous release keeps');
   assert.deepEqual(fs.readdirSync(directory).filter(name => name === 'calls.d' || name === 'live.d'), []);
+});
+
+test('a settled call that changed later is superseded by calls.json: counted, never folded over the newer copy', async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'rollback-superseded-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const store = new BrokerStore(directory);
+  const ended = new Date(Date.now() - 2 * SETTLED_QUIET_MS).toISOString();
+  const ids = [0, 1].map(() => {
+    const call = store.reserve({ requestId: randomUUID(), direction: 'outbound', purpose: 'Check the portfolio', number: '+12025550123' }).call;
+    store.update(call.id, { callSid: 'CA' + randomUUID().replace(/-/g, ''), status: 'completed', endedAt: ended });
+    return call.id;
+  });
+  assert.equal(await store.settle(() => true, Date.now() + 2 * SETTLED_QUIET_MS), 2);
+  store.update(ids[0]!, { failure: { code: 'late_callback', message: 'A late provider callback' } });
+  store.close();
+  const dry = JSON.parse(run(directory, '--dry-run', '--target', '6e23b1be9103').stdout);
+  assert.deepEqual([dry.settledFiles, dry.settledCallsFolded, dry.settledSuperseded], [2, 1, 1]);
+  runRollbackJournalCompat([directory, '--target', '6e23b1be9103'], { now: () => new Date(Date.UTC(2026, 9, 18)) });
+  const journal = read(path.join(directory, 'calls.json'));
+  assert.equal(journal.calls[ids[0]!]!.failure?.code, 'late_callback', 'the newer calls.json copy is kept');
+  assert.equal(journal.calls[ids[1]!]!.status, 'completed');
 });

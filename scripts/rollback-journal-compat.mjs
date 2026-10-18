@@ -88,12 +88,14 @@ export function journeyAwareTarget(target) {
 export function foldJournalFiles(state, directory) {
   if (!record(state) || state.version !== 1 || !record(state.calls)) throw new Error('rollback_journal_invalid');
   const next = structuredClone(state);
-  const folded = { settledCalls: 0, observations: 0 };
+  // A settled file whose call is also in calls.json is superseded: the call changed after it settled,
+  // and calls.json holds the newer copy. It is counted, never folded.
+  const folded = { settledCalls: 0, settledSuperseded: 0, observations: 0 };
   const names = folder => { try { return fs.readdirSync(path.join(directory, folder)).filter(name => name.endsWith('.json') && !name.startsWith('.')); }
     catch (error) { if (error?.code === 'ENOENT') return []; throw error; } };
   for (const name of names('calls.d')) {
     const id = name.slice(0, -'.json'.length);
-    if (Object.hasOwn(next.calls, id)) continue;
+    if (Object.hasOwn(next.calls, id)) { folded.settledSuperseded++; continue; }
     let saved;
     try { saved = JSON.parse(fs.readFileSync(path.join(directory, 'calls.d', name), 'utf8')); } catch { throw new Error('rollback_settled_call_invalid'); }
     if (saved?.version !== 1 || !record(saved.call) || saved.call.id !== id) throw new Error('rollback_settled_call_invalid');
@@ -236,7 +238,7 @@ export function runRollbackJournalCompat(args, options = {}) {
       catch (error) { if (error?.code === 'ENOENT') return 0; throw error; } })();
     const summary = { stateDir: directory, calls: changes.calls, changedCalls: changes.changedCalls.length,
       journeysDropped: changes.journeysDropped, journeyKeysRemoved: changes.journeyKeysRemoved,
-      settledCallsFolded: folded.settledCalls, settledFiles, observationsFolded: folded.observations,
+      settledCallsFolded: folded.settledCalls, settledSuperseded: folded.settledSuperseded, settledFiles, observationsFolded: folded.observations,
       ...(target ? { target } : {}), backup: null, written: false, dryRun };
     const sideFiles = ['calls.d', 'live.d'].filter(folder => fs.existsSync(path.join(directory, folder)));
     if (dryRun || (changes.changedCalls.length === 0 && !folded.settledCalls && !folded.observations && !sideFiles.length)) return summary;

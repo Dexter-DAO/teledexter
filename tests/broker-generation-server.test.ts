@@ -12,7 +12,7 @@ import { createPrimaryApiClient, PrimaryApiError, type PrimaryApiClient, type Pr
 import { eligiblePhoneCallSchema, type EligibleContextClient, type EligiblePhoneCall, type HistoryVersion } from '../src/broker/eligibleContext.js';
 import { BrokerStore } from '../src/broker/store.js';
 import { streamToken } from '../src/broker/phone.js';
-import { createGenerationVoice } from '../src/broker/generationVoice.js';
+import { createGenerationVoice, REPEATED_RESULT_NOTE } from '../src/broker/generationVoice.js';
 import type { LiveGenerationJournal } from '../src/broker/liveGeneration.js';
 import type { BrokerConfig } from '../src/broker/config.js';
 import type { BrokerDelegationRecord } from '../src/broker/backend.js';
@@ -239,6 +239,20 @@ test('actual server preserves accepted work through replacement and speaks only 
   assert.equal(call.publications!.records.at(-1)!.sourceSessionId, 'generation_1');
 });
 
+test('a result whose first delivery went unconfirmed is re-sent as a reminder, not announced fresh', async t => {
+  const f = await host(t, false, false, false, { resultText: 'You sold about $2.00 of Amazon stock. The sale is confirmed.', unconfirmedSpeech: true });
+  const work = observedWork(f.delegate());
+  await boundary('accepted request', () => f.posts.length === 1, [work]);
+  f.release();
+  await boundary('result re-sent', () => f.voices.some(voice => voice.spoken.filter(text => text === f.eligibleText).length === 2), [work]);
+  const voice = f.voices.find(value => value.spoken.filter(text => text === f.eligibleText).length === 2)!;
+  const first = voice.published.indexOf(f.eligibleText), second = voice.published.lastIndexOf(f.eligibleText);
+  assert.ok(first < second);
+  assert.equal(voice.published[second - 1], REPEATED_RESULT_NOTE, 'the re-send is introduced as a possible repeat');
+  assert.ok(!voice.published.slice(0, first).includes(REPEATED_RESULT_NOTE), 'the first delivery is plain');
+  assert.equal(f.posts.length, 1, 'a re-send never re-submits the request');
+});
+
 test('a Dexter API failure that ends the call says so plainly and never blames the voice', async t => {
   const f = await host(t);
   const first = observedWork(f.delegate());
@@ -249,8 +263,9 @@ test('a Dexter API failure that ends the call says so plainly and never blames t
   f.release();
   await boundary('the call is ended with a spoken reason', () => f.providerUpdates.some(update => typeof update.twiml === 'string'), [first]);
   const spoken = f.providerUpdates.map(update => String(update.twiml ?? '')).join(' ');
-  assert.match(spoken, /I lost the connection to your Dexter account/);
-  assert.doesNotMatch(spoken, /voice connection/);
+  assert.match(spoken, /I lost the connection to your Dexter account, so I have to end this call\. A result I hadn't given you yet is in the Dexter app\./,
+    'built from the request that finished but was never delivered; nothing claims queued work keeps running');
+  assert.doesNotMatch(spoken, /voice connection|Anything you already asked for/);
   assert.equal(f.store.get(f.callId)!.endReason, 'account_unavailable');
 });
 

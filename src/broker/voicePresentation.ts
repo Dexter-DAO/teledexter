@@ -117,6 +117,33 @@ export function cancelledRequestSpeech(entry: BrokerDelegationRecord): string {
     ? `${partial.text} The rest of the request was cancelled.` : `${cancelled} The last observed step before that: ${partial.text}`;
 }
 
+/**
+ * What the caller hears when the call must end because the Dexter account connection failed, built
+ * from the call's actual requests. Only work Primary already has keeps running after hangup: a
+ * request still queued behind another, or not yet sent, never runs, and a question waits for an answer.
+ */
+export function accountUnavailableSpeech(delegations: Record<string, unknown>): string {
+  const entries = Object.values(delegations) as BrokerDelegationRecord[];
+  const running = entries.filter(entry => ['queued', 'running'].includes(entry.status)).length;
+  const uncertain = entries.filter(entry => ['dispatching', 'dispatch_unknown'].includes(entry.status)).length;
+  const waiting = entries.filter(entry => entry.status === 'waiting_for_reply').length;
+  const undelivered = entries.filter(entry => ['completed', 'failed', 'cancelled'].includes(entry.status) && entry.delivery !== 'accepted').length;
+  const unsent = entries.filter(entry => entry.status === 'prepared').length
+    + entries.reduce((count, entry) => count + (entry.deferredTurns ?? []).filter(turn => turn.status === 'queued').length, 0);
+  const parts = ['I lost the connection to your Dexter account, so I have to end this call.'];
+  if (running) parts.push(running === 1 ? 'The request already sent to your account keeps running.'
+    : 'The requests already sent to your account keep running.');
+  if (uncertain) parts.push(uncertain === 1 ? "I couldn't confirm that your last request reached your account."
+    : "I couldn't confirm that your last requests reached your account.");
+  if (waiting) parts.push('A question about your request is waiting for your answer.');
+  if (undelivered) parts.push(undelivered === 1 ? "A result I hadn't given you yet is in the Dexter app."
+    : "Results I hadn't given you yet are in the Dexter app.");
+  if (unsent) parts.push(unsent === 1 ? "The request I hadn't sent yet won't run, so please ask again."
+    : "The requests I hadn't sent yet won't run, so please ask again.");
+  parts.push(running || uncertain || waiting ? 'Check the Dexter app for the rest.' : 'Please call me back.');
+  return parts.join(' ');
+}
+
 /** A partial is progress: quiet context for the voice, tied to its task, never a result. */
 export function partialResultUpdate(entry: BrokerDelegationRecord): LiveBackendUpdate | undefined {
   const partial = entry.primaryResult?.partialResult;

@@ -208,6 +208,58 @@ test('probe A2: a silent judge while the list changes still restates the list', 
   h.guardrail.stop();
 });
 
+function clocked(verdict: () => JudgeVerdict | undefined, tasks: () => VoiceTask[]) {
+  let clock = 1_000_000;
+  const corrections: string[] = [], triggers: GuardrailTrigger[] = [];
+  const guardrail = createVoiceGuardrail({ callId: 'call_1', judge: async () => verdict(), tasks, truth: tasks, now: () => clock,
+    correct: async text => { corrections.push(text); return { eventId: 'c', status: 'accepted' } as LiveDelivery; },
+    record: trigger => triggers.push(trigger) });
+  return { guardrail, corrections, triggers, advance: (ms: number) => { clock += ms; } };
+}
+
+test('restatements of the same list in any task order are sent once (two requests, six outcome claims, 30 s)', async () => {
+  const sale: VoiceTask = { ...pending, request: 'Sell two dollars of Amazon', status: 'finished', outcome: 'You sold about $2.00 of Amazon stock.', progress: undefined };
+  const cancel: VoiceTask = { ...pending, requestId: 'r2', delegationId: 'item_2', request: 'Cancel the Amazon sale', status: 'pending', progress: undefined };
+  const h = clocked(() => ({ contradicts: 0.99, kind: 'false_success', kindProbability: 0.8, supported: 0.9 }), () => [sale, cancel]);
+  const t = transcript();
+  const claims = ['The Amazon sale went through.', 'Your cancel went through.', 'The sale is done.', 'The cancel is done.',
+    'Amazon sold, all set.', 'Cancel went through too.'];
+  for (const [index, claim] of claims.entries()) {
+    h.guardrail.observe(t.say('assistant', claim, index * 5000), 'live_1');
+    await wait(20); h.advance(5000);
+  }
+  assert.equal(h.corrections.length, 1, 'alternating which task leads does not defeat the duplicate check');
+  assert.deepEqual(h.triggers.map(value => value.correction), ['accepted', ...Array(5).fill('suppressed_duplicate')]);
+  h.guardrail.stop();
+});
+
+test('a silent judge with two open requests restates once, not on every outcome claim', async () => {
+  const sale: VoiceTask = { ...pending, request: 'Sell two dollars of Amazon', status: 'finished', outcome: 'You sold about $2.00 of Amazon stock.', progress: undefined };
+  const cancel: VoiceTask = { ...pending, requestId: 'r2', delegationId: 'item_2', request: 'Cancel the Amazon sale', status: 'pending', progress: undefined };
+  const h = clocked(() => undefined, () => [sale, cancel]);
+  const t = transcript();
+  h.guardrail.observe(t.say('assistant', 'The Amazon sale went through.', 0), 'live_1');
+  h.advance(5000);
+  h.guardrail.observe(t.say('assistant', 'Your cancel went through.', 5000), 'live_1');
+  await wait(1500);
+  assert.equal(h.corrections.length, 1);
+  assert.deepEqual(h.triggers.map(value => value.correction).sort(), ['accepted', 'suppressed_duplicate']);
+  h.guardrail.stop();
+});
+
+test('a changed list is restated again only after the rate limit', async () => {
+  let progress = 'step 1';
+  const h = clocked(() => ({ contradicts: 0.99, kind: 'false_success', kindProbability: 0.8, supported: 0.9 }), () => [{ ...pending, progress }]);
+  const t = transcript();
+  h.guardrail.observe(t.say('assistant', 'It went through.', 0), 'live_1'); await wait(20);
+  progress = 'step 2'; h.advance(10_000);
+  h.guardrail.observe(t.say('assistant', 'It sold.', 10_000), 'live_1'); await wait(20);
+  h.advance(15_000);
+  h.guardrail.observe(t.say('assistant', 'It is done.', 25_000), 'live_1'); await wait(20);
+  assert.deepEqual(h.triggers.map(value => value.correction), ['accepted', 'suppressed_rate', 'accepted']);
+  h.guardrail.stop();
+});
+
 test('a judge that answers on retry is used normally', async () => {
   let calls = 0;
   const h = harness(() => (++calls === 1 ? undefined : fine));

@@ -189,7 +189,7 @@ test('rollback folds settled calls and live observations back into calls.json fo
   const state = JSON.parse(fs.readFileSync(path.join(dir, 'calls.json'), 'utf8'));
   assert.equal(state.calls[old.id], undefined);
   const { journal, folded } = foldJournalFiles(state, dir);
-  assert.deepEqual(folded, { settledCalls: 1, observations: 1 });
+  assert.deepEqual(folded, { settledCalls: 1, settledSuperseded: 0, observations: 1 });
   assert.equal(journal.calls[old.id].status, 'completed');
   assert.equal(journal.calls[live.id].transcriptRevision, 4);
   const summary = runRollbackJournalCompat([dir], { now: () => new Date(Date.UTC(2026, 9, 18)) });

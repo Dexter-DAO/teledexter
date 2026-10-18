@@ -55,6 +55,9 @@ export interface GenerationVoiceOptions {
   guardrailJudge?: GuardrailJudge;
 }
 
+/** Quiet context before re-sending a result whose first delivery was unconfirmed. */
+export const REPEATED_RESULT_NOTE = 'The next result repeats one you may already have given; the caller may have heard it. Present it as a reminder, for example "as I mentioned", not as news.';
+
 export interface GenerationVoiceSession extends BrokerLiveSession {
   prepareSelectedCloseout(): Promise<SelectedQuestionCloseout>;
 }
@@ -244,10 +247,16 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
     const lastAttempt = previous.at(-1)?.updateId.match(/_attempt_(\d+)_\d+$/)?.[1];
     let attempt = lastAttempt === undefined ? 1 : Number(lastAttempt);
     // A rejected or unconfirmed attempt is re-sent as a new attempt; an accepted one is never repeated.
-    if (previous.some(value => value.updateId.startsWith(`${prefix}_attempt_${attempt}_`)
-      && value.outcome && (value.outcome.status === 'rejected' || value.outcome.status === 'unconfirmed'
-        || call().publications?.rejections.some(rejection => rejection.sessionId === value.sessionId
-          && rejection.eventId === value.outcome!.eventId)))) attempt++;
+    const lateRejected = (value: (typeof previous)[number]) => call().publications?.rejections
+      .some(rejection => rejection.sessionId === value.sessionId && rejection.eventId === value.outcome!.eventId) ?? false;
+    const lastRecords = previous.filter(value => value.updateId.startsWith(`${prefix}_attempt_${attempt}_`) && value.outcome);
+    // An unconfirmed result may have been spoken anyway (only its acknowledgement timed out): the
+    // re-send is a repeat, so the voice is told to present it as one ("as I mentioned").
+    let maybeHeard = false;
+    if (lastRecords.some(value => value.outcome!.status === 'rejected' || value.outcome!.status === 'unconfirmed' || lateRejected(value))) {
+      maybeHeard = kind === 'result' && lastRecords.some(value => value.outcome!.status === 'unconfirmed' && !lateRejected(value));
+      attempt++;
+    }
 
     let chunks: string[];
     try { chunks = liveResultChunks(text); }
@@ -268,6 +277,9 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
         const status = interrupted() ?? receipt.status;
         if (status !== 'accepted') return { ...receipt, status, reason: 'task_context_unconfirmed' };
       }
+    }
+    if (maybeHeard) {
+      try { await session.voice.appendContext(REPEATED_RESULT_NOTE); } catch { /* The result itself still goes out. */ }
     }
     for (const [index, chunk] of chunks.entries()) {
       const halted = interrupted();
