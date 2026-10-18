@@ -51,7 +51,7 @@ async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; 
   const bindingId = randomUUID();
   const primaryDexterId = randomUUID();
   const threadId = randomUUID();
-  const calls = { create: 0, update: 0, preflight: 0, readiness: 0, bind: 0, close: 0, audio: 0, fetch: 0 };
+  const calls = { create: 0, update: 0, preflight: 0, readiness: 0, bind: 0, close: 0, audio: 0, fetch: 0, portfolio: 0 };
   let voiceOptions: BrokerLiveSessionOptions | undefined;
   let readyVoice: (() => void) | undefined;
   const openingCommands: string[] = [];
@@ -63,6 +63,7 @@ async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; 
   }) : undefined;
   void bindGate?.catch(() => {});
   const primary = {
+    async portfolio() { calls.portfolio++; throw new Error('Outbound must not read portfolio in the background'); },
     async readiness() { calls.readiness++; return { eligible: overrides.eligibility !== false, reason: overrides.eligibility === false ? 'authority_unavailable' : 'ready' }; },
     async openCall(proof: { params: Record<string, string> }, assignment?: PhoneCallAssignment) {
       calls.bind++;
@@ -154,7 +155,7 @@ async function preCallAssignmentCases(t: test.TestContext, parser: { safeParse(v
     if (!item.allowed) {
       assert.deepEqual(f.broker.store.list(), []);
       assert.equal(fs.readFileSync(journalFile, 'utf8'), emptyJournal);
-      assert.deepEqual(f.calls, { create: 0, update: 0, preflight: 0, readiness: 0, bind: 0, close: 0, audio: 0, fetch: 0 });
+      assert.deepEqual(f.calls, { create: 0, update: 0, preflight: 0, readiness: 0, bind: 0, close: 0, audio: 0, fetch: 0, portfolio: 0 });
       return;
     }
     const saved = f.broker.store.list()[0];
@@ -243,7 +244,7 @@ test('historical uppercase control retry recovers exact saved call without new a
   assert.equal((await response.json() as { replayed: boolean }).replayed, true);
   assert.deepEqual(f.broker.store.get(id), retainedCall);
   assert.deepEqual(fs.readFileSync(file), original);
-  assert.deepEqual(f.calls, { create: 0, update: 0, preflight: 0, readiness: 0, bind: 0, close: 0, audio: 0, fetch: 0 });
+  assert.deepEqual(f.calls, { create: 0, update: 0, preflight: 0, readiness: 0, bind: 0, close: 0, audio: 0, fetch: 0, portfolio: 0 });
   assert.notEqual((await f.post('/internal/broker/calls', { requestId, purpose: 'Different purpose' })).status, 200);
   assert.deepEqual(fs.readFileSync(file), original);
   assert.equal(f.calls.create, 0);
@@ -304,6 +305,7 @@ test('signed inbound call offers callback without account reads, voice preflight
 
 test('signed outbound answer preserves the repair brief and speaks its role-aware opening only after Live is ready', async t => {
   const f = await fixture(t, { deferVoiceReady: true, history: historicalAccountMessages });
+  t.mock.timers.enable({ apis: ['setInterval'] });
   const purpose = 'Verify the account request repair with Avery Example: answer one current portfolio question through Primary Dexter, then discuss his feedback. Explain any returned failure plainly.';
   assert.equal((await f.post('/internal/broker/calls', { requestId: randomUUID(), purpose })).status, 201);
   const call = f.broker.store.list()[0];
@@ -331,6 +333,10 @@ test('signed outbound answer preserves the repair brief and speaks its role-awar
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(f.openingCommands, [brokerOpening('outbound', true)]);
   assert.doesNotMatch(f.openingCommands[0], /verify|Primary|Avery/);
+  assert.equal(f.calls.portfolio, 0);
+  t.mock.timers.tick(90_000);
+  assert.equal(f.calls.portfolio, 0, 'outbound has no periodic portfolio reader');
+  t.mock.timers.reset();
   assert.match(f.voiceOptions()!.instructions, /called the person/);
   assert.ok(f.voiceOptions()!.instructions.includes(`Internal call brief (an assignment for you): ${JSON.stringify(purpose)}`));
   assert.equal(f.broker.store.get(call.id)!.purpose, purpose);

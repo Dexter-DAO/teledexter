@@ -1017,6 +1017,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
     let greetingHold: string[] | undefined;
     let greetingHeldBytes = 0;
     let greetingReleaseTimer: ReturnType<typeof setTimeout> | undefined;
+    let greetingStartTimer: ReturnType<typeof setTimeout> | undefined;
     const greetingMarks = new Set<string>();
     let greetingPlaybackRecorded = false;
     // Caller input gate. Closed while the greeting clip plays, so words spoken over the greeting
@@ -1172,7 +1173,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
       stopPortfolio(call.id);
       preconnect?.discard(call.id);
       clearTimeout(startTimer); clearTimeout(durationTimer);
-      greeting?.cancel(); clearTimeout(greetingReleaseTimer); greetingHold = undefined;
+      greeting?.cancel(); clearTimeout(greetingStartTimer); clearTimeout(greetingReleaseTimer); greetingHold = undefined;
       const previous = store.get(call.id)!;
       if (previous.inbound) inbound.stopLocal(call.id, reason);
       // An unbound call has nothing to close yet; a binding that lands later is closed by its owner.
@@ -1218,7 +1219,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
     /** Starts the account voice once the binding exists: Live opens with this call's context and
      * receives the caller audio kept since the greeting ended, first and in order. */
     function attach(): void {
-      if (stopping || released || live) return;
+      if (stopping || released || live || greetingStartTimer) return;
       if (!accepting) { void stop('service_shutdown'); return; }
       const bound = store.get(call.id)!;
       if (!bound.primary || (bound.inbound && !inbound.mediaAllowed(bound))) throw new Error('media_binding_unavailable');
@@ -1238,7 +1239,9 @@ export function createBrokerServer(options: BrokerServerOptions) {
       try { console.info(JSON.stringify({ event: 'broker_account_media', version: 1, callId: call.id, observedAt: new Date(now).toISOString(),
         mediaStartedAt, heldInputMs: heldInputBytes / 8, droppedInputMs: droppedInputBytes / 8, greetingInputMs: greetingInputBytes / 8 })); }
       catch { /* Telemetry only. */ }
-      if (!options.eligibleContext) backend = createPrimaryBackend({ callId: call.id, callSid: call.callSid!, bindingId: bound.primary.bindingId, api: primary, store, watchUntilCallEnds: true, lastCallerSpeechAt: () => lastSpeechAt });
+      if (!options.eligibleContext) backend = createPrimaryBackend({ callId: call.id, callSid: call.callSid!, bindingId: bound.primary.bindingId,
+        onResult: result => portfolioContext?.observe(result),
+        api: primary, store, watchUntilCallEnds: true, lastCallerSpeechAt: () => lastSpeechAt });
       const voiceOptions: BrokerLiveSessionOptions = { apiKey: config.apiKey, callId: call.id, voice: config.voice,
         instructions: brokerInstructions({ direction: call.direction, purpose: call.purpose, registeredAssignment: !!call.callAssignment,
           ...(call.callAssignment?.origin === 'authenticated_hark_delivery' ? { watch: call.callAssignment.value.hark } : {}),
@@ -1273,6 +1276,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
           // continues. Its receipt confirms context injection, not playback.
           queueMicrotask(() => {
             if (stopping || !live) return;
+            portfolioContext?.attach(live);
             void live.appendInstructions(brokerOpening(call.direction, !!call.callAssignment, call.callAssignment?.origin === 'authenticated_hark_delivery', call.callAssignment?.origin === 'authenticated_notification_delivery',
               Boolean(store.get(call.id)!.journey?.greetingClipStartedAt)))
               .then(result => { store.update(call.id, { voiceOpening: result }); })
@@ -1383,10 +1387,26 @@ export function createBrokerServer(options: BrokerServerOptions) {
           clearTimeout(startTimer);
           store.update(call.id, { streamSid, ...(managedNotification(call) ? {} : { status: 'in-progress' as const }),
             journey: { ...current.journey, streamStartedAt: current.journey?.streamStartedAt ?? new Date().toISOString() } });
-          // The clip carries no account data, so it starts now, before admission or binding
-          // finishes; Live's opening is later told it was heard.
+          // Let the inbound media path settle before the first syllable. Admission
+          // still runs in parallel; attach waits so the opening knows the clip started.
           const clip = call.direction === 'inbound' ? options.inboundGreetingClip : options.greetingClip;
-          if (clip && greets && greetingClipEligible(store.get(call.id)!)) startGreetingClip(clip); else openInput();
+          if (clip && greets && greetingClipEligible(store.get(call.id)!)) {
+            if (call.direction === 'inbound') {
+              greetingHold = [];
+              greetingStartTimer = setTimeout(() => {
+                greetingStartTimer = undefined;
+                if (stopping || released) return;
+                try {
+                  startGreetingClip(clip);
+                  const bound = store.get(call.id)!;
+                  if (bound.primary && (!bound.inbound || inbound.mediaAllowed(bound))) attachSafely();
+                } catch (error) {
+                  try { store.update(call.id, { failure: safeFailure(error) }); } catch { /* Stop still owns cleanup. */ }
+                  void stop('media_error');
+                }
+              }, Math.max(0, Date.parse(store.get(call.id)!.journey!.streamStartedAt!) + 300 - Date.now()));
+            } else startGreetingClip(clip);
+          } else openInput();
           if (call.inbound) void admitInbound();
           else awaitOutboundBinding();
         } else if (frame.event === 'media') {
