@@ -182,7 +182,7 @@ test('call 039b39cd: pending speech never claims an available result has not com
 test('pending work gets one short acknowledgment and no spoken queue mechanics', () => {
   const instructions = brokerInstructions({ direction: 'inbound', purpose: '' });
   assert.match(instructions, /never say "queued", "follow-ups", or "later requests"/);
-  assert.match(instructions, /at most one short acknowledgment such as "On it\."/);
+  assert.match(instructions, /When a request is first delegated, you may say "On it\." once/);
   assert.match(instructions, /stay quiet until the result arrives unless the caller speaks; do not say you are still waiting/);
   assert.match(instructions, /A queued receipt means the later request has not started/);
 });

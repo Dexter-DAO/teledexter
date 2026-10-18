@@ -89,6 +89,8 @@ export class PlaybackReceipts {
       }
       item.cleared = true;
     }
+    // Late Twilio marks for cleared audio must not count as played or backlog.
+    this.pending.clear();
   }
   isPending(id: string) { const item = this.pending.get(id); return Boolean(item && !item.cleared); }
   /** Marks every unplayed chunk dropped when none of them carries speech; the
@@ -106,6 +108,23 @@ export class PlaybackReceipts {
   }
   get backlogMs() { return (this.sentBytes - this.playedBytes - this.clearedBytes - this.preSpeechDroppedBytes) / 8; }
   get pendingCount() { return this.pending.size; }
+}
+
+const clearingSockets = new WeakSet<object>();
+/** Congestion drops playback, never the caller's connection. */
+export function clearAudioBacklog(socket: { bufferedAmount: number; send(data: string): void },
+  receipts: PlaybackReceipts, streamSid: string, callId: string, heldBytes = 0): boolean {
+  const numbers = { bufferedAmount: socket.bufferedAmount, pendingCount: receipts.pendingCount,
+    backlogMs: receipts.backlogMs, heldBytes };
+  if (socket.bufferedAmount <= 256_000) clearingSockets.delete(socket);
+  else if (clearingSockets.has(socket)) return true;
+  if (numbers.bufferedAmount <= 256_000 && numbers.pendingCount <= 300
+    && numbers.backlogMs <= 6_000 && heldBytes <= 48_000) return false;
+  socket.send(JSON.stringify({ event: 'clear', streamSid }));
+  if (socket.bufferedAmount > 256_000) clearingSockets.add(socket);
+  receipts.clear();
+  console.info(JSON.stringify({ event: 'broker_audio_backlog_cleared', callId, streamSid, ...numbers }));
+  return true;
 }
 
 /** Only the two exact PCMU zero encodings are silence. Quiet speech still
@@ -144,4 +163,18 @@ export function safeFailure(error: unknown): { code: string; message: string } {
       .replace(/sk-[A-Za-z0-9_-]+/g, '[credential]')
       .replace(/Bearer\s+\S+/gi, 'Bearer [credential]').slice(0, 400),
   };
+}
+
+/** Receipt congestion is recoverable. A socket that cannot drain for ten
+ * consecutive seconds is a failed media transport, even without a close event. */
+export function watchMediaSocket(socket: { bufferedAmount: number }, failed: () => void) {
+  let since: number | undefined, stopped = false;
+  const timer = setInterval(() => {
+    if (stopped) return;
+    if (socket.bufferedAmount <= 256_000) { since = undefined; return; }
+    since ??= Date.now();
+    if (Date.now() - since >= 10_000) { stopped = true; clearInterval(timer); failed(); }
+  }, 250);
+  timer.unref?.();
+  return () => { stopped = true; clearInterval(timer); };
 }

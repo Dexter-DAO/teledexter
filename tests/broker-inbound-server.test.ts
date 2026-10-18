@@ -356,6 +356,10 @@ for (const eligible of [false, true]) test(`greeting clip plays first at media s
   assert.equal(g.frames.filter(frame => frame.event === 'media').length, 15, 'no Live audio while the clip is unplayed');
   const journey = g.f.store.get(g.call.id)!.journey!;
   assert.ok(journey.greetingClipStartedAt && journey.firstAudioSentAt);
+  assert.ok(Date.parse(journey.greetingClipStartedAt) >= Date.parse(journey.streamStartedAt!),
+    'clip playback begins after stream start; loaded clips carry their silence lead-in');
+  assert.ok(Date.parse(journey.firstAudioSentAt) >= Date.parse(journey.greetingClipStartedAt),
+    'journey records the actual start of the clip');
   assert.equal(journey.greetingClipPlayedAt, undefined);
   // Acknowledge all but the last clip mark: Live is still held.
   const clipMarks = g.frames.filter(frame => frame.event === 'mark').map(frame => frame.name!);
@@ -938,13 +942,14 @@ async function preconnectMedia(f: Awaited<ReturnType<typeof fixture>>, call: Bro
 }
 
 test('bound inbound fetch runs before Live, leaves opening free, and delivers quiet portfolio context before a question', async t => {
+  const observedAt = new Date().toISOString();
   let reads = 0, release!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
   const f = await fixture(t, { eligible: true, preconnect: true, portfolio: async bindingId => {
     reads++;
     assert.equal(f.store.list()[0].primary?.bindingId, bindingId);
     await gate;
-    return { version: 'phone.portfolio.v1', bindingId, observedAt: '2026-10-17T12:52:00.000Z', totalUsd: '28.86',
+    return { version: 'phone.portfolio.v1', bindingId, observedAt, totalUsd: '28.86',
       holdingsComplete: true, holdingCount: 1, unpricedCount: 0, omittedCount: 0,
       holdings: [{ name: 'USD Coin', symbol: 'USDC', assetClass: 'token', amount: '28.86', valueUsd: '28.86', change24hPercent: null }] };
   } }); t.after(release);
@@ -961,7 +966,7 @@ test('bound inbound fetch runs before Live, leaves opening free, and delivers qu
   await preconnectUntil(() => transport.sent.some(event => event.type === 'session.thinking.append' && event.content.includes('only current portfolio note')));
   const notes = transport.sent.filter(event => event.type === 'session.thinking.append');
   assert.ok(notes.every(event => event.delegation_id === null && Buffer.byteLength(event.content) <= 500));
-  assert.match(notes.map(event => event.content).join(' '), /as of 2026-10-17T12:52:00.000Z: Your portfolio totals about \$28.86/);
+  assert.ok(notes.map(event => event.content).join(' ').includes(`as of ${observedAt}: Your portfolio totals about $28.86`));
   assert.equal(transport.sent.some(event => event.type === 'session.commentary.append'), false);
   transport.receive({ type: 'session.input_transcript.delta', event_id: 'portfolio_question', delta: "What's in my portfolio?",
     start_ms: 1000, end_ms: 1500 });
@@ -1295,6 +1300,53 @@ async function greetingMedia(f: Awaited<ReturnType<typeof fixture>>, call: Broke
   const clipFrames = () => frames.filter(frame => frame.event === 'media').length;
   return { ws, frames, caller, ackClip, clipFrames };
 }
+
+for (const ending of ['play', 'disconnect', 'failure']) test(`inbound greeting sends its silence immediately and handles ${ending}`, async t => {
+  const audible: string[] = [];
+  t.mock.method(console, 'info', (value: string) => { if (!value.startsWith('{')) return; const event = JSON.parse(value);
+    if (event.event === 'broker_audio_timing' && event.stage === 'firstAudibleAudioSentAt') audible.push(event.observedAt); });
+  const clip = Buffer.concat([Buffer.alloc(2400, 255), greetingFixtureClip]);
+  const f = await fixture(t, { greetingClip: clip });
+  await (await f.webhook('/broker/incoming-call')).text(); await f.waitForAdmission();
+  const call = f.store.list()[0];
+  if (ending === 'failure') {
+    const update = f.store.update.bind(f.store);
+    t.mock.method(f.store, 'update', (id, patch) => {
+      if (patch.journey?.greetingClipStartedAt) throw new Error('fixture_greeting_write_failed');
+      return update(id, patch);
+    });
+  }
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
+  const g = await greetingMedia(f, call);
+  t.after(() => { t.mock.timers.reset(); g.ws.close(); });
+  for (let i = 0; i < 100 && !f.store.get(call.id)!.journey?.streamStartedAt; i++)
+    await new Promise<void>(resolve => setImmediate(resolve));
+  const start = f.store.get(call.id)!.journey!.streamStartedAt!;
+  assert.ok(start, 'stream start recorded');
+  if (ending === 'failure') {
+    for (let i = 0; i < 100 && !f.store.get(call.id)!.endedAt; i++)
+      await new Promise<void>(resolve => setImmediate(resolve));
+    assert.ok(f.store.get(call.id)!.endedAt, 'clip-start errors retain media cleanup');
+    assert.equal(f.store.get(call.id)!.journey!.greetingClipStartedAt, undefined);
+    return;
+  }
+  assert.equal(f.store.get(call.id)!.journey!.greetingClipStartedAt, start, 'silence starts without a timer gate');
+  t.mock.timers.tick(200); // 200 ms elapsed + 100 ms carrier lead: only the 300 ms silence.
+  assert.deepEqual(audible, [], 'only silence has been queued');
+  if (ending === 'disconnect') {
+    g.ws.close();
+    for (let i = 0; i < 100 && !f.store.get(call.id)!.endedAt; i++)
+      await new Promise<void>(resolve => setImmediate(resolve));
+    assert.ok(f.store.get(call.id)!.endedAt, 'disconnect stops the call');
+    t.mock.timers.tick(1000);
+    assert.deepEqual(audible, [], 'no late greeting speech after hangup');
+  } else {
+    t.mock.timers.tick(20);
+    assert.equal(Date.parse(audible[0]!) - Date.parse(start), 220,
+      'first speech frame is queued with a 100 ms lead behind exactly 300 ms of silence');
+  }
+  t.mock.timers.reset();
+});
 
 test('the greeting plays at stream start while admission waits; words over it are dropped and later words reach Live first, in order', async t => {
   const media: Array<Record<string, unknown>> = [];

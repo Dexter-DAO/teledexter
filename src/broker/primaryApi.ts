@@ -1,3 +1,4 @@
+import { voiceContextSchema, type VoiceContext } from './conversationContext.js';
 import { callbackProviderProofSchema } from './verificationCallbackContract.js';
 import { phoneVerificationCallbackErrorSchema, PHONE_VERIFICATION_CALLBACK_PROOF_MAX_BYTES, PHONE_VERIFICATION_CALLBACK_COMMAND_MAX_BYTES } from './verificationCallbackContract.js';
 import { createHmac } from 'node:crypto';
@@ -56,6 +57,7 @@ export interface PrimaryCall {
 }
 
 export interface PrimarySubmission {
+  voiceContext?: VoiceContext;
   resultSms?: PhoneResultSmsAdmission;
   source: {
     callSid: string;
@@ -471,6 +473,7 @@ export const replyInputSchema = z.object({
   role: z.literal('user'), text: sourceText, reply: replySchema,
 }).strict();
 const submissionSchema = z.object({
+  voiceContext: voiceContextSchema.optional(),
   source: z.object({ callSid, itemId, sourceEventId: uuid, revision: z.literal(1), receivedAt: timestamp, role: z.literal('user') }).strict(),
   text: sourceText,
   relatedPrimaryRequestId: uuid.optional(), referenceOrigin: z.literal('broker_status_publication').optional(),
@@ -874,7 +877,8 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
         ...(parsed.callAssignmentRef === undefined ? {} : { callAssignmentRef: parsed.callAssignmentRef }),
         ...(parsed.associatedResultReference === undefined ? {} : {
           associatedResultReference: orderedAssociatedResultReference(parsed.associatedResultReference) }),
-        ...(parsed.resultSms ? {resultSms:parsed.resultSms} : {}) },
+        ...(parsed.resultSms ? {resultSms:parsed.resultSms} : {}),
+        ...(parsed.voiceContext ? {voiceContext:parsed.voiceContext} : {}) },
         { ...headers, ...(parsed.associatedResultReference || parsed.resultSms ? contextHeaders : {}), 'Idempotency-Key': requestId }, 202), bindingId, requestId, true);
     },
     async admitResultSms(bindingId,input) {
@@ -907,7 +911,7 @@ export function createPrimaryApiClient(options: PrimaryApiOptions): PrimaryApiCl
         : { bindingId, source, role, text: parsed.text,
           ...(parsed.callAssignmentRef === undefined ? {} : { callAssignmentRef: parsed.callAssignmentRef }),
           associatedResultReference: orderedAssociatedResultReference(parsed.associatedResultReference) };
-      const body={...rawBody,...(parsed.resultSms ? {resultSms:parsed.resultSms} : {})};
+      const body={...rawBody,...(parsed.voiceContext ? {voiceContext:parsed.voiceContext} : {}),...(parsed.resultSms ? {resultSms:parsed.resultSms} : {})};
       const result = parse(reconciliationSchema, await request('POST', `/requests/${requestId}/reconcile`,
         body, { ...headers, ...(parsed.associatedResultReference || parsed.resultSms ? contextHeaders : {}) }), 'invalid_response');
       same(result.bindingId, bindingId); same(result.requestId, requestId);

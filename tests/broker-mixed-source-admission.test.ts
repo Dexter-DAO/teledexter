@@ -668,3 +668,21 @@ test('an ordinary answer expiring during the question read is locally refused be
   await h.backend.answerFrozenQuestion(answer.request, answer.ref, h.channel);
   assert.equal(h.replies.length, 0);
 });
+
+
+test('a frozen acknowledgment joins the active request gate without submitting another task', async t => {
+  const h = await fixture(t), tracked: BrokerDelegationRecord[] = [];
+  h.options.onRequest = entry => { tracked.push(structuredClone(entry)); };
+  const submit = h.options.api.submit;
+  h.options.api.submit = async (...args) => {
+    await submit(...args); return { bindingId: h.bindingId, requestId: args[1], state: 'running' };
+  };
+  h.options.api.result = async (_binding, requestId) => ({ bindingId: h.bindingId, requestId, state: 'running' });
+  const first = h.route('Check my balance.', { kind: 'task' });
+  await h.backend.delegateFrozenTask(first.request, first.ref, h.channel);
+  const ack = h.route("I'll wait.", { kind: 'task' });
+  await h.backend.delegateFrozenTask(ack.request, ack.ref, h.channel);
+  assert.equal(h.posts.length, 1);
+  assert.equal(h.entries()[0].deferredTurns?.at(-1)?.status, 'recorded_not_submitted');
+  assert.ok(tracked.at(-1)?.delegationIds.includes(ack.request.delegationId));
+});

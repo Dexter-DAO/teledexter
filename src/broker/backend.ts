@@ -1,3 +1,4 @@
+import { conversationContext } from './conversationContext.js';
 import { createHash } from 'node:crypto';
 import type { BrokerLiveBackend, LiveBackendChannel, LiveDelegationRequest, LiveTranscriptSnapshot } from '../live/session.js';
 import { LIVE_APPEND_MAX_BYTES } from '../live/session.js';
@@ -30,6 +31,7 @@ export type ResolvedCallerTaskReference = NonNullable<Extract<CallerIntentDecisi
 
 export interface PrimaryBackendOptions {
   onResult?(result: PrimaryResult): void;
+  onRequest?(entry: BrokerDelegationRecord): void;
   callId: string;
   callSid: string;
   bindingId: string;
@@ -208,7 +210,7 @@ const isSmsAdmissionRefusal = (status: number, code: string): code is SmsAdmissi
 const taskAdmissionRefusalText = (entry: BrokerDelegationRecord) => entry.submission.resultSms
   ? resultSmsResearchRefusal(entry.admissionRefusal?.code)
   : 'I could not start that request from the saved result. Please tell me what you want me to check or do.';
-const terminal = (state: string) => ['completed', 'failed', 'cancelled', 'not_admitted', 'admission_refused', 'admission_expired'].includes(state);
+export const terminal = (state: string) => ['completed', 'failed', 'cancelled', 'not_admitted', 'admission_refused', 'admission_expired'].includes(state);
 
 const ACK_HARD = "(?:thanks|thank you|great|nice|awesome|excellent|no worries|no problem|i'?m good|got it|ah|oh|wow|hmm|uh|um)";
 // These double as confirmations, so they count only alongside an explicit waiting statement.
@@ -223,6 +225,11 @@ export function isConversationalAcknowledgement(text: string): boolean {
   const normalized = text.toLowerCase().replace(/[‘’]/g, "'").replace(/[^a-z' ]+/g, ' ').replace(/\s+/g, ' ').trim();
   if (!normalized || normalized.length > 120 || !ackPattern.test(normalized)) return false;
   return waitPattern.test(normalized) || !softPattern.test(normalized);
+}
+
+/** A status check reads saved work; it never submits that work again. */
+export function isRequestStatusQuestion(text: string): boolean {
+  return /^(?:(?:hey|okay|ok|so)[, ]+)?(?:how(?:'s| is| are) (?:it|that|the|my|things)\b.{0,60}(?:going|coming|doing)|any (?:news|update|luck)|no luck|(?:is|did|has) (?:it|that|the (?:buy|sale|trade|send|swap|purchase))\b.{0,50}(?:done|finish|complete|through)|(?:what(?:'s| is)|check) the status)[?.!\s]*$/i.test(text.trim());
 }
 
 /** Every chunk of this exact result was appended to the voice provider (it holds a provider event
@@ -864,8 +871,30 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     });
   };
   let observedTranscript: LiveTranscriptSnapshot | undefined;
+  // A caller status turn and the result observer may reach the same answer together.
+  // Share that publication; a later caller turn may explicitly ask to hear it again.
+  const observedPublications = new Map<string, { key: string; promise: ReturnType<NonNullable<PrimaryBackendOptions['observation']>['publish']> }>();
+  const publishObserved = (entry: BrokerDelegationRecord, update?: LiveBackendUpdate) => {
+    if (update || !['completed', 'failed', 'cancelled'].includes(entry.status))
+      return options.observation!.publish(entry, update);
+    const key = JSON.stringify([entry.status, entry.primaryResult?.assistant?.messageId,
+      boundCall(entry.sessionId).liveSessionId, observedTranscript?.callerRevision]);
+    const previous = observedPublications.get(entry.requestId);
+    if (previous?.key === key) return previous.promise;
+    const promise = options.observation!.publish(entry).then(receipt => {
+      if (receipt.delivery.status !== 'accepted' && observedPublications.get(entry.requestId)?.promise === promise)
+        observedPublications.delete(entry.requestId);
+      return receipt;
+    }, error => {
+      if (observedPublications.get(entry.requestId)?.promise === promise) observedPublications.delete(entry.requestId);
+      throw error;
+    });
+    observedPublications.set(entry.requestId, { key, promise });
+    return promise;
+  };
   let transcriptChangedAt = 0;
   let completionTimer: ReturnType<typeof setTimeout> | undefined;
+  let statusSource: string | undefined;
   const scheduleCallerCompletion = () => {
     clearTimeout(completionTimer);
     if (!observedTranscript || options.store.get(options.callId)?.endedAt) return;
@@ -896,6 +925,25 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
           changed = true;
         }
         if (changed) options.store.update(call.id, { callerCompletions: checkpoints });
+        const latest = completedCallerGroups(snapshot).at(-1);
+        if (options.observation && latest && latest.sourceEventId !== statusSource
+          && isRequestStatusQuestion(latest.fragments.map(fragment => fragment.text).join(''))) {
+          statusSource = latest.sourceEventId;
+          // Terminal results outrank a holding line, including records written by
+          // an older broker that incorrectly marked a partial as final delivery.
+          const saved = entries(sessionId, true);
+          const ready = (value: BrokerDelegationRecord) => ['completed', 'failed', 'cancelled'].includes(value.status)
+            && value.primaryResult?.state === value.status;
+          const waiting = saved.filter(value => ready(value) && (value.delivery !== 'accepted'
+            || value.status === 'completed' && !resultAlreadyPresented(call, value))).at(-1);
+          const latestRequest = saved.at(-1);
+          const result = waiting ?? (latestRequest && ready(latestRequest) ? latestRequest : undefined);
+          const pending = latestRequest && !terminal(latestRequest.status) ? latestRequest : undefined;
+          if (result || pending) void publishObserved(result ?? pending!, result ? undefined : {
+            id: `${pending!.requestId}_status_${latest.sourceEventId}`, kind: 'progress', speak: true,
+            text: 'Still working on it.',
+          }).catch(() => console.error('broker_status_delivery_failed', { callId: options.callId }));
+        }
       } catch {
         // The optional checkpoint must not crash an active call. Closeout will
         // report unqualified text when no durable completion evidence exists.
@@ -988,6 +1036,21 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       throw new Error('call_assignment_binding_mismatch');
     return assignmentRef === undefined ? undefined : phoneCallAssignmentRefSchema.parse(assignmentRef);
   };
+  const recentConversation = (sessionId: string, snapshot: LiveTranscriptSnapshot, sequence: number, atMs: number) => {
+    const segments = boundCall(sessionId).liveGenerations?.segments ?? [];
+    const current = segments.find(segment => segment.sessionId === sessionId);
+    const ordinal = current?.ordinal ?? 0;
+    const fragments = [
+      ...segments.filter(segment => segment.ordinal < ordinal && segment.inputFirstSample !== undefined).flatMap(segment => {
+        const shift = (segment.inputFirstSample! - (current?.inputFirstSample ?? 0)) / 8;
+        return segment.transcript.fragments.map(fragment => ({ ...fragment,
+          startMs: fragment.startMs + shift, endMs: fragment.endMs + shift }));
+      }),
+      ...snapshot.fragments.filter(fragment => fragment.sequence < sequence),
+    ].map((fragment, index) => ({ ...fragment, sequence: index + 1 }));
+    const voiceContext = conversationContext(fragments, fragments.length + 1, atMs);
+    return voiceContext ? { voiceContext } : {};
+  };
   const submissionForTurn = (sessionId: string, snapshot: LiveTranscriptSnapshot,
     fragments: LiveTranscriptSnapshot['fragments']): PrimarySubmission => {
     const first = fragments.reduce((a, b) => a.sequence < b.sequence ? a : b);
@@ -996,6 +1059,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     return { source: { callSid: options.callSid, itemId: `live-turn-${sourceEventId}`, sourceEventId,
       revision: 1, receivedAt: new Date(mediaOrigin(sessionId) + first.startMs).toISOString(), role: 'user' },
     text: fragments.map(fragment => fragment.text).join(''),
+    ...recentConversation(sessionId, snapshot, first.sequence, first.startMs),
     ...selectBrokerPublicationReference(call, { callId: options.callId, callSid: options.callSid,
       bindingId: options.bindingId, sessionId }, snapshot, first.sequence),
     ...(frozenAssignmentRef === undefined ? {} : { callAssignmentRef: frozenAssignmentRef }) };
@@ -1004,6 +1068,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     const ref = assignmentReference(frozen.sessionId), turn = frozen.turn;
     return { source: { callSid: options.callSid, itemId: turn.itemId, sourceEventId: turn.sourceEventId,
       revision: 1, receivedAt: turn.occurredAt, role: 'user' }, text: turn.text,
+    ...recentConversation(frozen.sessionId, observedTranscript ?? { revision: 0, callerRevision: 0, fragments: [] }, frozen.firstSequence, frozen.startMs),
     ...(ref === undefined ? {} : { callAssignmentRef: ref }) };
   };
   const questionTargets = (sessionId: string): CallerQuestionTarget[] => {
@@ -1068,7 +1133,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       && isConversationalAcknowledgement(frozen.turn.text)) {
       // Recorded for the transcript only; it starts no request and needs no result.
       persistSpans();
-      const entry = save({ ...active, deferredTurns: [...active.deferredTurns ?? [], { delegationId: request.delegationId,
+      const entry = save({ ...active, delegationIds: [...new Set([...active.delegationIds, request.delegationId])], deferredTurns: [...active.deferredTurns ?? [], { delegationId: request.delegationId,
         sourceEventId: frozen.turn.sourceEventId, text: frozen.turn.text, firstSequence: frozen.firstSequence,
         callerRevision: frozen.callerRevision, status: 'recorded_not_submitted',
         ...(active.sessionId !== request.sessionId ? { sourceSessionId: request.sessionId } : {}) }] });
@@ -1316,6 +1381,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       entry = save(entry); // This source and exact request survive a crash before POST.
       settleAdmission(request);
       entry = save({ ...entry, status: 'dispatching' });
+      options.onRequest?.(entry);
       try {
         const result = await options.api.submit(options.bindingId, entry.requestId, structuredClone(entry.submission));
         entry = applyResult(entry, result);
@@ -1342,11 +1408,11 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       throw new Error('primary_terminal_result_changed');
     if (result.question) current = observeQuestion(current, result.question);
     if (result.state === 'waiting_for_reply' && !result.question) throw new Error('invalid_primary_result');
-    const saved = save({ ...current, status: result.state, primaryResult: structuredClone(result), resultReadUnavailable: false,
+    const saved = save({ ...current, ...(current.status !== result.state ? { delivery: undefined } : {}), status: result.state, primaryResult: structuredClone(result), resultReadUnavailable: false,
       ...(reconciliation ? { reconciliation: structuredClone(reconciliation) } : {}),
       ...(result.question ? { currentQuestionId: result.question.id } : {}),
       ...(result.assistant ? { result: result.assistant.text } : {}) });
-    try { options.onResult?.(result); } catch { /* Optional background reads cannot affect work. */ }
+    try { options.onRequest?.(saved); options.onResult?.(result); } catch { /* Optional background reads cannot affect work. */ }
     return saved;
   };
   const captureRevision = async (entry: BrokerDelegationRecord, channel: LiveBackendChannel): Promise<BrokerDelegationRecord> => {
@@ -1378,8 +1444,9 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     });
   };
   const publishRequest = (entry: BrokerDelegationRecord, channel: LiveBackendChannel, update: LiveBackendUpdate): Promise<LiveDelivery> => {
+    update = { ...update, pending: update.pending ?? !terminal(entry.status) };
     if (options.observation) return options.observation.signal.aborted
-      ? Promise.resolve({ eventId: '', status: 'closed' }) : options.observation.publish(entry, update).then(value => value.delivery);
+      ? Promise.resolve({ eventId: '', status: 'closed' }) : publishObserved(entry, update).then(value => value.delivery);
     if (channel.signal.aborted) return Promise.resolve({ eventId: '', status: 'closed' });
     const intent = beginBrokerPublication(options.store, { callId: options.callId, callSid: options.callSid,
       bindingId: options.bindingId, sessionId: entry.sessionId }, entry.requestId, update, channel.getContext());
@@ -1484,7 +1551,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       let state = load(entry);
       const question = state.currentQuestionId ? state.questions?.[state.currentQuestionId] : undefined;
       const tell = async (text: string, suffix: string) => {
-        const result = await options.observation!.publish(state, { id: `${entry.requestId}_${state.currentQuestionId ?? 'question'}_${suffix}`,
+        const result = await publishObserved(state, { id: `${entry.requestId}_${state.currentQuestionId ?? 'question'}_${suffix}`,
           kind: 'progress', speak: true, text });
         save({ ...load(entry), delivery: result.delivery.status });
         return result.delivery.status;
@@ -1515,19 +1582,19 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
           ? 'I could not accept that answer. Please say it again.'
           : 'That answer was not accepted. The request is still waiting for a reply.', 'reply_refused') !== 'accepted') return;
       }
-      // An answer the caller already heard is never spoken again: neither the final message
-      // after its accepted partial (the unprompted portfolio recap), nor a result whose
-      // append landed but was journaled stale (the repeated buy confirmation).
+      // A partial observation never settles the final answer. In particular, a submitted
+      // sale can subsequently fail. Deduplicate only this exact terminal message.
       if (state.status === 'completed' && state.primaryResult?.state === 'completed'
-        && (state.partialDelivery?.status === 'accepted' || resultAlreadyPresented(boundCall(entry.sessionId), state))) {
+        && resultAlreadyPresented(boundCall(entry.sessionId), state)) {
         save({ ...state, delivery: 'accepted' });
         return;
       }
-      const receipt = await options.observation.publish(load(entry));
+      const receipt = await publishObserved(load(entry));
       let current = load(entry);
       if (options.observation.signal.aborted || boundCall(entry.sessionId).endedAt) return;
       current = save({ ...current, delivery: receipt.delivery.reason === 'result_format_unsupported'
-        ? `format_unsupported:${receipt.delivery.status}` : receipt.delivery.status });
+        ? `format_unsupported:${receipt.delivery.status}`
+        : receipt.delivery.reason === 'speech_not_confirmed' ? 'speech_unconfirmed' : receipt.delivery.status });
       const questionId = current.currentQuestionId;
       const deliveredQuestion = questionId ? current.questions?.[questionId] : undefined;
       const snapshot = receipt.snapshot;
@@ -1592,7 +1659,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       const stopped = interrupted();
       if (stopped) { save({ ...load(entry), delivery: stopped }); return; }
       const outcome = await publishRequest(entry, channel, { id: `${prefix}_${entry.status}_result_${index}`, kind: 'result',
-        speak: true, text: chunk, expectedCallerRevision: current.callerRevision });
+        speak: true, text: chunk, terminal: index === chunks.length - 1, expectedCallerRevision: current.callerRevision });
       const status = interrupted() ?? outcome.status;
       if (status !== 'accepted') { save({ ...load(entry), delivery: status }); return; }
     }
@@ -1684,6 +1751,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       const observationSignal = options.observation?.signal ?? channel.signal;
       if (observationSignal.aborted) return;
       if (!entry) {
+        channel.release?.();
         console.info(JSON.stringify({ event: 'broker_delegation_unadmitted', callId: options.callId,
           sessionId: request.sessionId, delegationId: request.delegationId,
           reason: unadmittedReasons.get(request) ?? 'no_qualified_caller_source' }));
@@ -1692,6 +1760,10 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
           expectedCallerRevision: channel.getContext().callerRevision });
         return;
       }
+      // A duplicate delegation can refer to a result that has already played.
+      // It owns no remaining work and must not leave a new provisional gate.
+      if (terminal(entry.status) && entry.delivery === 'accepted') channel.release?.();
+      options.onRequest?.(entry);
       // The active observer owns status speech; queue admission can wake it
       // without waiting for the earlier result GET or starting the queued task.
       notices!.get(`${options.callId}:${entry.requestId}`)?.wake?.();
@@ -1711,7 +1783,8 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
               || boundCall(request.sessionId).endedAt) return;
           const pending = entries(request.sessionId, true).filter(value => value.requestId !== exceptRequestId
             && ['completed', 'failed', 'cancelled'].includes(value.status)
-            && value.primaryResult?.state === value.status && value.delivery === 'stale');
+            && value.primaryResult?.state === value.status && (value.delivery === 'stale'
+              || value.delivery === 'speech_unconfirmed'));
           if (!pending.length) return;
           const last = pending.findIndex(value => value.requestId === lastDeferredResult);
           const next = pending[(last + 1) % pending.length];

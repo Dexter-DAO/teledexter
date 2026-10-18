@@ -51,7 +51,7 @@ async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; 
   const bindingId = randomUUID();
   const primaryDexterId = randomUUID();
   const threadId = randomUUID();
-  const calls = { create: 0, update: 0, preflight: 0, readiness: 0, bind: 0, close: 0, audio: 0, fetch: 0 };
+  const calls = { create: 0, update: 0, preflight: 0, readiness: 0, bind: 0, close: 0, audio: 0, fetch: 0, portfolio: 0 };
   let voiceOptions: BrokerLiveSessionOptions | undefined;
   let readyVoice: (() => void) | undefined;
   const openingCommands: string[] = [];
@@ -63,6 +63,7 @@ async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; 
   }) : undefined;
   void bindGate?.catch(() => {});
   const primary = {
+    async portfolio() { calls.portfolio++; throw new Error('Outbound must not read portfolio in the background'); },
     async readiness() { calls.readiness++; return { eligible: overrides.eligibility !== false, reason: overrides.eligibility === false ? 'authority_unavailable' : 'ready' }; },
     async openCall(proof: { params: Record<string, string> }, assignment?: PhoneCallAssignment) {
       calls.bind++;
@@ -154,7 +155,7 @@ async function preCallAssignmentCases(t: test.TestContext, parser: { safeParse(v
     if (!item.allowed) {
       assert.deepEqual(f.broker.store.list(), []);
       assert.equal(fs.readFileSync(journalFile, 'utf8'), emptyJournal);
-      assert.deepEqual(f.calls, { create: 0, update: 0, preflight: 0, readiness: 0, bind: 0, close: 0, audio: 0, fetch: 0 });
+      assert.deepEqual(f.calls, { create: 0, update: 0, preflight: 0, readiness: 0, bind: 0, close: 0, audio: 0, fetch: 0, portfolio: 0 });
       return;
     }
     const saved = f.broker.store.list()[0];
@@ -243,7 +244,7 @@ test('historical uppercase control retry recovers exact saved call without new a
   assert.equal((await response.json() as { replayed: boolean }).replayed, true);
   assert.deepEqual(f.broker.store.get(id), retainedCall);
   assert.deepEqual(fs.readFileSync(file), original);
-  assert.deepEqual(f.calls, { create: 0, update: 0, preflight: 0, readiness: 0, bind: 0, close: 0, audio: 0, fetch: 0 });
+  assert.deepEqual(f.calls, { create: 0, update: 0, preflight: 0, readiness: 0, bind: 0, close: 0, audio: 0, fetch: 0, portfolio: 0 });
   assert.notEqual((await f.post('/internal/broker/calls', { requestId, purpose: 'Different purpose' })).status, 200);
   assert.deepEqual(fs.readFileSync(file), original);
   assert.equal(f.calls.create, 0);
@@ -304,6 +305,7 @@ test('signed inbound call offers callback without account reads, voice preflight
 
 test('signed outbound answer preserves the repair brief and speaks its role-aware opening only after Live is ready', async t => {
   const f = await fixture(t, { deferVoiceReady: true, history: historicalAccountMessages });
+  t.mock.timers.enable({ apis: ['setInterval'] });
   const purpose = 'Verify the account request repair with Avery Example: answer one current portfolio question through Primary Dexter, then discuss his feedback. Explain any returned failure plainly.';
   assert.equal((await f.post('/internal/broker/calls', { requestId: randomUUID(), purpose })).status, 201);
   const call = f.broker.store.list()[0];
@@ -331,6 +333,10 @@ test('signed outbound answer preserves the repair brief and speaks its role-awar
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(f.openingCommands, [brokerOpening('outbound', true)]);
   assert.doesNotMatch(f.openingCommands[0], /verify|Primary|Avery/);
+  assert.equal(f.calls.portfolio, 0);
+  t.mock.timers.tick(90_000);
+  assert.equal(f.calls.portfolio, 0, 'outbound has no periodic portfolio reader');
+  t.mock.timers.reset();
   assert.match(f.voiceOptions()!.instructions, /called the person/);
   assert.ok(f.voiceOptions()!.instructions.includes(`Internal call brief (an assignment for you): ${JSON.stringify(purpose)}`));
   assert.equal(f.broker.store.get(call.id)!.purpose, purpose);
@@ -634,4 +640,45 @@ test('HTTP health exposes an unavailable API and recovers without a call or prov
   assert.equal(f.calls.preflight, 0);
   assert.equal(f.calls.readiness, 0);
   assert.equal(f.calls.bind, 0);
+});
+
+for (const holdingGreeting of [false, true]) {
+  test(`call truth: ${holdingGreeting ? 'greeting hold' : 'account audio'} backlog clears and the call continues`, { timeout: 5000 }, async t => {
+    const f = await fixture(t, holdingGreeting ? { greetingClip: Buffer.alloc(16000, 0x20) } : {});
+    await f.post('/internal/broker/calls', { requestId: randomUUID(), purpose: 'Read the current portfolio.' });
+    const call = f.broker.store.list()[0];
+    const media = await (await answeredStream(f, call)).connect(); t.after(() => media.ws.close());
+    await until(() => Boolean(f.voiceOptions()));
+    try {
+      const voice = f.voiceOptions()!;
+      for (let i = 0; i < 32; i++) voice.onAudio(Buffer.alloc(1600, 0x20).toString('base64'), { deliveryId: `burst_${i}` });
+      await until(() => media.frames.some(frame => frame.event === 'clear') || f.calls.update > 0);
+      assert.ok(media.frames.some(frame => frame.event === 'clear'));
+      assert.equal(f.calls.update, 0, 'backlog must not send Twilio status=completed');
+      assert.equal(media.ws.readyState, WebSocket.OPEN);
+      const inputs = f.calls.audio;
+      media.caller(Buffer.alloc(160, 0xff));
+      await until(() => f.calls.audio > inputs);
+      assert.equal(f.broker.store.get(call.id)!.endedAt, undefined);
+    } finally { media.ws.terminate(); }
+  });
+}
+
+test('call truth: speech playback callbacks follow carrier marks and reject cleared frames', async t => {
+  const f = await fixture(t);
+  await f.post('/internal/broker/calls', { requestId: randomUUID(), purpose: 'Read the current portfolio.' });
+  const call = f.broker.store.list()[0], media = await (await answeredStream(f, call)).connect();
+  t.after(() => media.ws.close()); await until(() => Boolean(f.voiceOptions()));
+  const heard: boolean[] = [], voice = f.voiceOptions()!;
+  voice.onAudio(Buffer.alloc(160, 0x20).toString('base64'), { deliveryId: 'checked_1', onPlayed: value => heard.push(value) });
+  await until(() => media.frames.some(frame => frame.event === 'mark'));
+  assert.equal(heard.length, 0, 'sending is not playback');
+  const mark = media.frames.filter(frame => frame.event === 'mark').at(-1)!.name!;
+  media.ack(mark); await until(() => heard.length === 1); assert.deepEqual(heard, [true]);
+  voice.onAudio(Buffer.alloc(160, 0x20).toString('base64'), { deliveryId: 'checked_2', onPlayed: value => heard.push(value) });
+  await until(() => media.frames.filter(frame => frame.event === 'mark').length === 2);
+  const cleared = media.frames.filter(frame => frame.event === 'mark').at(-1)!.name!;
+  voice.onPlaybackClear!('application_interrupt'); assert.deepEqual(heard, [true, false]);
+  media.ack(cleared); await new Promise(resolve => setTimeout(resolve, 20));
+  assert.deepEqual(heard, [true, false], 'a late mark cannot turn cleared speech into heard speech');
 });

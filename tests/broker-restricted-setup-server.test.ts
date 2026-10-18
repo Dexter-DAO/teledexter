@@ -426,3 +426,18 @@ test('actual non-A incoming settles ordinary attachment before restricted conver
   assert.equal(counts.private, 0); assert.equal(counts.dial, 0); assert.equal(counts.receipt, 0);
   assert.deepEqual(store.get(saved.id)!.inbound!.begin.providerProof.params, params);
 });
+
+test('call truth: restricted setup clears a backlog and continues receiving caller audio', { timeout: 5000 }, async t => {
+  const f = await fixture(t); await f.kickoff(); await f.answer(); const ws = await f.connect();
+  try {
+    const frames: Array<{ event: string }> = [];
+    ws.on('message', bytes => frames.push(JSON.parse(bytes.toString())));
+    for (let i = 0; i < 32; i++) f.voices[0].onAudio(Buffer.alloc(1600, 0x20).toString('base64'), { deliveryId: `burst_${i}` });
+    await until(() => frames.some(frame => frame.event === 'clear') || f.updates.length > 0, 'clear or old hangup');
+    assert.ok(frames.some(frame => frame.event === 'clear'), 'backlog must clear instead of hanging up');
+    assert.equal(f.updates.some(value => value.status === 'completed'), false);
+    assert.equal(ws.readyState, WebSocket.OPEN);
+    f.voices[0].onAudio(Buffer.alloc(160, 0x20).toString('base64'), { deliveryId: 'after_clear' });
+    await until(() => frames.filter(frame => frame.event === 'media').length >= 33, 'audio continues');
+  } finally { ws.terminate(); }
+});

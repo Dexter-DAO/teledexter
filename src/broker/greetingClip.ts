@@ -18,7 +18,8 @@ const MIN_CLIP_BYTES = 2_400, MAX_CLIP_BYTES = 32_000; // 0.3 s to 4 s.
 export function loadGreetingClip(path: URL | string = GREETING_CLIP_ASSET): Buffer | undefined {
   try {
     const clip = readFileSync(path);
-    return clip.length >= MIN_CLIP_BYTES && clip.length <= MAX_CLIP_BYTES ? clip : undefined;
+    return clip.length >= MIN_CLIP_BYTES && clip.length <= MAX_CLIP_BYTES
+      ? Buffer.concat([Buffer.alloc(2_400, 0xff), clip]) : undefined;
   } catch { return undefined; }
 }
 

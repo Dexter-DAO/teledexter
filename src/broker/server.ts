@@ -1,3 +1,4 @@
+import { watchMediaSocket } from './phone.js';
 import type { BrokerSmsBridge } from './sms.js';
 import { formatCallTranscript } from './callTranscript.js';
 import { createResultSmsClient, type ResultSmsClient } from './resultSmsClient.js';
@@ -13,7 +14,7 @@ import { createBrokerLiveSession, type BrokerLiveSession, type BrokerLiveSession
 import type { LiveTranscriptSnapshot } from '../live/session.js';
 import { createPrimaryApiClient, type PrimaryApiClient } from './primaryApi.js';
 import { createPortfolioContext, type PortfolioContext } from './portfolioContext.js';
-import { createPrimaryBackend, type BrokerDelegationRecord } from './backend.js';
+import { terminal as terminalRequest, createPrimaryBackend, type BrokerDelegationRecord } from './backend.js';
 import { eligiblePhoneCallSchema, type EligibleContextClient } from './eligibleContext.js';
 import { createGenerationVoice, type GenerationVoiceOptions, type GenerationVoiceSession } from './generationVoice.js';
 import { carrierPlaybackState } from './voicePresentation.js';
@@ -53,15 +54,13 @@ import { BrokerStore, type BrokerCall, type CallStatus, terminalCallStatuses } f
 import { brokerInstructions, brokerHistory, brokerOpening } from './instructions.js';
 import { greetingClipEligible, playGreetingClip, type GreetingClipPlayback } from './greetingClip.js';
 import { probeLive } from './preflight.js';
-import { authorizedControl, callTwiml, fallbackTwiml, inputSpeechEnergy, mediaStart, PlaybackReceipts, hasAudiblePcmu, carriesSpeechPcmu, safeFailure, streamToken, verifyTwilio, type ProviderCallProof } from './phone.js';
+import { authorizedControl, callTwiml, fallbackTwiml, inputSpeechEnergy, mediaStart, PlaybackReceipts, clearAudioBacklog, hasAudiblePcmu, carriesSpeechPcmu, safeFailure, streamToken, verifyTwilio, type ProviderCallProof } from './phone.js';
 
 /** A pre-speech backlog shorter than this is ordinary network jitter, not a delay worth clearing. */
 const PRE_SPEECH_CLEAR_MIN_MS = 300;
 /** Re-queued after a pre-speech clear: the last 200 ms of PCMU, which may hold the speech onset. */
 const PRE_SPEECH_ONSET_BYTES = 1_600;
 const PRE_SPEECH_TAIL_LIMIT = 400;
-/** Live output held behind the greeting clip is bounded like the carrier backlog (6 s). */
-const GREETING_HOLD_MAX_BYTES = 48_000;
 /** Live output is released, and caller input opened, this long after the clip's own duration even without carrier marks. */
 const GREETING_ACK_GRACE_MS = 1_500;
 /** Caller audio kept between the greeting's end and Live attaching: the newest 15 s. Typical admission
@@ -998,6 +997,8 @@ export function createBrokerServer(options: BrokerServerOptions) {
     let connectedSessionId: string | undefined;
     let backend: ReturnType<typeof createPrimaryBackend> | undefined;
     let portfolioContext: PortfolioContext | undefined;
+    const stopSocketWatch = watchMediaSocket(ws, () => { void stop('media_socket_stalled'); });
+    ws.once('close', stopSocketWatch);
     let stopping = false;
     let stopPromise: Promise<void> | undefined;
     // Inbound admission ended without account media: the stream was handed back to its TwiML.
@@ -1014,7 +1015,13 @@ export function createBrokerServer(options: BrokerServerOptions) {
     // Greeting clip: while it plays, Live output is held in order (never sent), so
     // the carrier queue holds only the clip and Live can neither overlap nor clear it.
     let greeting: GreetingClipPlayback | undefined;
-    let greetingHold: string[] | undefined;
+    let greetingHold: Array<{ payload: string; onPlayed?: (heard: boolean) => void }> | undefined;
+    const playbackCallbacks = new Map<string, (heard: boolean) => void>();
+    const rejectPlayback = () => {
+      const callbacks = [...playbackCallbacks.values()]; playbackCallbacks.clear();
+      for (const callback of callbacks) callback(false);
+      for (const held of greetingHold ?? []) held.onPlayed?.(false);
+    };
     let greetingHeldBytes = 0;
     let greetingReleaseTimer: ReturnType<typeof setTimeout> | undefined;
     const greetingMarks = new Set<string>();
@@ -1037,7 +1044,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
       try { console.info(JSON.stringify({ event: 'broker_audio_timing', version: 1, callId: call.id,
         stage, observedAt: new Date().toISOString(), ...detail })); } catch { /* Timing cannot interrupt audio or playback. */ }
     };
-    const sendOutputChunk = (payload: string, bytes: Buffer, audible: boolean, speech: boolean): string => {
+    const sendOutputChunk = (payload: string, bytes: Buffer, audible: boolean, speech: boolean, onPlayed?: (heard: boolean) => void): string => {
       ws.send(JSON.stringify({ event: 'media', streamSid, media: { payload } }));
       if (!audioSentRecorded) {
         const saved = store.get(call.id)!;
@@ -1048,6 +1055,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
         audibleSentRecorded = true; recordAudibleTiming('firstAudibleAudioSentAt');
       }
       const name = receipts.sent(bytes.length, audible, speech);
+      if (onPlayed) playbackCallbacks.set(name, onPlayed);
       ws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name } }));
       return name;
     };
@@ -1073,9 +1081,13 @@ export function createBrokerServer(options: BrokerServerOptions) {
         observedAt: new Date().toISOString(), backlogMs, droppedMs: dropped / 8, requeuedMs: keptBytes / 8 })); } catch { /* Telemetry only. */ }
     };
     /** Live audio path after the greeting (unchanged pre-speech handling). */
-    const forwardLiveAudio = (payload: string) => {
-      if (stopping || ws.readyState !== WebSocket.OPEN || !streamSid) return;
-      if (ws.bufferedAmount > 256_000 || receipts.pendingCount > 300 || receipts.backlogMs > 6_000) { void stop('audio_backpressure'); return; }
+    const forwardLiveAudio = (payload: string, onPlayed?: (heard: boolean) => void) => {
+      if (stopping || ws.readyState !== WebSocket.OPEN || !streamSid) { onPlayed?.(false); return; }
+      if (clearAudioBacklog(ws, receipts, streamSid, call.id)) {
+        rejectPlayback();
+        preSpeechTail = [];
+        if (ws.bufferedAmount > 256_000) { onPlayed?.(false); return; }
+      }
       const bytes = Buffer.from(payload, 'base64');
       const audible = hasAudiblePcmu(bytes);
       const speech = bytes.length > 0 && carriesSpeechPcmu(bytes);
@@ -1083,7 +1095,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
         clearPreSpeechBacklog();
         preSpeechTail = [];
       }
-      const name = sendOutputChunk(payload, bytes, audible, speech);
+      const name = sendOutputChunk(payload, bytes, audible, speech, onPlayed);
       if (speech && !speechSentRecorded) {
         speechSentRecorded = true;
         // Dexter's first words (never the greeting clip). After a caller who already spoke, the gap
@@ -1120,7 +1132,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
       }
       recordAudibleTiming('greetingClipPlayedAt', { heldLiveMs: heldMs, ...(reason === 'played' ? {} : { incomplete: 1 }) });
       openInput();
-      for (const payload of held) { if (stopping) break; forwardLiveAudio(payload); }
+      for (const item of held) { if (stopping) { item.onPlayed?.(false); continue; } forwardLiveAudio(item.payload, item.onPlayed); }
     };
     const startGreetingClip = (clip: Buffer) => {
       const saved = store.get(call.id)!;
@@ -1158,7 +1170,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
     function releaseToTwiml(): void {
       if (stopping || released) return;
       if (inputOpenedAt === undefined) { releaseAfterGreeting = true; return; }
-      released = true;
+      released = true; stopSocketWatch();
       clearTimeout(startTimer); clearTimeout(durationTimer);
       try { console.info(JSON.stringify({ event: 'broker_greeting_stream_released', version: 1, callId: call.id,
         observedAt: new Date().toISOString() })); } catch { /* Telemetry only. */ }
@@ -1168,11 +1180,11 @@ export function createBrokerServer(options: BrokerServerOptions) {
 
     function stop(reason: string): Promise<void> {
       if (stopPromise) return stopPromise;
-      stopping = true;
+      stopping = true; stopSocketWatch();
       stopPortfolio(call.id);
       preconnect?.discard(call.id);
       clearTimeout(startTimer); clearTimeout(durationTimer);
-      greeting?.cancel(); clearTimeout(greetingReleaseTimer); greetingHold = undefined;
+      greeting?.cancel(); clearTimeout(greetingReleaseTimer); rejectPlayback(); greetingHold = undefined;
       const previous = store.get(call.id)!;
       if (previous.inbound) inbound.stopLocal(call.id, reason);
       // An unbound call has nothing to close yet; a binding that lands later is closed by its owner.
@@ -1238,22 +1250,32 @@ export function createBrokerServer(options: BrokerServerOptions) {
       try { console.info(JSON.stringify({ event: 'broker_account_media', version: 1, callId: call.id, observedAt: new Date(now).toISOString(),
         mediaStartedAt, heldInputMs: heldInputBytes / 8, droppedInputMs: droppedInputBytes / 8, greetingInputMs: greetingInputBytes / 8 })); }
       catch { /* Telemetry only. */ }
-      if (!options.eligibleContext) backend = createPrimaryBackend({ callId: call.id, callSid: call.callSid!, bindingId: bound.primary.bindingId, api: primary, store, watchUntilCallEnds: true, lastCallerSpeechAt: () => lastSpeechAt });
-      const voiceOptions: BrokerLiveSessionOptions = { apiKey: config.apiKey, callId: call.id, voice: config.voice,
+      if (!options.eligibleContext) backend = createPrimaryBackend({ callId: call.id, callSid: call.callSid!, bindingId: bound.primary.bindingId,
+        onResult: result => portfolioContext?.observe(result),
+        onRequest: entry => {
+          if ((!terminalRequest(entry.status) || entry.delivery !== 'accepted'))
+            live?.trackRequest?.(entry.requestId, entry.delegationIds);
+        },
+        api: primary, store, watchUntilCallEnds: true, lastCallerSpeechAt: () => lastSpeechAt });
+      const voiceOptions: BrokerLiveSessionOptions = { speechGate: true, apiKey: config.apiKey, callId: call.id, voice: config.voice,
         instructions: brokerInstructions({ direction: call.direction, purpose: call.purpose, registeredAssignment: !!call.callAssignment,
           ...(call.callAssignment?.origin === 'authenticated_hark_delivery' ? { watch: call.callAssignment.value.hark } : {}),
           ...(call.callAssignment?.origin === 'authenticated_notification_delivery' ? { notification: call.callAssignment.value.notification } : {}),
           name: bound.primary.name, context: bound.primary.context }),
         history: brokerHistory({ name: bound.primary.name, context: bound.primary.context }),
         backend: backend ?? { async delegate() { throw new Error('generation_backend_required'); } },
-        onAudio(payload) {
-          if (stopping || ws.readyState !== WebSocket.OPEN || !streamSid) return;
+        onAudio(payload, metadata) {
+          if (stopping || ws.readyState !== WebSocket.OPEN || !streamSid) { metadata?.onPlayed?.(false); return; }
           if (greetingHold) {
             greetingHeldBytes += Buffer.byteLength(payload, 'base64');
-            if (greetingHeldBytes > GREETING_HOLD_MAX_BYTES) { void stop('audio_backpressure'); return; }
-            greetingHold.push(payload); return;
+            if (clearAudioBacklog(ws, receipts, streamSid, call.id, greetingHeldBytes)) {
+              rejectPlayback(); metadata?.onPlayed?.(false);
+              greetingHold = []; greetingHeldBytes = 0; preSpeechTail = [];
+              return;
+            }
+            greetingHold.push({ payload, onPlayed: metadata?.onPlayed }); return;
           }
-          forwardLiveAudio(payload);
+          forwardLiveAudio(payload, metadata?.onPlayed);
         },
         onTranscript(snapshot) {
           store.update(call.id, { transcript: snapshot, transcriptRevision: snapshot.revision });
@@ -1273,6 +1295,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
           // continues. Its receipt confirms context injection, not playback.
           queueMicrotask(() => {
             if (stopping || !live) return;
+            portfolioContext?.attach(live);
             void live.appendInstructions(brokerOpening(call.direction, !!call.callAssignment, call.callAssignment?.origin === 'authenticated_hark_delivery', call.callAssignment?.origin === 'authenticated_notification_delivery',
               Boolean(store.get(call.id)!.journey?.greetingClipStartedAt)))
               .then(result => { store.update(call.id, { voiceOpening: result }); })
@@ -1281,6 +1304,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
         },
         onClosed(result) { store.update(call.id, { finalized: result.finalized, metrics: metrics() }); if (!stopping) void stop(result.finalized ? result.reason : 'voice_unavailable'); },
         onPlaybackClear() {
+          rejectPlayback();
           // During the clip the carrier holds only the clip: Live's clear drops its own held audio.
           if (greetingHold) { greetingHold = []; greetingHeldBytes = 0; return; }
           receipts.clear();
@@ -1307,7 +1331,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
         ...(call.continuation && options.callerIntent ? { callerIntent: createCallerIntentResolver({
           callId: call.id, store, client: options.callerIntent.client, timeoutMs: options.callerIntent.timeoutMs,
         }) } : {}),
-        onAudio: payload => voiceOptions.onAudio(payload, { deliveryId: 'generation_host_audio' }),
+        onAudio: (payload, onPlayed) => voiceOptions.onAudio(payload, { deliveryId: 'generation_host_audio', onPlayed }),
         onReady: voiceOptions.onReady, onClosed: voiceOptions.onClosed,
         onPlaybackClear: () => voiceOptions.onPlaybackClear?.('application_interrupt'),
         onProblem(code) { queueMicrotask(() => { if (stopping) return;
@@ -1383,10 +1407,11 @@ export function createBrokerServer(options: BrokerServerOptions) {
           clearTimeout(startTimer);
           store.update(call.id, { streamSid, ...(managedNotification(call) ? {} : { status: 'in-progress' as const }),
             journey: { ...current.journey, streamStartedAt: current.journey?.streamStartedAt ?? new Date().toISOString() } });
-          // The clip carries no account data, so it starts now, before admission or binding
-          // finishes; Live's opening is later told it was heard.
+          // The loaded clip contains its silence lead-in; admission runs in parallel.
           const clip = call.direction === 'inbound' ? options.inboundGreetingClip : options.greetingClip;
-          if (clip && greets && greetingClipEligible(store.get(call.id)!)) startGreetingClip(clip); else openInput();
+          if (clip && greets && greetingClipEligible(store.get(call.id)!)) {
+            startGreetingClip(clip);
+          } else openInput();
           if (call.inbound) void admitInbound();
           else awaitOutboundBinding();
         } else if (frame.event === 'media') {
@@ -1412,7 +1437,10 @@ export function createBrokerServer(options: BrokerServerOptions) {
         } else if (frame.event === 'mark' && frame.streamSid === streamSid && typeof frame.mark?.name === 'string') {
           const previouslyPlayed = receipts.playedBytes, previouslyAudiblePlayed = receipts.audiblePlayedBytes;
           const previouslySpeechPlayed = receipts.speechPlayedBytes;
+          const played = receipts.isPending(frame.mark.name);
           receipts.acknowledge(frame.mark.name);
+          const callback = playbackCallbacks.get(frame.mark.name); playbackCallbacks.delete(frame.mark.name);
+          callback?.(played);
           if (audibleSentRecorded && !audiblePlaybackRecorded && receipts.audiblePlayedBytes > previouslyAudiblePlayed) {
             audiblePlaybackRecorded = true; recordAudibleTiming('firstAudiblePlaybackAcknowledgedAt');
           }

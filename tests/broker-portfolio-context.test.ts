@@ -4,19 +4,20 @@ import { createPortfolioContext } from '../src/broker/portfolioContext.js';
 import { brokerInstructions } from '../src/broker/instructions.js';
 import type { PhonePortfolio } from '../src/broker/portfolio.js';
 import { createPrimaryApiClient, type PrimaryResult } from '../src/broker/primaryApi.js';
-import { createBrokerLiveSession } from '../src/live/session.js';
+import { createBrokerLiveSession, type BrokerLiveBackend, type LiveDelegationRequest } from '../src/live/session.js';
 import { PreconnectTransport } from './helpers/preconnectTransport.js';
 
 const bindingId = '11111111-1111-4111-8111-111111111111';
+test.beforeEach(t => t.mock.timers.enable({ apis: ['Date', 'setTimeout', 'setInterval'], now: Date.parse('2026-10-17T12:52:00.000Z') }));
 const facts = (totalUsd = '28.86'): PhonePortfolio => ({ version: 'phone.portfolio.v1', bindingId,
-  observedAt: '2026-10-17T12:52:00.000Z', totalUsd, holdingsComplete: true, holdingCount: 1, unpricedCount: 0, omittedCount: 0,
+  observedAt: new Date().toISOString(), totalUsd, holdingsComplete: true, holdingCount: 1, unpricedCount: 0, omittedCount: 0,
   holdings: [{ name: 'USD Coin', symbol: 'USDC', assetClass: 'token', amount: totalUsd, valueUsd: totalUsd, change24hPercent: null }],
 });
 const flush = () => new Promise<void>(resolve => setImmediate(resolve));
-function voice(t: test.TestContext) {
+function voice(t: test.TestContext, backend: BrokerLiveBackend = { async delegate() {} }) {
   const transport = new PreconnectTransport();
   const session = createBrokerLiveSession({ apiKey: 'synthetic', callId: 'call_test', instructions: brokerInstructions({ direction: 'inbound', purpose: '' }),
-    backend: { async delegate() {} }, connectionFactory: () => transport,
+    backend, connectionFactory: () => transport,
     onAudio() {}, onTranscript() {}, onReady() {}, onClosed() {}, closeTimeoutMs: 20 });
   t.after(() => session.close()); transport.open();
   const notes = () => transport.sent.filter(event => event.type === 'session.thinking.append').map(event => event.content);
@@ -102,7 +103,6 @@ test('untyped completion refreshes conservatively, while ordinary running work a
 
 for (const failure of ['error', 'timeout'] as const) test(`${failure} sends no context and logs one outcome`, async t => {
   const v = voice(t); await flush();
-  t.mock.timers.enable({ apis: ['setTimeout'] });
   const logs: Record<string, unknown>[] = [];
   t.mock.method(console, 'info', (text: string) => logs.push(JSON.parse(text)));
   const api = createPrimaryApiClient({ apiBaseUrl: 'https://api.example.test',
@@ -136,10 +136,197 @@ test('instructions allow the current note and retain delegation for actions and 
   assert.match(text, /Delegate trades, transfers, research, prices, missing facts/);
   assert.match(text, /anything needing judgment/);
   assert.match(text, /Keep note updates silent until the caller asks/);
+  assert.match(text, /at most 60 seconds old/);
+  assert.match(text, /Say its as-of age naturally/);
+  assert.match(text, /expired, older or missing note requires delegation as usual/);
 });
 
 test('outbound instructions contain neither the portfolio paragraph nor the delegation exception', () => {
   const text = brokerInstructions({ direction: 'outbound', purpose: '' });
   assert.doesNotMatch(text, /portfolio note/);
   assert.match(text, /ongoing work\. Obtain a result for that request during this call/);
+});
+
+test('background refresh replaces changed content, sends only timestamps for unchanged content, and stops at hangup', async t => {
+  let reads = 0;
+  const logs: Record<string, unknown>[] = [];
+  t.mock.method(console, 'info', (text: string) => logs.push(JSON.parse(text)));
+  const context = createPortfolioContext('call_test', bindingId, { portfolio: async () => facts(++reads < 3 ? '10' : '20') });
+  t.after(() => context.stop()); const v = voice(t); await flush(); context.attach(v.session); await flush();
+  const replacements = () => v.notes().filter(text => text.includes('replaces all earlier')).length;
+  assert.equal(reads, 1); assert.equal(replacements(), 1);
+  t.mock.timers.tick(29_999); await flush(); assert.equal(reads, 1);
+  t.mock.timers.tick(1); await flush();
+  assert.equal(reads, 2); assert.equal(replacements(), 1);
+  assert.match(v.notes().at(-1)!, /is unchanged.*2026-10-17T12:52:30.000Z/);
+  assert.equal(logs.at(-1)!.publication, 'unchanged');
+  t.mock.timers.tick(30_000); await flush();
+  assert.equal(reads, 3); assert.equal(replacements(), 2);
+  assert.match(v.notes().join(' '), /about \$20.00/);
+  assert.equal(logs.at(-1)!.publication, 'published');
+  assert.ok(logs.every(log => Number(log.latencyMs) >= 0));
+  const before = v.notes().length;
+  context.stop(); t.mock.timers.tick(120_000); await flush();
+  assert.equal(reads, 3); assert.equal(v.notes().length, before);
+});
+
+test('post-action reads run serially after a superseded background read; periodic ticks cannot supersede them', async t => {
+  let reads = 0, active = 0, maximum = 0;
+  const pending: Array<{ resolve(value: PhonePortfolio): void; signal?: AbortSignal }> = [];
+  const context = createPortfolioContext('call_test', bindingId, { portfolio: async (_binding, signal) => {
+    reads++; maximum = Math.max(maximum, ++active);
+    try {
+      if (reads === 1) return facts('10');
+      return await new Promise<PhonePortfolio>(resolve => pending.push({ resolve, signal }));
+    } finally { active--; }
+  } }); t.after(() => context.stop());
+  const v = voice(t); await flush(); context.attach(v.session); await flush();
+  t.mock.timers.tick(30_000); await flush(); assert.equal(reads, 2);
+  context.observe(result());
+  assert.equal(pending[0].signal?.aborted, true); assert.equal(reads, 2, 'aborted read must settle first');
+  pending[0].resolve(facts('20')); await flush(); assert.equal(reads, 3);
+  t.mock.timers.tick(30_000); await flush();
+  assert.equal(reads, 3); assert.equal(pending[1].signal?.aborted, false, 'background never cancels the post-action read');
+  pending[1].resolve(facts('30')); await flush();
+  assert.equal(maximum, 1);
+  assert.doesNotMatch(v.notes().join(' '), /about \$20\.00/);
+  assert.match(v.notes().join(' '), /about \$30\.00/);
+  assert.match(v.notes().at(-1)!, /only current portfolio note/);
+});
+
+test('failed background reads retain the observation only until its 60-second expiry', async t => {
+  let reads = 0;
+  const context = createPortfolioContext('call_test', bindingId, { portfolio: async () => {
+    if (++reads > 1) throw new Error('unavailable'); return facts();
+  } }); t.after(() => context.stop());
+  const v = voice(t); await flush(); context.attach(v.session); await flush();
+  t.mock.timers.tick(30_000); await flush();
+  assert.match(v.notes().at(-1)!, /only current portfolio note/);
+  t.mock.timers.tick(29_999); await flush();
+  assert.match(v.notes().at(-1)!, /only current portfolio note/);
+  t.mock.timers.tick(1); await flush();
+  assert.match(v.notes().at(-1)!, /Portfolio note withdrawn/);
+  assert.equal(v.transport.sent.some(event => event.type === 'session.commentary.append'), false);
+});
+
+test('background polling waits for live attachment and for a pending action to settle', async t => {
+  let reads = 0;
+  const context = createPortfolioContext('call_test', bindingId, { portfolio: async () => { reads++; return facts(); } });
+  t.after(() => context.stop()); await flush();
+  t.mock.timers.tick(30_000); await flush(); assert.equal(reads, 1);
+  const v = voice(t); await flush(); context.attach(v.session); await flush();
+  const confirmed = result();
+  context.observe({ ...confirmed, partialResult: { ...confirmed.partialResult!, actionState: 'pending' } } as PrimaryResult);
+  t.mock.timers.tick(30_000); await flush(); assert.equal(reads, 1);
+  context.observe(confirmed); await flush(); assert.equal(reads, 2);
+  context.detach(v.session); t.mock.timers.tick(30_000); await flush(); assert.equal(reads, 2);
+});
+
+for (const state of ['missing', 'stale', 'fresh'] as const)
+test(`${state} portfolio context leaves client delegation unchanged for refresh and non-portfolio requests`, async t => {
+  let reads = 0;
+  const delegated: LiveDelegationRequest[] = [];
+  const context = createPortfolioContext('call_test', bindingId, { portfolio: async () => {
+    if (++reads > 1 || state === 'missing') throw new Error('unavailable'); return facts();
+  } }); t.after(() => context.stop());
+  const v = voice(t, { async delegate(request) { delegated.push(request); } });
+  await flush(); context.attach(v.session); await flush();
+  if (state === 'stale') { t.mock.timers.tick(60_000); await flush(); assert.match(v.notes().at(-1)!, /withdrawn/); }
+  if (state === 'missing') assert.deepEqual(v.notes(), []);
+  const before = reads;
+  for (const [index, text] of ['What is my balance now?', 'Buy one dollar of Apple.', 'Research Apple.', 'What is the price of SOL?'].entries()) {
+    v.transport.receive({ type: 'session.input_transcript.delta', event_id: `caller_${index}`, delta: text, start_ms: index * 3000, end_ms: index * 3000 + 1000 });
+    v.transport.receive({ type: 'session.delegation.created', offset_ms: index * 3000 + 1200,
+      delegation: { id: `delegation_${index}`, type: 'delegation', target: 'client' } });
+    await flush();
+    assert.equal(delegated.length, index + 1);
+    assert.equal(delegated[index].transcript.fragments.at(-1)!.text, text);
+  }
+  assert.equal(reads, before, 'no request starts a portfolio read or routing step');
+  assert.deepEqual(v.transport.sent.find(event => event.type === 'session.start')!.session.delegation, { type: 'client' });
+  assert.equal(v.transport.sent.some(event => event.type === 'response.create' || event.type === 'response.item.create'), false);
+});
+
+test('hangup aborts an in-flight background read and prevents late publication', async t => {
+  let reads = 0, resolve!: (value: PhonePortfolio) => void, signal: AbortSignal | undefined;
+  const context = createPortfolioContext('call_test', bindingId, { portfolio: async (_binding, nextSignal) => {
+    if (++reads === 1) return facts();
+    signal = nextSignal; return new Promise(done => { resolve = done; });
+  } }); t.after(() => context.stop());
+  const v = voice(t); await flush(); context.attach(v.session); await flush();
+  t.mock.timers.tick(30_000); await flush(); assert.equal(reads, 2);
+  const before = v.notes().length;
+  context.stop(); assert.equal(signal?.aborted, true); resolve(facts('99')); await flush();
+  t.mock.timers.tick(90_000); await flush();
+  assert.equal(reads, 2); assert.equal(v.notes().length, before);
+});
+
+test('review: a delayed note carries its broker-computed age and no expiry timestamp', async t => {
+  const old = facts(); let resolve!: (value: PhonePortfolio) => void;
+  const context = createPortfolioContext('call_test', bindingId, { portfolio: () => new Promise(done => { resolve = done; }) });
+  t.after(() => context.stop()); const v = voice(t); await flush(); context.attach(v.session);
+  t.mock.timers.tick(40_000); resolve(old); await flush();
+  assert.match(v.notes().at(-1)!, /as of 40 seconds ago/);
+  assert.doesNotMatch(v.notes().join(' '), /valid until|few seconds ago/);
+});
+
+test('review: each overlapping trade pauses reads until it settles and withdraws an intervening note', async t => {
+  let reads = 0;
+  const context = createPortfolioContext('call_test', bindingId, { portfolio: async () => { reads++; return facts(String(reads)); } });
+  t.after(() => context.stop()); const v = voice(t); await flush(); context.attach(v.session); await flush();
+  const action = (intentId: string, actionState: 'pending' | 'confirmed') => ({ ...result(),
+    partialResult: { ...result().partialResult!, intentId, actionState } } as PrimaryResult);
+  context.observe(action('one', 'pending')); context.observe(action('two', 'pending'));
+  context.observe(action('one', 'confirmed')); await flush();
+  t.mock.timers.tick(30_000); await flush();
+  assert.equal(reads, 1, 'confirming one trade cannot unpause the other trade');
+  context.observe(action('two', 'confirmed')); await flush(); assert.equal(reads, 2);
+  context.observe(action('three', 'pending'));
+  // A late confirmation for trade two must not unpause trade three.
+  context.observe(action('two', 'confirmed')); t.mock.timers.tick(30_000); await flush(); assert.equal(reads, 2);
+  const before = v.notes().length;
+  context.observe(action('three', 'confirmed')); await flush();
+  assert.match(v.notes()[before]!, /withdrawn/);
+  assert.equal(reads, 3);
+  assert.match(v.notes().at(-1)!, /only current portfolio note/);
+});
+
+test('review: an expired note is read immediately on reattach', async t => {
+  let reads = 0;
+  const context = createPortfolioContext('call_test', bindingId, { portfolio: async () => { reads++; return facts(String(reads)); } });
+  t.after(() => context.stop()); const v = voice(t); await flush(); context.attach(v.session); await flush();
+  context.detach(v.session); t.mock.timers.tick(61_000); await flush();
+  const next = voice(t); await flush(); context.attach(next.session); await flush();
+  assert.equal(reads, 2, 'reattach must not wait for the next poll');
+  assert.match(next.notes().join(' '), /about \$2\.00/);
+  assert.doesNotMatch(next.notes().join(' '), /about \$1\.00/);
+});
+
+test('review: detach clears the periodic timer and hangup clears the expiry timer', async t => {
+  const intervals = t.mock.method(globalThis, 'clearInterval');
+  const timeouts = t.mock.method(globalThis, 'clearTimeout');
+  const context = createPortfolioContext('call_test', bindingId, { portfolio: async () => facts() });
+  t.after(() => context.stop()); const v = voice(t); await flush(); context.attach(v.session); await flush();
+  intervals.mock.resetCalls(); context.detach(v.session);
+  assert.ok(intervals.mock.calls.some(call => call.arguments[0] !== undefined), 'detach must release its timer resource');
+  timeouts.mock.resetCalls(); context.stop();
+  assert.ok(timeouts.mock.calls.some(call => call.arguments[0] !== undefined), 'hangup must release its expiry timer resource');
+});
+
+test('call truth: a dispatched send observation withdraws the portfolio before completion', async t => {
+  let reads = 0;
+  const context = createPortfolioContext('call_test', bindingId, { portfolio: async () => { reads++; return facts(); } });
+  t.after(() => context.stop()); const v = voice(t); await flush(); context.attach(v.session); await flush();
+  const requestId = '33333333-3333-4333-8333-333333333333';
+  const api = createPrimaryApiClient({ apiBaseUrl: 'https://api.example.test', phoneServiceSecret: 'synthetic-phone-service-secret-32-characters',
+    fetch: async () => Response.json({ bindingId, requestId, state: 'running', partialResult: {
+      kind: 'action_status', actionState: 'pending', intentId: '44444444-4444-4444-8444-444444444444',
+      toolInvocationId: '55555555-5555-5555-8555-555555555555', observedAt: facts().observedAt,
+      text: 'The account action is being attempted. Its outcome is not yet known.' } }) });
+  context.observe(await api.result(bindingId, requestId)); await flush();
+  assert.match(v.notes().at(-1)!, /Portfolio note withdrawn/);
+  t.mock.timers.tick(30_000); await flush(); assert.equal(reads, 1, 'send stays paused while the attempt is pending');
+  context.observe({ bindingId, requestId, state: 'completed', assistant: { messageId: 'm', eventId: 'e', sequence: '1', text: 'The transfer was confirmed.' } });
+  await flush(); assert.equal(reads, 2);
+  assert.match(v.notes().at(-1)!, /only current portfolio note/);
 });

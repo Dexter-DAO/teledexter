@@ -2104,3 +2104,77 @@ test('a saved action observation cannot silently change its financial intent on 
   assert.equal(f.posts.length, 1);
   assert.equal(f.updates.filter(update => update.text === partialResult.text).length, 1);
 });
+
+test('call truth: legacy question speech remains pending and only the last terminal chunk releases the gate', async t => {
+  const f = await waitingFixture(t);
+  assert.ok(f.updates.filter(update => update.id.includes('_prompt_')).every(update => update.pending === true));
+  const g = await fixture(t, { maxPollMs: 1000 }); g.add('Sell $1 of SpaceX.'); g.speech();
+  g.result('Nothing was sold. ' + 'Your SpaceX stock and cash are unchanged. '.repeat(20));
+  await g.backend.delegate(g.request(), g.channel);
+  const chunks = g.updates.filter(update => update.kind === 'result');
+  assert.ok(chunks.length > 1);
+  assert.ok(chunks.every(update => update.pending === false));
+  assert.ok(chunks.slice(0, -1).every(update => update.terminal === false));
+  assert.equal(chunks.at(-1)!.terminal, true);
+});
+
+test('RV gate leak2: early yes and question reply delegations are tracked', async t => {
+  const seen: BrokerDelegationRecord[] = [];
+  const f = await fixture(t, { onRequest: entry => { seen.push(structuredClone(entry)); } });
+  const value = question();
+  f.behavior.result = async id => waiting(id, value);
+  f.behavior.question = async id => questionResult(id, value);
+  const originalPublish = f.channel.publish;
+  let interrupt = true;
+  f.channel.publish = async update => {
+    if (interrupt) { interrupt = false; f.add('Yes.', 3000, 3200); f.speech(3000, 3200); }
+    return originalPublish(update);
+  };
+  f.add('Buy the stock.'); f.speech();
+  await f.backend.delegate(f.request(), f.channel);
+  await f.backend.delegate(f.request('early_yes'), f.channel);
+  f.behavior.result = async id => f.completed(id);
+  await f.backend.delegate(f.request('original_finished'), f.channel);
+  const tracked = new Set(seen.flatMap(e => [...e.delegationIds, ...(e.delegationAliases ?? []).map(a => a.delegationId)]));
+  t.diagnostic(`tracked=${JSON.stringify([...tracked])} last status=${seen.at(-1)?.status}`);
+  assert.ok(tracked.has('early_yes'), 'early_yes delegation is never re-keyed: the gate keeps it pending after the request ends');
+  assert.ok(tracked.has('original_finished'), 'original_finished delegation is never re-keyed');
+});
+
+test('RV gate leak3: duplicate delegation on same turn and status question delegation', async t => {
+  const seen: BrokerDelegationRecord[] = [];
+  const f = await fixture(t, { onRequest: entry => { seen.push(structuredClone(entry)); } });
+  f.behavior.result = async id => ({ requestId: id, bindingId: f.saved()[0]?.bindingId ?? 'x', state: 'running' } as any);
+  f.add('Check my balance.'); f.speech();
+  await f.backend.delegate(f.request(), f.channel).catch(e => t.diagnostic('d1 ' + e));
+  await f.backend.delegate(f.request('dup_same_turn'), f.channel).catch(e => t.diagnostic('d2 ' + e));
+  f.add('Is it done yet?', 3000, 3400); f.speech(3000, 3400);
+  await f.backend.delegate(f.request('status_q'), f.channel).catch(e => t.diagnostic('d3 ' + e));
+  const tracked = new Set(seen.flatMap(e => [...e.delegationIds, ...(e.delegationAliases ?? []).map(a => a.delegationId)]));
+  t.diagnostic(`tracked=${JSON.stringify([...tracked])} saved=${JSON.stringify(f.saved().map(e => [e.requestId.slice(0,12), e.status, e.delegationIds, (e.deferredTurns ?? []).map(d => [d.delegationId, d.status])]))}`);
+  assert.ok(tracked.has('dup_same_turn'), 'dup_same_turn never tracked');
+  assert.ok(tracked.has('status_q'), 'status_q never tracked');
+});
+
+test('RV gate leak4: delegation with no caller speech', async t => {
+  const seen: BrokerDelegationRecord[] = [];
+  const f = await fixture(t, { onRequest: entry => { seen.push(structuredClone(entry)); } });
+  let released = 0; f.channel.release = () => { released++; };
+  const pubs: any[] = []; const orig = f.channel.publish;
+  f.channel.publish = async u => { pubs.push(u); return orig(u); };
+  await f.backend.delegate(f.request('no_speech'), f.channel).catch(e => t.diagnostic('d ' + e));
+  const tracked = new Set(seen.flatMap(e => e.delegationIds));
+  t.diagnostic(`tracked=${JSON.stringify([...tracked])} pubs=${JSON.stringify(pubs.map(p => [p.id, p.kind, p.speak]))}`);
+  assert.equal(released, 1, 'unadmitted delegation explicitly releases its provisional gate');
+  assert.equal(pubs.some(p => p.kind === 'result'), false, 'release is not a fabricated Primary result');
+});
+
+
+test('a duplicate delegation for an already spoken result releases only its provisional gate', async t => {
+  const f = await fixture(t); f.add('Check my balance.'); f.speech(); f.result('Your cash is unchanged.');
+  await f.backend.delegate(f.request(), f.channel);
+  assert.equal(f.saved()[0].delivery, 'accepted');
+  let released = 0; f.channel.release = () => { released++; };
+  await f.backend.delegate(f.request('duplicate_after_result'), f.channel);
+  assert.equal(released, 1); assert.equal(f.posts.length, 1);
+});
