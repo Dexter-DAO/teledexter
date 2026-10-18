@@ -33,7 +33,7 @@ function deferred<T>() {
 }
 const empty = (): LiveTranscriptSnapshot => ({ revision: 0, callerRevision: 0, fragments: [] });
 
-async function fixture(t: test.TestContext, initialHooks: { firstDelivery?: Promise<void> } = {}) {
+async function fixture(t: test.TestContext, initialHooks: { firstDelivery?: Promise<void>; money?: boolean; unconfirmedFinal?: boolean } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-selected-generation-'));
   let store = new BrokerStore(directory);
   const call = store.reserve({ requestId: uuid(10), number: '+12025550123', direction: 'outbound',
@@ -113,6 +113,7 @@ async function fixture(t: test.TestContext, initialHooks: { firstDelivery?: Prom
           : { state: 'ready', source: { ...source, kind: 'assistant' }, text: 'The comparison is saved.' } };
     },
   };
+  const spokenRequests: Array<{ id: string; aliases?: readonly string[]; terminal: boolean }> = [];
   const voices: Array<{ options: BrokerLiveSessionOptions; caption: LiveTranscriptSnapshot;
     channel: LiveBackendChannel; comments: string[]; instructions: string[]; input: string[]; closed: boolean }> = [];
   const live = createGenerationVoice({ call: store.get(call.id)!, callDeadlineAt: deadline, apiKey: 'fixture-key', voice: 'marin',
@@ -134,6 +135,13 @@ async function fixture(t: test.TestContext, initialHooks: { firstDelivery?: Prom
       const receipt = () => ({ eventId: `append_${sessionId}_${value.comments.length}`, status: 'accepted' as const,
         observedCallerRevision: value.caption.callerRevision, observedTranscriptSequence: value.caption.revision });
       const voice: BrokerLiveSession = {
+        hasPendingRequest: () => Boolean(initialHooks.money && posts.length),
+        async speakRequest(update, request) {
+          spokenRequests.push(request); value.comments.push(update.text);
+          if (initialHooks.unconfirmedFinal && request.terminal && spokenRequests.filter(value => value.terminal).length === 1)
+            return { ...receipt(), status: 'unconfirmed', reason: 'speech_not_confirmed' };
+          return receipt();
+        },
         appendAudio(payload) { value.input.push(payload); return true; },
         async appendContext() { throw new Error('Unexpected flattened context'); },
         async appendInstructions(text) { value.instructions.push(text); return receipt(); },
@@ -162,7 +170,7 @@ async function fixture(t: test.TestContext, initialHooks: { firstDelivery?: Prom
     return { request, voice, delegate: () => voice.options.backend.delegate(request, voice.channel) };
   };
   t.after(async () => { await live.close('fixture_done'); store.close(); fs.rmSync(directory, { recursive: true, force: true }); });
-  return { call, live, voices, captures, posts, associations, problems, hooks, requests, primary, say, currentCall,
+  return { call, live, voices, spokenRequests, captures, posts, associations, problems, hooks, requests, primary, say, currentCall,
     setQuestion: (id: string) => { questionId = id; }, complete: () => { completed = true; },
     rotate: async () => { epoch++; await live.appendInstructions('Continue the saved question.'); },
     loseCapture: (value: boolean) => { loseCapture = value; }, loseReply: (value: boolean) => { loseReply = value; },
@@ -253,4 +261,29 @@ test('a greeting before selected question publication cannot trigger the ordinar
     assert.equal(f.posts.length, 0); assert.equal(f.captures.length, 0); assert.equal(f.ordinarySubmits(), 0);
     assert.deepEqual(f.currentCall().delegations, {});
   } finally { gate.resolve(); }
+});
+
+
+test('selected money continuation sends its terminal speech with the original request and answer alias', async t => {
+  const f = await fixture(t, { money: true });
+  await until(() => (f.currentCall().selectedQuestionVoice?.presentations.length ?? 0) === 1);
+  const answer = await f.say(); await answer.delegate();
+  for (let n = 0; n < 3; n++) f.live.appendAudio(silence);
+  f.complete(); await until(() => f.voices[0]!.comments.includes('The comparison is saved.'));
+  assert.deepEqual(f.spokenRequests.at(-1), { id: originalRequest, aliases: [answer.request.delegationId], terminal: true });
+  assert.equal(f.spokenRequests[0].terminal, false, 'the initial question is not a completed action');
+});
+
+
+test('selected money result retries unconfirmed speech without a new caller turn', async t => {
+  const f = await fixture(t, { money: true, unconfirmedFinal: true });
+  await until(() => (f.currentCall().selectedQuestionVoice?.presentations.length ?? 0) === 1);
+  const answer = await f.say(); await answer.delegate();
+  for (let n = 0; n < 3; n++) f.live.appendAudio(silence);
+  f.complete(); await until(() => f.spokenRequests.filter(request => request.terminal).length === 2);
+  await until(() => f.currentCall().publications?.records.some(record => record.selectedDelivery?.response.delivery.text === 'The comparison is saved.' && record.outcome?.status === 'accepted') === true);
+  const publications = f.currentCall().publications!.records.filter(record => record.selectedDelivery?.response.delivery.text === 'The comparison is saved.');
+  assert.deepEqual(publications.map(record => record.outcome?.status), ['unconfirmed', 'accepted']);
+  assert.equal(new Set(publications.map(record => record.updateId)).size, 2);
+  assert.equal(f.posts.length, 1, 'speech retry cannot execute the action again');
 });

@@ -1,3 +1,6 @@
+import { createSpeechGate } from './speechGate.js';
+import { playGreetingClip } from '../broker/greetingClip.js';
+import { SidebandWS } from 'openai/resources/live/sideband/ws';
 import { restrictedSetupFunctionTools, restrictedSetupBackendInstructions, restrictedSetupToolSchema, restrictedSetupToolResultSchema, type RestrictedSetupTool } from './restrictedSetupTools.js';
 import { createHash } from 'node:crypto';
 import OpenAI from 'openai';
@@ -35,19 +38,35 @@ const audioBytes = (v: unknown): number | undefined => {
 };
 
 export function createOpenAILiveConnection(apiKey: string): BrokerLiveConnection {
-  const ws = new LiveWS(new OpenAI({ apiKey, maxRetries: 0 }), {
+  const client = new OpenAI({ apiKey, maxRetries: 0 });
+  const ws = new LiveWS(client, {
     reconnect: null, maxQueueSize: 256 * 1024, maxPayload: 1024 * 1024,
     headers: { 'User-Agent': 'dexter-broker/Node 0.1' },
   });
+  let sideband: SidebandWS | undefined;
+  let shuttingDown = false, reflectionUnavailable: (() => void) | undefined;
+  const lostReflection = () => { if (!shuttingDown) reflectionUnavailable?.(); };
+  let reflected: ((event: unknown) => void) | undefined;
+  ws.on('event', value => {
+    const event = record(value);
+    if (event.type === 'session.started' && reflected && id(record(event.session).id) && !sideband) {
+      sideband = new SidebandWS(client, { session_id: record(event.session).id as string }, { reconnect: null, maxPayload: 2 * 1024 * 1024 });
+      sideband.on('event', value => { if (record(value).type === 'session.output_audio.delta') reflected?.(value); });
+      sideband.on('error', lostReflection);
+      sideband.socket.on('close', lostReflection);
+    }
+  });
   return {
+    onReflectionUnavailable: fn => { reflectionUnavailable = fn; },
+    onReflectedAudio: fn => { reflected = fn; },
     onOpen: fn => { ws.socket.on('open', fn); },
     onEvent: fn => { ws.on('event', fn); },
     onError: fn => { ws.on('error', fn); },
     onClose: fn => { ws.socket.on('close', fn); },
     isOpen: () => ws.socket.readyState === 1,
     send: event => ws.send(event),
-    close: () => ws.close(),
-    terminate: () => ws.socket.platformSocket.terminate(),
+    close: () => { shuttingDown = true; sideband?.close(); ws.close(); },
+    terminate: () => { shuttingDown = true; sideband?.socket.platformSocket.terminate(); ws.socket.platformSocket.terminate(); },
   };
 }
 
@@ -92,6 +111,63 @@ export function createBrokerLiveSession(options: BrokerLiveSessionOptions): Brok
   const transport = (options.connectionFactory ?? createOpenAILiveConnection)(options.apiKey);
   let started = false, ready = false, closing = false, closed = false, playbackBlocked = false;
   let outputAudioDiscarded = false;
+  const requestAliases = new Map<string, string>();
+  const trackRequest = (id: string, aliases: readonly string[] = []) => {
+    for (const alias of aliases) requestAliases.set(alias, id);
+    gate?.pending(id, aliases);
+  };
+  const speechQueue: Array<{ audio: Buffer; played(heard: boolean): void; segment: { id: number; receivedAt: number; requestId?: string } }> = [];
+  let playing: { playback: ReturnType<typeof playGreetingClip>; played(heard: boolean): void; requestId?: string } | undefined;
+  const pumpSpeech = () => {
+    if (playing || closing || closed || playbackBlocked) return;
+    const next = speechQueue.shift(); if (!next) return;
+    let outstanding = 0, sent = false, failed = false, reported = false, begun = false;
+    const acknowledged = (heard: boolean) => {
+      if (!heard) { failed = true; outputAudioDiscarded = true; }
+      else outstanding--;
+      if (!reported && (failed || sent && outstanding === 0)) { reported = true; next.played(!failed); playing = undefined; queueMicrotask(pumpSpeech); }
+    };
+    const playback = playGreetingClip(next.audio, {
+      send(frame) {
+        if (closing || closed || playbackBlocked) { next.played(false); return false; }
+        if (!begun) { begun = true; emit({ type: 'live.speech_gate.playback_started', segmentId: next.segment.id, latencyMs: Date.now() - next.segment.receivedAt }); }
+        outstanding++;
+        options.onAudio(frame.toString('base64'), { deliveryId: `broker_audio_${++audioDeliveryNumber}`, onPlayed: acknowledged });
+        return true;
+      },
+      onSent() { sent = true;
+        if (!reported && outstanding === 0) { reported = true; next.played(!failed); playing = undefined; queueMicrotask(pumpSpeech); } },
+    });
+    if (playback.sending) playing = { playback, played: next.played, requestId: next.segment.requestId };
+  };
+  const stopSpeech = (requestId?: string, clearTransport = true) => {
+    const stopsPlaying = playing && (requestId === undefined || playing.requestId === requestId);
+    if (stopsPlaying) {
+      const prior = playing; playing = undefined;
+      outputAudioDiscarded = true; prior?.playback.cancel(); prior?.played(false);
+    }
+    for (let i = speechQueue.length - 1; i >= 0; i--) if (requestId === undefined || speechQueue[i].segment.requestId === requestId) {
+      outputAudioDiscarded = true; speechQueue.splice(i, 1)[0].played(false);
+    }
+    if (clearTransport && (stopsPlaying || requestId === undefined)) options.onPlaybackClear?.('application_interrupt');
+    queueMicrotask(pumpSpeech);
+  };
+  const gate = options.speechGate && !setup ? createSpeechGate({
+    release(audio, played, segment) {
+      if (speechQueue.length >= 8) { played(false); emit({ type: 'live.speech_gate.playback_overflow' }); return; }
+      speechQueue.push({ audio, played, segment }); pumpSpeech();
+    },
+    steer(text) { void append('instructions', text, null); },
+    clear(requestId) { stopSpeech(requestId); },
+    event(value) {
+      if (value.type === 'broker_speech_relay_failed') console.info(JSON.stringify({ event: value.type, callId: options.callId,
+        requestId: value.requestId, discardedAttempts: value.discardedAttempts, pendingRequests: value.pendingRequests }));
+      if (value.type === 'live.speech_gate.discarded') outputAudioDiscarded = true;
+      if (value.type === 'live.speech_gate.released') capture({ type: 'session.output_transcript.delta',
+        event_id: `broker_checked_${value.segmentId}`, delta: value.text, start_ms: value.startMs, end_ms: value.endMs });
+      emit(value as BrokerLiveEvent);
+    },
+  }) : undefined;
   let sessionId: string | undefined, usageSeconds: number | undefined;
   let commandNumber = 0, audioDeliveryNumber = 0, transcriptBytes = 0;
   let startupAudio: string[] = [], startupAudioBytes = 0;
@@ -129,6 +205,8 @@ export function createBrokerLiveSession(options: BrokerLiveSessionOptions): Brok
   };
   const clearPlayback = (reason: 'application_interrupt' | 'session_closed' | 'session_failed') => {
     playbackBlocked = true;
+    gate?.interrupt();
+    stopSpeech(undefined, false);
     try { options.onPlaybackClear?.(reason); } catch { emit({ type: 'live.playback_clear_failed' }); }
   };
   const detachBackend = () => {
@@ -141,6 +219,7 @@ export function createBrokerLiveSession(options: BrokerLiveSessionOptions): Brok
     closed = true; closing = true; ready = false;
     startupAudio = []; startupAudioBytes = 0;
     detachBackend();
+    gate?.close();
     for (const eventId of appends.keys()) settleAppend(eventId, 'unconfirmed', 'session_ended');
     for (const timer of timers) clearTimeout(timer);
     timers.clear();
@@ -185,6 +264,22 @@ export function createBrokerLiveSession(options: BrokerLiveSessionOptions): Brok
       if (!send({ type: `session.${kind}.append`, event_id: eventId, delegation_id: delegationId, content: text }))
         settleAppend(eventId, 'unconfirmed', 'transport_unavailable');
     });
+  };
+  const publishSpeech = async (update: LiveBackendUpdate, requestId: string,
+    terminal: boolean, delegationId: string | null): Promise<LiveDelivery> => {
+    const spoken = update.speak ?? update.kind === 'result';
+    if (!spoken || !gate?.active()) return append(spoken ? 'commentary' : 'thinking', update.text, delegationId);
+    if (update.kind === 'progress' && ['On it.', 'Still working on it.'].includes(update.text)) {
+      gate.statusRequested(); return { eventId: commandId(), status: 'accepted' };
+    }
+    const heard = gate.deliver(requestId, update.text, terminal);
+    void append('instructions', 'Read the next Primary commentary exactly, without adding or changing words. Do not narrate a pending action yourself.', null);
+    const receipt = await append('commentary', update.text, delegationId);
+    if (receipt.status !== 'accepted' || !terminal && (update.kind !== 'result' || update.pending === true)) return receipt;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const played = await Promise.race([heard, new Promise<false>(resolve => { timer = setTimeout(() => resolve(false), 45_000); timer.unref?.(); })]);
+    clearTimeout(timer);
+    return played ? { ...receipt, observedCallerRevision: transcript.callerRevision, observedTranscriptSequence: transcript.revision } : { ...receipt, status: 'unconfirmed', reason: 'speech_not_confirmed' };
   };
   const start = () => {
     if (started || closing || closed || !transport.isOpen()) return;
@@ -247,10 +342,11 @@ export function createBrokerLiveSession(options: BrokerLiveSessionOptions): Brok
       state.toolCalls = new Map();
       return; // Metadata alone never invokes a restricted setup tool.
     }
+    gate?.pending(delegationId);
     const requestId = createHash('sha256').update(JSON.stringify(['dexter-broker/live/v1', options.callId, sessionId, delegationId])).digest('hex');
     const publish = (update: LiveBackendUpdate): Promise<LiveDelivery> => {
       if (!id(update.id)) return Promise.resolve({ eventId: '', status: 'rejected', reason: 'invalid_update_id' });
-      const signature = JSON.stringify([update.kind, update.text,
+      const signature = JSON.stringify([update.kind, update.text, update.pending ?? null, update.terminal ?? null,
         update.expectedCallerRevision ?? null, update.speak ?? update.kind === 'result']);
       const previous = state.updates.get(update.id);
       if (previous) return previous.signature === signature ? previous.delivery
@@ -262,14 +358,19 @@ export function createBrokerLiveSession(options: BrokerLiveSessionOptions): Brok
       if ((update.kind === 'result' || update.expectedCallerRevision !== undefined)
           && (!Number.isSafeInteger(update.expectedCallerRevision) || update.expectedCallerRevision! < 0))
         return Promise.resolve({ eventId: '', status: 'rejected', reason: 'caller_revision_required' });
-      const delivery = update.expectedCallerRevision !== undefined && update.expectedCallerRevision !== transcript.callerRevision
+      if (gate?.active() && update.kind === 'progress' && ['On it.', 'Still working on it.'].includes(update.text))
+        { gate.statusRequested(); return Promise.resolve({ eventId: commandId(), status: 'accepted' }); }
+      const pending = gate?.has(requestAliases.get(delegationId) ?? delegationId) === true;
+      const pendingFinal = pending && update.kind === 'result' && update.pending !== true;
+      const delivery = !pendingFinal && update.expectedCallerRevision !== undefined && update.expectedCallerRevision !== transcript.callerRevision
         ? Promise.resolve<LiveDelivery>({ eventId: '', status: 'stale', reason: 'caller_context_changed' })
-        : append((update.speak ?? update.kind === 'result') ? 'commentary' : 'thinking', update.text, delegationId);
+        : publishSpeech(update, requestAliases.get(delegationId) ?? delegationId, update.kind === 'result' && update.pending !== true && update.terminal !== false, delegationId);
       state.updates.set(update.id, { signature, delivery });
       return delivery;
     };
     state.publish=publish;
     const channel: LiveBackendChannel = {
+      release: () => gate?.release(delegationId),
       getContext: () => clone(persistedTranscript),
       subscribeContext: listener => {
         if (state.controller.signal.aborted) return () => {};
@@ -288,7 +389,11 @@ export function createBrokerLiveSession(options: BrokerLiveSessionOptions): Brok
         delegationId, requestId, offsetMs: state.offsetMs, transcript: clone(persistedTranscript) };
       emit({ type: 'live.delegation.started', delegationId, requestId, revision: request.transcript.revision });
       await options.backend.delegate(request, channel);
-    }).catch(() => emit({ type: 'live.delegation.error', delegationId, requestId, code: 'backend_failed' }));
+    }).catch(() => {
+      emit({ type: 'live.delegation.error', delegationId, requestId, code: 'backend_failed' });
+      // A delegation whose backend call failed started no work; it must not keep the gate on.
+      if (!requestAliases.has(delegationId)) gate?.release(delegationId);
+    });
   };
 
   const receiveSetupTool = (event: Record<string, unknown>) => {
@@ -375,7 +480,17 @@ export function createBrokerLiveSession(options: BrokerLiveSessionOptions): Brok
       return;
     }
     // Drain transcripts after a graceful close request; backend subscriptions are already detached.
-    if (ready && (type === 'session.input_transcript.delta' || type === 'session.output_transcript.delta')) { capture(event); return; }
+    if (ready && (type === 'session.input_transcript.delta' || type === 'session.output_transcript.delta')) {
+      if (type === 'session.input_transcript.delta') gate?.callerSpoke(typeof event.delta === 'string' ? event.delta : '');
+      else if (gate?.active()) {
+        if (id(event.event_id) && typeof event.delta === 'string' && offset(event.start_ms) && offset(event.end_ms) && event.end_ms >= event.start_ms)
+          gate.transcript(event.event_id, event.delta, event.start_ms, event.end_ms);
+        else gate.interrupt();
+        return;
+      }
+      capture(event);
+      return;
+    }
     if (ready && type === 'session.output_audio.delta' && (closing || playbackBlocked)) {
       outputAudioDiscarded = true;
       emit({ type: 'live.output_audio.discarded' });
@@ -388,12 +503,13 @@ export function createBrokerLiveSession(options: BrokerLiveSessionOptions): Brok
       if (!started || !id(session.id) || session.model !== 'gpt-live-1'
           || (session.delegation != null && record(session.delegation).type !== (setup ? 'responses' : 'client'))) { fail('invalid_started_session'); return; }
       sessionId = session.id; ready = true; clearTimer(startupTimer);
+      for (const pending of options.pendingRequests ?? []) trackRequest(pending.id, pending.aliases);
       const queued = startupAudio; startupAudio = []; startupAudioBytes = 0;
       for (const audio of queued) if (!send({ type: 'session.input_audio.append', audio })) return;
       try { options.onReady({ callId: options.callId, sessionId }); } catch { fail('ready_observer_failed'); }
     } else if (type === 'session.output_audio.delta') {
       if (!ready || audioBytes(event.delta) === undefined) { fail('invalid_output_audio'); return; }
-      if (!playbackBlocked) {
+      if (!playbackBlocked && !gate?.active()) {
         // Primary WebSocket audio has no provider event ID. This connection-local
         // delivery ID tracks playback order; it cannot identify provider evidence.
         const deliveryId = `broker_audio_${++audioDeliveryNumber}`;
@@ -408,6 +524,14 @@ export function createBrokerLiveSession(options: BrokerLiveSessionOptions): Brok
       if (!setup) fail('unexpected_responses_backend'); else receiveSetupTool(event);
     }
   });
+  if (gate) transport.onReflectedAudio?.(value => {
+    const event = record(value);
+    if (!gate?.active() || closing || closed || playbackBlocked) return;
+    if (typeof event.delta !== 'string' || event.delta.length > 1_920_000 || event.delta.length % 4
+      || !/^[A-Za-z0-9+/]*={0,2}$/.test(event.delta) || !offset(event.start_ms) || !offset(event.end_ms)) { gate.interrupt(); return; }
+    gate.audio(Buffer.from(event.delta, 'base64'), event.start_ms, event.end_ms);
+  });
+  transport.onReflectionUnavailable?.(() => { if (gate && !closing && !closed) fail('reflection_unavailable'); });
   transport.onError(error => {
     // The SDK emits a protocol error twice: as an event, then wrapped in its
     // error callback. Correlated command rejection remains recoverable on both.
@@ -432,6 +556,12 @@ export function createBrokerLiveSession(options: BrokerLiveSessionOptions): Brok
     },
     publishDelegation: (delegationId,update) => delegations.get(delegationId)?.publish?.(update)
       ?? Promise.resolve({eventId:'',status:'rejected',reason:'unknown_delegation'}),
+    hasPendingRequest: id => gate?.has(requestAliases.get(id) ?? id) ?? false,
+    trackRequest,
+    speakRequest: (update, request) => {
+      trackRequest(request.id, request.aliases);
+      return publishSpeech(update, request.id, request.terminal, null);
+    },
     appendContext: text => append('thinking', text, null),
     appendInstructions: text => append('instructions', text, null),
     appendCommentary: text => append('commentary', text, null),
@@ -441,7 +571,7 @@ export function createBrokerLiveSession(options: BrokerLiveSessionOptions): Brok
     getTranscript: () => clone(transcript),
     close(reason = 'application_close') {
       if (closing || closed) return closedPromise;
-      closing = true; startupAudio = []; startupAudioBytes = 0; detachBackend();
+      closing = true; startupAudio = []; startupAudioBytes = 0; detachBackend(); gate?.close();
       clearPlayback('session_closed');
       emit({ type: 'live.closing', reason: id(reason) ? reason : 'application_close' });
       if (!ready || !transport.isOpen()) finish(false, 'closed_before_ready');

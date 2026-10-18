@@ -356,8 +356,8 @@ for (const eligible of [false, true]) test(`greeting clip plays first at media s
   assert.equal(g.frames.filter(frame => frame.event === 'media').length, 15, 'no Live audio while the clip is unplayed');
   const journey = g.f.store.get(g.call.id)!.journey!;
   assert.ok(journey.greetingClipStartedAt && journey.firstAudioSentAt);
-  assert.ok(Date.parse(journey.greetingClipStartedAt) - Date.parse(journey.streamStartedAt!) >= 300,
-    'inbound greeting waits 300 ms after stream start');
+  assert.ok(Date.parse(journey.greetingClipStartedAt) >= Date.parse(journey.streamStartedAt!),
+    'clip playback begins after stream start; loaded clips carry their silence lead-in');
   assert.ok(Date.parse(journey.firstAudioSentAt) >= Date.parse(journey.greetingClipStartedAt),
     'journey records the actual start of the clip');
   assert.equal(journey.greetingClipPlayedAt, undefined);
@@ -1301,26 +1301,14 @@ async function greetingMedia(f: Awaited<ReturnType<typeof fixture>>, call: Broke
   return { ws, frames, caller, ackClip, clipFrames };
 }
 
-for (const ending of ['play', 'disconnect', 'failure']) test(`inbound greeting waits exactly 300 ms and handles ${ending}`, async t => {
-  const f = await fixture(t, { greetingClip: greetingFixtureClip });
+for (const ending of ['play', 'disconnect', 'failure']) test(`inbound greeting sends its silence immediately and handles ${ending}`, async t => {
+  const audible: string[] = [];
+  t.mock.method(console, 'info', (value: string) => { if (!value.startsWith('{')) return; const event = JSON.parse(value);
+    if (event.event === 'broker_audio_timing' && event.stage === 'firstAudibleAudioSentAt') audible.push(event.observedAt); });
+  const clip = Buffer.concat([Buffer.alloc(2400, 255), greetingFixtureClip]);
+  const f = await fixture(t, { greetingClip: clip });
   await (await f.webhook('/broker/incoming-call')).text(); await f.waitForAdmission();
   const call = f.store.list()[0];
-  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
-  const g = await greetingMedia(f, call);
-  t.after(() => { t.mock.timers.reset(); g.ws.close(); });
-  for (let i = 0; i < 100 && !f.store.get(call.id)!.journey?.streamStartedAt; i++)
-    await new Promise<void>(resolve => setImmediate(resolve));
-  const start = f.store.get(call.id)!.journey!.streamStartedAt!;
-  assert.ok(start);
-  t.mock.timers.tick(299);
-  assert.equal(f.store.get(call.id)!.journey!.greetingClipStartedAt, undefined);
-  assert.equal(f.store.get(call.id)!.journey!.firstAudioSentAt, undefined);
-  if (ending === 'disconnect') {
-    g.ws.close();
-    for (let i = 0; i < 100 && !f.store.get(call.id)!.endedAt; i++)
-      await new Promise<void>(resolve => setImmediate(resolve));
-    assert.ok(f.store.get(call.id)!.endedAt);
-  }
   if (ending === 'failure') {
     const update = f.store.update.bind(f.store);
     t.mock.method(f.store, 'update', (id, patch) => {
@@ -1328,15 +1316,34 @@ for (const ending of ['play', 'disconnect', 'failure']) test(`inbound greeting w
       return update(id, patch);
     });
   }
-  t.mock.timers.tick(1);
-  const journey = f.store.get(call.id)!.journey!;
-  if (ending !== 'play') {
-    assert.equal(journey.greetingClipStartedAt, undefined);
-    assert.ok(f.store.get(call.id)!.endedAt, 'delayed-start errors retain ordinary media cleanup');
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
+  const g = await greetingMedia(f, call);
+  t.after(() => { t.mock.timers.reset(); g.ws.close(); });
+  for (let i = 0; i < 100 && !f.store.get(call.id)!.journey?.streamStartedAt; i++)
+    await new Promise<void>(resolve => setImmediate(resolve));
+  const start = f.store.get(call.id)!.journey!.streamStartedAt!;
+  assert.ok(start, 'stream start recorded');
+  if (ending === 'failure') {
+    for (let i = 0; i < 100 && !f.store.get(call.id)!.endedAt; i++)
+      await new Promise<void>(resolve => setImmediate(resolve));
+    assert.ok(f.store.get(call.id)!.endedAt, 'clip-start errors retain media cleanup');
+    assert.equal(f.store.get(call.id)!.journey!.greetingClipStartedAt, undefined);
+    return;
   }
-  else {
-    assert.equal(Date.parse(journey.greetingClipStartedAt!) - Date.parse(start), 300);
-    assert.equal(journey.firstAudioSentAt, journey.greetingClipStartedAt);
+  assert.equal(f.store.get(call.id)!.journey!.greetingClipStartedAt, start, 'silence starts without a timer gate');
+  t.mock.timers.tick(200); // 200 ms elapsed + 100 ms carrier lead: only the 300 ms silence.
+  assert.deepEqual(audible, [], 'only silence has been queued');
+  if (ending === 'disconnect') {
+    g.ws.close();
+    for (let i = 0; i < 100 && !f.store.get(call.id)!.endedAt; i++)
+      await new Promise<void>(resolve => setImmediate(resolve));
+    assert.ok(f.store.get(call.id)!.endedAt, 'disconnect stops the call');
+    t.mock.timers.tick(1000);
+    assert.deepEqual(audible, [], 'no late greeting speech after hangup');
+  } else {
+    t.mock.timers.tick(20);
+    assert.equal(Date.parse(audible[0]!) - Date.parse(start), 220,
+      'first speech frame is queued with a 100 ms lead behind exactly 300 ms of silence');
   }
   t.mock.timers.reset();
 });

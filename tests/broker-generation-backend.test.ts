@@ -181,11 +181,13 @@ async function fixture(t: TestContext, diagnostic?: Diagnostic) {
       } catch (error) { diagnostic?.('observer.publish', 'rejected'); throw error; }
     },
   };
-  const backend = (sourceSessionId: string): PrimaryBackend => createPrimaryBackend({
+  const trackedRequests: BrokerDelegationRecord[] = [];
+  const backend = (sourceSessionId: string, maxPollMs = 30): PrimaryBackend => createPrimaryBackend({
     callId: call.id, callSid, bindingId, api, store, sourceSessionId, observation,
+    onRequest: entry => { trackedRequests.push(structuredClone(entry)); },
     admissionSettled: request => { admissions.push({ request: structuredClone(request),
       entries: structuredClone(Object.values(store.get(call.id)!.delegations)) as BrokerDelegationRecord[] }); },
-    stabilityMs: 5, maxWaitMs: 100, pollIntervalMs: 5, maxPollMs: 30, progressIntervalMs: 60_000,
+    stabilityMs: 5, maxWaitMs: 100, pollIntervalMs: 5, maxPollMs, progressIntervalMs: 60_000,
   });
   const request = (sessionId: string, delegationId: string): LiveDelegationRequest => ({
     callId: call.id, sessionId, delegationId, requestId: `live_${sessionId}_${delegationId}`,
@@ -246,7 +248,7 @@ async function fixture(t: TestContext, diagnostic?: Diagnostic) {
       diagnostic?.('teardown.finally', 'after');
     }
   }));
-  return { directory, call, contexts, posts, reads, captures, replies, questionReads, publications, admissions, behavior, completed,
+  return { trackedRequests, directory, call, contexts, posts, reads, captures, replies, questionReads, publications, admissions, behavior, completed,
     callLifetime, backend, request, delegate, speak, rotate, saved, reopen, store: () => store,
     onCleanup: (fn: () => void) => { cleanups.push(fn); } };
 }
@@ -803,4 +805,84 @@ test('ended-call closeout settles a definitely-undispatched answer locally and p
   assert.deepEqual(f.saved()[0].questions![questionId].reply!.input, prepared.input);
   assert.equal(f.questionReads.length, readsBefore);
   assert.equal(f.replies.length, 0); assert.equal(f.posts.length, 1);
+});
+
+// The accepted tool observation on Oct 18 was followed by a different terminal outcome.
+for (const partialStatus of ['accepted', 'unconfirmed'] as const) {
+  test(`call truth: a ${partialStatus} partial never suppresses the final money result after later speech`, async t => {
+    const recorded = JSON.parse(await readFile(new URL('./fixtures/call-truth-oct18.json', import.meta.url), 'utf8')).sale;
+    const sale = recorded.requests[1];
+    const f = await fixture(t), backend = f.backend(oldSession, 1000);
+    let reads = 0;
+    f.behavior.result = async id => {
+      if (++reads === 1) return { bindingId, requestId: id, state: 'running', partialResult: {
+        toolInvocationId: eventId, text: sale.partial,
+      } } as PrimaryResult;
+      f.speak(backend, oldSession, "How's that buy going", 60000, 61000);
+      return { ...f.completed(id), assistant: { ...f.completed(id).assistant!, text: sale.result } };
+    };
+    f.speak(backend, oldSession, sale.text);
+    // Reproduce the partial delivery receipt independently of any later caller revision.
+    f.behavior.submit = async id => {
+      const saved = f.store().get(f.call.id)!;
+      f.store().update(f.call.id, { delegations: { ...saved.delegations,
+        [id]: { ...saved.delegations[id], partialDelivery: { toolInvocationId: eventId, text: sale.partial, status: partialStatus } },
+      } });
+      return { bindingId, requestId: id, state: 'running' };
+    };
+    await f.delegate(backend, oldSession, 'oct18_sale');
+    const final = f.publications.filter(value => !value.update && value.entry.status === 'completed');
+    assert.equal(final.length, 1);
+    assert.equal(final[0].entry.primaryResult?.assistant?.text, sale.result);
+    assert.equal(f.saved()[0].delivery, 'accepted');
+    assert.equal(f.posts.length, 1, 'the status question must not submit the sale again');
+  });
+}
+
+test('call truth: a status question gets the saved final result even after a partial was marked delivered', async t => {
+  const recorded = JSON.parse(await readFile(new URL('./fixtures/call-truth-oct18.json', import.meta.url), 'utf8')).sale.requests[1];
+  const f = await fixture(t), backend = f.backend(oldSession);
+  f.behavior.result = async id => ({ ...f.completed(id), assistant: { ...f.completed(id).assistant!, text: recorded.result } });
+  f.speak(backend, oldSession, recorded.text);
+  await f.delegate(backend, oldSession, 'sale');
+  const before = f.publications.length;
+  f.speak(backend, oldSession, "How's that buy going", 60000, 61000);
+  await until(() => f.publications.length > before);
+  assert.equal(f.publications.at(-1)!.entry.primaryResult?.assistant?.text, recorded.result);
+  assert.equal(f.publications.at(-1)!.update, undefined, 'the waiting result outranks a holding line');
+  assert.equal(f.posts.length, 1);
+});
+
+test('call truth: Primary receives the toilet conversation separately from the exact follow-up words', async t => {
+  const recorded = JSON.parse(await readFile(new URL('./fixtures/call-truth-oct18.json', import.meta.url), 'utf8')).toilet;
+  const f = await fixture(t), backend = f.backend(oldSession);
+  const source = recorded.requests.at(-1);
+  const fragments = recorded.fragments.filter((fragment: { sequence: number }) => fragment.sequence < source.firstSequence);
+  const current = f.store().get(f.call.id)!;
+  // Previous generation speech is still this call's context after a provider rotation.
+  f.store().update(f.call.id, { liveGenerations: { ...current.liveGenerations!, segments: current.liveGenerations!.segments.map(segment => ({
+    ...segment, transcript: { revision: fragments.at(-1).sequence,
+      callerRevision: fragments.filter((fragment: { role: string }) => fragment.role === 'user').length, fragments },
+  })) } });
+  f.rotate();
+  const next = f.backend(newSession);
+  f.speak(next, newSession, source.text, 60000, 61000);
+  await f.delegate(next, newSession, 'toilet_followup');
+  assert.equal(f.posts.length, 1);
+  assert.equal(f.posts[0].input.text, source.text, 'caller words stay unchanged');
+  assert.ok(f.posts[0].input.voiceContext?.recentSpeech.some(turn => turn.role === 'dexter' && /toilet/i.test(turn.text)), 'current call context travels to Primary');
+});
+
+test('RV gate leak: every delegation id is tracked under some request', async t => {
+  const f = await fixture(t);
+  f.behavior.result = async id => ({ requestId: id, bindingId, state: 'running' } as PrimaryResult);
+  const old = f.backend(oldSession); f.speak(old, oldSession, 'Check my balance.');
+  await f.delegate(old, oldSession, 'task');
+  f.speak(old, oldSession, 'Thanks.', 3000, 3200);
+  await f.delegate(old, oldSession, 'thanks');
+  const seen = f.trackedRequests;
+  const tracked = new Set(seen.flatMap(e => [...e.delegationIds, ...(e.delegationAliases ?? []).map(a => a.delegationId)]));
+  t.diagnostic(`tracked delegation ids=${JSON.stringify([...tracked])}; saved deferred=${JSON.stringify(f.saved().map(e => (e.deferredTurns ?? []).map(d => [d.delegationId, d.status])))}`);
+  assert.ok(tracked.has('task'));
+  assert.ok(tracked.has('thanks'), 'ack delegation never re-keyed onto a request: gate keeps it pending forever');
 });

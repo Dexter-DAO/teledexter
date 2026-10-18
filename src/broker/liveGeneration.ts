@@ -35,7 +35,7 @@ export type LiveGenerationClocks = z.infer<typeof clocksSchema>;
 const startupFailureCodeSchema = z.enum([
   'credit_balance_exhausted', 'insufficient_quota', 'invalid_api_key', 'model_not_found',
   'rate_limit_exceeded', 'permission_denied', 'invalid_request_error', 'authentication_error', 'server_error',
-  'provider_error', 'provider_connection_error', 'connection_closed_without_final_usage',
+  'provider_error', 'provider_connection_error', 'reflection_unavailable', 'connection_closed_without_final_usage',
   'transport_send_failed', 'invalid_started_session', 'started_session_identity_changed',
   'closed_session_identity_mismatch', 'invalid_output_audio', 'delegation_before_ready',
   'unexpected_responses_backend', 'ready_observer_failed', 'startup_timeout', 'closed_before_ready',
@@ -103,7 +103,7 @@ export interface GenerationHandle {
   close(reason: 'context_replaced' | 'call_stopped' | 'context_unavailable'): Promise<LiveSessionClosed>;
 }
 export interface GenerationCallbacks {
-  onAudio(payload: string): void;
+  onAudio(payload: string, onPlayed?: (heard: boolean) => void): void;
   onTranscript(snapshot: LiveTranscriptSnapshot): void;
   onClosed(result: LiveSessionClosed): void;
 }
@@ -134,7 +134,7 @@ export interface LiveGenerationOptions {
   onActivated?(attachment: LiveGenerationAttachment): void;
   /** Drain only source admissions already observed on this generation; the host deadline remains independent. */
   beforeRetire?(generationId: string): Promise<void>;
-  onAudio(payload: string, attachment: LiveGenerationAttachment): void;
+  onAudio(payload: string, attachment: LiveGenerationAttachment, onPlayed?: (heard: boolean) => void): void;
   clearPlayback(): void;
   onProblem(code: string): void;
   onContextReadFailure?(failure: ContextReadFailure): void;
@@ -284,14 +284,14 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
     if (affectsDelivery) unavailable(code); else save();
   };
   const callbacks = (generationId: string): GenerationCallbacks => ({
-    onAudio(payload) {
+    onAudio(payload, onPlayed) {
       if (stopped || now() >= Date.parse(clocks.callDeadlineAt) || state.phase !== 'active' || activeId !== generationId) {
         const old = segment(generationId);
         if (!old.outputDiscarded) { old.outputDiscarded = true; save(); }
-        return;
+        onPlayed?.(false); return;
       }
-      try { options.onAudio(payload, attachment()); }
-      catch { unavailable('output_delivery_failed'); }
+      try { options.onAudio(payload, attachment(), onPlayed); }
+      catch { onPlayed?.(false); unavailable('output_delivery_failed'); }
     },
     onTranscript(snapshot) {
       const current = segment(generationId);
@@ -314,7 +314,12 @@ export function createLiveGenerationController(options: LiveGenerationOptions) {
       current.state = 'closed'; current.closedAt = stamp(); current.providerFinalized = result.finalized;
       current.transcriptPersisted = result.transcriptPersisted;
       current.outputDiscarded ||= result.outputAudioDiscarded;
-      if (unexpected) unavailable('generation_closed'); else save();
+      if (unexpected && result.reason === 'reflection_unavailable') {
+        // Reuse the bounded, serialized context/authority reattachment path.
+        // Stop exposing this generation before any successor can deliver audio.
+        block('unavailable');
+        void serial(beforeReuse).catch(() => {}); // Replacement reports its own failure.
+      } else if (unexpected) unavailable('generation_closed'); else save();
     },
   });
   const retire = (reason: 'context_replaced' | 'call_stopped' | 'context_unavailable',

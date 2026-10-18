@@ -1,3 +1,4 @@
+import { watchMediaSocket } from './phone.js';
 import { createHmac } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import Twilio from 'twilio';
@@ -18,7 +19,7 @@ import { createVerificationCallbackChallenge } from './verificationCallbackChall
 import { prepareRestrictedSetup, stopRestrictedSetup, validateRestrictedSetupCall } from './restrictedSetupJournal.js';
 import { callbackStatusReceipt, callbackEndedReceipt, deliverCallbackReceipt, verificationCallbackProviderTiming, type CallbackVoiceReceipt } from './verificationCallbackReceipts.js';
 import { changeRestrictedMedia, type RestrictedMedia } from './restrictedMedia.js';
-import { authorizedControl, callTwiml, inputSpeechEnergy, mediaStart, PlaybackReceipts, streamToken, verifyTwilio } from './phone.js';
+import { authorizedControl, callTwiml, inputSpeechEnergy, mediaStart, PlaybackReceipts, clearAudioBacklog, streamToken, verifyTwilio } from './phone.js';
 
 type Active = { stop(reason: string): Promise<void> };
 export interface RestrictedSetupServerOptions {
@@ -280,10 +281,12 @@ export function createRestrictedSetupServer(options: RestrictedSetupServerOption
   }
   function connect(ws: WebSocket, initial: BrokerCall) {
     let streamSid: string | undefined, sessionId: string | undefined, inputBytes = 0, speechThroughMs: number | undefined, speechAt: number | undefined;
+    const stopSocketWatch = watchMediaSocket(ws, () => { void stop('media_socket_stalled'); });
+    ws.once('close', stopSocketWatch);
     let stopping = false, detached = false, protectedReady = false, voice: RestrictedSetupVoice | undefined;
     let stopPromise: Promise<void> | undefined;
     const receipts = new PlaybackReceipts(), listeners = new Set<() => void>(), initialClock = media(initial);
-    if (!initialClock) { ws.close(); claimed.delete(initial.id); return; }
+    if (!initialClock) { stopSocketWatch(); ws.close(); claimed.delete(initial.id); return; }
     const clock = initialClock;
     const deadline = setTimeout(() => { void stop('duration_limit'); }, Math.max(1, Date.parse(clock.deadlineAt) - Date.now()));
     const starting = setTimeout(() => { void stop('media_start_timeout'); }, 8000);
@@ -304,7 +307,7 @@ export function createRestrictedSetupServer(options: RestrictedSetupServerOption
       async requestProtectedInput(value) {
         if (!isCurrent(value) || !voice) fail();
         const call = get(initial.id), j = call.verificationCallback; if (!j || j.permit.purpose !== 'enrollment') fail();
-        patchMedia(call.id, { protectedRequestedAt: new Date().toISOString() }); detached = true;
+        patchMedia(call.id, { protectedRequestedAt: new Date().toISOString() }); detached = true; stopSocketWatch();
         await voice.suspendForSensitiveInput();
         if (stopping || Date.now() >= Date.parse(clock.deadlineAt)) fail();
         protectedReady = true;
@@ -329,7 +332,7 @@ export function createRestrictedSetupServer(options: RestrictedSetupServerOption
     async function enterPrivate() {
       const call = get(initial.id), j = call.verificationCallback;
       if (stopping || detached || !voice || !j || j.completion?.observation?.state !== 'admitted') return;
-      patchMedia(call.id, { privateRequestedAt: new Date().toISOString() }); detached = true;
+      patchMedia(call.id, { privateRequestedAt: new Date().toISOString() }); detached = true; stopSocketWatch();
       await voice.close();
       await flow.privateCall(j.permit.request, options.primary, () => detached && !stopping);
       if (stopping || !options.accepting() || Date.now() >= Date.parse(clock.deadlineAt)) return stop('private_admission_stopped');
@@ -348,7 +351,7 @@ export function createRestrictedSetupServer(options: RestrictedSetupServerOption
       clearPrivateWaitDeadline(initial.id);
       const successor = active.get(initial.id);
       if (detached && successor && successor !== activeHandle) { clearTimeout(deadline); return successor.stop(reason); }
-      stopping = true; clearTimeout(deadline); clearTimeout(starting);
+      stopping = true; stopSocketWatch(); clearTimeout(deadline); clearTimeout(starting);
       challenge.clear(); const value = scope(); if (value) host.abandonProtectedInput(value);
       // Provider termination starts before waiting on Live's transcript drain.
       const ending = stopSaved(get(initial.id), reason); const retiring = voice?.close();
@@ -380,7 +383,7 @@ export function createRestrictedSetupServer(options: RestrictedSetupServerOption
                 isCurrent: () => { const current = scope(); return current !== undefined && isCurrent(current); }, subscribeSpeech(fn) { listeners.add(fn); return () => { listeners.delete(fn); }; } }); },
             onAudio(payload) {
               if (stopping || detached || ws.readyState !== WebSocket.OPEN || !streamSid) return;
-              if (ws.bufferedAmount > 256000 || receipts.pendingCount > 300 || receipts.backlogMs > 6000) { void stop('audio_backpressure'); return; }
+              if (clearAudioBacklog(ws, receipts, streamSid, initial.id) && ws.bufferedAmount > 256_000) return;
               ws.send(JSON.stringify({ event: 'media', streamSid, media: { payload } }));
               ws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: receipts.sent(Buffer.from(payload, 'base64').length) } }));
             }, onPlaybackClear() { receipts.clear(); if (ws.readyState === WebSocket.OPEN && streamSid) ws.send(JSON.stringify({ event: 'clear', streamSid })); },

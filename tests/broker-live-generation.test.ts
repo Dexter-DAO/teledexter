@@ -1213,3 +1213,19 @@ test('a startup page counts its age from when the API returned it, even if the h
   assert.deepEqual(fresh.operations.map(value => value.name), ['assert'], 'a receipt time later than now counts as now');
   await fresh.controller.stop();
 });
+
+
+test('reflection loss replaces the active generation with fresh authority checks and rejects old output', async t => {
+  const h = harness(); t.after(() => h.controller.stop()); await h.controller.start();
+  const old = h.sessions[0];
+  old.input.callbacks.onClosed({ callId, sessionId: old.handle.sessionId, reason: 'reflection_unavailable',
+    finalized: false, transcriptPersisted: true, outputAudioDiscarded: true });
+  old.input.callbacks.onAudio('old audio');
+  await h.controller.beforeReuse();
+  assert.equal(h.sessions.length, 2); assert.equal(h.controller.snapshot().phase, 'active');
+  assert.deepEqual(h.problems, []); assert.equal(h.audio.length, 0);
+  h.sessions[1].input.callbacks.onAudio('new audio');
+  assert.equal(h.audio[0].sessionId, 'session_2');
+  assert.ok(h.operations.filter(operation => operation.name === 'fetch').length >= 2);
+  assert.deepEqual(h.controller.snapshot().clocks, clocks);
+});

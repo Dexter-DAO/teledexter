@@ -260,3 +260,73 @@ test('hangup aborts an in-flight background read and prevents late publication',
   t.mock.timers.tick(90_000); await flush();
   assert.equal(reads, 2); assert.equal(v.notes().length, before);
 });
+
+test('review: a delayed note carries its broker-computed age and no expiry timestamp', async t => {
+  const old = facts(); let resolve!: (value: PhonePortfolio) => void;
+  const context = createPortfolioContext('call_test', bindingId, { portfolio: () => new Promise(done => { resolve = done; }) });
+  t.after(() => context.stop()); const v = voice(t); await flush(); context.attach(v.session);
+  t.mock.timers.tick(40_000); resolve(old); await flush();
+  assert.match(v.notes().at(-1)!, /as of 40 seconds ago/);
+  assert.doesNotMatch(v.notes().join(' '), /valid until|few seconds ago/);
+});
+
+test('review: each overlapping trade pauses reads until it settles and withdraws an intervening note', async t => {
+  let reads = 0;
+  const context = createPortfolioContext('call_test', bindingId, { portfolio: async () => { reads++; return facts(String(reads)); } });
+  t.after(() => context.stop()); const v = voice(t); await flush(); context.attach(v.session); await flush();
+  const action = (intentId: string, actionState: 'pending' | 'confirmed') => ({ ...result(),
+    partialResult: { ...result().partialResult!, intentId, actionState } } as PrimaryResult);
+  context.observe(action('one', 'pending')); context.observe(action('two', 'pending'));
+  context.observe(action('one', 'confirmed')); await flush();
+  t.mock.timers.tick(30_000); await flush();
+  assert.equal(reads, 1, 'confirming one trade cannot unpause the other trade');
+  context.observe(action('two', 'confirmed')); await flush(); assert.equal(reads, 2);
+  context.observe(action('three', 'pending'));
+  // A late confirmation for trade two must not unpause trade three.
+  context.observe(action('two', 'confirmed')); t.mock.timers.tick(30_000); await flush(); assert.equal(reads, 2);
+  const before = v.notes().length;
+  context.observe(action('three', 'confirmed')); await flush();
+  assert.match(v.notes()[before]!, /withdrawn/);
+  assert.equal(reads, 3);
+  assert.match(v.notes().at(-1)!, /only current portfolio note/);
+});
+
+test('review: an expired note is read immediately on reattach', async t => {
+  let reads = 0;
+  const context = createPortfolioContext('call_test', bindingId, { portfolio: async () => { reads++; return facts(String(reads)); } });
+  t.after(() => context.stop()); const v = voice(t); await flush(); context.attach(v.session); await flush();
+  context.detach(v.session); t.mock.timers.tick(61_000); await flush();
+  const next = voice(t); await flush(); context.attach(next.session); await flush();
+  assert.equal(reads, 2, 'reattach must not wait for the next poll');
+  assert.match(next.notes().join(' '), /about \$2\.00/);
+  assert.doesNotMatch(next.notes().join(' '), /about \$1\.00/);
+});
+
+test('review: detach clears the periodic timer and hangup clears the expiry timer', async t => {
+  const intervals = t.mock.method(globalThis, 'clearInterval');
+  const timeouts = t.mock.method(globalThis, 'clearTimeout');
+  const context = createPortfolioContext('call_test', bindingId, { portfolio: async () => facts() });
+  t.after(() => context.stop()); const v = voice(t); await flush(); context.attach(v.session); await flush();
+  intervals.mock.resetCalls(); context.detach(v.session);
+  assert.ok(intervals.mock.calls.some(call => call.arguments[0] !== undefined), 'detach must release its timer resource');
+  timeouts.mock.resetCalls(); context.stop();
+  assert.ok(timeouts.mock.calls.some(call => call.arguments[0] !== undefined), 'hangup must release its expiry timer resource');
+});
+
+test('call truth: a dispatched send observation withdraws the portfolio before completion', async t => {
+  let reads = 0;
+  const context = createPortfolioContext('call_test', bindingId, { portfolio: async () => { reads++; return facts(); } });
+  t.after(() => context.stop()); const v = voice(t); await flush(); context.attach(v.session); await flush();
+  const requestId = '33333333-3333-4333-8333-333333333333';
+  const api = createPrimaryApiClient({ apiBaseUrl: 'https://api.example.test', phoneServiceSecret: 'synthetic-phone-service-secret-32-characters',
+    fetch: async () => Response.json({ bindingId, requestId, state: 'running', partialResult: {
+      kind: 'action_status', actionState: 'pending', intentId: '44444444-4444-4444-8444-444444444444',
+      toolInvocationId: '55555555-5555-5555-8555-555555555555', observedAt: facts().observedAt,
+      text: 'The account action is being attempted. Its outcome is not yet known.' } }) });
+  context.observe(await api.result(bindingId, requestId)); await flush();
+  assert.match(v.notes().at(-1)!, /Portfolio note withdrawn/);
+  t.mock.timers.tick(30_000); await flush(); assert.equal(reads, 1, 'send stays paused while the attempt is pending');
+  context.observe({ bindingId, requestId, state: 'completed', assistant: { messageId: 'm', eventId: 'e', sequence: '1', text: 'The transfer was confirmed.' } });
+  await flush(); assert.equal(reads, 2);
+  assert.match(v.notes().at(-1)!, /only current portfolio note/);
+});

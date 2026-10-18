@@ -21,11 +21,11 @@ export function createPortfolioContext(callId: string, bindingId: string,
     publishing = publishing.then(async () => {
       if (stopped || target !== voice || version !== revision || !note) return;
       const current = () => !stopped && target === voice && version === revision && !!note;
-      const freshness = `As of ${value.observedAt}; valid until ${new Date(Date.parse(value.observedAt) + 60_000).toISOString()}. State this as-of age for a portfolio-only fresh view; after 60 seconds or for anything else, use Primary.`;
+      const freshness = () => `Observed at ${value.observedAt}, as of ${Math.ceil(Math.max(0, Date.now() - Date.parse(value.observedAt)) / 1000)} seconds ago when delivered. When answering later, say "under a minute ago" while this note remains current. After withdrawal or for anything else, use Primary.`;
       const send = (text: string) => target.appendContext(text);
       // An unchanged observation needs only a new timestamp, not another holdings payload.
       if (unchanged && publishedVersion === version) {
-        complete = (await send(`Portfolio note ${version} is unchanged. ${freshness}`)).status === 'accepted';
+        complete = (await send(`Portfolio note ${version} is unchanged. ${freshness()}`)).status === 'accepted';
         return;
       }
       if ((await send(`Portfolio note ${version} replaces all earlier portfolio notes. Loading; use Primary for holdings until this note is complete.`)).status !== 'accepted') return;
@@ -34,7 +34,7 @@ export function createPortfolioContext(callId: string, bindingId: string,
         if ((await send(part)).status !== 'accepted') return;
       }
       if (current()) {
-        complete = (await send(`Portfolio note ${version} is complete and is the only current portfolio note. ${freshness}`)).status === 'accepted';
+        complete = (await send(`Portfolio note ${version} is complete and is the only current portfolio note. ${freshness()}`)).status === 'accepted';
         if (complete && current()) publishedVersion = version;
       }
     }).catch(() => { /* Optional context cannot interrupt the call. */ });
@@ -47,14 +47,14 @@ export function createPortfolioContext(callId: string, bindingId: string,
     if (target && !stopped) void target.appendContext('Portfolio note withdrawn. Use Primary for holdings and fresh views until a replacement note is complete.').catch(() => {});
   };
   const refresh = async (reason: 'pickup' | 'background' | 'post_action') => {
-    if (stopped || !api.portfolio) return;
+    if (stopped || !api.portfolio || changing.size) return;
     if (read) { if (reason === 'post_action') actionQueued = true; return; }
     const controller = new AbortController(); read = controller;
     const version = revision, started = performance.now();
     let outcome = 'error', publication = 'none';
     try {
       const facts = await api.portfolio(bindingId, controller.signal);
-      if (stopped || version !== revision) { outcome = 'superseded'; return; }
+      if (stopped || version !== revision || changing.size) { outcome = 'superseded'; return; }
       const remaining = Date.parse(facts.observedAt) + 60_000 - Date.now();
       if (remaining <= 0 || remaining > 60_000) { outcome = 'stale'; return; }
       const content = portfolioFactsText(facts, true), unchanged = note?.content === content;
@@ -80,7 +80,9 @@ export function createPortfolioContext(callId: string, bindingId: string,
   return {
     attach(next: BrokerLiveSession) {
       if (voice === next || stopped) return;
-      voice = next; publishedVersion = undefined; publishing = Promise.resolve(); void publish();
+      voice = next; publishedVersion = undefined; publishing = Promise.resolve();
+      if (note && Date.parse(note.observedAt) + 60_000 <= Date.now()) invalidate();
+      if (note) void publish(); else void refresh('background');
       timer ??= setInterval(() => { if (voice && !changing.size) void refresh('background'); }, 30_000);
       timer.unref?.();
     },
@@ -90,15 +92,19 @@ export function createPortfolioContext(callId: string, bindingId: string,
     observe(result: PrimaryResult) {
       if (stopped || result.bindingId !== bindingId) return;
       const action = result.partialResult;
-      if (action?.kind === 'action_status' && ['submitted', 'pending', 'unknown', 'confirmed'].includes(action.actionState)) {
+      if (action?.kind === 'action_status') {
         const key = `${result.requestId}:${action.intentId}`;
-        if (action.actionState === 'confirmed') changing.delete(result.requestId); else changing.add(result.requestId);
+        const settled = ['confirmed', 'failed', 'refused'].includes(action.actionState);
+        if (settled) changing.delete(key); else if (!refreshed.has(key)) changing.add(key);
         if (!changedRequests.has(key)) { changedRequests.add(key); invalidate(); }
-        if (action.actionState === 'confirmed' && !refreshed.has(key)) {
-          refreshed.add(key); void refresh('post_action');
+        if (settled && !refreshed.has(key)) {
+          // Each trade's terminal observation withdraws any intervening read.
+          refreshed.add(key); invalidate(); void refresh('post_action');
         }
       }
-      if (['completed', 'failed', 'cancelled'].includes(result.state)) changing.delete(result.requestId);
+      if (['completed', 'failed', 'cancelled'].includes(result.state)) {
+        for (const key of changing) if (key.startsWith(`${result.requestId}:`)) changing.delete(key);
+      }
       // Completion also covers transfers and multiple trades between observations.
       if (result.state === 'completed' && !refreshed.has(result.requestId)) {
         refreshed.add(result.requestId); invalidate(); void refresh('post_action');

@@ -2,6 +2,8 @@ import type { ClientEvent } from 'openai/resources/live/live';
 
 /** One provider connection. Tests inject this boundary without opening a socket. */
 export interface BrokerLiveConnection {
+  onReflectionUnavailable?(listener: () => void): void;
+  onReflectedAudio?(listener: (event: unknown) => void): void;
   onOpen(listener: () => void): void;
   onEvent(listener: (event: unknown) => void): void;
   onError(listener: (error: unknown) => void): void;
@@ -51,6 +53,10 @@ export interface LiveBackendUpdate {
   /** Backend-owned update identity, retained with the durable work record. */
   id: string;
   kind: 'progress' | 'result';
+  /** A delivered partial is still an observation of pending work. */
+  pending?: boolean;
+  /** Only the last chunk may finish a delegated request. */
+  terminal?: boolean;
   text: string;
   /** Caller revision the backend reviewed. Required for a result. */
   expectedCallerRevision?: number;
@@ -59,6 +65,8 @@ export interface LiveBackendUpdate {
 }
 
 export interface LiveBackendChannel {
+  /** Release only this provisional delegation when no durable request was admitted. */
+  release?(): void;
   getContext(): LiveTranscriptSnapshot;
   subscribeContext(listener: (snapshot: LiveTranscriptSnapshot) => void): () => void;
   publish(update: LiveBackendUpdate): Promise<LiveDelivery>;
@@ -89,6 +97,8 @@ export interface BrokerLiveEvent {
 }
 
 export interface BrokerLiveSessionOptions {
+  pendingRequests?: Array<{ id: string; aliases?: string[] }>;
+  speechGate?: boolean;
   apiKey: string;
   callId: string;
   instructions: string;
@@ -100,7 +110,7 @@ export interface BrokerLiveSessionOptions {
   /** Restricted setup only; absent preserves the original client delegation protocol. */
   restrictedSetupTools?: import('./restrictedSetupTools.js').RestrictedSetupTools;
   /** Ordered audio deliveries use connection-local IDs, never provider event IDs. */
-  onAudio(base64: string, metadata: { deliveryId: string }): void;
+  onAudio(base64: string, metadata: { deliveryId: string; onPlayed?: (heard: boolean) => void }): void;
   onTranscript(snapshot: LiveTranscriptSnapshot): void | Promise<void>;
   onReady(metadata: { callId: string; sessionId: string }): void;
   onClosed(result: LiveSessionClosed): void;
@@ -114,6 +124,9 @@ export interface BrokerLiveSessionOptions {
 }
 
 export interface BrokerLiveSession {
+  hasPendingRequest?(id: string): boolean;
+  trackRequest?(id: string, aliases?: readonly string[]): void;
+  speakRequest?(update: LiveBackendUpdate, request: { id: string; aliases?: readonly string[]; terminal: boolean }): Promise<LiveDelivery>;
   appendAudio(base64: string): boolean;
   appendContext(text: string): Promise<LiveDelivery>;
   publishDelegation?(delegationId:string,update:LiveBackendUpdate):Promise<LiveDelivery>;

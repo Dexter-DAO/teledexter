@@ -73,7 +73,7 @@ test('successor registration/context crosses actual HTTP with negotiated full me
 
 async function host(t: test.TestContext, slowClose = false, questionMode = false, boundedCleanup = false,
   settings: { admitted?: boolean; failed?: boolean; failureCode?: string; cancelled?: boolean; sameEpoch?: boolean; resultText?: string; callerText?: string;
-    openingStatus?: 'accepted' | 'rejected' | 'unconfirmed'; greetingClip?: Buffer } = {}) {
+    openingStatus?: 'accepted' | 'rejected' | 'unconfirmed'; greetingClip?: Buffer; unconfirmedSpeech?: boolean } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-generation-server-'));
   const config: BrokerConfig = { host: '127.0.0.1', port: 3213, publicOrigin: 'https://phone.example.test', stateDir: directory,
     controlToken: 'c'.repeat(40), apiKey: 'fixture-key', model: 'gpt-live-1', voice: 'marin',
@@ -135,6 +135,7 @@ async function host(t: test.TestContext, slowClose = false, questionMode = false
   const voices: Array<{ options: BrokerLiveSessionOptions; voice: BrokerLiveSession; captions: LiveTranscriptSnapshot;
     channel: LiveBackendChannel; abort: AbortController; spoken: string[]; quiet: string[]; published:string[]; native:Array<{id:string;kind:string;speak:boolean}>; inputs: string[]; closed: string[] }> = [];
   const opening: string[] = [];
+  let speechAttempts = 0;
   let finishSlowClose: (() => void) | undefined;
   let finishQuestion: (() => void) | undefined;
   const broker = createBrokerServer({ config, store, primary, eligibleContext: eligible,
@@ -158,6 +159,9 @@ async function host(t: test.TestContext, slowClose = false, questionMode = false
         }}:{}),
         async appendInstructions(text) { opening.push(text); return { eventId: `open_${opening.length}`, status: settings.openingStatus ?? 'accepted' }; },
         async appendCommentary(text) { spoken.push(text);published.push(text);
+          if (settings.unconfirmedSpeech && text === eligibleText && ++speechAttempts === 1)
+            return { eventId: `comment_${sessionId}_${spoken.length}`, status: 'unconfirmed', reason: 'speech_not_confirmed',
+              observedCallerRevision: captions.callerRevision, observedTranscriptSequence: captions.revision };
           if (questionMode && spoken.join('') === eligibleText) await new Promise<void>(resolve => { finishQuestion = resolve; });
           return { eventId: `comment_${sessionId}_${spoken.length}`, status: 'accepted',
           observedCallerRevision: captions.callerRevision, observedTranscriptSequence: captions.revision }; },
@@ -1073,4 +1077,39 @@ test('a confirmed financial receipt survives a later model failure and voice rep
   const saved = f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord;
   assert.equal(saved.status, 'failed'); assert.deepEqual(saved.primaryResult?.partialResult, partialResult);
   assert.equal(saved.primaryResult?.assistant, undefined);
+});
+
+
+test('money result retries unconfirmed speech on the current generation without re-executing', async t => {
+  const f = await host(t, false, false, true, { sameEpoch: true, callerText: 'Sell $1 of SpaceX.',
+    resultText: 'Nothing was sold.', unconfirmedSpeech: true });
+  const work = observedWork(f.delegate());
+  await boundary('money request submitted', () => f.posts.length === 1, [work]);
+  f.release();
+  await boundary('terminal speech retried', () => work.settled() &&
+    (f.store.get(f.callId)!.delegations[f.posts[0].requestId] as BrokerDelegationRecord).delivery === 'accepted', [work]);
+  assert.equal(f.voices.flatMap(voice => voice.spoken).filter(text => text === 'Nothing was sold.').length, 2);
+  assert.equal(f.posts.length, 1);
+  const publications = f.store.get(f.callId)!.publications!.records.filter(record => record.ordinaryDelivery?.response.delivery.state === 'ready');
+  assert.deepEqual(publications.map(record => record.outcome?.status), ['unconfirmed', 'accepted']);
+});
+
+
+test('reflection loss replaces the voice without ending the Twilio leg or resubmitting pending work', async t => {
+  const f = await host(t);
+  const work = observedWork(f.delegate());
+  await boundary('request accepted', () => f.posts.length === 1, [work]);
+  const original = structuredClone(f.posts[0]);
+  const first = f.voices[0];
+  first.options.onEvent?.({ type: 'live.error', code: 'reflection_unavailable' });
+  first.options.onClosed({ callId: f.callId, sessionId: 'generation_1', reason: 'reflection_unavailable',
+    finalized: false, transcriptPersisted: true, outputAudioDiscarded: true });
+  await boundary('replacement active', () => f.voices.length === 2
+    && f.store.get(f.callId)?.liveGenerations?.phase === 'active', [work]);
+  assert.equal(f.providerEnds(), 0); assert.equal(f.ws.readyState, WebSocket.OPEN);
+  assert.ok(f.voices[1].options.pendingRequests?.some(request => request.id === original.requestId));
+  f.release();
+  await boundary('saved result delivered', () => f.voices.some(voice => voice.spoken.join('') === f.eligibleText) && work.settled(), [work]);
+  assert.deepEqual(f.posts, [original]); assert.equal(f.providerEnds(), 0);
+  assert.equal(f.opening.length, 1);
 });

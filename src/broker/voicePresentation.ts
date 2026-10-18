@@ -137,7 +137,7 @@ export function failedRequestSpeech(entry: BrokerDelegationRecord): string {
 export function partialResultUpdate(entry: BrokerDelegationRecord): LiveBackendUpdate | undefined {
   const partial = entry.primaryResult?.partialResult;
   if (!partial || !['running', 'queued'].includes(entry.status)) return;
-  return { id: `${entry.requestId}_partial_${partial.toolInvocationId}`, kind: 'result', speak: true, text: partial.text };
+  return { id: `${entry.requestId}_partial_${partial.toolInvocationId}`, kind: 'result', pending: true, speak: true, text: partial.text };
 }
 
 export function isPartialResultUpdate(entry: BrokerDelegationRecord, update?: LiveBackendUpdate): boolean {

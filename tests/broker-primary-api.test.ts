@@ -624,3 +624,20 @@ test('canonical action observations require an exact intent and state without cl
     }
   }
 });
+
+test('call truth: optional context crosses submit and recovery without changing caller words or old digests', async () => {
+  const voiceContext = { recentSpeech: [{ role: 'caller' as const, text: 'Do you know a good toilet?' },
+    { role: 'dexter' as const, text: 'I can look for one with a heated seat.' }] };
+  const input = { ...submission, text: ' Okay, then look for it', voiceContext };
+  const h = harness([json({ ...completed, replayed: false }, 202), json({
+    bindingId, requestId, outcome: 'admitted', canonicalRequestId: requestId, result: completed,
+  })]);
+  await h.client.submit(bindingId, requestId, input);
+  await h.client.reconcile(bindingId, requestId, input);
+  for (const request of h.requests) {
+    const body = JSON.parse(String(request.init.body));
+    assert.deepEqual(body.voiceContext, voiceContext);
+    assert.equal(body.text, input.text);
+  }
+  assert.equal(rawSubmissionDigest(bindingId, input), rawSubmissionDigest(bindingId, { ...submission, text: input.text }));
+});

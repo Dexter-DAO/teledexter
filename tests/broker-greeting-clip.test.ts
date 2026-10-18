@@ -102,3 +102,23 @@ test('after the clip, every outbound opening continues without greeting or namin
   // Without the clip, Live still speaks the full greeting.
   assert.match(brokerOpening('outbound', true), /Immediately say "Hey, it's Dexter\."/);
 });
+
+test('review: loaded greetings begin with exactly 300 ms of PCMU silence followed by the original clip', () => {
+  for (const asset of [GREETING_CLIP_ASSET, INBOUND_GREETING_CLIP_ASSET]) {
+    const original = fs.readFileSync(asset), loaded = loadGreetingClip(asset)!;
+    assert.equal(loaded.length, original.length + 2400);
+    assert.deepEqual(loaded.subarray(0, 2400), Buffer.alloc(2400, 255));
+    assert.deepEqual(loaded.subarray(2400), original);
+  }
+});
+
+test('review: cancelling a greeting releases its pacing timer without late frames', t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
+  const cleared = t.mock.method(globalThis, 'clearTimeout');
+  let frames = 0, completed = 0;
+  const playback = playGreetingClip(Buffer.alloc(8000, 255), { send() { frames++; return true; }, onSent() { completed++; } });
+  playback.cancel();
+  assert.ok(cleared.mock.calls.some(call => call.arguments[0] !== undefined), 'cancel must release the pacing timer');
+  const before = frames; t.mock.timers.tick(2000);
+  assert.equal(frames, before); assert.equal(completed, 0);
+});
