@@ -18,7 +18,7 @@ import { orderedAssociatedResultReference } from './associatedResult.js';
 import { callerIntentDecisionSchema, type CallerIntentDecision } from './callerIntentContract.js';
 import { resultSmsAcknowledgement, resultSmsResearchRefusal } from './resultSmsAcknowledgement.js';
 import { phoneResultSmsAdmissionReceiptSchema, type PhoneResultSmsAdmissionReceipt } from './resultSmsContract.js';
-import { failedRequestSpeech, partialResultUpdate } from './voicePresentation.js';
+import { cancelledRequestSpeech, failedRequestSpeech, partialResultUpdate } from './voicePresentation.js';
 
 export interface CallerSourceAnchor {
   frozen: FrozenCallerTurn;
@@ -66,8 +66,17 @@ export interface PrimaryBackendOptions {
       delivery: LiveDelivery; sessionId?: string; snapshot?: LiveTranscriptSnapshot;
       inputThroughMs?: number; publicationReceipts?: BrokerPublicationReceipt[];
     }>;
+    /** Speaks a plain notice on the current voice without the journal, for when the journal
+     * itself cannot be written. */
+    notice?(text: string): Promise<LiveDelivery>;
   };
 }
+
+/** Re-sends of a terminal result whose delivery was rejected, unconfirmed or closed before the caller
+ * is told plainly to check the app. */
+export const MAX_RESULT_REDELIVERIES = 3;
+export const RESULT_UNDELIVERABLE_NOTICE = "I couldn't pass on the result of that request. Please check the Dexter app for it.";
+export const TRACKING_FAILED_NOTICE = "I can't track that request right now. Please check the Dexter app for its result.";
 
 export interface PrimaryBackend extends BrokerLiveBackend {
   deliverFrozenResult(request: LiveDelegationRequest, route: CallerRouteRef, channel: LiveBackendChannel): Promise<void>;
@@ -439,6 +448,12 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
   const stabilityMs = positive(options.stabilityMs, 700, 10_000);
   const maxWaitMs = positive(options.maxWaitMs, 30_000, 60_000);
   const pollIntervalMs = positive(options.pollIntervalMs, 750, 10_000);
+  // Re-sends per request of a result whose delivery failed, and requests whose caller was already told.
+  const redeliveries = new Map<string, number>();
+  const undeliverableNoticed = new Set<string>();
+  // A result the API will not present in this voice (its source is outside the eligible projection)
+  // is never re-sent: that is a refusal, not a failed delivery.
+  const notRedeliverable = new Set<string>();
   const maxPollMs = positive(options.maxPollMs, 90_000, 300_000);
   if (maxWaitMs < stabilityMs || !options.callId || !options.callSid || !uuidPattern.test(options.bindingId))
     throw new Error('invalid_backend_configuration');
@@ -1543,6 +1558,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
         return;
       }
       const receipt = await options.observation.publish(load(entry));
+      if (receipt.delivery.reason === 'source_not_in_projection') notRedeliverable.add(entry.requestId);
       let current = load(entry);
       if (options.observation.signal.aborted || boundCall(entry.sessionId).endedAt) return;
       current = save({ ...current, delivery: receipt.delivery.reason === 'result_format_unsupported'
@@ -1590,7 +1606,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     else if (entry.status === 'admission_refused') text = taskAdmissionRefusalText(entry);
     else if (entry.status === 'admission_expired') text = 'The request took too long to confirm. Please tell me what you want me to do now.';
     else if (entry.status === 'failed') text = failedRequestSpeech(entry);
-    else if (entry.status === 'cancelled') text = 'The request was cancelled.';
+    else if (entry.status === 'cancelled') text = cancelledRequestSpeech(entry);
     else if (['dispatching', 'dispatch_unknown', 'prepared'].includes(entry.status))
       text = 'I could not confirm the outcome. Please check the request status before trying again.';
     else text = 'Your request is still pending. I can check its status again.';
@@ -1722,18 +1738,36 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
         if (terminal(entry.status)
             && !saved.some(value => value.deferredTurns?.some(turn => turn.status === 'queued'))) return;
       }
+      // A plain notice on the current voice that needs no journal write.
+      const notice = (text: string, id: string) => options.observation?.notice ? options.observation.notice(text)
+        : channel.publish({ id, kind: 'progress', speak: true, text, expectedCallerRevision: channel.getContext().callerRevision });
       const run = async () => {
         let lastDeferredResult: string | undefined;
+        // A terminal result whose delivery was deferred (stale) waits for its turn; one whose delivery
+        // was rejected, unconfirmed or closed is re-sent a few times, then the caller hears a plain
+        // notice instead of a list that says "in progress" forever.
         const deferredResult = (exceptRequestId?: string) => {
           if (!options.observation || !options.watchUntilCallEnds || observationSignal.aborted
               || boundCall(request.sessionId).endedAt) return;
-          const pending = entries(request.sessionId, true).filter(value => value.requestId !== exceptRequestId
-            && ['completed', 'failed', 'cancelled'].includes(value.status)
-            && value.primaryResult?.state === value.status && value.delivery === 'stale');
+          const terminalResults = entries(request.sessionId, true).filter(value => value.requestId !== exceptRequestId
+            && ['completed', 'failed', 'cancelled'].includes(value.status) && value.primaryResult?.state === value.status);
+          const failed = (value: BrokerDelegationRecord) => ['rejected', 'unconfirmed', 'closed'].includes(value.delivery ?? '')
+            && !notRedeliverable.has(value.requestId);
+          for (const value of terminalResults) if (failed(value) && (redeliveries.get(value.requestId) ?? 0) >= MAX_RESULT_REDELIVERIES
+            && !undeliverableNoticed.has(value.requestId)) {
+            undeliverableNoticed.add(value.requestId);
+            console.info(JSON.stringify({ event: 'broker_result_undeliverable', callId: options.callId, requestId: value.requestId }));
+            void notice(RESULT_UNDELIVERABLE_NOTICE, `${value.requestId}_undeliverable`).catch(() => {});
+          }
+          const pending = terminalResults.filter(value => value.delivery === 'stale'
+            || (failed(value) && (redeliveries.get(value.requestId) ?? 0) < MAX_RESULT_REDELIVERIES));
           if (!pending.length) return;
           const last = pending.findIndex(value => value.requestId === lastDeferredResult);
           const next = pending[(last + 1) % pending.length];
-          if (next) lastDeferredResult = next.requestId;
+          if (next) {
+            lastDeferredResult = next.requestId;
+            if (failed(next)) redeliveries.set(next.requestId, (redeliveries.get(next.requestId) ?? 0) + 1);
+          }
           return next;
         };
         while (!observationSignal.aborted) {
@@ -1796,7 +1830,14 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
           entry = deferred;
         }
       };
-      const work = run();
+      // A journal that can no longer be written stops this worker; the caller hears it plainly
+      // rather than waiting on a request the broker can no longer follow.
+      const work = run().catch(async error => {
+        if (observationSignal.aborted) return;
+        try { console.error(JSON.stringify({ event: 'broker_request_tracking_failed', callId: options.callId,
+          requestId: entry?.requestId ?? null, message: (error as Error)?.message ?? String(error) })); } catch { /* Telemetry only. */ }
+        try { await notice(TRACKING_FAILED_NOTICE, `${request.requestId}_tracking_failed`); } catch { /* The call continues. */ }
+      });
       workers!.set(workerKey, work);
       try { await work; }
       finally { if (workers!.get(workerKey) === work) workers!.delete(workerKey); }

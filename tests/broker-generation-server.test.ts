@@ -83,6 +83,7 @@ async function host(t: test.TestContext, slowClose = false, questionMode = false
   const reserved = store.reserve({ requestId: randomUUID(), number: proof.params.To, direction: 'outbound', purpose: 'Discuss my portfolio', callSid: sid }).call;
   store.recordPrimaryBinding(reserved.id, context());
   let generation = 1, released = false, providerEnds = 0, cursor = 280, fetches=0, assertions=0;
+  const providerUpdates: Array<Record<string, unknown>> = [];
   const currentContext = () => { const value = context(generation);
     if(settings.admitted) value.context.history.version.contextEpoch='1';
     if(settings.admitted) value.context.history.admission={invalidationDigest:"a".repeat(64),messages:[],memories:[]};
@@ -140,7 +141,7 @@ async function host(t: test.TestContext, slowClose = false, questionMode = false
   let finishQuestion: (() => void) | undefined;
   const broker = createBrokerServer({ config, store, primary, eligibleContext: eligible,
     ...(settings.greetingClip ? { greetingClip: settings.greetingClip } : {}),
-    provider: { calls: () => ({ async update() { providerEnds++; return { status: 'completed' }; } }) } as unknown as ReturnType<typeof Twilio>,
+    provider: { calls: () => ({ async update(input: Record<string, unknown>) { providerEnds++; providerUpdates.push(input); return { status: 'completed' }; } }) } as unknown as ReturnType<typeof Twilio>,
     voiceFactory(options) {
       const sessionId = `generation_${voices.length + 1}`;
       const abort = new AbortController();
@@ -211,7 +212,7 @@ async function host(t: test.TestContext, slowClose = false, questionMode = false
   };
   return { broker, store, primary, callId: reserved.id, ws, streamSid, voices, posts, opening, eligible, eligibleText, delegate,
     advanceWork: () => { cursor++; },
-    release: (callback?: () => void) => { beforeResult = callback; released = true; }, providerEnds: () => providerEnds,
+    release: (callback?: () => void) => { beforeResult = callback; released = true; }, providerEnds: () => providerEnds, providerUpdates,
     fetches:()=>fetches,assertions:()=>assertions,finishSlow: () => finishSlowClose?.(), finishQuestion: () => finishQuestion?.(), questionId, audio };
 }
 
@@ -236,6 +237,21 @@ test('actual server preserves accepted work through replacement and speaks only 
   assert.equal(call.liveGenerations!.segments[0]!.transcript.fragments[0]!.text, original.input.text);
   assert.equal(call.liveGenerations!.clocks.mediaStartedAt, call.mediaStartedAt);
   assert.equal(call.publications!.records.at(-1)!.sourceSessionId, 'generation_1');
+});
+
+test('a Dexter API failure that ends the call says so plainly and never blames the voice', async t => {
+  const f = await host(t);
+  const first = observedWork(f.delegate());
+  await boundary('original accepted request', () => f.posts.length === 1, [first]);
+  f.eligible.fetch = async () => { throw new PrimaryApiError('http_error', 401, { code: 'binding_revoked', retryable: false }); };
+  f.eligible.delivery = async () => { throw new PrimaryApiError('http_error', 401, { code: 'binding_revoked', retryable: false }); };
+  f.eligible.assert = async () => { throw new PrimaryApiError('http_error', 401, { code: 'binding_revoked', retryable: false }); };
+  f.release();
+  await boundary('the call is ended with a spoken reason', () => f.providerUpdates.some(update => typeof update.twiml === 'string'), [first]);
+  const spoken = f.providerUpdates.map(update => String(update.twiml ?? '')).join(' ');
+  assert.match(spoken, /I lost the connection to your Dexter account/);
+  assert.doesNotMatch(spoken, /voice connection/);
+  assert.equal(f.store.get(f.callId)!.endReason, 'account_unavailable');
 });
 
 test('a temporary context failure during a completed request preserves the call, result and next caller request', async t => {

@@ -2,7 +2,7 @@ import type { BrokerCall } from './store.js';
 import type { BrokerDelegationRecord } from './backend.js';
 import type { BrokerLiveSession, LiveDelivery } from '../live/types.js';
 import { LIVE_APPEND_MAX_BYTES } from '../live/session.js';
-import { failedRequestSpeech, requestFailureSpeech } from './voicePresentation.js';
+import { cancelledRequestSpeech, failedRequestSpeech, requestFailureSpeech } from './voicePresentation.js';
 
 /** One caller request on this call, as the voice may describe it. */
 export interface VoiceTask {
@@ -69,7 +69,7 @@ export function callTasks(call: BrokerCall, view: { truth?: boolean; arriving?: 
       case 'failed':
         tasks.push({ ...base, status: 'failed', outcome: lead(failedRequestSpeech(entry), 260) }); break;
       case 'cancelled':
-        tasks.push({ ...base, status: 'cancelled', outcome: 'The request was cancelled.' }); break;
+        tasks.push({ ...base, status: 'cancelled', outcome: lead(cancelledRequestSpeech(entry), 260) }); break;
       case 'not_admitted': case 'admission_refused': case 'admission_expired':
         tasks.push({ ...base, status: 'not_started', outcome: 'This request was not started.' }); break;
       case 'waiting_for_reply': {

@@ -6,7 +6,7 @@ import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { BrokerStore } from '../src/broker/store.js';
 import { brokerIdentity, createPrimaryBackend, type BrokerDelegationRecord, type PrimaryBackend,
-  type PrimaryBackendOptions } from '../src/broker/backend.js';
+  type PrimaryBackendOptions, MAX_RESULT_REDELIVERIES, RESULT_UNDELIVERABLE_NOTICE, TRACKING_FAILED_NOTICE } from '../src/broker/backend.js';
 import type { LiveGenerationJournal } from '../src/broker/liveGeneration.js';
 import { PrimaryApiError, type PrimaryQuestion, type PrimaryQuestionResult, type PrimaryReplyInput,
   type PrimaryResult, type PrimarySubmission, type PrimaryTurn } from '../src/broker/primaryApi.js';
@@ -182,8 +182,8 @@ async function fixture(t: TestContext, diagnostic?: Diagnostic) {
     },
   };
   const trackedRequests: BrokerDelegationRecord[] = [];
-  const backend = (sourceSessionId: string, maxPollMs = 30): PrimaryBackend => createPrimaryBackend({
-    callId: call.id, callSid, bindingId, api, store, sourceSessionId, observation,
+  const backend = (sourceSessionId: string, maxPollMs = 30, watchUntilCallEnds = false): PrimaryBackend => createPrimaryBackend({
+    callId: call.id, callSid, bindingId, api, store, sourceSessionId, observation, ...(watchUntilCallEnds ? { watchUntilCallEnds } : {}),
     onRequest: entry => { trackedRequests.push(structuredClone(entry)); },
     admissionSettled: request => { admissions.push({ request: structuredClone(request),
       entries: structuredClone(Object.values(store.get(call.id)!.delegations)) as BrokerDelegationRecord[] }); },
@@ -280,6 +280,53 @@ async function currentQuestionFixture(t: TestContext) {
   assert.equal(f.saved()[0].questions![questionId].presentation!.sessionId, newSession);
   return { ...f, question, current };
 }
+
+test('probe G: a terminal result whose delivery was rejected is re-sent until it is accepted', async t => {
+  const f = await fixture(t);
+  f.behavior.publicationStatus = 'rejected';
+  const instance = f.backend(oldSession, 30, true);
+  f.speak(instance, oldSession, ' Read my portfolio.');
+  void f.delegate(instance, oldSession, 'resend');
+  await until(() => f.saved()[0]?.delivery === 'rejected');
+  f.behavior.publicationStatus = 'accepted';
+  await until(() => f.saved()[0]?.delivery === 'accepted');
+  const results = f.publications.filter(value => !value.update && value.entry.status === 'completed');
+  assert.ok(results.length >= 2, 'the rejected result went out again');
+  assert.deepEqual(f.contexts.get(oldSession)!.directPublications.map(update => update.text).filter(text => text === RESULT_UNDELIVERABLE_NOTICE), []);
+  assert.equal(f.posts.length, 1, 're-sending a result never re-submits the request');
+});
+
+test('probe G: a result that cannot be delivered ends in a plain notice, not "in progress" forever', async t => {
+  const f = await fixture(t);
+  f.behavior.publicationStatus = 'rejected';
+  const instance = f.backend(oldSession, 30, true);
+  f.speak(instance, oldSession, ' Read my portfolio.');
+  void f.delegate(instance, oldSession, 'undeliverable');
+  await until(() => f.contexts.get(oldSession)!.directPublications.some(update => update.text === RESULT_UNDELIVERABLE_NOTICE));
+  const results = f.publications.filter(value => !value.update && value.entry.status === 'completed');
+  assert.equal(results.length, 1 + MAX_RESULT_REDELIVERIES, 'the first delivery and three re-sends');
+  assert.equal(f.contexts.get(oldSession)!.directPublications.filter(update => update.text === RESULT_UNDELIVERABLE_NOTICE).length, 1);
+  assert.equal(f.posts.length, 1);
+});
+
+test('a journal that cannot be written stops tracking with a plain notice to the caller', async t => {
+  const f = await fixture(t);
+  const held = deferred<PrimaryResult>();
+  f.behavior.result = async () => held.promise;
+  const instance = f.backend(oldSession, 30, true);
+  f.speak(instance, oldSession, ' Read my portfolio.');
+  const work = f.delegate(instance, oldSession, 'journal_failure');
+  await until(() => f.reads.length === 1);
+  const store = f.store();
+  const update = store.update.bind(store);
+  const requestId = f.saved()[0]!.requestId;
+  store.update = () => { throw new Error('Broker journal write outcome is uncertain'); };
+  try {
+    held.resolve(f.completed(requestId));
+    await work;
+  } finally { store.update = update; }
+  assert.deepEqual(f.contexts.get(oldSession)!.directPublications.map(value => value.text), [TRACKING_FAILED_NOTICE]);
+});
 
 test('accepted task observation survives old voice abort and delivers through the current generation', async t => {
   const f = await fixture(t); const old = f.backend(oldSession);

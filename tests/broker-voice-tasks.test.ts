@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { callTasks, createVoiceTasks, taskLine, taskListLines, type VoiceTask } from '../src/broker/voiceTasks.js';
 import { LIVE_APPEND_MAX_BYTES } from '../src/live/session.js';
+import { cancelledRequestSpeech } from '../src/broker/voicePresentation.js';
 import type { BrokerCall } from '../src/broker/store.js';
 import type { BrokerLiveSession, LiveDelivery } from '../src/live/types.js';
 
@@ -38,6 +39,18 @@ test('the task list projects each saved request to one status the voice can stat
   assert.equal(tasks[1]!.outcome, 'The AI service is busy and could not answer this request.');
   assert.equal(tasks[4]!.progress, 'Not yet confirmed that the request was received.');
   assert.equal(tasks[6]!.request, 'Then buy it back.');
+});
+
+test('a cancelled request keeps a step that already settled, outcome first', () => {
+  const tasks = callTasks(call(
+    entry('a', 'cancelled', { primaryResult: { state: 'cancelled', partialResult: { kind: 'action_status', actionState: 'confirmed',
+      text: 'The sale of about $4.00 of Apple is confirmed.' } } }),
+    entry('b', 'cancelled'),
+  ));
+  assert.deepEqual(tasks.map(task => task.outcome), ['The sale of about $4.00 of Apple is confirmed. The rest of the request was cancelled.',
+    'The request was cancelled.']);
+  assert.equal(cancelledRequestSpeech(entry('c', 'cancelled', { primaryResult: { state: 'cancelled', partialResult: { kind: 'prepared_action',
+    text: 'The sale was being placed.' } } }) as never), 'The request was cancelled. The last observed step before that: The sale was being placed.');
 });
 
 test('a completed result enters the voice list only once delivered; the truth view has it at once', () => {

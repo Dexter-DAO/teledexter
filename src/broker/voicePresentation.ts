@@ -107,6 +107,16 @@ export function failedRequestSpeech(entry: BrokerDelegationRecord): string {
     ? `${partial.text} ${failure}` : `${failure} The last observed step before that: ${partial.text}`;
 }
 
+/** A cancelled request, outcome first: a step that already settled (a confirmed sale) is said before
+ * the cancellation, because progress reached the voice only as quiet context. */
+export function cancelledRequestSpeech(entry: BrokerDelegationRecord): string {
+  const cancelled = 'The request was cancelled.';
+  const partial = entry.primaryResult?.partialResult;
+  if (!partial) return cancelled;
+  return partial.kind === 'action_status' && ['confirmed', 'failed', 'refused'].includes(partial.actionState)
+    ? `${partial.text} The rest of the request was cancelled.` : `${cancelled} The last observed step before that: ${partial.text}`;
+}
+
 /** A partial is progress: quiet context for the voice, tied to its task, never a result. */
 export function partialResultUpdate(entry: BrokerDelegationRecord): LiveBackendUpdate | undefined {
   const partial = entry.primaryResult?.partialResult;

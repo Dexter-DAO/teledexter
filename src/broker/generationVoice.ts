@@ -1,6 +1,6 @@
 import { terminal as terminalRequest, createPrimaryBackend, liveResultChunks, withCallerAdmission, type BrokerDelegationRecord, type PrimaryBackend } from './backend.js';
 import { createLiveGenerationController, LiveGenerationError, LiveGenerationStartupError, LIVE_GENERATION_STARTUP_MS, type GenerationHandle, type GenerationPublication, type LiveGenerationAttachment } from './liveGeneration.js';
-import { callerPresentationFrontier, failedRequestSpeech, hasLaterCallerSpeech, hasNewerCallerWork, requestPresentationContext } from './voicePresentation.js';
+import { callerPresentationFrontier, cancelledRequestSpeech, failedRequestSpeech, hasLaterCallerSpeech, hasNewerCallerWork, requestPresentationContext } from './voicePresentation.js';
 import { createVoiceTasks } from './voiceTasks.js';
 import { createVoiceGuardrail, type GuardrailJudge } from './voiceGuardrail.js';
 import { recordGuardrailTrigger, recordVoiceClose } from './voiceEvidence.js';
@@ -243,8 +243,9 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
       && value.updateId.startsWith(`${prefix}_attempt_`)) ?? [];
     const lastAttempt = previous.at(-1)?.updateId.match(/_attempt_(\d+)_\d+$/)?.[1];
     let attempt = lastAttempt === undefined ? 1 : Number(lastAttempt);
+    // A rejected or unconfirmed attempt is re-sent as a new attempt; an accepted one is never repeated.
     if (previous.some(value => value.updateId.startsWith(`${prefix}_attempt_${attempt}_`)
-      && value.outcome && (value.outcome.status === 'rejected'
+      && value.outcome && (value.outcome.status === 'rejected' || value.outcome.status === 'unconfirmed'
         || call().publications?.rejections.some(rejection => rejection.sessionId === value.sessionId
           && rejection.eventId === value.outcome!.eventId)))) attempt++;
 
@@ -341,7 +342,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
         ? outcome.response.delivery.reason : 'publication_unconfirmed' };
     } else {
       const outcomeText = update?.text ?? (entry.status === 'failed' ? failedRequestSpeech(entry)
-        : entry.status === 'cancelled' ? 'The request was cancelled.' : 'I am checking the saved request status.');
+        : entry.status === 'cancelled' ? cancelledRequestSpeech(entry) : 'I am checking the saved request status.');
       // Label at publication time: caller speech during the context read still marks it earlier.
       const text = () => !update && ['failed', 'cancelled'].includes(entry.status) && entry.primaryResult?.state === entry.status
         && hasLaterCallerSpeech(call(), entry) ? `For your earlier request: ${outcomeText}` : outcomeText;
@@ -538,7 +539,12 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
                   return callerIntentResultPublicationCandidates(call(), route.frozen.sessionId)
                     .find(candidate => candidate.id === ref.id && candidate.digest === ref.digest)?.reference;
                 },
-                observation: { signal: observer.signal, publish } });
+                observation: { signal: observer.signal, publish, notice: async text => {
+                  // No journal: this is how the caller hears that the journal itself failed.
+                  const attachment = controller.snapshot().deliveryAttachment;
+                  const voice = attachment ? sessions.get(attachment.sessionId)?.voice : undefined;
+                  return voice?.appendCommentary ? voice.appendCommentary(text) : { eventId: '', status: 'closed' as const };
+                } } });
               const record = { voice, backend, firstSample: undefined as number | undefined,
                 eligibleMessages: prepared.source.context.messages };
               sessions.set(sessionId, record);

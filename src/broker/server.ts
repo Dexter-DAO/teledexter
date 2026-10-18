@@ -84,7 +84,13 @@ export function inboundAdmissionPollDelay(poll: number): number {
 const SPOKEN_STOPS: Record<string, string> = {
   voice_unavailable: 'My voice connection stopped working. Please try me again shortly.',
   primary_unavailable: 'I could not reach your Dexter account just now. Please try again shortly.',
+  // A Dexter API failure mid-call is never blamed on the voice. Accepted work keeps running.
+  account_unavailable: 'I lost the connection to your Dexter account, so I have to end this call. Anything you already asked for keeps running, and its result will be in the Dexter app.',
+  media_socket_stalled: 'I lost the audio on this call. Please call me back.',
 };
+/** Generation problems caused by the Dexter API (eligible context reads and admission), not by the voice. */
+const ACCOUNT_PROBLEMS = new Set(['context_assert_unavailable', 'eligible_delivery_unavailable', 'source_admission_unconfirmed',
+  'context_unavailable', 'call_not_open']);
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const CALL_SID = /^CA[0-9a-f]{32}$/i;
@@ -1359,7 +1365,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
           try { store.update(call.id, { failure: safeFailure(Object.assign(new Error(code), { code })) }); }
           catch (error) { console.error(JSON.stringify({ event: 'broker_failure_record_unavailable', callId: call.id, code,
             message: (error as Error).message })); }
-          void stop('voice_unavailable');
+          void stop(ACCOUNT_PROBLEMS.has(code) ? 'account_unavailable' : 'voice_unavailable');
         }); },
       }) : voiceFactory(voiceOptions);
       if (call.continuation && options.eligibleContext) selectedHosts.set(call.id, live as GenerationVoiceSession);
