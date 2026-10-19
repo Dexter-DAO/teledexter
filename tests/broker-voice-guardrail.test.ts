@@ -217,19 +217,17 @@ function clocked(verdict: () => JudgeVerdict | undefined, tasks: () => VoiceTask
   return { guardrail, corrections, triggers, advance: (ms: number) => { clock += ms; } };
 }
 
-test('restatements of the same list in any task order are sent once (two requests, six outcome claims, 30 s)', async () => {
+test('no-verdict restatements of the same list, in any task order, are sent once (two requests, six outcome claims, 30 s)', async () => {
   const sale: VoiceTask = { ...pending, request: 'Sell two dollars of Amazon', status: 'finished', outcome: 'You sold about $2.00 of Amazon stock.', progress: undefined };
   const cancel: VoiceTask = { ...pending, requestId: 'r2', delegationId: 'item_2', request: 'Cancel the Amazon sale', status: 'pending', progress: undefined };
-  const h = clocked(() => ({ contradicts: 0.99, kind: 'false_success', kindProbability: 0.8, supported: 0.9 }), () => [sale, cancel]);
+  const h = clocked(() => undefined, () => [sale, cancel]);
   const t = transcript();
   const claims = ['The Amazon sale went through.', 'Your cancel went through.', 'The sale is done.', 'The cancel is done.',
     'Amazon sold, all set.', 'Cancel went through too.'];
-  for (const [index, claim] of claims.entries()) {
-    h.guardrail.observe(t.say('assistant', claim, index * 5000), 'live_1');
-    await wait(20); h.advance(5000);
-  }
-  assert.equal(h.corrections.length, 1, 'alternating which task leads does not defeat the duplicate check');
-  assert.deepEqual(h.triggers.map(value => value.correction), ['accepted', ...Array(5).fill('suppressed_duplicate')]);
+  for (const [index, claim] of claims.entries()) { h.guardrail.observe(t.say('assistant', claim, index * 5000), 'live_1'); h.advance(5000); }
+  await wait(1500);
+  assert.equal(h.corrections.length, 1, 'alternating which task leads, or judging at the same moment, does not defeat the duplicate check');
+  assert.deepEqual(h.triggers.map(value => value.correction).sort(), ['accepted', ...Array(5).fill('suppressed_duplicate')]);
   h.guardrail.stop();
 });
 
@@ -247,16 +245,59 @@ test('a silent judge with two open requests restates once, not on every outcome 
   h.guardrail.stop();
 });
 
-test('a changed list is restated again only after the rate limit', async () => {
+test('a changed list is restated again without a verdict only after the rate limit', async () => {
   let progress = 'step 1';
-  const h = clocked(() => ({ contradicts: 0.99, kind: 'false_success', kindProbability: 0.8, supported: 0.9 }), () => [{ ...pending, progress }]);
+  const h = clocked(() => undefined, () => [{ ...pending, progress }]);
   const t = transcript();
-  h.guardrail.observe(t.say('assistant', 'It went through.', 0), 'live_1'); await wait(20);
+  h.guardrail.observe(t.say('assistant', 'It went through.', 0), 'live_1'); await wait(1400);
   progress = 'step 2'; h.advance(10_000);
-  h.guardrail.observe(t.say('assistant', 'It sold.', 10_000), 'live_1'); await wait(20);
+  h.guardrail.observe(t.say('assistant', 'It sold.', 10_000), 'live_1'); await wait(1400);
   h.advance(15_000);
-  h.guardrail.observe(t.say('assistant', 'It is done.', 25_000), 'live_1'); await wait(20);
+  h.guardrail.observe(t.say('assistant', 'It is done.', 25_000), 'live_1'); await wait(1400);
   assert.deepEqual(h.triggers.map(value => value.correction), ['accepted', 'suppressed_rate', 'accepted']);
+  h.guardrail.stop();
+});
+
+// Review of PR #11 (0ac71a2): a detected contradiction must never be held back by the no-verdict limits.
+const ambiguousStopped: JudgeVerdict = { contradicts: 1, kind: 'false_success', kindProbability: 0.94, supported: 0.61 }; // cached real verdict
+test('an ambiguous false claim 10 s after a no-verdict restatement is corrected, not rate-limited', async () => {
+  const sale: VoiceTask = { ...pending, request: 'Sell two dollars of Amazon', status: 'finished', outcome: 'You sold about $2.00 of Amazon stock.', progress: undefined };
+  let list: VoiceTask[] = [sale, { ...pending, requestId: 'r2', delegationId: 'item_2', request: 'Cancel that', status: 'pending', progress: undefined }];
+  let verdict: JudgeVerdict | undefined;
+  const h = clocked(() => verdict, () => list);
+  const t = transcript();
+  h.guardrail.observe(t.say('assistant', 'The Amazon sale went through.', 0), 'live_1'); await wait(1400);
+  // The cancel's result lands, then the voice makes a real false claim the judge finds ambiguous.
+  list = [sale, { ...pending, requestId: 'r2', delegationId: 'item_2', request: 'Cancel that', status: 'finished',
+    outcome: 'Nothing was left to cancel; the sale had gone through.', progress: undefined }];
+  h.advance(10_000); verdict = ambiguousStopped;
+  h.guardrail.observe(t.say('assistant', 'That sell was stopped, nothing went through.', 10_000), 'live_1'); await wait(50);
+  assert.deepEqual(h.triggers.map(value => [value.kind, value.correction]), [['unverified', 'accepted'], ['ambiguous', 'accepted']]);
+  h.guardrail.stop();
+});
+
+test('an ambiguous false claim is corrected again later, never suppressed as a duplicate', async () => {
+  const sale: VoiceTask = { ...pending, request: 'Sell two dollars of Amazon', status: 'finished', outcome: 'You sold about $2.00 of Amazon stock.', progress: undefined };
+  const cancel: VoiceTask = { ...pending, requestId: 'r2', delegationId: 'item_2', request: 'Cancel that', status: 'pending', progress: undefined };
+  const h = clocked(() => ambiguousStopped, () => [sale, cancel]);
+  const t = transcript();
+  h.guardrail.observe(t.say('assistant', 'So no sell.', 0), 'live_1'); await wait(20);
+  h.advance(90_000);
+  h.guardrail.observe(t.say('assistant', 'That sell was stopped, nothing went through.', 90_000), 'live_1'); await wait(20);
+  assert.deepEqual(h.triggers.map(value => [value.kind, value.correction]), [['ambiguous', 'accepted'], ['ambiguous', 'accepted']]);
+  h.guardrail.stop();
+});
+
+test('a clear contradiction is never rate-limited by an earlier no-verdict restatement', async () => {
+  const sale: VoiceTask = { ...pending, request: 'Sell two dollars of Amazon', status: 'finished', outcome: 'You sold about $2.00 of Amazon stock.', progress: undefined };
+  const cancel: VoiceTask = { ...pending, requestId: 'r2', delegationId: 'item_2', request: 'Cancel that', status: 'pending', progress: undefined };
+  let verdict: JudgeVerdict | undefined;
+  const h = clocked(() => verdict, () => [sale, cancel]);
+  const t = transcript();
+  h.guardrail.observe(t.say('assistant', 'The Amazon sale went through.', 0), 'live_1'); await wait(1400);
+  h.advance(6_000); verdict = { contradicts: 1, kind: 'false_failure', kindProbability: 0.5, supported: 0.08 };
+  h.guardrail.observe(t.say('assistant', 'That sale did not go through, so nothing was sold.', 6_000), 'live_1'); await wait(20);
+  assert.deepEqual(h.triggers.map(value => [value.kind, value.correction]), [['unverified', 'accepted'], ['false_failure', 'accepted']]);
   h.guardrail.stop();
 });
 

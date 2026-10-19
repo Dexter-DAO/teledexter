@@ -184,3 +184,24 @@ test('the account-failure stop says only what is true of each request', () => {
   for (const text of [speech(entry('queued', { deferredTurns: [{ status: 'queued' }] })), speech(entry('prepared'))])
     assert.doesNotMatch(text, /Anything you already asked for keeps running/);
 });
+
+test('the account-failure stop, for every mix of request states: "keeps running" only with sent work, "won\'t run" only with unsent work', () => {
+  const kinds: Record<string, Record<string, unknown>> = {
+    running: { status: 'running' }, primaryQueued: { status: 'queued' }, dispatching: { status: 'dispatching' },
+    unknown: { status: 'dispatch_unknown' }, waiting: { status: 'waiting_for_reply' },
+    undelivered: { status: 'completed', delivery: 'stale' }, heard: { status: 'completed', delivery: 'accepted' },
+    failedUnheard: { status: 'failed', delivery: 'rejected' }, prepared: { status: 'prepared' },
+    refused: { status: 'admission_refused' }, notAdmitted: { status: 'not_admitted' },
+    queuedTurn: { status: 'running', deferredTurns: [{ status: 'queued' }] },
+    ack: { status: 'completed', delivery: 'accepted', deferredTurns: [{ status: 'recorded_not_submitted' }] },
+  };
+  const names = Object.keys(kinds);
+  for (let mask = 0; mask < 1 << names.length; mask++) {
+    const picked = names.filter((_, index) => mask & (1 << index));
+    const text = accountUnavailableSpeech(Object.fromEntries(picked.map((name, index) => [`r${index}`, { requestId: `r${index}`, ...kinds[name] }])));
+    assert.equal(/keeps? running/.test(text), picked.some(name => ['running', 'primaryQueued', 'queuedTurn'].includes(name)), `${picked}: ${text}`);
+    assert.equal(/won't run/.test(text), picked.some(name => ['prepared', 'queuedTurn'].includes(name)), `${picked}: ${text}`);
+    assert.ok(text.startsWith('I lost the connection to your Dexter account, so I have to end this call.'));
+  }
+  assert.throws(() => accountUnavailableSpeech(undefined as never), 'a record that cannot be read falls back to the fixed sentence in the server');
+});

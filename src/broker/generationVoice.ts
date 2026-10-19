@@ -55,8 +55,9 @@ export interface GenerationVoiceOptions {
   guardrailJudge?: GuardrailJudge;
 }
 
-/** Quiet context before re-sending a result whose first delivery was unconfirmed. */
-export const REPEATED_RESULT_NOTE = 'The next result repeats one you may already have given; the caller may have heard it. Present it as a reminder, for example "as I mentioned", not as news.';
+/** Quiet context before re-sending a result that may already have been heard, in whole or in part.
+ * Conditional: an unheard first delivery (its acknowledgement timed out) must still come as news. */
+export const REPEATED_RESULT_NOTE = 'The next result may repeat something you already told the caller. If you already told them, refer back to it briefly; if not, give it as news.';
 
 export interface GenerationVoiceSession extends BrokerLiveSession {
   prepareSelectedCloseout(): Promise<SelectedQuestionCloseout>;
@@ -250,11 +251,12 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
     const lateRejected = (value: (typeof previous)[number]) => call().publications?.rejections
       .some(rejection => rejection.sessionId === value.sessionId && rejection.eventId === value.outcome!.eventId) ?? false;
     const lastRecords = previous.filter(value => value.updateId.startsWith(`${prefix}_attempt_${attempt}_`) && value.outcome);
-    // An unconfirmed result may have been spoken anyway (only its acknowledgement timed out): the
-    // re-send is a repeat, so the voice is told to present it as one ("as I mentioned").
+    // A re-sent result may repeat what the caller already heard: an unconfirmed chunk may have been
+    // spoken (only its acknowledgement timed out), and earlier accepted chunks were. The voice is told
+    // to refer back to it if it was already given, and to give it as news if not.
     let maybeHeard = false;
     if (lastRecords.some(value => value.outcome!.status === 'rejected' || value.outcome!.status === 'unconfirmed' || lateRejected(value))) {
-      maybeHeard = kind === 'result' && lastRecords.some(value => value.outcome!.status === 'unconfirmed' && !lateRejected(value));
+      maybeHeard = kind === 'result' && lastRecords.some(value => ['unconfirmed', 'accepted'].includes(value.outcome!.status) && !lateRejected(value));
       attempt++;
     }
 
