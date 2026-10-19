@@ -16,8 +16,7 @@ import { createPrimaryApiClient, type PrimaryApiClient } from './primaryApi.js';
 import { createPortfolioContext, type PortfolioContext } from './portfolioContext.js';
 import { createPrimaryBackend, type BrokerDelegationRecord } from './backend.js';
 import { createVoiceTasks } from './voiceTasks.js';
-import { createVoiceGuardrail, type GuardrailJudge } from './voiceGuardrail.js';
-import { recordGuardrailTrigger, recordVoiceClose } from './voiceEvidence.js';
+import { recordVoiceClose } from './voiceEvidence.js';
 import { eligiblePhoneCallSchema, type EligibleContextClient } from './eligibleContext.js';
 import { createGenerationVoice, type GenerationVoiceOptions, type GenerationVoiceSession } from './generationVoice.js';
 import { accountUnavailableSpeech, carrierPlaybackState } from './voicePresentation.js';
@@ -179,8 +178,6 @@ export interface BrokerServerOptions {
   /** Pre-rendered "Hey, it's Dexter. What can I do for you?" for inbound calls: the whole
    * opening; Live then waits for the caller. Omission retains the Live-spoken greeting. */
   inboundGreetingClip?: Buffer;
-  /** Judge for the transcript guardrail (production: the Decisions API). Absent: no guardrail. */
-  guardrailJudge?: GuardrailJudge;
   /** How often settled calls move out of calls.json (default 10 minutes). */
   settleIntervalMs?: number;
   /** A fixed admission poll interval for a greeting stream waiting on inbound approval. The default
@@ -1012,7 +1009,6 @@ export function createBrokerServer(options: BrokerServerOptions) {
     let backend: ReturnType<typeof createPrimaryBackend> | undefined;
     let portfolioContext: PortfolioContext | undefined;
     let voiceTasks: ReturnType<typeof createVoiceTasks> | undefined;
-    let guardrail: ReturnType<typeof createVoiceGuardrail> | undefined;
     const stopSocketWatch = watchMediaSocket(ws, () => { void stop('media_socket_stalled'); });
     ws.once('close', stopSocketWatch);
     let stopping = false;
@@ -1194,7 +1190,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
       preconnect?.discard(call.id);
       clearTimeout(startTimer); clearTimeout(durationTimer);
       greeting?.cancel(); clearTimeout(greetingReleaseTimer); greetingHold = undefined;
-      voiceTasks?.stop(); guardrail?.stop();
+      voiceTasks?.stop();
       const previous = store.get(call.id)!;
       if (previous.inbound) inbound.stopLocal(call.id, reason);
       // An unbound call has nothing to close yet; a binding that lands later is closed by its owner.
@@ -1267,28 +1263,17 @@ export function createBrokerServer(options: BrokerServerOptions) {
       catch { /* Telemetry only. */ }
       if (!options.eligibleContext) {
         voiceTasks = createVoiceTasks(() => store.get(call.id));
-        guardrail = options.guardrailJudge ? createVoiceGuardrail({ callId: call.id, judge: options.guardrailJudge,
-          tasks: () => voiceTasks?.correctable() ?? [], truth: () => voiceTasks?.tasks(true) ?? [],
-          correct: (text, delegationId, sessionId) => live && sessionId === connectedSessionId
-            ? live.appendInstructions(text, delegationId) : Promise.resolve({ eventId: '', status: 'closed' as const }),
-          record: trigger => recordGuardrailTrigger(store, call.id, trigger) }) : undefined;
         backend = createPrimaryBackend({ callId: call.id, callSid: call.callSid!, bindingId: bound.primary.bindingId,
           onResult: result => portfolioContext?.observe(result), onRequest: () => voiceTasks?.refresh(),
-          admissionSettled: request => voiceTasks?.settled(request),
           api: primary, store, watchUntilCallEnds: true, lastCallerSpeechAt: () => lastSpeechAt });
       }
-      const directBackend = backend;
       const voiceOptions: BrokerLiveSessionOptions = { apiKey: config.apiKey, callId: call.id, voice: config.voice,
         instructions: brokerInstructions({ direction: call.direction, purpose: call.purpose, registeredAssignment: !!call.callAssignment,
           ...(call.callAssignment?.origin === 'authenticated_hark_delivery' ? { watch: call.callAssignment.value.hark } : {}),
           ...(call.callAssignment?.origin === 'authenticated_notification_delivery' ? { notification: call.callAssignment.value.notification } : {}),
           name: bound.primary.name, context: bound.primary.context }),
         history: brokerHistory({ name: bound.primary.name, context: bound.primary.context }),
-        backend: directBackend ? { delegate(request, channel) {
-          // The request exists for the caller from the moment the voice delegates it.
-          voiceTasks?.starting(request);
-          return directBackend.delegate(request, channel).finally(() => voiceTasks?.settled(request));
-        } } : { async delegate() { throw new Error('generation_backend_required'); } },
+        backend: backend ?? { async delegate() { throw new Error('generation_backend_required'); } },
         onAudio(payload) {
           if (stopping || ws.readyState !== WebSocket.OPEN || !streamSid) return;
           if (greetingHold) {
@@ -1305,7 +1290,6 @@ export function createBrokerServer(options: BrokerServerOptions) {
           // Evidence, written off the media path (see BrokerStore.observeTranscript).
           store.observeTranscript(call.id, snapshot);
           backend?.observeTranscript(snapshot);
-          if (connectedSessionId) guardrail?.observe(snapshot, connectedSessionId);
         },
         onReady({ sessionId }) {
           connectedSessionId = sessionId;
@@ -1360,7 +1344,6 @@ export function createBrokerServer(options: BrokerServerOptions) {
           callId: call.id, store, client: options.callerIntent.client, timeoutMs: options.callerIntent.timeoutMs,
         }) } : {}),
         onAudio: payload => voiceOptions.onAudio(payload, { deliveryId: 'generation_host_audio' }),
-        ...(options.guardrailJudge ? { guardrailJudge: options.guardrailJudge } : {}),
         onReady: voiceOptions.onReady, onClosed: voiceOptions.onClosed,
         onPlaybackClear: () => voiceOptions.onPlaybackClear?.('application_interrupt'),
         onProblem(code) { queueMicrotask(() => { if (stopping) return;

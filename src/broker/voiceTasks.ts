@@ -12,7 +12,7 @@ export interface VoiceTask {
   delegationId?: string;
   /** The caller turn that started it; its words reach a voice only where that voice may see them. */
   sourceEventId: string;
-  status: 'starting' | 'pending' | 'waiting_to_start' | 'waiting_for_answer' | 'arriving' | 'finished' | 'failed' | 'cancelled' | 'not_started';
+  status: 'pending' | 'waiting_to_start' | 'waiting_for_answer' | 'finished' | 'failed' | 'cancelled' | 'not_started';
   request: string;
   progress?: string;
   outcome?: string;
@@ -36,12 +36,10 @@ const lead = (text: string, limit: number) => {
 };
 
 /**
- * The application's task list: a projection of this call's saved request records.
- * The voice's view (the default) states a finished request's result only once that result has
- * been delivered to the voice; `truth` adds every confirmed result as soon as it is saved, for
- * the application's own guardrail judge, which never speaks.
+ * The application's task list: a projection of this call's saved request records. It states a
+ * finished request's result only once that result has been delivered to the voice.
  */
-export function callTasks(call: BrokerCall, view: { truth?: boolean; arriving?: boolean } = {}): VoiceTask[] {
+export function callTasks(call: BrokerCall): VoiceTask[] {
   const tasks: VoiceTask[] = [];
   for (const raw of Object.values(call.delegations)) {
     const entry = raw as BrokerDelegationRecord;
@@ -62,10 +60,8 @@ export function callTasks(call: BrokerCall, view: { truth?: boolean; arriving?: 
         // Primary's words reach the voice only through the eligible delivery. Until the voice has
         // the result itself, its list keeps the request in progress: a list announcing a result the
         // voice did not have yet prompted it to talk about the wait (eval status_pending).
-        tasks.push(entry.delivery === 'accepted' || view.truth
-          ? { ...base, status: 'finished', outcome: lead(entry.primaryResult?.assistant?.text ?? '', 260) }
-          // A correction may say a result is on its way (no Primary words); the list does not.
-          : view.arriving ? { ...base, status: 'arriving' } : pending()); break;
+        tasks.push(entry.delivery === 'accepted'
+          ? { ...base, status: 'finished', outcome: lead(entry.primaryResult?.assistant?.text ?? '', 260) } : pending()); break;
       case 'failed':
         tasks.push({ ...base, status: 'failed', outcome: lead(failedRequestSpeech(entry), 260) }); break;
       case 'cancelled':
@@ -87,19 +83,14 @@ export function callTasks(call: BrokerCall, view: { truth?: boolean; arriving?: 
   return tasks;
 }
 
-/** Every delegation already attached to a saved request, queued turn or recorded correction. */
-const savedDelegations = (call: BrokerCall) => new Set(Object.values(call.delegations)
-  .flatMap(raw => (raw as BrokerDelegationRecord)?.delegationIds ?? []));
-
 const phrase: Record<VoiceTask['status'], string> = {
-  starting: 'Just passed on to Primary; not started yet, no outcome',
   pending: 'In progress, no result yet', waiting_to_start: 'Not started yet; it starts after the earlier request finishes',
-  waiting_for_answer: "Waiting for the caller's answer", arriving: 'Finished; its result is being given to you now',
+  waiting_for_answer: "Waiting for the caller's answer",
   finished: 'Finished', failed: 'Failed', cancelled: 'Cancelled', not_started: 'Not started',
 };
 export function taskLine(task: VoiceTask, index: number, version: number, showRequest = true): string {
   const detail = task.outcome ? ` Result: ${task.outcome}` : task.progress ? ` Progress, not a result: ${task.progress}` : '';
-  const asked = !task.request ? ' The request you just passed on.' : showRequest ? ` Caller asked: "${task.request}".` : ' An earlier request.';
+  const asked = showRequest ? ` Caller asked: "${task.request}".` : ' An earlier request.';
   let line = `Task list ${version}, task ${index + 1}: ${phrase[task.status]}.${asked}${detail}`;
   while (Buffer.byteLength(line) > LIVE_APPEND_MAX_BYTES) line = `${line.slice(0, Math.floor(line.length * 0.9)).trimEnd()} …`;
   return line;
@@ -117,22 +108,11 @@ export function taskListLines(tasks: readonly VoiceTask[], version: number, visi
 export function createVoiceTasks(load: () => BrokerCall | undefined, onSent?: (lines: string[], deliveries: LiveDelivery[]) => void) {
   let voice: BrokerLiveSession | undefined, sent = '', version = 0, timer: ReturnType<typeof setTimeout> | undefined, stopped = false;
   let visible: (task: VoiceTask) => boolean = () => true;
-  // Delegations the voice has made that the backend has not yet saved as a request: admission
-  // takes a moment after session.delegation.created. The guardrail's truth includes them (an
-  // "On it." is no phantom); the voice already knows what it just delegated, and a list sent for
-  // that moment only prompted it to talk about the wait (eval chitchat_pending).
-  const starting = new Map<string, VoiceTask>();
-  const current = (call: BrokerCall, truth = false, withStarting = truth, arriving = false) => {
-    const saved = savedDelegations(call);
-    for (const [delegationId] of starting) if (saved.has(delegationId)) starting.delete(delegationId);
-    const tasks = callTasks(call, { truth, arriving });
-    return withStarting ? [...tasks, ...starting.values()] : tasks;
-  };
   const flush = () => {
     timer = undefined;
     const call = load(), target = voice;
     if (!call || !target || stopped) return;
-    const tasks = current(call);
+    const tasks = callTasks(call);
     // Before the first request there is nothing to say: no list means nothing has been started.
     if (!tasks.length && !version) return;
     const key = JSON.stringify(tasks.map(task => [task.status, task.request, task.progress ?? null, task.outcome ?? null, visible(task)]));
@@ -150,22 +130,6 @@ export function createVoiceTasks(load: () => BrokerCall | undefined, onSent?: (l
   return {
     /** Coalesce bursts of saves (dispatching, running, partial) into one list. */
     refresh,
-    /** The voice delegated: the request exists for the caller before the backend admits it. */
-    starting(request: { sessionId: string; delegationId: string; requestId: string }) {
-      if (stopped || starting.has(request.delegationId)) return;
-      starting.set(request.delegationId, { requestId: request.requestId, sessionId: request.sessionId,
-        delegationId: request.delegationId, sourceEventId: '', status: 'starting', request: '' });
-      if (starting.size > 8) starting.delete(starting.keys().next().value!);
-    },
-    /** Admission settled: the saved request (or its refusal) now speaks for this delegation. */
-    settled(request: { delegationId: string }) { starting.delete(request.delegationId); },
-    /** The current list. `truth` adds confirmed results not yet delivered to the voice (for the
-     * judge only); `withStarting` adds delegations not yet admitted, which carry no Primary words. */
-    tasks(truth = false, withStarting = truth): VoiceTask[] { const call = load(); return call ? current(call, truth, withStarting) : []; },
-    /** What a correction may state: the voice's list, delegations not yet admitted, and results
-     * on their way to the voice (without their words), so a correction never says "in progress"
-     * about a request that has finished. */
-    correctable(): VoiceTask[] { const call = load(); return call ? current(call, false, true, true) : []; },
     /** A voice sees a request's words only where it may: its own session, or source admitted into its history. */
     attach(next: BrokerLiveSession, canSee: (task: VoiceTask) => boolean = () => true) {
       if (stopped || voice === next) return;

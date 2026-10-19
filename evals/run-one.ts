@@ -52,7 +52,7 @@ const requireFromRoot = createRequire(path.join(moduleRoot, 'package.json'));
 const Twilio = requireFromRoot('twilio');
 const { WebSocket } = requireFromRoot('ws');
 
-const spend: { ttsChars: number; liveSeconds: number; judgeCalls?: number } = { ttsChars: 0, liveSeconds: 0 };
+const spend: { ttsChars: number; liveSeconds: number } = { ttsChars: 0, liveSeconds: 0 };
 const voiceName = callerVoice(seed);
 const turnAudio = new Map<string, Buffer>();
 for (const turn of scenario.turns) turnAudio.set(turn.id, await callerAudio(apiKey, turn.text, voiceName, audioCache, spend));
@@ -209,18 +209,8 @@ const config = { host: '127.0.0.1', port: 0, publicOrigin: 'https://phone-eval.e
   allowedTo: ['+12025550123'], apiBaseUrl: 'http://127.0.0.1:1', phoneServiceSecret: 'eval-primary-secret-'.repeat(3),
   maxCallSeconds: Math.ceil(scenario.maxMs / 1000) + 30 };
 const clip = greetingModule.loadGreetingClip(greetingModule.INBOUND_GREETING_CLIP_ASSET);
-// Releases with the transcript guardrail get the production judge, wrapped to record every verdict.
-const guardrailModule = fs.existsSync(path.join(moduleRoot, 'src/broker/voiceGuardrail.ts')) ? await load('broker/voiceGuardrail') : undefined;
-const productionJudge = guardrailModule?.createDecisionsJudge(apiKey);
-const guardrailJudge = productionJudge && (async (input: { tasks: string; conversation: string; sentence: string }) => {
-  const started = now();
-  const verdict = await productionJudge(input).catch(() => undefined);
-  note('guardrail.judged', { sentence: input.sentence, tasks: input.tasks, verdict: verdict ?? null, ms: now() - started });
-  spend.judgeCalls = (spend.judgeCalls ?? 0) + 1;
-  return verdict;
-});
 const broker = serverModule.createBrokerServer({ config, store, primary, eligibleContext: eligible, provider,
-  ...(clip ? { inboundGreetingClip: clip } : {}), ...(guardrailJudge ? { guardrailJudge } : {}),
+  ...(clip ? { inboundGreetingClip: clip } : {}),
   voiceFactory: (options: any) => liveModule.createBrokerLiveSession({ ...options,
     connectionFactory: (key: string) => wrap(liveModule.createOpenAILiveConnection(key)) }) });
 await new Promise<void>(resolve => broker.server.listen(0, '127.0.0.1', resolve));
@@ -328,7 +318,7 @@ const evidence = {
   requests: requests.map(req => ({ index: req.index + 1, requestId: req.requestId, label: req.script.label, scripted: req.index < scenario.requests.length,
     submittedAt: req.submittedAt, finalAt: req.finalAt ?? null, outcome: req.script.outcome, text: req.text })),
   call: call ? { failure: call.failure ?? null, finalized: call.finalized ?? null, voiceCloses: (call as any).voiceCloses ?? null,
-    guardrail: (call as any).voiceGuardrail ?? null, transcript: call.liveGenerations?.segments.map((segment: any) => segment.transcript) ?? [] } : null,
+    transcript: call.liveGenerations?.segments.map((segment: any) => segment.transcript) ?? [] } : null,
 };
 fs.writeFileSync(path.join(out, 'evidence.json'), JSON.stringify(evidence, null, 1), { mode: 0o600 });
 fs.writeFileSync(path.join(out, 'output.pcmu'), Buffer.concat(outputAudio), { mode: 0o600 });

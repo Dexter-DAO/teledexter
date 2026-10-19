@@ -53,18 +53,13 @@ test('a cancelled request keeps a step that already settled, outcome first', () 
     text: 'The sale was being placed.' } } }) as never), 'The request was cancelled. The last observed step before that: The sale was being placed.');
 });
 
-test('a completed result enters the voice list only once delivered; the truth view has it at once', () => {
+test('a completed result enters the voice list only once delivered', () => {
   const completed = entry('a', 'completed', { primaryResult: { assistant: { text: 'The sale failed. Nothing was sold. Holdings are unchanged.' },
     partialResult: { kind: 'prepared_action', text: 'The sale was being placed.' } } });
   const voiceView = callTasks(call(completed));
   assert.equal(voiceView[0]!.status, 'pending', 'undelivered: the voice still has no outcome to state');
   assert.equal(voiceView[0]!.outcome, undefined);
   assert.equal(voiceView[0]!.progress, 'The sale was being placed.', 'same as before completion, so no new list is sent');
-  const truth = callTasks(call(completed), { truth: true });
-  assert.deepEqual([truth[0]!.status, truth[0]!.outcome], ['finished', 'The sale failed. Nothing was sold. Holdings are unchanged.']);
-  const forCorrection = callTasks(call(completed), { arriving: true });
-  assert.deepEqual([forCorrection[0]!.status, forCorrection[0]!.outcome], ['arriving', undefined],
-    'a correction may say the result is on its way, never "in progress" and never its words');
   const delivered = callTasks(call({ ...completed, delivery: 'accepted' }));
   assert.deepEqual([delivered[0]!.status, delivered[0]!.outcome], ['finished', 'The sale failed. Nothing was sold. Holdings are unchanged.']);
 });
@@ -81,23 +76,18 @@ test('every task line fits one append, outcome first, and hides caller words whe
   assert.match(header[0]!, /^Task list 4 replaces all earlier task lists\. The caller has 7 requests on this call; the 6 most recent follow\. Nothing else has been started\.$/);
 });
 
-test('a delegation is in the truth from the moment the voice makes it; the voice hears of it once it is saved', async () => {
+test('no list before the first request; the voice hears of a request once it is saved, and only when the list changes', async () => {
   let saved = call();
   const tasks = createVoiceTasks(() => saved);
   const target = voice();
   tasks.attach(target.session);
-  assert.deepEqual(target.sent, [], 'no list before the first request: nothing has been started');
-  tasks.starting({ sessionId: 'session_a', delegationId: 'item_a', requestId: 'a' });
   tasks.refresh(); await wait(250);
-  assert.deepEqual(target.sent, [], 'the voice knows what it just delegated; no list is sent for that moment');
-  assert.deepEqual(tasks.tasks(true).map(task => task.status), ['starting'], 'the guardrail judges "On it." against it');
-  assert.deepEqual(tasks.tasks(), []);
+  assert.deepEqual(target.sent, [], 'no list before the first request: nothing has been started');
   saved = call(entry('a', 'running'));
   tasks.refresh(); await wait(250);
   assert.deepEqual(target.sent, ['Task list 1 replaces all earlier task lists. The caller has 1 request on this call. Nothing else has been started.',
     'Task list 1, task 1: In progress, no result yet. Caller asked: "Request a text.".']);
-  assert.deepEqual(tasks.tasks(true).map(task => task.status), ['pending'], 'the saved request replaces the delegation');
-  tasks.settled({ delegationId: 'item_a' }); tasks.refresh(); await wait(250);
+  tasks.refresh(); await wait(250);
   assert.equal(target.sent.length, 2, 'an unchanged list is not sent again');
   tasks.stop();
 });

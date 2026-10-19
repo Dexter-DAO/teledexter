@@ -52,8 +52,6 @@ async function judge(scenario: Scenario, evidence: any, said: Sentence[]): Promi
     if (event.type === 'primary.partial_visible') events.push({ at: event.at, line: `BACKEND: request ${event.request} progress (not a result): ${event.text}` });
     if (event.type === 'primary.final_visible') events.push({ at: event.at, line: `BACKEND: request ${event.request} FINAL RESULT: ${event.text ?? event.state}` });
   }
-  for (const log of evidence.brokerLogs ?? []) if (log.event === 'broker_voice_guardrail')
-    events.push({ at: log.at, line: `APPLICATION CORRECTION sent to the voice about the sentence "${log.sentence}"` });
   for (const s of said) events.push({ at: s.at, line: `DEXTER [S${s.i}]: ${s.text}` });
   events.sort((a, b) => a.at - b.at);
   for (const event of events) lines.push(`${(event.at / 1000).toFixed(1)}s ${event.line}`);
@@ -121,11 +119,6 @@ async function scoreRun(dir: string, scenario: Scenario) {
   const falseClaims = said.filter(s => ['false', 'phantom'].includes(verdicts.get(s.i)?.verdict) || flags.has(s.i));
   const corrections = new Map<number, Sentence>();
   for (const s of said) { const target = verdicts.get(s.i)?.corrects; if (target && !corrections.has(target)) corrections.set(target, s); }
-  const triggers = (evidence.brokerLogs ?? []).filter((log: any) => log.event === 'broker_voice_guardrail');
-  const falseCorrections = triggers.filter((trigger: any) => {
-    const s = said.find(value => value.text.replace(/\s+/g, ' ').includes(String(trigger.sentence).replace(/\s+/g, ' ').slice(0, 40)));
-    return s && !falseClaims.includes(s) && verdicts.get(s.i)?.verdict !== 'promise';
-  });
   const turnEnds = timeline.filter(event => event.type === 'caller.turn_end');
   const speechStarts = timeline.filter(event => event.type === 'audio.assistant_speech_start').map(event => event.playbackAt as number);
   const responseLatency = turnEnds.map(end => { const next = speechStarts.find(at => at > end.at); return next === undefined ? null : next - end.at; })
@@ -143,8 +136,6 @@ async function scoreRun(dir: string, scenario: Scenario) {
     promises: said.filter(s => verdicts.get(s.i)?.verdict === 'promise').length,
     uncorrected: falseClaims.filter(s => !corrections.has(s.i)).length,
     chat: graded.chat, resultsReported: graded.results_reported,
-    guardrailTriggers: triggers.map((trigger: any) => ({ sentence: trigger.sentence, kind: trigger.kind, probability: trigger.probability, correction: trigger.correction })),
-    falseCorrections: falseCorrections.length,
     extraDelegations: (evidence.requests as any[]).filter(req => !req.scripted).length,
     responseLatencyMs: responseLatency, resultLatencyMs: resultLatency,
     judgeWhy: graded.sentences,
@@ -152,8 +143,8 @@ async function scoreRun(dir: string, scenario: Scenario) {
 }
 
 const pct = (values: number[], p: number) => { if (!values.length) return null; const sorted = [...values].sort((a, b) => a - b); return sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))]; };
-const table: string[] = ['| variant | scenario | runs | false claims (runs with any) | corrected (median ms to correction) | uncorrected | phantom | promised steps | false corrections | chat answered | results reported | extra delegations | response p50/p90 ms | result p50 ms |',
-  '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|'];
+const table: string[] = ['| variant | scenario | runs | false claims (runs with any) | corrected (median ms to correction) | uncorrected | phantom | promised steps | chat answered | results reported | extra delegations | response p50/p90 ms | result p50 ms |',
+  '|---|---|---|---|---|---|---|---|---|---|---|---|---|'];
 const all: Record<string, any[]> = {};
 for (const label of labels) for (const scenario of Object.values(scenarios)) {
   const root = path.join(runsRoot, label, scenario.id);
@@ -182,7 +173,7 @@ for (const label of labels) for (const scenario of Object.values(scenarios)) {
   const result = scores.flatMap(score => score.resultLatencyMs);
   const corrected = scores.flatMap(score => score.falseClaims.filter((claim: any) => claim.correctedBy !== null));
   const correctionMs = pct(corrected.map((claim: any) => claim.correctionMs).filter((value: any) => typeof value === 'number'), 0.5);
-  table.push(`| ${label} | ${scenario.id} | ${scores.length} | ${sum('falseClaims')} (${runsWith}) | ${corrected.length}${correctionMs === null ? '' : ` (${correctionMs})`} | ${sum('uncorrected')} | ${sum('phantom')} | ${sum('promises')} | ${sum('falseCorrections')} | ${chat.length ? `${chat.filter(c => c.answered).length}/${chat.length}` : 'n/a'} | ${reported.filter(r => r.reported).length}/${reported.length} | ${sum('extraDelegations')} | ${pct(latency, 0.5) ?? '-'}/${pct(latency, 0.9) ?? '-'} | ${pct(result, 0.5) ?? '-'} |`);
+  table.push(`| ${label} | ${scenario.id} | ${scores.length} | ${sum('falseClaims')} (${runsWith}) | ${corrected.length}${correctionMs === null ? '' : ` (${correctionMs})`} | ${sum('uncorrected')} | ${sum('phantom')} | ${sum('promises')} | ${chat.length ? `${chat.filter(c => c.answered).length}/${chat.length}` : 'n/a'} | ${reported.filter(r => r.reported).length}/${reported.length} | ${sum('extraDelegations')} | ${pct(latency, 0.5) ?? '-'}/${pct(latency, 0.9) ?? '-'} | ${pct(result, 0.5) ?? '-'} |`);
 }
 console.log(table.join('\n'));
 console.log(`judge tokens in=${judgeUsage.input} out=${judgeUsage.output} approx $${((judgeUsage.input / 1e6 * 2 + judgeUsage.output / 1e6 * 10) / 2).toFixed(2)} (flex)`);
