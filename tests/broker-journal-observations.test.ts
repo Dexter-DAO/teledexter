@@ -45,7 +45,9 @@ test('a transcript observation returns at once on a blocked disk and never rewri
     slowest = Math.max(slowest, performance.now() - started);
     if (revision % 20 === 0) await wait(1);
   }
-  assert.ok(slowest < 20, `observation took ${slowest.toFixed(1)} ms`);
+  // A wait on the blocked disk would last until it is released, below; the bound leaves room for a
+  // loaded full suite (single observations took 30 ms there).
+  assert.ok(slowest < 100, `observation took ${slowest.toFixed(1)} ms`);
   assert.equal(fs.readFileSync(path.join(dir, 'calls.json'), 'utf8'), journal, 'calls.json is not rewritten for transcripts');
   assert.equal(store.get(call.id)!.transcriptRevision, 200, 'readers see the newest transcript at once');
   assert.deepEqual(disk.started, [`.${call.id}.tmp`], 'one write in flight; later observations wait and coalesce');

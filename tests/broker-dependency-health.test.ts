@@ -57,8 +57,10 @@ test('an actual local stalled HTTP response times out and a later probe recovers
   const server = createServer((_request, response) => { if (healthy) { response.setHeader('content-type', 'application/json'); response.end(JSON.stringify(valid())); } });
   await new Promise<void>(yes => server.listen(0, '127.0.0.1', yes));
   t.after(() => { server.closeAllConnections(); server.close(); });
+  // The same budget covers the recovery probe: a healthy local response usually takes 5 ms (30 ms cold) but
+  // ran past 50 ms under a loaded full suite, so the budget leaves a wide margin.
   const health = createBrokerDependencyHealth({ apiBaseUrl: `http://127.0.0.1:${(server.address() as { port: number }).port}`,
-    timeoutMs: 50, cacheMs: 0 });
+    timeoutMs: 500, cacheMs: 0 });
   assert.deepEqual((await health()).primaryApi, { ok: false, reason: 'timeout' });
   healthy = true; assert.equal((await health()).ok, true);
 });
