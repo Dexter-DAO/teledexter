@@ -81,7 +81,7 @@ pm2 save
 
 Run `pm2 save` after every start and every rollback. A reboot resurrects whatever `~/.pm2/dump.pm2` names. An old dump would start the previous release on a journal that was never folded.
 
-Rolling forward again needs no step, because this release reads a folded `calls.json` as is. The call records this release adds (`endReason`, `voiceCloses`, `voiceGuardrail`) are plain fields. Production's `6e23b1b` store loads a folded journal written by this release and keeps those fields across its own writes.
+Rolling forward again needs no step, because this release reads a folded `calls.json` as is. The call records added since `6e23b1b` (`endReason`, `voiceCloses`, and `voiceGuardrail` on calls from the release that had the guardrail) are plain fields. Production's `6e23b1b` store loads a folded journal written by this release and keeps those fields across its own writes.
 
 ### Rolling back to prod-2026-10-13
 

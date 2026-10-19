@@ -146,7 +146,7 @@ test('the template headings, the delegation rules and the task list are the only
   for (const direction of ['inbound', 'outbound'] as const) {
     const text = brokerInstructions({ direction, purpose: 'Read the current portfolio.' });
     for (const heading of ['Backchannel policy:', 'Interruption policy:', 'Delegation policy:', 'Backend tools:',
-      'Delegate to the backend when:', 'Do not delegate to the backend when:', 'Task list:'])
+      'Delegate to the backend when:', 'Do not delegate to the backend when:', 'Outcomes:', 'Task list:'])
       assert.ok(text.includes(heading), heading);
     assert.match(text, /Delegate before giving an answer that depends on backend work\.\nDo not guess the result while waiting\./);
     assert.match(text, /Delegate the caller's whole request in one delegation, including a multi-step request such as "sell it, then buy it back"\. Primary performs and sequences every step\. Never promise, schedule or narrate a step yourself/);
@@ -154,7 +154,8 @@ test('the template headings, the delegation rules and the task list are the only
     assert.match(text, /A step or request that is not on the task list has not started\./);
     assert.match(text, /In progress: you have no outcome yet\. Never say it is done, placed, confirmed, sold, bought, sent or cancelled/);
     assert.match(text, /Say an action succeeded only when its result says it succeeded\./);
-    assert.match(text, /If the application sends you a correction, say right away that you misspoke/);
+    assert.match(text, /Outcomes:\nA request's outcome comes only from its result, delivered to you for that request\. Never state an outcome without that result: not from progress, the caller, history, your earlier words or a guess\. When it arrives, say it in your own words\./);
+    assert.doesNotMatch(text, /sends you a correction|misspoke/i, 'nothing sends the voice corrections');
     assert.doesNotMatch(text, /Truth rule|neutral hold|holding line/, 'no gate-era hold scripts');
   }
 });

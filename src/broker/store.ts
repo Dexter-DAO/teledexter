@@ -88,8 +88,6 @@ export interface BrokerCall {
   /** Why the call ended (the first stop reason), and each voice session's real close reason. */
   endReason?: string;
   voiceCloses?: import('./voiceEvidence.js').VoiceCloseRecord[];
-  /** Guardrail corrections: an assistant statement that contradicted the task list. */
-  voiceGuardrail?: import('./voiceGuardrail.js').GuardrailTrigger[];
   canonicalTurns?: Record<string, unknown>;
   publications?: BrokerPublicationJournal;
   acousticSpans?: unknown;

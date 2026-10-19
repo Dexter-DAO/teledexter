@@ -1,6 +1,5 @@
 import type { BrokerStore } from './store.js';
 import type { LiveSessionClosed } from '../live/types.js';
-import type { GuardrailTrigger } from './voiceGuardrail.js';
 import { startupFailureCodeSchema } from './liveGeneration.js';
 
 /** Codes that may enter the call record. An unrecognized provider string is recorded as a generic code
@@ -40,9 +39,4 @@ export function recordVoiceClose(store: Store, callId: string, result: LiveSessi
   // Evidence must never affect the call. Bounded so a reconnecting call cannot grow its record.
   try { const call = store.get(callId); if (call) store.update(callId, { voiceCloses: [...call.voiceCloses ?? [], record].slice(-20) }); }
   catch { /* The log line above still carries it. */ }
-}
-
-export function recordGuardrailTrigger(store: Store, callId: string, trigger: GuardrailTrigger): void {
-  try { const call = store.get(callId); if (call) store.update(callId, { voiceGuardrail: [...call.voiceGuardrail ?? [], trigger].slice(-50) }); }
-  catch { /* The guardrail already logged the trigger. */ }
 }

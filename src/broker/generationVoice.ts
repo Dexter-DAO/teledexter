@@ -2,8 +2,7 @@ import { terminal as terminalRequest, createPrimaryBackend, liveResultChunks, wi
 import { createLiveGenerationController, LiveGenerationError, LiveGenerationStartupError, LIVE_GENERATION_STARTUP_MS, type GenerationHandle, type GenerationPublication, type LiveGenerationAttachment } from './liveGeneration.js';
 import { callerPresentationFrontier, cancelledRequestSpeech, failedRequestSpeech, hasLaterCallerSpeech, hasNewerCallerWork, requestPresentationContext } from './voicePresentation.js';
 import { createVoiceTasks } from './voiceTasks.js';
-import { createVoiceGuardrail, type GuardrailJudge } from './voiceGuardrail.js';
-import { recordGuardrailTrigger, recordVoiceClose } from './voiceEvidence.js';
+import { recordVoiceClose } from './voiceEvidence.js';
 import { prepareEligibleHistory } from './eligibleHistory.js';
 import { eligibleAssociatedDeliveryResponseSchema, eligibleDeliveryResponseSchema,
   type EligibleContextClient, type EligibleContextBinding, type EligiblePhoneMessage } from './eligibleContext.js';
@@ -51,8 +50,6 @@ export interface GenerationVoiceOptions {
   onPlaybackClear(): void;
   onProblem(code: string): void;
   playbackState?(): 'idle' | 'pending' | 'unavailable';
-  /** Monitor-and-correct judge for assistant statements about tasks. Absent: no guardrail. */
-  guardrailJudge?: GuardrailJudge;
 }
 
 /** Quiet context before re-sending a result that may already have been heard, in whole or in part.
@@ -113,14 +110,6 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
   // The application owns the task list: projected from saved requests, sent silently on change.
   // A saved-question continuation presents its own question journal instead, so it gets neither.
   const tasks = createVoiceTasks(() => continuation ? undefined : options.store.get(initialCall.id));
-  const guardrail = options.guardrailJudge && !continuation ? createVoiceGuardrail({ callId: initialCall.id, judge: options.guardrailJudge,
-    tasks: () => tasks.correctable(), truth: () => tasks.tasks(true),
-    correct: (text, delegationId, sessionId) => {
-      const current = controller.snapshot().deliveryAttachment;
-      const voice = current?.sessionId === sessionId ? sessions.get(sessionId)?.voice : undefined;
-      return voice ? voice.appendInstructions(text, delegationId) : Promise.resolve({ eventId: '', status: 'closed' as const });
-    },
-    record: trigger => recordGuardrailTrigger(options.store, initialCall.id, trigger) }) : undefined;
   const current = () => {
     const attachment = controller.snapshot().deliveryAttachment;
     return attachment ? { attachment, session: sessions.get(attachment.sessionId) } : undefined;
@@ -509,7 +498,6 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
               let resolveAdmission!: () => void;
               const promise = new Promise<void>(resolve => { resolveAdmission = resolve; });
               pending.set(request, { promise, resolve: resolveAdmission });
-              if (!continuation) tasks.starting(request);
               try {
                 if (continuation) {
                   if (!selected || !selectedActive()) throw new Error('selected_question_not_ready');
@@ -517,13 +505,10 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
                   else await selected.delegate(request, channel);
                 } else await backend.delegate(request, channel);
               }
-              finally { pending.get(request)?.resolve(); pending.delete(request); tasks.settled(request); }
+              finally { pending.get(request)?.resolve(); pending.delete(request); }
             } },
             onAudio(payload) { input.callbacks.onAudio(payload); },
-            onTranscript(snapshot) {
-              input.callbacks.onTranscript(snapshot); backend?.observeTranscript(snapshot);
-              if (sessionId) guardrail?.observe(snapshot, sessionId);
-            },
+            onTranscript(snapshot) { input.callbacks.onTranscript(snapshot); backend?.observeTranscript(snapshot); },
             onReady(value) {
               if (ready) return;
               if (startCancelled || input.signal.aborted || stopped) {
@@ -539,7 +524,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
                 onResult: result => options.portfolioContext?.observe(result),
                 onRequest: () => tasks.refresh(),
                 api: options.primary, store: options.store, sourceSessionId: sessionId, watchUntilCallEnds: true,
-                admissionSettled(request) { pending.get(request)?.resolve(); pending.delete(request); mixed?.admissionSettled(request); tasks.settled(request); },
+                admissionSettled(request) { pending.get(request)?.resolve(); pending.delete(request); mixed?.admissionSettled(request); },
                 lastCallerSpeechAt: () => sourceSpeechAt,
                 ...(continuation ? { selectedQuestionSources: () => selectedQuestionSourceAnchors(call()) } : {}),
                 ...(continuation && options.callerIntent ? { callerRouteSources: () => callerRouteSources(call()) } : {}),
@@ -813,7 +798,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
     getTranscript() { return current()?.session?.voice.getTranscript() ?? emptyTranscript(); },
     close(reason = 'call_stopped') {
       if (closing) return closing;
-      stopped = true; observer.abort(); tasks.stop(); guardrail?.stop();
+      stopped = true; observer.abort(); tasks.stop();
       // stop gates output synchronously. The server performs provider hangup before awaiting this promise.
       const cleanup = controller.stop();
       stopSelected();
