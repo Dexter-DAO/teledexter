@@ -8,11 +8,12 @@ import { createServer } from 'node:http';
 import Twilio from 'twilio';
 import { WebSocket } from 'ws';
 import { createBrokerServer } from '../src/broker/server.js';
+import { liveResultChunks } from '../src/broker/backend.js';
 import { createPrimaryApiClient, PrimaryApiError, type PrimaryApiClient, type PrimarySubmission } from '../src/broker/primaryApi.js';
 import { eligiblePhoneCallSchema, type EligibleContextClient, type EligiblePhoneCall, type HistoryVersion } from '../src/broker/eligibleContext.js';
 import { BrokerStore } from '../src/broker/store.js';
 import { streamToken } from '../src/broker/phone.js';
-import { createGenerationVoice } from '../src/broker/generationVoice.js';
+import { createGenerationVoice, REPEATED_RESULT_NOTE } from '../src/broker/generationVoice.js';
 import type { LiveGenerationJournal } from '../src/broker/liveGeneration.js';
 import type { BrokerConfig } from '../src/broker/config.js';
 import type { BrokerDelegationRecord } from '../src/broker/backend.js';
@@ -73,7 +74,8 @@ test('successor registration/context crosses actual HTTP with negotiated full me
 
 async function host(t: test.TestContext, slowClose = false, questionMode = false, boundedCleanup = false,
   settings: { admitted?: boolean; failed?: boolean; failureCode?: string; cancelled?: boolean; sameEpoch?: boolean; resultText?: string; callerText?: string;
-    openingStatus?: 'accepted' | 'rejected' | 'unconfirmed'; greetingClip?: Buffer; unconfirmedSpeech?: boolean } = {}) {
+    openingStatus?: 'accepted' | 'rejected' | 'unconfirmed'; greetingClip?: Buffer; unconfirmedSpeech?: boolean;
+    failedSpeech?: { text: string; status: 'rejected' | 'unconfirmed' } } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-generation-server-'));
   const config: BrokerConfig = { host: '127.0.0.1', port: 3213, publicOrigin: 'https://phone.example.test', stateDir: directory,
     controlToken: 'c'.repeat(40), apiKey: 'fixture-key', model: 'gpt-live-1', voice: 'marin',
@@ -136,7 +138,7 @@ async function host(t: test.TestContext, slowClose = false, questionMode = false
   const voices: Array<{ options: BrokerLiveSessionOptions; voice: BrokerLiveSession; captions: LiveTranscriptSnapshot;
     channel: LiveBackendChannel; abort: AbortController; spoken: string[]; quiet: string[]; published:string[]; native:Array<{id:string;kind:string;speak:boolean}>; inputs: string[]; closed: string[] }> = [];
   const opening: string[] = [];
-  let speechAttempts = 0;
+  let speechAttempts = 0, failedSpeechUsed = false;
   let finishSlowClose: (() => void) | undefined;
   let finishQuestion: (() => void) | undefined;
   const broker = createBrokerServer({ config, store, primary, eligibleContext: eligible,
@@ -160,6 +162,11 @@ async function host(t: test.TestContext, slowClose = false, questionMode = false
         }}:{}),
         async appendInstructions(text) { opening.push(text); return { eventId: `open_${opening.length}`, status: settings.openingStatus ?? 'accepted' }; },
         async appendCommentary(text) { spoken.push(text);published.push(text);
+          if (settings.failedSpeech && text === settings.failedSpeech.text && !failedSpeechUsed) {
+            failedSpeechUsed = true;
+            return { eventId: `comment_${sessionId}_${spoken.length}`, status: settings.failedSpeech.status,
+              observedCallerRevision: captions.callerRevision, observedTranscriptSequence: captions.revision };
+          }
           if (settings.unconfirmedSpeech && text === eligibleText && ++speechAttempts === 1)
             return { eventId: `comment_${sessionId}_${spoken.length}`, status: 'unconfirmed', reason: 'speech_not_confirmed',
               observedCallerRevision: captions.callerRevision, observedTranscriptSequence: captions.revision };
@@ -239,6 +246,51 @@ test('actual server preserves accepted work through replacement and speaks only 
   assert.equal(call.publications!.records.at(-1)!.sourceSessionId, 'generation_1');
 });
 
+test('the repeat note is conditional: an unheard first delivery is still given as news', () => {
+  assert.match(REPEATED_RESULT_NOTE, /If you already told them, refer back to it briefly; if not, give it as news\./);
+  assert.doesNotMatch(REPEATED_RESULT_NOTE, /as I mentioned/i);
+});
+
+test('a whole result re-sent after an unheard later chunk carries the repeat note, since its first part was heard', async t => {
+  const resultText = Array.from({ length: 12 }, (_, index) => `Line ${index + 1}: you sold about $2.00 of Amazon stock and the sale is confirmed.`).join(' ');
+  const chunks = liveResultChunks(resultText);
+  assert.ok(chunks.length >= 2);
+  const f = await host(t, false, false, false, { resultText, failedSpeech: { text: chunks[1]!, status: 'rejected' } });
+  const work = observedWork(f.delegate());
+  await boundary('accepted request', () => f.posts.length === 1, [work]);
+  f.release();
+  await boundary('result re-sent', () => f.voices.some(voice => voice.spoken.filter(text => text === chunks[0]).length === 2), [work]);
+  const voice = f.voices.find(value => value.spoken.filter(text => text === chunks[0]).length === 2)!;
+  const second = voice.published.lastIndexOf(chunks[0]!);
+  assert.equal(voice.published[second - 1], REPEATED_RESULT_NOTE, 'the heard first chunk is not announced as news again');
+  assert.equal(f.posts.length, 1);
+});
+
+test('a result whose only delivery was rejected (never heard) is re-sent plainly, without the repeat note', async t => {
+  const resultText = 'You sold about $2.00 of Amazon stock. The sale is confirmed.';
+  const f = await host(t, false, false, false, { resultText, failedSpeech: { text: resultText, status: 'rejected' } });
+  const work = observedWork(f.delegate());
+  await boundary('accepted request', () => f.posts.length === 1, [work]);
+  f.release();
+  await boundary('result re-sent', () => f.voices.some(voice => voice.spoken.filter(text => text === resultText).length === 2), [work]);
+  const voice = f.voices.find(value => value.spoken.filter(text => text === resultText).length === 2)!;
+  assert.ok(!voice.published.includes(REPEATED_RESULT_NOTE));
+});
+
+test('a result whose first delivery went unconfirmed is re-sent with the conditional repeat note', async t => {
+  const f = await host(t, false, false, false, { resultText: 'You sold about $2.00 of Amazon stock. The sale is confirmed.', unconfirmedSpeech: true });
+  const work = observedWork(f.delegate());
+  await boundary('accepted request', () => f.posts.length === 1, [work]);
+  f.release();
+  await boundary('result re-sent', () => f.voices.some(voice => voice.spoken.filter(text => text === f.eligibleText).length === 2), [work]);
+  const voice = f.voices.find(value => value.spoken.filter(text => text === f.eligibleText).length === 2)!;
+  const first = voice.published.indexOf(f.eligibleText), second = voice.published.lastIndexOf(f.eligibleText);
+  assert.ok(first < second);
+  assert.equal(voice.published[second - 1], REPEATED_RESULT_NOTE, 'the re-send is introduced as a possible repeat');
+  assert.ok(!voice.published.slice(0, first).includes(REPEATED_RESULT_NOTE), 'the first delivery is plain');
+  assert.equal(f.posts.length, 1, 'a re-send never re-submits the request');
+});
+
 test('a Dexter API failure that ends the call says so plainly and never blames the voice', async t => {
   const f = await host(t);
   const first = observedWork(f.delegate());
@@ -249,8 +301,9 @@ test('a Dexter API failure that ends the call says so plainly and never blames t
   f.release();
   await boundary('the call is ended with a spoken reason', () => f.providerUpdates.some(update => typeof update.twiml === 'string'), [first]);
   const spoken = f.providerUpdates.map(update => String(update.twiml ?? '')).join(' ');
-  assert.match(spoken, /I lost the connection to your Dexter account/);
-  assert.doesNotMatch(spoken, /voice connection/);
+  assert.match(spoken, /I lost the connection to your Dexter account, so I have to end this call\. A result I hadn't given you yet is in the Dexter app\./,
+    'built from the request that finished but was never delivered; nothing claims queued work keeps running');
+  assert.doesNotMatch(spoken, /voice connection|Anything you already asked for/);
   assert.equal(f.store.get(f.callId)!.endReason, 'account_unavailable');
 });
 

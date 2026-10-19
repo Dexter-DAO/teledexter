@@ -69,7 +69,7 @@ REL=/var/lib/dexter-broker/releases/teledexter-<this release>
 node "$REL/scripts/rollback-journal-compat.mjs" /var/lib/dexter-broker/state --dry-run --target 6e23b1be9103
 ```
 
-The dry run must report `settledCallsFolded` equal to `settledFiles`, the number of files in `calls.d`. Then:
+The dry run must report `settledCallsFolded + settledSuperseded` equal to `settledFiles`, the number of files in `calls.d`. A superseded file belongs to a call that changed after it settled; `calls.json` holds its newer copy. Then:
 
 ```sh
 pm2 stop dexter-broker

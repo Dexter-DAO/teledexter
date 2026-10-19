@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { carrierPlaybackState, callerPresentationFrontier, hasLaterCallerSpeech, hasNewerCallerWork,
-  failedRequestSpeech, requestPresentationContext } from '../src/broker/voicePresentation.js';
+  failedRequestSpeech, requestPresentationContext, accountUnavailableSpeech } from '../src/broker/voicePresentation.js';
 import { callTasks } from '../src/broker/voiceTasks.js';
 import { carriesSpeechPcmu, hasAudiblePcmu, PlaybackReceipts } from '../src/broker/phone.js';
 import type { BrokerCall } from '../src/broker/store.js';
@@ -169,3 +169,39 @@ test('replacement context carries the eligible source in bounded quoted fragment
   assert.deepEqual(requestPresentationContext(entry, revised), absent);
 });
 
+test('the account-failure stop says only what is true of each request', () => {
+  const entry = (status: string, extra: Record<string, unknown> = {}) => ({ requestId: status, status, ...extra });
+  const speech = (...entries: Array<Record<string, unknown>>) => accountUnavailableSpeech(Object.fromEntries(entries.map((value, index) => [String(index), value])));
+  assert.equal(speech(entry('running', { deferredTurns: [{ status: 'queued' }] })),
+    "I lost the connection to your Dexter account, so I have to end this call. The request already sent to your account keeps running. The request I hadn't sent yet won't run, so please ask again. Check the Dexter app for the rest.");
+  assert.equal(speech(entry('prepared')),
+    "I lost the connection to your Dexter account, so I have to end this call. The request I hadn't sent yet won't run, so please ask again. Please call me back.");
+  assert.equal(speech(entry('waiting_for_reply'), entry('dispatch_unknown')),
+    "I lost the connection to your Dexter account, so I have to end this call. I couldn't confirm that your last request reached your account. A question about your request is waiting for your answer. Check the Dexter app for the rest.");
+  assert.equal(speech(entry('completed', { delivery: 'stale' }), entry('completed', { delivery: 'accepted' })),
+    "I lost the connection to your Dexter account, so I have to end this call. A result I hadn't given you yet is in the Dexter app. Please call me back.");
+  assert.equal(speech(), 'I lost the connection to your Dexter account, so I have to end this call. Please call me back.');
+  for (const text of [speech(entry('queued', { deferredTurns: [{ status: 'queued' }] })), speech(entry('prepared'))])
+    assert.doesNotMatch(text, /Anything you already asked for keeps running/);
+});
+
+test('the account-failure stop, for every mix of request states: "keeps running" only with sent work, "won\'t run" only with unsent work', () => {
+  const kinds: Record<string, Record<string, unknown>> = {
+    running: { status: 'running' }, primaryQueued: { status: 'queued' }, dispatching: { status: 'dispatching' },
+    unknown: { status: 'dispatch_unknown' }, waiting: { status: 'waiting_for_reply' },
+    undelivered: { status: 'completed', delivery: 'stale' }, heard: { status: 'completed', delivery: 'accepted' },
+    failedUnheard: { status: 'failed', delivery: 'rejected' }, prepared: { status: 'prepared' },
+    refused: { status: 'admission_refused' }, notAdmitted: { status: 'not_admitted' },
+    queuedTurn: { status: 'running', deferredTurns: [{ status: 'queued' }] },
+    ack: { status: 'completed', delivery: 'accepted', deferredTurns: [{ status: 'recorded_not_submitted' }] },
+  };
+  const names = Object.keys(kinds);
+  for (let mask = 0; mask < 1 << names.length; mask++) {
+    const picked = names.filter((_, index) => mask & (1 << index));
+    const text = accountUnavailableSpeech(Object.fromEntries(picked.map((name, index) => [`r${index}`, { requestId: `r${index}`, ...kinds[name] }])));
+    assert.equal(/keeps? running/.test(text), picked.some(name => ['running', 'primaryQueued', 'queuedTurn'].includes(name)), `${picked}: ${text}`);
+    assert.equal(/won't run/.test(text), picked.some(name => ['prepared', 'queuedTurn'].includes(name)), `${picked}: ${text}`);
+    assert.ok(text.startsWith('I lost the connection to your Dexter account, so I have to end this call.'));
+  }
+  assert.throws(() => accountUnavailableSpeech(undefined as never), 'a record that cannot be read falls back to the fixed sentence in the server');
+});

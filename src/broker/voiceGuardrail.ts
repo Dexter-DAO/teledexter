@@ -17,7 +17,8 @@ export interface JudgeVerdict { contradicts: number; kind: GuardrailKind | 'none
 export type GuardrailJudge = (input: { tasks: string; conversation: string; sentence: string }) => Promise<JudgeVerdict | undefined>;
 export interface GuardrailTrigger {
   at: string; sessionId: string; delegationId: string | null; kind: GuardrailKind; probability: number;
-  sentence: string; judgeMs: number; correction: LiveDelivery['status'] | 'suppressed_cooldown' | 'suppressed_duplicate';
+  sentence: string; judgeMs: number;
+  correction: LiveDelivery['status'] | 'suppressed_cooldown' | 'suppressed_duplicate' | 'suppressed_rate';
 }
 
 /** Words that can carry a claim about a request's progress or outcome. Every sentence is judged; these
@@ -38,6 +39,12 @@ const JUDGE_RETRY_MS = [300, 900] as const;
  * these gets a neutral restatement; every sentence is judged regardless. */
 export const concernsTasks = (sentence: string) => TASK_TERMS.test(sentence) || MONEY_STATE.test(sentence);
 const CORRECTION_COOLDOWN_MS = 4_000;
+/** No-verdict restatements are rate-limited: each instructions.append can cut into Dexter's speech.
+ * A detected contradiction (clear or ambiguous) is never held back by them; it keeps the normal cooldown. */
+const RESTATEMENT_INTERVAL_MS = 20_000;
+/** A restatement's content regardless of task order, so a differently referenced copy is still a duplicate. */
+const restatementKey = (tasks: readonly VoiceTask[]) => tasks
+  .map(task => `${task.status}|${task.outcome ?? task.progress ?? ''}`).sort().join('\n');
 const clipText = (text: string, limit: number) => text.length <= limit ? text : `${text.slice(0, limit - 1).trimEnd()}…`;
 const state: Record<VoiceTask['status'], string> = {
   starting: 'just passed on to Primary, not started yet', pending: 'in progress with no result yet',
@@ -134,7 +141,7 @@ export function createVoiceGuardrail(options: {
   const recent: string[] = [];
 
   const truth = () => (options.truth ?? options.tasks)();
-  let lastRestatement = '';
+  let lastRestatementKey: string | undefined, lastRestatementAt = -Infinity;
   const judgeSentence = async (sessionId: string, sentence: string) => {
     // Every sentence is judged, off the audio path: a claim needs no particular words to be false.
     const conversation = recent.slice(-8, -1).join('\n');
@@ -176,15 +183,23 @@ export function createVoiceGuardrail(options: {
     const task = [...tasks].reverse().find(value => value.sessionId === sessionId && value.delegationId);
     const delegationId = task?.delegationId ?? null;
     let status: GuardrailTrigger['correction'];
-    // The same restatement of an unchanged list adds nothing the voice was not just given.
-    if ((kind === 'ambiguous' || kind === 'unverified') && text === lastRestatement) status = 'suppressed_duplicate';
+    const restating = kind === 'ambiguous' || kind === 'unverified';
+    // A no-verdict restatement with the same content (in any task order) adds nothing the voice was
+    // not just given, and those restatements are rate-limited: each can cut into Dexter's speech. A
+    // detected contradiction, ambiguous included, is a real false claim: only the cooldown applies.
+    if (kind === 'unverified' && restatementKey(visible) === lastRestatementKey) status = 'suppressed_duplicate';
+    else if (kind === 'unverified' && now() - lastRestatementAt < RESTATEMENT_INTERVAL_MS) status = 'suppressed_rate';
     else if (now() - lastCorrectionAt < CORRECTION_COOLDOWN_MS) status = 'suppressed_cooldown';
     else {
+      // Reserve the cooldown and the restatement before awaiting the append, so sentences judged at
+      // the same moment cannot both go out; a correction the voice did not accept releases them again.
+      const previous = { correction: lastCorrectionAt, key: lastRestatementKey, at: lastRestatementAt };
+      lastCorrectionAt = now();
+      if (restating) { lastRestatementKey = restatementKey(visible); lastRestatementAt = now(); }
       try { status = (await options.correct(text, delegationId, sessionId)).status; } catch { status = 'unconfirmed'; }
-      // Only a correction the voice accepted starts the cooldown; a refused one leaves the next claim open.
-      if (status === 'accepted') {
-        lastCorrectionAt = now();
-        if (kind === 'ambiguous' || kind === 'unverified') lastRestatement = text;
+      if (status !== 'accepted') {
+        lastCorrectionAt = previous.correction;
+        if (restating) { lastRestatementKey = previous.key; lastRestatementAt = previous.at; }
       }
     }
     const trigger: GuardrailTrigger = { at: new Date().toISOString(), sessionId, delegationId, kind,

@@ -20,7 +20,7 @@ import { createVoiceGuardrail, type GuardrailJudge } from './voiceGuardrail.js';
 import { recordGuardrailTrigger, recordVoiceClose } from './voiceEvidence.js';
 import { eligiblePhoneCallSchema, type EligibleContextClient } from './eligibleContext.js';
 import { createGenerationVoice, type GenerationVoiceOptions, type GenerationVoiceSession } from './generationVoice.js';
-import { carrierPlaybackState } from './voicePresentation.js';
+import { accountUnavailableSpeech, carrierPlaybackState } from './voicePresentation.js';
 import { createInboundStartupContexts } from './startupContext.js';
 import { createInboundPreconnect } from './inboundPreconnect.js';
 import { createNotificationAssignmentResolver, NotificationAssignmentError, type NotificationAssignmentResolver } from './notificationResolver.js';
@@ -84,8 +84,9 @@ export function inboundAdmissionPollDelay(poll: number): number {
 const SPOKEN_STOPS: Record<string, string> = {
   voice_unavailable: 'My voice connection stopped working. Please try me again shortly.',
   primary_unavailable: 'I could not reach your Dexter account just now. Please try again shortly.',
-  // A Dexter API failure mid-call is never blamed on the voice. Accepted work keeps running.
-  account_unavailable: 'I lost the connection to your Dexter account, so I have to end this call. Anything you already asked for keeps running, and its result will be in the Dexter app.',
+  // A Dexter API failure mid-call is never blamed on the voice. The full sentence is built from the
+  // call's requests (accountUnavailableSpeech); this is the fallback when they cannot be read.
+  account_unavailable: 'I lost the connection to your Dexter account, so I have to end this call. Check the Dexter app for your requests.',
   media_socket_stalled: 'I lost the audio on this call. Please call me back.',
 };
 /** Generation problems caused by the Dexter API (eligible context reads and admission), not by the voice. */
@@ -1210,7 +1211,9 @@ export function createBrokerServer(options: BrokerServerOptions) {
             await restricted.endPrivateProvider(saved, reason);
           } else if (reason !== 'provider_terminal' && saved && !providerFinished(saved)) {
             if (SPOKEN_STOPS[reason]) {
-              const spoken = await provider.calls(call.callSid!).update({ twiml: fallbackTwiml(SPOKEN_STOPS[reason]) });
+              let speech = SPOKEN_STOPS[reason]!;
+              if (reason === 'account_unavailable') { try { speech = accountUnavailableSpeech(saved.delegations); } catch { /* Fallback above. */ } }
+              const spoken = await provider.calls(call.callSid!).update({ twiml: fallbackTwiml(speech) });
               if (providerStates.has(spoken.status as CallStatus)) observeProviderRecord(saved, spoken, 'authenticated_update');
               else store.update(call.id, { status: 'unknown' });
             } else {
