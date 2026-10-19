@@ -1,5 +1,5 @@
 import { liveResultChunks } from './backend.js';
-import { portfolioFactsText } from './portfolio.js';
+import { portfolioFactsText, portfolioLabels } from './portfolio.js';
 import type { PrimaryApiClient, PrimaryResult } from './primaryApi.js';
 import { PrimaryApiError } from './primaryApi.js';
 import type { BrokerLiveSession } from '../live/types.js';
@@ -14,6 +14,8 @@ export function createPortfolioContext(callId: string, bindingId: string,
   let timer: ReturnType<typeof setInterval> | undefined, expiry: ReturnType<typeof setTimeout> | undefined;
   let publishing = Promise.resolve();
   const refreshed = new Set<string>(), changedRequests = new Set<string>(), changing = new Set<string>();
+  // Every holding name a note has carried on this call: what the voice can read out from broker data.
+  const labels = new Set<string>();
   const publish = (unchanged = false) => {
     const target = voice, value = note, version = revision;
     if (!target || !value || stopped) return Promise.resolve(false);
@@ -57,6 +59,7 @@ export function createPortfolioContext(callId: string, bindingId: string,
       if (stopped || version !== revision || changing.size) { outcome = 'superseded'; return; }
       const remaining = Date.parse(facts.observedAt) + 60_000 - Date.now();
       if (remaining <= 0 || remaining > 60_000) { outcome = 'stale'; return; }
+      for (const label of portfolioLabels(facts)) labels.add(label);
       const content = portfolioFactsText(facts, true), unchanged = note?.content === content;
       if (!unchanged) { revision++; publishedVersion = undefined; }
       note = { content, observedAt: facts.observedAt };
@@ -89,6 +92,9 @@ export function createPortfolioContext(callId: string, bindingId: string,
     detach(previous: BrokerLiveSession) {
       if (voice === previous) { voice = undefined; clearInterval(timer); timer = undefined; }
     },
+    /** Holding names the notes on this call carried, kept after a note is withdrawn: the voice may
+     * already have read them out. */
+    labels: (): string[] => [...labels],
     observe(result: PrimaryResult) {
       if (stopped || result.bindingId !== bindingId) return;
       const action = result.partialResult;

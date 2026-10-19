@@ -1,4 +1,5 @@
 import { conversationContext } from './conversationContext.js';
+import { toldFacts } from './toldFacts.js';
 import { createHash } from 'node:crypto';
 import type { BrokerLiveBackend, LiveBackendChannel, LiveDelegationRequest, LiveTranscriptSnapshot } from '../live/session.js';
 import { LIVE_APPEND_MAX_BYTES } from '../live/session.js';
@@ -46,6 +47,9 @@ export interface PrimaryBackendOptions {
   watchUntilCallEnds?: boolean;
   now?: () => number;
   lastCallerSpeechAt?: () => number | undefined;
+  /** Holding names from the call's portfolio notes. A sentence of Dexter's that names one is a fact it
+   * told the caller, passed to Primary with every later request (see toldFacts.ts). */
+  holdingLabels?(): readonly string[];
   mediaStartedAt?: string;
   /** Canonical transcript clock owned by this backend; delivery may use another Live session. */
   sourceSessionId?: string;
@@ -1005,7 +1009,9 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       throw new Error('call_assignment_binding_mismatch');
     return assignmentRef === undefined ? undefined : phoneCallAssignmentRefSchema.parse(assignmentRef);
   };
-  const recentConversation = (sessionId: string, snapshot: LiveTranscriptSnapshot, sequence: number, atMs: number) => {
+  // The rolling speech window before a request, plus the account facts Dexter told the caller anywhere
+  // earlier in the call (all sessions), so "the token you said I had" still resolves minutes later.
+  const recentConversation = (sessionId: string, snapshot: LiveTranscriptSnapshot, sequence: number, atMs: number, request: string) => {
     const segments = boundCall(sessionId).liveGenerations?.segments ?? [];
     const current = segments.find(segment => segment.sessionId === sessionId);
     const ordinal = current?.ordinal ?? 0;
@@ -1017,7 +1023,9 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
       }),
       ...snapshot.fragments.filter(fragment => fragment.sequence < sequence),
     ].map((fragment, index) => ({ ...fragment, sequence: index + 1 }));
-    const voiceContext = conversationContext(fragments, fragments.length + 1, atMs);
+    let labels: readonly string[] = [];
+    try { labels = options.holdingLabels?.() ?? []; } catch { /* Optional vocabulary; amounts and outcomes still count. */ }
+    const voiceContext = conversationContext(fragments, fragments.length + 1, atMs, { facts: toldFacts(fragments, labels), anchor: request });
     return voiceContext ? { voiceContext } : {};
   };
   const submissionForTurn = (sessionId: string, snapshot: LiveTranscriptSnapshot,
@@ -1025,10 +1033,11 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     const first = fragments.reduce((a, b) => a.sequence < b.sequence ? a : b);
     const sourceEventId = brokerIdentity('source', options.callId, sessionId, first.eventId);
     const call = boundCall(sessionId), frozenAssignmentRef = assignmentReference(sessionId);
+    const text = fragments.map(fragment => fragment.text).join('');
     return { source: { callSid: options.callSid, itemId: `live-turn-${sourceEventId}`, sourceEventId,
       revision: 1, receivedAt: new Date(mediaOrigin(sessionId) + first.startMs).toISOString(), role: 'user' },
-    text: fragments.map(fragment => fragment.text).join(''),
-    ...recentConversation(sessionId, snapshot, first.sequence, first.startMs),
+    text,
+    ...recentConversation(sessionId, snapshot, first.sequence, first.startMs, text),
     ...selectBrokerPublicationReference(call, { callId: options.callId, callSid: options.callSid,
       bindingId: options.bindingId, sessionId }, snapshot, first.sequence),
     ...(frozenAssignmentRef === undefined ? {} : { callAssignmentRef: frozenAssignmentRef }) };
@@ -1037,7 +1046,7 @@ export function createPrimaryBackend(options: PrimaryBackendOptions): PrimaryBac
     const ref = assignmentReference(frozen.sessionId), turn = frozen.turn;
     return { source: { callSid: options.callSid, itemId: turn.itemId, sourceEventId: turn.sourceEventId,
       revision: 1, receivedAt: turn.occurredAt, role: 'user' }, text: turn.text,
-    ...recentConversation(frozen.sessionId, observedTranscript ?? { revision: 0, callerRevision: 0, fragments: [] }, frozen.firstSequence, frozen.startMs),
+    ...recentConversation(frozen.sessionId, observedTranscript ?? { revision: 0, callerRevision: 0, fragments: [] }, frozen.firstSequence, frozen.startMs, turn.text),
     ...(ref === undefined ? {} : { callAssignmentRef: ref }) };
   };
   const questionTargets = (sessionId: string): CallerQuestionTarget[] => {

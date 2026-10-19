@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { claimsOutcome, concernsTasks, correctionText, createDecisionsJudge, createVoiceGuardrail, type GuardrailJudge,
+import { readFileSync } from 'node:fs';
+import { claimsOutcome, concernsTasks, correctionText, createDecisionsJudge, createVoiceGuardrail, TOLD_INSTRUCTIONS, type GuardrailJudge,
   type GuardrailTrigger, type JudgeVerdict } from '../src/broker/voiceGuardrail.js';
 import type { VoiceTask } from '../src/broker/voiceTasks.js';
 import type { LiveDelivery, LiveTranscriptSnapshot } from '../src/live/types.js';
@@ -431,4 +432,188 @@ test('the Decisions judge asks two predicates and one choice and reads every ans
     [['predicate', 'contradicts'], ['predicate', 'supported'], ['choice', 'kind']]);
   const failing = createDecisionsJudge('sk-test', (async () => new Response('{}', { status: 500 })) as unknown as typeof fetch);
   assert.equal(await failing({ tasks: '', conversation: '', sentence: 'x' }), undefined);
+});
+
+// A correction blocked only by one still awaiting its acknowledgement (reviewer probe pr11b, ea26521).
+const amazonSale: VoiceTask = { requestId: 'r1', sessionId: 's', delegationId: 'd1', sourceEventId: 'e1', status: 'pending', request: 'Sell two dollars of Amazon' };
+const falseSuccess: JudgeVerdict = { contradicts: 0.99, kind: 'false_success', kindProbability: 0.9, supported: 0.1 };
+const falseFailure: JudgeVerdict = { contradicts: 0.99, kind: 'false_failure', kindProbability: 0.9, supported: 0.1 };
+const byWords = (sentence: string): JudgeVerdict => sentence.includes('went through') ? falseSuccess : sentence.includes('failed') ? falseFailure : fine;
+function inFlight(outcomes: Array<{ ms: number; status: LiveDelivery['status'] }>, tasks: () => VoiceTask[] = () => [amazonSale],
+  verdict: (sentence: string) => JudgeVerdict | undefined = byWords) {
+  const clock = { t: 0 }, sent: string[] = [], judged: string[] = [], triggers: GuardrailTrigger[] = [];
+  let next = 0, sequence = 0;
+  const guardrail = createVoiceGuardrail({ callId: 'c', tasks, now: () => clock.t,
+    judge: async input => { judged.push(input.sentence); return verdict(input.sentence); },
+    correct: async text => {
+      const outcome = outcomes[next++] ?? { ms: 0, status: 'accepted' as const };
+      sent.push(text); await wait(outcome.ms); return { eventId: 'x', status: outcome.status } as LiveDelivery;
+    },
+    record: trigger => triggers.push(trigger) });
+  const fragments: LiveTranscriptSnapshot['fragments'] = [];
+  const say = (text: string, at: number) => {
+    clock.t = at; sequence++;
+    fragments.push({ eventId: `f${sequence}`, role: 'assistant', text, startMs: at, endMs: at + 100, sequence } as LiveTranscriptSnapshot['fragments'][number]);
+    guardrail.observe({ revision: sequence, callerRevision: 0, fragments: [...fragments] } as LiveTranscriptSnapshot, 's');
+  };
+  return { guardrail, sent, judged, triggers, say };
+}
+const outcomes = (triggers: GuardrailTrigger[]) => triggers.map(trigger => [trigger.sentence.slice(0, 18), trigger.correction]);
+
+test('probe pr11b: a correction blocked only by one in flight is sent when that one is refused', async () => {
+  const h = inFlight([{ ms: 400, status: 'rejected' }]);
+  h.say('Your sale went through.', 0); await wait(50);           // A: reserved, its append pending 400 ms
+  h.say('Actually the sale failed.', 1000); await wait(500);     // B: judged while A is pending, held; A refused, B sent
+  h.say('So it went through after all.', 2000); await wait(50);  // C: within B's accepted cooldown
+  h.guardrail.stop();
+  assert.deepEqual(outcomes(h.triggers), [['Your sale went thr', 'rejected'], ['Actually the sale ', 'accepted'],
+    ['So it went through', 'suppressed_cooldown']]);
+  assert.equal(h.sent.length, 2);
+  assert.match(h.sent[1]!, /^Correction: You said something failed or did not happen/);
+  assert.deepEqual(h.judged, ['Your sale went through.', 'Actually the sale failed.', 'So it went through after all.'],
+    'the task list did not change while B waited, so B went out on its first verdict');
+});
+
+test('probe pr11b: an append that ends unconfirmed (ack timeout) releases the cooldown; no wedge', async () => {
+  const h = inFlight([{ ms: 300, status: 'unconfirmed' }]);
+  h.say('Your sale went through.', 0); await wait(350);
+  h.say('Your sale went through, done.', 1000); await wait(50);
+  h.guardrail.stop();
+  assert.deepEqual(h.triggers.map(trigger => trigger.correction), ['unconfirmed', 'accepted']);
+});
+
+test('a correction held behind one in flight stays suppressed when that one is accepted, and is recorded once', async () => {
+  const h = inFlight([{ ms: 300, status: 'accepted' }]);
+  h.say('Your sale went through.', 0); await wait(50);
+  h.say('Actually the sale failed.', 1000); await wait(400);
+  h.guardrail.stop();
+  assert.deepEqual(outcomes(h.triggers), [['Your sale went thr', 'accepted'], ['Actually the sale ', 'suppressed_cooldown']]);
+  assert.equal(h.sent.length, 1);
+});
+
+test('of corrections held behind one in flight the latest is sent, and a restatement never displaces a clear correction', async () => {
+  const ambiguous: JudgeVerdict = { contradicts: 0.99, kind: 'false_success', kindProbability: 0.9, supported: 0.7 };
+  const h = inFlight([{ ms: 400, status: 'rejected' }], undefined, sentence => sentence.startsWith('Anyway') ? ambiguous : byWords(sentence));
+  h.say('Your sale went through.', 0); await wait(50);              // A in flight
+  h.say('The sale failed.', 1000); await wait(20);                   // B1 held
+  h.say('Nothing sold, the sale failed.', 1500); await wait(20);     // B2, later, replaces B1
+  h.say('Anyway, it went through.', 2000); await wait(500);          // B3, a restatement, leaves B2 held; A refused, B2 sent
+  h.guardrail.stop();
+  assert.deepEqual(outcomes(h.triggers), [['The sale failed.', 'suppressed_cooldown'], ['Anyway, it went th', 'suppressed_cooldown'],
+    ['Your sale went thr', 'rejected'], ['Nothing sold, the ', 'accepted']]);
+  assert.equal(h.sent.length, 2);
+});
+
+test('a held correction is judged again when the task list changed while it waited, and dropped if no longer false', async () => {
+  let tasks = [amazonSale];
+  const h = inFlight([{ ms: 300, status: 'rejected' }], () => tasks,
+    sentence => sentence.includes('went through') && tasks[0]!.status === 'pending' ? falseSuccess : fine);
+  h.say('Your sale went through.', 0); await wait(50);   // A in flight
+  h.say('Yes, it went through.', 1000); await wait(20);  // B held
+  tasks = [{ ...amazonSale, status: 'finished', outcome: 'You sold about $2.00 of Amazon stock.' }];
+  await wait(400);
+  h.guardrail.stop();
+  assert.deepEqual(h.judged, ['Your sale went through.', 'Yes, it went through.', 'Yes, it went through.'], 'judged again on the new list');
+  assert.equal(h.sent.length, 1, 'true by then, so nothing more is sent');
+  assert.deepEqual(h.triggers.map(trigger => trigger.correction), ['rejected']);
+});
+
+// Call 1325b55e, scrubbed (tests/fixtures/voice-told-facts.json).
+const call1325 = JSON.parse(readFileSync(new URL('./fixtures/voice-told-facts.json', import.meta.url), 'utf8')) as {
+  holdingLabels: string[]; fragments: LiveTranscriptSnapshot['fragments']; requests: Array<{ firstSequence: number; result?: string }> };
+const RELAYED = "I haven't mentioned anything called Maple, but Cedar Leaf is five hundred tokens worth about four dollars and eighty cents.";
+function replay(guardrail: ReturnType<typeof createVoiceGuardrail>, fragments: LiveTranscriptSnapshot['fragments']) {
+  const shown: LiveTranscriptSnapshot['fragments'] = [];
+  for (const fragment of fragments) {
+    shown.push(fragment);
+    guardrail.observe({ revision: shown.length, callerRevision: 0, fragments: [...shown] } as LiveTranscriptSnapshot, 'live_1');
+  }
+}
+function toldHarness(fragments = call1325.fragments) {
+  const inputs: Array<{ sentence: string; told: string }> = [], corrections: string[] = [], triggers: GuardrailTrigger[] = [];
+  const tasks: VoiceTask[] = call1325.requests.slice(0, 3).map((request, index) => ({ requestId: `r${index}`, sessionId: 'live_1',
+    delegationId: `d${index}`, sourceEventId: `e${index}`, status: 'finished' as const, request: `request ${index}`, outcome: request.result }));
+  const guardrail = createVoiceGuardrail({ callId: 'c', tasks: () => tasks, labels: () => call1325.holdingLabels,
+    // The relayed result matches a listed result, so the task-list questions find nothing wrong with it;
+    // only Dexter's own earlier words show the conflict.
+    judge: async input => {
+      inputs.push({ sentence: input.sentence, told: input.told ?? '' });
+      return { contradicts: 0.02, kind: 'none', kindProbability: 0.97, supported: 0.95,
+        contradictsTold: input.sentence.startsWith("I haven't mentioned anything called Maple")
+          && (input.told ?? '').includes('"MAPLE is about twenty-one forty') ? 0.995 : 0.01 };
+    },
+    correct: async text => { corrections.push(text); return { eventId: 'x', status: 'accepted' } as LiveDelivery; },
+    record: trigger => triggers.push(trigger) });
+  replay(guardrail, fragments);
+  return { guardrail, inputs, corrections, triggers };
+}
+
+test('call 1325b55e: a relayed "I haven\'t mentioned Maple" after Dexter read Maple out gets a neutral restatement of its own words', async () => {
+  const h = toldHarness();
+  await wait(50); h.guardrail.stop();
+  assert.deepEqual(h.triggers.map(trigger => [trigger.kind, trigger.correction, trigger.sentence, trigger.probability]),
+    [['told_conflict', 'accepted', RELAYED, 0.995]]);
+  assert.equal(h.corrections.length, 1);
+  assert.match(h.corrections[0]!, /^For accuracy, this is what you already told the caller earlier on this call, in your own words: "MAPLE is about twenty-one forty, Birch nine oh-five, Cedarleaf four eighty, SpaceX two ninety, /,
+    'the statement it contradicts comes first');
+  assert.match(h.corrections[0]!, /never deny having said it/);
+  assert.doesNotMatch(h.corrections[0]!, ACCUSES);
+  assert.ok(Buffer.byteLength(h.corrections[0]!) <= 500);
+  const relayed = h.inputs.find(input => input.sentence === RELAYED)!;
+  assert.match(relayed.told, /^- "Your portfolio is about forty-one dollars and twenty cents\."$/m);
+  assert.match(relayed.told, /^- "MAPLE is about twenty-one forty, .* USDC forty cents,"$/m);
+  assert.match(relayed.told, /^- "Right, MAPLE\."$/m, 'a holding named from the portfolio note is a fact');
+  assert.doesNotMatch(relayed.told, /haven't mentioned|Let me check/, 'only what Dexter said before this sentence');
+  assert.doesNotMatch(relayed.told, /On it|Checking that one|Should I run it|still waiting/, 'progress talk and questions are not facts');
+  assert.equal(h.inputs[0]!.told, '', 'nothing was told before the first sentence');
+});
+
+test('call 1325b55e: the same sentence passes when Dexter never read Maple out', async () => {
+  const h = toldHarness(call1325.fragments.filter(fragment => fragment.sequence < 9 || fragment.sequence > 38));
+  await wait(50); h.guardrail.stop();
+  assert.deepEqual(h.triggers, []);
+  assert.doesNotMatch(h.inputs.find(input => input.sentence === RELAYED)!.told, /twenty-one forty/);
+});
+
+test('a sentence the guardrail found false is never offered back to the judge as something Dexter told the caller', async () => {
+  const inputs: Array<{ sentence: string; told: string }> = [];
+  const h = createVoiceGuardrail({ callId: 'c', tasks: () => [pending],
+    judge: async input => { inputs.push({ sentence: input.sentence, told: input.told ?? '' });
+      return input.sentence.includes('went through') ? contradiction : fine; },
+    correct: async () => ({ eventId: 'x', status: 'accepted' }) as LiveDelivery });
+  const t = transcript();
+  h.observe(t.say('assistant', 'Your Apple sale went through.', 0), 'live_1'); await wait(20);
+  h.observe(t.say('assistant', 'You have about twelve dollars of Apple stock.', 6000), 'live_1'); await wait(20);
+  h.observe(t.say('assistant', 'Your balance is about forty dollars.', 12000), 'live_1'); await wait(20);
+  h.stop();
+  assert.equal(inputs[1]!.told, '', 'the corrected false claim is not a fact');
+  assert.equal(inputs[2]!.told, '- "You have about twelve dollars of Apple stock."');
+});
+
+test('the told restatement stays within one append however long the earlier statements', () => {
+  const told = ['ß'.repeat(900), 'You have about twelve dollars of WALNUT.', '😀 '.repeat(300)];
+  const text = correctionText('told_conflict', [], 'I never mentioned WALNUT.', told);
+  assert.ok(Buffer.byteLength(text) <= 500, String(Buffer.byteLength(text)));
+  assert.match(text, /in your own words: "You have about twelve dollars of WALNUT\." "/, 'the related statement first');
+  assert.match(text, /otherwise carry on\.$/);
+});
+
+test('the Decisions judge sends Dexter\'s earlier statements, and asks about them, only when there are any', async () => {
+  const bodies: Array<{ input: string; questions: Array<{ name: string; instructions?: string }> }> = [];
+  const judge = createDecisionsJudge('sk-test', (async (_url: string, init: RequestInit) => {
+    bodies.push(JSON.parse(String(init.body)));
+    return new Response(JSON.stringify({ answers: [{ name: 'contradicts', type: 'predicate', probability: 0.01 },
+      { name: 'supported', type: 'predicate', probability: 0.93 },
+      { name: 'kind', type: 'choice', choice: 'none', probabilities: [{ value: 'none', probability: 0.97 }] },
+      { name: 'contradicts_told', type: 'predicate', probability: 0.99 }] }), { status: 200 });
+  }) as typeof fetch);
+  assert.deepEqual(await judge({ tasks: '1. finished.', conversation: '', sentence: RELAYED, told: '- "MAPLE is about twenty-one forty,"' }),
+    { contradicts: 0.01, kind: 'none', kindProbability: 0.97, supported: 0.93, contradictsTold: 0.99 });
+  assert.match(bodies[0]!.input, /\n\nWHAT DEXTER ALREADY TOLD THE CALLER EARLIER ON THIS CALL \(its own words, before the latest sentence\):\n- "MAPLE is about twenty-one forty,"\n\nRECENT CONVERSATION:/);
+  assert.deepEqual(bodies[0]!.questions.map(question => question.name), ['contradicts', 'supported', 'kind', 'contradicts_told']);
+  assert.equal(bodies[0]!.questions[3]!.instructions, TOLD_INSTRUCTIONS);
+  await judge({ tasks: '1. finished.', conversation: '', sentence: 'Okay.', told: '' });
+  assert.doesNotMatch(bodies[1]!.input, /ALREADY TOLD/);
+  assert.deepEqual(bodies[1]!.questions.map(question => question.name), ['contradicts', 'supported', 'kind'],
+    'without earlier statements the request is the calibrated one');
 });

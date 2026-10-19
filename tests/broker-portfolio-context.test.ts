@@ -330,3 +330,16 @@ test('call truth: a dispatched send observation withdraws the portfolio before c
   await flush(); assert.equal(reads, 2);
   assert.match(v.notes().at(-1)!, /only current portfolio note/);
 });
+
+test('every holding name a note carried stays known for the call, even after the note is withdrawn', async t => {
+  let reads = 0;
+  const context = createPortfolioContext('call_test', bindingId, { portfolio: async () => ({ ...facts(), holdings: reads++ === 0
+    ? [{ name: 'Maple Token', symbol: 'MAPLE', assetClass: 'token', amount: '5', valueUsd: '21.40', change24hPercent: null },
+      { name: 'Unnamed', symbol: 'not a label!', assetClass: 'token', amount: '1', valueUsd: '1', change24hPercent: null }]
+    : [{ name: 'USD Coin', symbol: 'USDC', assetClass: 'token', amount: '7', valueUsd: '7', change24hPercent: null }] }) });
+  t.after(() => context.stop()); const v = voice(t); await flush(); context.attach(v.session); await flush();
+  assert.deepEqual(context.labels(), ['MAPLE'], 'only the names a note states, as it states them');
+  context.observe(result('completed')); await flush();
+  assert.match(v.notes().join(' '), /Portfolio note withdrawn\./);
+  assert.deepEqual(context.labels(), ['MAPLE', 'USDC'], 'the voice may already have read MAPLE out');
+});

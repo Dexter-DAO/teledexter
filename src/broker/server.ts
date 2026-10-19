@@ -1267,13 +1267,14 @@ export function createBrokerServer(options: BrokerServerOptions) {
       catch { /* Telemetry only. */ }
       if (!options.eligibleContext) {
         voiceTasks = createVoiceTasks(() => store.get(call.id));
+        const holdingLabels = () => portfolioContext?.labels() ?? [];
         guardrail = options.guardrailJudge ? createVoiceGuardrail({ callId: call.id, judge: options.guardrailJudge,
-          tasks: () => voiceTasks?.correctable() ?? [], truth: () => voiceTasks?.tasks(true) ?? [],
+          tasks: () => voiceTasks?.correctable() ?? [], truth: () => voiceTasks?.tasks(true) ?? [], labels: holdingLabels,
           correct: (text, delegationId, sessionId) => live && sessionId === connectedSessionId
             ? live.appendInstructions(text, delegationId) : Promise.resolve({ eventId: '', status: 'closed' as const }),
           record: trigger => recordGuardrailTrigger(store, call.id, trigger) }) : undefined;
         backend = createPrimaryBackend({ callId: call.id, callSid: call.callSid!, bindingId: bound.primary.bindingId,
-          onResult: result => portfolioContext?.observe(result), onRequest: () => voiceTasks?.refresh(),
+          onResult: result => portfolioContext?.observe(result), onRequest: () => voiceTasks?.refresh(), holdingLabels,
           admissionSettled: request => voiceTasks?.settled(request),
           api: primary, store, watchUntilCallEnds: true, lastCallerSpeechAt: () => lastSpeechAt });
       }

@@ -75,7 +75,8 @@ test('successor registration/context crosses actual HTTP with negotiated full me
 async function host(t: test.TestContext, slowClose = false, questionMode = false, boundedCleanup = false,
   settings: { admitted?: boolean; failed?: boolean; failureCode?: string; cancelled?: boolean; sameEpoch?: boolean; resultText?: string; callerText?: string;
     openingStatus?: 'accepted' | 'rejected' | 'unconfirmed'; greetingClip?: Buffer; unconfirmedSpeech?: boolean;
-    failedSpeech?: { text: string; status: 'rejected' | 'unconfirmed' } } = {}) {
+    /** The first delivery of this text fails; with replace, the context also moves on, so the re-send needs a new voice session. */
+    failedSpeech?: { text: string; status: 'rejected' | 'unconfirmed'; replace?: boolean } } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-generation-server-'));
   const config: BrokerConfig = { host: '127.0.0.1', port: 3213, publicOrigin: 'https://phone.example.test', stateDir: directory,
     controlToken: 'c'.repeat(40), apiKey: 'fixture-key', model: 'gpt-live-1', voice: 'marin',
@@ -109,7 +110,7 @@ async function host(t: test.TestContext, slowClose = false, questionMode = false
       posts.push({ requestId, input: structuredClone(input) }); return { bindingId, requestId, state: 'queued', replayed: false };
     },
     async result(_binding: string, requestId: string) {
-      if (released) { const callback = beforeResult; beforeResult = undefined; callback?.(); generation = 2; if (settings.cancelled) return { bindingId, requestId, state: 'cancelled', error: { code: 'cancelled', retryable: false } }; if (settings.failed) return { bindingId, requestId, state: 'failed', error: { code: settings.failureCode ?? 'primary_financial_result_unknown', retryable: false } }; return questionMode ? { bindingId, requestId, state: 'waiting_for_reply', question } : completed(requestId); }
+      if (released) { const callback = beforeResult; beforeResult = undefined; callback?.(); generation = Math.max(generation, 2); if (settings.cancelled) return { bindingId, requestId, state: 'cancelled', error: { code: 'cancelled', retryable: false } }; if (settings.failed) return { bindingId, requestId, state: 'failed', error: { code: settings.failureCode ?? 'primary_financial_result_unknown', retryable: false } }; return questionMode ? { bindingId, requestId, state: 'waiting_for_reply', question } : completed(requestId); }
       return { bindingId, requestId, state: 'running' };
     },
     async close() { return { bindingId, callSid: sid, state: 'closed' }; },
@@ -164,6 +165,7 @@ async function host(t: test.TestContext, slowClose = false, questionMode = false
         async appendCommentary(text) { spoken.push(text);published.push(text);
           if (settings.failedSpeech && text === settings.failedSpeech.text && !failedSpeechUsed) {
             failedSpeechUsed = true;
+            if (settings.failedSpeech.replace) generation++;
             return { eventId: `comment_${sessionId}_${spoken.length}`, status: settings.failedSpeech.status,
               observedCallerRevision: captions.callerRevision, observedTranscriptSequence: captions.revision };
           }
@@ -275,6 +277,34 @@ test('a result whose only delivery was rejected (never heard) is re-sent plainly
   await boundary('result re-sent', () => f.voices.some(voice => voice.spoken.filter(text => text === resultText).length === 2), [work]);
   const voice = f.voices.find(value => value.spoken.filter(text => text === resultText).length === 2)!;
   assert.ok(!voice.published.includes(REPEATED_RESULT_NOTE));
+});
+
+test('a result cut off after a heard chunk and re-sent on a replacement voice session carries the repeat note', async t => {
+  const resultText = Array.from({ length: 12 }, (_, index) => `Line ${index + 1}: you sold about $2.00 of Amazon stock and the sale is confirmed.`).join(' ');
+  const chunks = liveResultChunks(resultText);
+  const f = await host(t, false, false, false, { resultText, failedSpeech: { text: chunks[1]!, status: 'rejected', replace: true } });
+  const work = observedWork(f.delegate());
+  await boundary('accepted request', () => f.posts.length === 1, [work]);
+  f.release();
+  await boundary('result re-sent on a replacement session', () => f.voices.length === 3 && f.voices[2]!.spoken.includes(chunks.at(-1)!), [work]);
+  const [, cut, successor] = f.voices;
+  assert.deepEqual(cut!.spoken.slice(0, 2), chunks.slice(0, 2), 'the first chunk was heard before the second failed and the session was replaced');
+  const note = successor!.published.indexOf(REPEATED_RESULT_NOTE), first = successor!.published.indexOf(chunks[0]!);
+  assert.ok(note >= 0 && note < first, 'the replacement is told the result may repeat what the caller heard');
+  assert.ok(successor!.published.slice(note + 1, first).every(text => successor!.quiet.includes(text)), 'nothing is spoken between the note and the result');
+  assert.equal(f.posts.length, 1);
+});
+
+test('a result never heard on its first session is re-sent plainly on the replacement voice session', async t => {
+  const resultText = Array.from({ length: 12 }, (_, index) => `Line ${index + 1}: you sold about $2.00 of Amazon stock and the sale is confirmed.`).join(' ');
+  const chunks = liveResultChunks(resultText);
+  const f = await host(t, false, false, false, { resultText, failedSpeech: { text: chunks[0]!, status: 'rejected', replace: true } });
+  const work = observedWork(f.delegate());
+  await boundary('accepted request', () => f.posts.length === 1, [work]);
+  f.release();
+  await boundary('result re-sent on a replacement session', () => f.voices.length === 3 && f.voices[2]!.spoken.includes(chunks.at(-1)!), [work]);
+  assert.deepEqual(f.voices[1]!.spoken, [chunks[0]], 'refused at its first chunk, so nothing was heard');
+  assert.ok(!f.voices[2]!.published.includes(REPEATED_RESULT_NOTE));
 });
 
 test('a result whose first delivery went unconfirmed is re-sent with the conditional repeat note', async t => {

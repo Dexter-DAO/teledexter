@@ -1,5 +1,6 @@
 import type { LiveDelivery, LiveTranscriptSnapshot } from '../live/types.js';
 import type { VoiceTask } from './voiceTasks.js';
+import { contentWords, isToldFact, selectTold } from './toldFacts.js';
 
 /**
  * Monitor-and-correct guardrail (developers.openai.com/api/docs/guides/voice-server-controls,
@@ -9,12 +10,18 @@ import type { VoiceTask } from './voiceTasks.js';
  */
 /** A clear contradiction is corrected outright. 'ambiguous' (the judge found a contradiction but also
  * a listed status or result the sentence matches) and 'unverified' (no verdict) get a neutral
- * restatement of the voice's own task list instead, which retracts nothing true. */
-export type GuardrailKind = 'false_success' | 'false_failure' | 'phantom_step' | 'ambiguous' | 'unverified';
+ * restatement of the voice's own task list instead, which retracts nothing true. 'told_conflict' (the
+ * sentence denies or contradicts what Dexter itself already told the caller, as when it relays
+ * "I haven't mentioned Maple" after reading Maple out) gets a neutral restatement of those words. */
+export type GuardrailKind = 'false_success' | 'false_failure' | 'phantom_step' | 'ambiguous' | 'unverified' | 'told_conflict';
 export interface JudgeVerdict { contradicts: number; kind: GuardrailKind | 'none' | 'stale_pending'; kindProbability: number;
   /** Whether the sentence matches the status or result of any listed request (absent: not asked). */
-  supported?: number }
-export type GuardrailJudge = (input: { tasks: string; conversation: string; sentence: string }) => Promise<JudgeVerdict | undefined>;
+  supported?: number;
+  /** Whether the sentence denies or contradicts what Dexter already told the caller (absent: not asked). */
+  contradictsTold?: number }
+export type GuardrailJudge = (input: { tasks: string; conversation: string; sentence: string;
+  /** Dexter's own earlier statements of account facts on this call, one per line; '' when none. */
+  told?: string }) => Promise<JudgeVerdict | undefined>;
 export interface GuardrailTrigger {
   at: string; sessionId: string; delegationId: string | null; kind: GuardrailKind; probability: number;
   sentence: string; judgeMs: number;
@@ -56,16 +63,13 @@ const state: Record<VoiceTask['status'], string> = {
 const statusLine = (task: VoiceTask, limit = 150) => `${state[task.status]}${task.outcome ? `; its result: ${clipText(task.outcome, limit)}`
   : task.progress ? `; progress only: ${clipText(task.progress, Math.min(90, limit))}` : ''}`;
 
-const STOP_WORDS = new Set(['the', 'and', 'that', 'this', 'for', 'you', 'your', 'about', 'was', 'were', 'has', 'have', 'had', 'with',
-  'its', 'it', 'is', 'are', 'not', 'yet', 'now', 'all', 'one', 'too', 'did', 'just', 'then', 'what', 'from', 'will']);
-const words = (text: string) => new Set((text.toLowerCase().match(/[a-z][a-z'-]{2,}/g) ?? []).filter(word => !STOP_WORDS.has(word)));
 /** The task a sentence most likely refers to: the most shared words with its request or result, the most
  * recent on a tie. Corrections name it first so a claim about an earlier request is never left out. */
 export function referencedTask(sentence: string, tasks: readonly VoiceTask[]): number {
-  const said = words(sentence);
+  const said = contentWords(sentence);
   let best = tasks.length - 1, bestScore = 0;
   tasks.forEach((task, index) => {
-    const known = words(`${task.request} ${task.outcome ?? ''} ${task.progress ?? ''}`);
+    const known = contentWords(`${task.request} ${task.outcome ?? ''} ${task.progress ?? ''}`);
     let score = 0; for (const word of said) if (known.has(word)) score++;
     if (score >= bestScore && score > 0) { best = index; bestScore = score; }
   });
@@ -86,12 +90,43 @@ function taskLines(tasks: readonly VoiceTask[], first: number, budget: number,
   return `${text.slice(0, Math.max(0, budget - 3)).trimEnd()}…`;
 }
 
+/** Text cut to a UTF-8 byte budget, marked when cut. */
+function clipBytes(text: string, budget: number): string {
+  if (Buffer.byteLength(text) <= budget) return text;
+  let cut = Array.from(text).slice(0, Math.max(0, budget)).join('');
+  while (cut && Buffer.byteLength(`${cut}…`) > budget) cut = Array.from(cut).slice(0, -1).join('');
+  return `${cut.trimEnd()}…`;
+}
+/** Dexter's earlier statements, quoted within a byte budget: those sharing the most words with the
+ * sentence first, then the newest. */
+function toldLines(told: readonly string[], sentence: string, budget: number): string {
+  const said = contentWords(sentence);
+  const ranked = told.map((text, index) => ({ text, index, score: [...contentWords(text)].filter(word => said.has(word)).length }))
+    .sort((a, b) => b.score - a.score || b.index - a.index);
+  let text = '';
+  for (const { text: statement } of ranked) {
+    const room = budget - Buffer.byteLength(text) - (text ? 1 : 0) - 2;
+    if (room < 24) break;
+    const quoted = `"${clipBytes(statement, room)}"`;
+    text = text ? `${text} ${quoted}` : quoted;
+    if (quoted !== `"${statement}"`) break;
+  }
+  return text;
+}
+
 /**
  * Application-authored and within one append: statuses and Primary's delivered results, never caller
  * words. A clear contradiction asks the voice to correct itself; 'ambiguous' and 'unverified' restate
- * the list neutrally, so a true, delivered result is never retracted.
+ * the list neutrally, so a true, delivered result is never retracted. 'told_conflict' quotes back what
+ * the voice itself already told the caller, neutrally: it may be the earlier words or the new ones
+ * that are wrong, so it asks only that the two not be left contradicting each other.
  */
-export function correctionText(kind: GuardrailKind, tasks: readonly VoiceTask[], sentence = ''): string {
+export function correctionText(kind: GuardrailKind, tasks: readonly VoiceTask[], sentence = '', told: readonly string[] = []): string {
+  if (kind === 'told_conflict') {
+    const head = 'For accuracy, this is what you already told the caller earlier on this call, in your own words:';
+    const tail = 'If what you just said conflicts with that, say so plainly in one short sentence, never deny having said it, and offer to check; otherwise carry on.';
+    return `${head} ${toldLines(told, sentence, 500 - Buffer.byteLength(`${head}  ${tail}`))} ${tail}`;
+  }
   const first = referencedTask(sentence, tasks);
   if (kind === 'ambiguous' || kind === 'unverified') {
     const head = 'Status from the application, for accuracy:';
@@ -115,6 +150,17 @@ export function describeTasks(tasks: readonly VoiceTask[], withRequests = true):
     + (task.outcome ? ` Result: ${task.outcome}` : task.progress ? ` Progress, not a result: ${task.progress}` : '')).join('\n');
 }
 
+/** A correction that went out (accepted) or is still awaiting its acknowledgement (pending). A
+ * refused one is removed: only a correction the voice accepted holds the cooldown and the limits. */
+interface Reservation { at: number; pending: boolean; /** Restatement content, for ambiguous and unverified. */ key?: string }
+/** What a judged sentence carries into the decision, and back into the judge if it had to wait. */
+interface JudgeContext { conversation: string; told: readonly string[]; entry?: { disputed: boolean } }
+interface Candidate { sessionId: string; sentence: string; context: JudgeContext; kind: GuardrailKind; key: string;
+  /** The truth the verdict was given against. */ described: string; at: number; trigger: GuardrailTrigger }
+const CLEAR_KINDS = new Set<GuardrailKind>(['false_success', 'false_failure', 'phantom_step']);
+/** Characters of Dexter's earlier statements in the judge's input. */
+const TOLD_JUDGE_BUDGET = 1500;
+
 export function createVoiceGuardrail(options: {
   callId: string;
   /** The task list as the voice may hear it (its list plus delegations not yet admitted);
@@ -122,6 +168,8 @@ export function createVoiceGuardrail(options: {
   tasks(): VoiceTask[];
   /** The application's full truth for judging, including confirmed results not yet delivered. */
   truth?(): VoiceTask[];
+  /** Holding names from the call's portfolio notes: a sentence naming one is a fact Dexter told. */
+  labels?(): readonly string[];
   judge: GuardrailJudge;
   correct(text: string, delegationId: string | null, sessionId: string): Promise<LiveDelivery>;
   record?(trigger: GuardrailTrigger): void;
@@ -137,19 +185,92 @@ export function createVoiceGuardrail(options: {
   const cursors = new Map<string, number>();
   let buffer: { sessionId: string; text: string; endMs: number } | undefined;
   let flushTimer: ReturnType<typeof setTimeout> | undefined;
-  let lastCorrectionAt = -Infinity, stopped = false;
+  let stopped = false;
   const recent: string[] = [];
+  // Every sentence Dexter said on this call, the source of the facts it already told the caller. One
+  // the guardrail found false (against the task list or those facts) is disputed and never offered.
+  const spoken: Array<{ text: string; disputed: boolean }> = [];
+  const reservations: Reservation[] = [];
+  // The latest correction blocked only by one still in flight, sent if that one is refused.
+  let held: Candidate | undefined;
 
   const truth = () => (options.truth ?? options.tasks)();
-  let lastRestatementKey: string | undefined, lastRestatementAt = -Infinity;
-  const judgeSentence = async (sessionId: string, sentence: string) => {
+  const labels = (): readonly string[] => { try { return options.labels?.() ?? []; } catch { return []; } };
+  const emit = (trigger: GuardrailTrigger) => {
+    try { console.info(JSON.stringify({ event: 'broker_voice_guardrail', callId: options.callId, ...trigger })); } catch { /* Telemetry only. */ }
+    try { options.record?.(trigger); } catch { /* Evidence only; never affects the call. */ }
+  };
+  /** Why a correction of this kind may not go out at `at`, against the corrections made by then. A
+   * no-verdict restatement with the same content (in any task order) adds nothing the voice was not
+   * just given, and those restatements are rate-limited: each can cut into Dexter's speech. A detected
+   * contradiction (every other kind) is a real false claim: only the cooldown applies. */
+  const limit = (kind: GuardrailKind, key: string, at: number, from: readonly Reservation[]): GuardrailTrigger['correction'] | undefined => {
+    const made = from.filter(value => value.at <= at);
+    const restatement = made.filter(value => value.key !== undefined).at(-1);
+    if (kind === 'unverified' && restatement?.key === key) return 'suppressed_duplicate';
+    if (kind === 'unverified' && restatement && at - restatement.at < RESTATEMENT_INTERVAL_MS) return 'suppressed_rate';
+    if (made.some(value => at - value.at < CORRECTION_COOLDOWN_MS)) return 'suppressed_cooldown';
+    return undefined;
+  };
+  const prune = () => {
+    const lastRestatement = reservations.filter(value => value.key !== undefined && !value.pending).at(-1);
+    for (let index = reservations.length - 1; index >= 0; index--) {
+      const value = reservations[index]!;
+      if (!value.pending && value !== lastRestatement && now() - value.at >= 30_000) reservations.splice(index, 1);
+    }
+  };
+  /** The latest blocked sentence is kept, but a restatement never displaces a clear correction. The
+   * one dropped is recorded as suppressed. */
+  const hold = (candidate: Candidate) => {
+    if (held && CLEAR_KINDS.has(held.kind) && !CLEAR_KINDS.has(candidate.kind)) { emit(candidate.trigger); return; }
+    if (held) emit(held.trigger);
+    held = candidate;
+  };
+  /** Once no correction is in flight, the held sentence stays suppressed if a correction that was in
+   * flight when it was held went out; otherwise it goes out now, judged again if the truth changed. */
+  const release = () => {
+    if (!held || reservations.some(value => value.pending)) return;
+    const candidate = held; held = undefined;
+    const status = limit(candidate.kind, candidate.key, candidate.at, reservations);
+    if (status || stopped) { emit({ ...candidate.trigger, correction: status ?? candidate.trigger.correction }); return; }
+    if (describeTasks(truth()) === candidate.described) void decide({ ...candidate, key: restatementKey(options.tasks()), at: now() });
+    else void judgeSentence(candidate.sessionId, candidate.sentence, candidate.context);
+  };
+  const decide = async (candidate: Candidate): Promise<void> => {
+    const { kind, key, at } = candidate;
+    const blocked = limit(kind, key, at, reservations);
+    // Blocked only by a correction still awaiting its acknowledgement, which may yet be refused (a
+    // dying or replaced session, a full queue, the 15 s timeout): held, not dropped.
+    if (blocked && !limit(kind, key, at, reservations.filter(value => !value.pending))) {
+      hold({ ...candidate, trigger: { ...candidate.trigger, correction: blocked } }); return;
+    }
+    let status: GuardrailTrigger['correction'];
+    if (blocked) status = blocked;
+    else {
+      // Reserved before awaiting the append, so sentences judged at the same moment cannot both go out.
+      const visible = options.tasks();
+      const reservation: Reservation = { at, pending: true,
+        ...(kind === 'ambiguous' || kind === 'unverified' ? { key: restatementKey(visible) } : {}) };
+      reservations.push(reservation);
+      try {
+        status = (await options.correct(correctionText(kind, visible, candidate.sentence, candidate.context.told),
+          candidate.trigger.delegationId, candidate.sessionId)).status;
+      } catch { status = 'unconfirmed'; }
+      reservation.pending = false;
+      if (status !== 'accepted') reservations.splice(reservations.indexOf(reservation), 1);
+      prune();
+    }
+    emit({ ...candidate.trigger, correction: status });
+    release();
+  };
+  const judgeSentence = async (sessionId: string, sentence: string, context: JudgeContext) => {
     // Every sentence is judged, off the audio path: a claim needs no particular words to be false.
-    const conversation = recent.slice(-8, -1).join('\n');
     const started = now();
+    const told = context.told.map(statement => `- "${statement}"`).join('\n');
     // A judge call that returns nothing (timeout, provider refusal, unreadable answer) is retried.
     const ask = async (described: string): Promise<JudgeVerdict | undefined> => {
       for (let attempt = 0; ; attempt++) {
-        try { const value = await options.judge({ tasks: described, conversation, sentence }); if (value) return value; }
+        try { const value = await options.judge({ tasks: described, conversation: context.conversation, sentence, told }); if (value) return value; }
         catch { /* Retried below. */ }
         if (stopped || attempt >= JUDGE_RETRY_MS.length) return undefined;
         await new Promise<void>(resolve => { const timer = setTimeout(resolve, JUDGE_RETRY_MS[attempt]); timer.unref?.(); });
@@ -157,8 +278,9 @@ export function createVoiceGuardrail(options: {
     };
     // A result that lands while the judge runs makes its verdict stale: judge the new list again, up
     // to three rounds. A list that keeps changing keeps the latest verdict; it is never dropped.
-    let verdict: JudgeVerdict | undefined, tasks = truth(), described = describeTasks(tasks);
+    let verdict: JudgeVerdict | undefined, tasks = truth(), described = describeTasks(tasks), judged = described;
     for (let round = 0; round < 3; round++) {
+      judged = described;
       verdict = await ask(described);
       tasks = truth();
       const latest = describeTasks(tasks);
@@ -176,36 +298,16 @@ export function createVoiceGuardrail(options: {
       // The judge also found a listed status or result the sentence matches (a finished sale beside an
       // open cancel): restate the list neutrally rather than accuse, so nothing true is retracted.
       kind = (verdict!.supported ?? 0) >= 0.5 ? 'ambiguous' : verdict!.kind as GuardrailKind;
-    } else if (!verdict && claimsOutcome(sentence) && (visible.length || concernsMoney(sentence))) kind = 'unverified';
+    } else if (verdict && context.told.length && (verdict.contradictsTold ?? 0) >= threshold) kind = 'told_conflict';
+    else if (!verdict && claimsOutcome(sentence) && (visible.length || concernsMoney(sentence))) kind = 'unverified';
     else return;
-    const text = correctionText(kind, visible, sentence);
+    if (kind !== 'unverified' && context.entry) context.entry.disputed = true;
     // The most recent request started on this provider session is the one being discussed.
     const task = [...tasks].reverse().find(value => value.sessionId === sessionId && value.delegationId);
-    const delegationId = task?.delegationId ?? null;
-    let status: GuardrailTrigger['correction'];
-    const restating = kind === 'ambiguous' || kind === 'unverified';
-    // A no-verdict restatement with the same content (in any task order) adds nothing the voice was
-    // not just given, and those restatements are rate-limited: each can cut into Dexter's speech. A
-    // detected contradiction, ambiguous included, is a real false claim: only the cooldown applies.
-    if (kind === 'unverified' && restatementKey(visible) === lastRestatementKey) status = 'suppressed_duplicate';
-    else if (kind === 'unverified' && now() - lastRestatementAt < RESTATEMENT_INTERVAL_MS) status = 'suppressed_rate';
-    else if (now() - lastCorrectionAt < CORRECTION_COOLDOWN_MS) status = 'suppressed_cooldown';
-    else {
-      // Reserve the cooldown and the restatement before awaiting the append, so sentences judged at
-      // the same moment cannot both go out; a correction the voice did not accept releases them again.
-      const previous = { correction: lastCorrectionAt, key: lastRestatementKey, at: lastRestatementAt };
-      lastCorrectionAt = now();
-      if (restating) { lastRestatementKey = restatementKey(visible); lastRestatementAt = now(); }
-      try { status = (await options.correct(text, delegationId, sessionId)).status; } catch { status = 'unconfirmed'; }
-      if (status !== 'accepted') {
-        lastCorrectionAt = previous.correction;
-        if (restating) { lastRestatementKey = previous.key; lastRestatementAt = previous.at; }
-      }
-    }
-    const trigger: GuardrailTrigger = { at: new Date().toISOString(), sessionId, delegationId, kind,
-      probability: verdict?.contradicts ?? 0, sentence: sentence.slice(0, 300), judgeMs, correction: status };
-    try { console.info(JSON.stringify({ event: 'broker_voice_guardrail', callId: options.callId, ...trigger })); } catch { /* Telemetry only. */ }
-    try { options.record?.(trigger); } catch { /* Evidence only; never affects the call. */ }
+    await decide({ sessionId, sentence, context, kind, key: restatementKey(visible), described: judged, at: now(),
+      trigger: { at: new Date().toISOString(), sessionId, delegationId: task?.delegationId ?? null, kind,
+        probability: kind === 'told_conflict' ? verdict!.contradictsTold! : verdict?.contradicts ?? 0,
+        sentence: sentence.slice(0, 300), judgeMs, correction: 'unconfirmed' } });
   };
   const flush = () => {
     clearTimeout(flushTimer); flushTimer = undefined;
@@ -213,8 +315,15 @@ export function createVoiceGuardrail(options: {
     if (!value || stopped) return;
     const sentence = value.text.trim();
     if (!sentence) return;
+    // What Dexter told the caller before this sentence: never this sentence or a later one.
+    const known = labels();
+    const facts = spoken.filter(entry => !entry.disputed && isToldFact(entry.text, known)).map(entry => entry.text);
+    const entry = { text: sentence, disputed: false };
+    spoken.push(entry);
+    if (spoken.length > 200) spoken.shift();
     recent.push(`Dexter: ${sentence}`);
-    void judgeSentence(value.sessionId, sentence);
+    void judgeSentence(value.sessionId, sentence, { conversation: recent.slice(-8, -1).join('\n'),
+      told: selectTold(facts, sentence, TOLD_JUDGE_BUDGET, 600), entry });
   };
   return {
     /** Feed each transcript snapshot of a provider session; work runs asynchronously, off the audio path. */
@@ -239,7 +348,10 @@ export function createVoiceGuardrail(options: {
       clearTimeout(flushTimer);
       if (buffer) { flushTimer = setTimeout(flush, 1200); flushTimer.unref?.(); }
     },
-    stop() { stopped = true; clearTimeout(flushTimer); buffer = undefined; },
+    stop() {
+      stopped = true; clearTimeout(flushTimer); buffer = undefined;
+      if (held) { const candidate = held; held = undefined; emit(candidate.trigger); }
+    },
   };
 }
 export type VoiceGuardrail = ReturnType<typeof createVoiceGuardrail>;
@@ -248,15 +360,20 @@ export const JUDGE_INSTRUCTIONS = "Judge only DEXTER'S LATEST SENTENCE against t
 
 const SUPPORTED_INSTRUCTIONS = "True if DEXTER'S LATEST SENTENCE agrees with the TASK LIST: what it says about the caller's requests matches the status or the result of at least one listed request (any request on the list, not only the latest), or it makes no claim about a request. For example, \"the sale went through\" agrees when any listed request's result says the sale went through, even while a later request, such as a cancellation, is still in progress.";
 
-/** A small, fast judge: OpenAI Decisions API (gpt-6-luna), bounded by a short timeout. */
+export const TOLD_INSTRUCTIONS = "True if DEXTER'S LATEST SENTENCE denies or contradicts something listed under WHAT DEXTER ALREADY TOLD THE CALLER: for example, it says Dexter never mentioned or never said something that is listed there, or it gives a different holding or amount for the same thing without saying that it changed or was checked again. False if it agrees with, repeats or adds to those statements; if it openly corrects one of them; if it is about something they do not cover; and when nothing is listed.";
+
+/** A small, fast judge: OpenAI Decisions API (gpt-6-luna), bounded by a short timeout. Dexter's own
+ * earlier statements, and the question whether the sentence contradicts them, are sent only when
+ * there are any, so every other judgement is unchanged from the calibrated one. */
 export function createDecisionsJudge(apiKey: string, fetchImpl: typeof fetch = fetch, timeoutMs = 2_500,
   instructions = JUDGE_INSTRUCTIONS): GuardrailJudge {
-  return async ({ tasks, conversation, sentence }) => {
+  return async ({ tasks, conversation, sentence, told }) => {
     let response: Response;
     try { response = await fetchImpl('https://api.openai.com/v1/decisions', { method: 'POST',
       headers: { authorization: `Bearer ${apiKey}`, 'content-type': 'application/json' }, signal: AbortSignal.timeout(timeoutMs),
       body: JSON.stringify({ model: 'gpt-6-luna',
-        input: `TASK LIST (application state; the only truth about the caller's requests on this call):\n${tasks}\n\nRECENT CONVERSATION:\n${conversation || '(none)'}\n\nDEXTER'S LATEST SENTENCE:\n"${sentence}"`,
+        input: `TASK LIST (application state; the only truth about the caller's requests on this call):\n${tasks}${told
+          ? `\n\nWHAT DEXTER ALREADY TOLD THE CALLER EARLIER ON THIS CALL (its own words, before the latest sentence):\n${told}` : ''}\n\nRECENT CONVERSATION:\n${conversation || '(none)'}\n\nDEXTER'S LATEST SENTENCE:\n"${sentence}"`,
         questions: [
           { type: 'predicate', name: 'contradicts', instructions },
           { type: 'predicate', name: 'supported', instructions: SUPPORTED_INSTRUCTIONS },
@@ -265,7 +382,8 @@ export function createDecisionsJudge(apiKey: string, fetchImpl: typeof fetch = f
             { value: 'false_success', description: 'Says a request finished, succeeded, went through or was cancelled, but the list does not show that.' },
             { value: 'false_failure', description: 'Says a request failed or did not happen, but the list shows it succeeded or still in progress.' },
             { value: 'phantom_step', description: 'Says a step or request is running or has started that the list does not contain.' },
-            { value: 'stale_pending', description: 'Says a request is still in progress, but the list shows it has finished.' }] }] }) }); }
+            { value: 'stale_pending', description: 'Says a request is still in progress, but the list shows it has finished.' }] },
+          ...(told ? [{ type: 'predicate', name: 'contradicts_told', instructions: TOLD_INSTRUCTIONS }] : [])] }) }); }
     catch (error) {
       try { console.error(JSON.stringify({ event: 'broker_voice_guardrail_judge_failed', status: null,
         error: (error as Error)?.name === 'TimeoutError' ? 'timeout' : 'request_failed' })); } catch { /* Telemetry only. */ }
@@ -282,10 +400,12 @@ export function createDecisionsJudge(apiKey: string, fetchImpl: typeof fetch = f
       probabilities?: Array<{ value: string; probability: number }> }> };
     const contradicts = body.answers?.find(answer => answer.name === 'contradicts');
     const supported = body.answers?.find(answer => answer.name === 'supported');
+    const contradictsTold = body.answers?.find(answer => answer.name === 'contradicts_told');
     const kind = body.answers?.find(answer => answer.name === 'kind');
     if (typeof contradicts?.probability !== 'number' || typeof kind?.choice !== 'string') return undefined;
     return { contradicts: contradicts.probability, kind: kind.choice as JudgeVerdict['kind'],
       kindProbability: kind.probabilities?.find(value => value.value === kind.choice)?.probability ?? 0,
-      ...(typeof supported?.probability === 'number' ? { supported: supported.probability } : {}) };
+      ...(typeof supported?.probability === 'number' ? { supported: supported.probability } : {}),
+      ...(typeof contradictsTold?.probability === 'number' ? { contradictsTold: contradictsTold.probability } : {}) };
   };
 }

@@ -86,7 +86,12 @@ function voiceContext(sessionId: string) {
     snapshot.fragments.push({ eventId, role: 'user', text, startMs, endMs, sequence: snapshot.revision });
     for (const listener of listeners) listener(structuredClone(snapshot));
   };
-  return { controller, channel, add, directPublications,
+  const say = (text: string, startMs: number, endMs: number) => {
+    snapshot.revision++;
+    snapshot.fragments.push({ eventId: `${sessionId}_dexter_${snapshot.revision}`, role: 'assistant', text, startMs, endMs, sequence: snapshot.revision });
+    for (const listener of listeners) listener(structuredClone(snapshot));
+  };
+  return { controller, channel, add, say, directPublications,
     advanceAudio: (offsetMs: number) => { inputThroughMs = Math.max(inputThroughMs, offsetMs); },
     inputThroughMs: () => inputThroughMs };
 }
@@ -182,7 +187,8 @@ async function fixture(t: TestContext, diagnostic?: Diagnostic) {
     },
   };
   const trackedRequests: BrokerDelegationRecord[] = [];
-  const backend = (sourceSessionId: string, maxPollMs = 30, watchUntilCallEnds = false): PrimaryBackend => createPrimaryBackend({
+  const backend = (sourceSessionId: string, maxPollMs = 30, watchUntilCallEnds = false,
+    extra: Partial<PrimaryBackendOptions> = {}): PrimaryBackend => createPrimaryBackend({ ...extra,
     callId: call.id, callSid, bindingId, api, store, sourceSessionId, observation, ...(watchUntilCallEnds ? { watchUntilCallEnds } : {}),
     onRequest: entry => { trackedRequests.push(structuredClone(entry)); },
     admissionSettled: request => { admissions.push({ request: structuredClone(request),
@@ -206,6 +212,14 @@ async function fixture(t: TestContext, diagnostic?: Diagnostic) {
     // Ordinary fixture speech is a distinct host observation after the latest ACK.
     const observedAt = Math.max(Date.now(), latestPresentation + 1);
     instance.noteCallerSpeech(observedAt, startMs); instance.noteCallerSpeech(observedAt, endMs);
+    const snapshot = context.channel.getContext(); instance.observeTranscript(snapshot);
+    const current = store.get(call.id)!;
+    store.update(call.id, { liveGenerations: { ...current.liveGenerations!, segments: current.liveGenerations!.segments.map(segment =>
+      segment.sessionId === sessionId ? { ...segment, transcript: snapshot } : segment) } });
+  };
+  /** Dexter's own speech on a session, saved as the voice's transcript is. */
+  const dexterSays = (instance: PrimaryBackend, sessionId: string, text: string, startMs: number, endMs: number) => {
+    const context = contexts.get(sessionId)!; context.say(text, startMs, endMs);
     const snapshot = context.channel.getContext(); instance.observeTranscript(snapshot);
     const current = store.get(call.id)!;
     store.update(call.id, { liveGenerations: { ...current.liveGenerations!, segments: current.liveGenerations!.segments.map(segment =>
@@ -249,7 +263,7 @@ async function fixture(t: TestContext, diagnostic?: Diagnostic) {
     }
   }));
   return { trackedRequests, directory, call, contexts, posts, reads, captures, replies, questionReads, publications, admissions, behavior, completed,
-    callLifetime, backend, request, delegate, speak, rotate, saved, reopen, store: () => store,
+    callLifetime, backend, request, delegate, speak, dexterSays, rotate, saved, reopen, store: () => store,
     onCleanup: (fn: () => void) => { cleanups.push(fn); } };
 }
 
@@ -926,4 +940,26 @@ test('call truth: Primary receives this call\'s conversation separately from the
   assert.equal(f.posts.length, 1);
   assert.equal(f.posts[0].input.text, source.text, 'caller words stay unchanged');
   assert.ok(f.posts[0].input.voiceContext?.recentSpeech.some(turn => turn.role === 'dexter' && /basil|soil|buds/i.test(turn.text)), 'current call context travels to Primary');
+});
+
+test('call 1325b55e: Primary receives what the voice already told the caller after the rolling window has lost it', async t => {
+  const f = await fixture(t);
+  const instance = f.backend(oldSession, 30, false, { holdingLabels: () => ['MAPLE', 'BIRCH'] });
+  f.dexterSays(instance, oldSession, 'Your portfolio is about forty-one dollars and twenty cents.', 1_000, 3_000);
+  f.dexterSays(instance, oldSession, ' MAPLE is about twenty-one forty, Birch nine oh-five.', 3_500, 6_000);
+  f.dexterSays(instance, oldSession, ' Right, MAPLE.', 6_500, 7_000);
+  // A minute and a half of other talk carries the read-out out of the rolling window.
+  for (let index = 0; index < 4; index++) {
+    f.speak(instance, oldSession, ` Tell me something else, part ${index}.`, 10_000 + index * 25_000, 11_000 + index * 25_000);
+    f.dexterSays(instance, oldSession, ` Here is something else, part ${index}.`, 12_000 + index * 25_000, 13_000 + index * 25_000);
+  }
+  f.speak(instance, oldSession, ' Sell some of the token you said I had about $20 of.', 110_000, 112_000);
+  await f.delegate(instance, oldSession, 'told');
+  assert.equal(f.posts.length, 1);
+  assert.equal(f.posts[0]!.input.text, ' Sell some of the token you said I had about $20 of.', 'the caller\'s words are unchanged');
+  const speech = f.posts[0]!.input.voiceContext!.recentSpeech;
+  assert.deepEqual(speech[0], { role: 'dexter', text: 'Earlier on this call, the voice already told the caller: '
+    + '"Your portfolio is about forty-one dollars and twenty cents." "MAPLE is about twenty-one forty, Birch nine oh-five." "Right, MAPLE."' });
+  assert.ok(speech.length <= 6 && speech.slice(1).every(turn => !turn.text.includes('MAPLE')), 'the rest is the recent speech');
+  assert.deepEqual(f.saved()[0]!.submission, f.posts[0]!.input, 'saved before submission, so a retry sends the same facts');
 });

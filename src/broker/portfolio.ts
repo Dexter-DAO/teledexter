@@ -19,6 +19,11 @@ const money = (value: string) => Number(value) > 0 && Number(value) < 0.01
   ? 'less than a cent'
   : `about ${new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(Number(value))}`;
 
+const label = (symbol: string | null) => symbol && /^[A-Za-z0-9._-]{1,32}$/.test(symbol) ? symbol : undefined;
+/** The holding names a note states, exactly as portfolioFactsText writes them. */
+export const portfolioLabels = (portfolio: PhonePortfolio): string[] =>
+  portfolio.holdings.flatMap(holding => label(holding.symbol) ?? []);
+
 /** Facts for the existing Live dollars-first presentation policy. Token labels
  * stay bounded data inside fixed sentences; quantities appear only on request. */
 export function portfolioFactsText(portfolio: PhonePortfolio, quantities = false): string {
@@ -26,8 +31,7 @@ export function portfolioFactsText(portfolio: PhonePortfolio, quantities = false
     ? `Your priced holdings total ${money(portfolio.totalUsd)}.`
     : `Your portfolio totals ${money(portfolio.totalUsd)}.`];
   for (const holding of portfolio.holdings) {
-    const name = holding.symbol && /^[A-Za-z0-9._-]{1,32}$/.test(holding.symbol)
-      ? holding.symbol : 'an unnamed token';
+    const name = label(holding.symbol) ?? 'an unnamed token';
     text.push(holding.valueUsd === null ? `The value of ${name} is unavailable.`
       : `You have ${money(holding.valueUsd)} of ${name}.`);
     if (quantities) text.push(`The quantity is about ${Number(holding.amount).toLocaleString('en-US', { maximumSignificantDigits: 2 })}.`);

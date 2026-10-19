@@ -113,8 +113,9 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
   // The application owns the task list: projected from saved requests, sent silently on change.
   // A saved-question continuation presents its own question journal instead, so it gets neither.
   const tasks = createVoiceTasks(() => continuation ? undefined : options.store.get(initialCall.id));
+  const holdingLabels = () => options.portfolioContext?.labels() ?? [];
   const guardrail = options.guardrailJudge && !continuation ? createVoiceGuardrail({ callId: initialCall.id, judge: options.guardrailJudge,
-    tasks: () => tasks.correctable(), truth: () => tasks.tasks(true),
+    tasks: () => tasks.correctable(), truth: () => tasks.tasks(true), labels: holdingLabels,
     correct: (text, delegationId, sessionId) => {
       const current = controller.snapshot().deliveryAttachment;
       const voice = current?.sessionId === sessionId ? sessions.get(sessionId)?.voice : undefined;
@@ -251,14 +252,17 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
     const lateRejected = (value: (typeof previous)[number]) => call().publications?.rejections
       .some(rejection => rejection.sessionId === value.sessionId && rejection.eventId === value.outcome!.eventId) ?? false;
     const lastRecords = previous.filter(value => value.updateId.startsWith(`${prefix}_attempt_${attempt}_`) && value.outcome);
+    if (lastRecords.some(value => value.outcome!.status === 'rejected' || value.outcome!.status === 'unconfirmed' || lateRejected(value))) attempt++;
     // A re-sent result may repeat what the caller already heard: an unconfirmed chunk may have been
-    // spoken (only its acknowledgement timed out), and earlier accepted chunks were. The voice is told
-    // to refer back to it if it was already given, and to give it as news if not.
-    let maybeHeard = false;
-    if (lastRecords.some(value => value.outcome!.status === 'rejected' || value.outcome!.status === 'unconfirmed' || lateRejected(value))) {
-      maybeHeard = kind === 'result' && lastRecords.some(value => ['unconfirmed', 'accepted'].includes(value.outcome!.status) && !lateRejected(value));
-      attempt++;
-    }
+    // spoken (only its acknowledgement timed out), and accepted chunks were. That holds for an earlier
+    // attempt on this voice session, before the caller spoke again, or on a session since replaced:
+    // a replacement starts its records afresh, but not the caller's memory. The voice is told to refer
+    // back to it if it was already given, and to give it as news if not. An attempt resumed after its
+    // accepted chunks sends only what is left, which repeats nothing.
+    const resuming = previous.some(value => value.updateId.startsWith(`${prefix}_attempt_${attempt}_`));
+    const maybeHeard = kind === 'result' && !resuming && (call().publications?.records ?? []).some(value =>
+      value.updateId.startsWith(`${updateId}_caller_`) && value.outcome && !lateRejected(value)
+      && ['unconfirmed', 'accepted'].includes(value.outcome.status));
 
     let chunks: string[];
     try { chunks = liveResultChunks(text); }
@@ -537,7 +541,7 @@ export function createGenerationVoice(options: GenerationVoiceOptions): Generati
               sessionId = value.sessionId;
               backend = createPrimaryBackend({ callId: initialCall.id, callSid: binding.callSid, bindingId: binding.bindingId,
                 onResult: result => options.portfolioContext?.observe(result),
-                onRequest: () => tasks.refresh(),
+                onRequest: () => tasks.refresh(), holdingLabels,
                 api: options.primary, store: options.store, sourceSessionId: sessionId, watchUntilCallEnds: true,
                 admissionSettled(request) { pending.get(request)?.resolve(); pending.delete(request); mixed?.admissionSettled(request); tasks.settled(request); },
                 lastCallerSpeechAt: () => sourceSpeechAt,

@@ -212,10 +212,11 @@ const clip = greetingModule.loadGreetingClip(greetingModule.INBOUND_GREETING_CLI
 // Releases with the transcript guardrail get the production judge, wrapped to record every verdict.
 const guardrailModule = fs.existsSync(path.join(moduleRoot, 'src/broker/voiceGuardrail.ts')) ? await load('broker/voiceGuardrail') : undefined;
 const productionJudge = guardrailModule?.createDecisionsJudge(apiKey);
-const guardrailJudge = productionJudge && (async (input: { tasks: string; conversation: string; sentence: string }) => {
+const guardrailJudge = productionJudge && (async (input: { tasks: string; conversation: string; sentence: string; told?: string }) => {
   const started = now();
   const verdict = await productionJudge(input).catch(() => undefined);
-  note('guardrail.judged', { sentence: input.sentence, tasks: input.tasks, verdict: verdict ?? null, ms: now() - started });
+  note('guardrail.judged', { sentence: input.sentence, tasks: input.tasks, ...(input.told ? { told: input.told } : {}),
+    verdict: verdict ?? null, ms: now() - started });
   spend.judgeCalls = (spend.judgeCalls ?? 0) + 1;
   return verdict;
 });

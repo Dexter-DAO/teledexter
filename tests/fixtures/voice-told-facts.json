@@ -1,0 +1,1731 @@
+{
+ "_comment": "Call 1325b55e (2026-10-19), scrubbed: holding names, amounts and caller phrasing are neutral stand-ins; fragment order, roles and timing are the real call's. The voice read the portfolio note at the start; the caller later referred back to it (\"the token you said I had $20 worth of\", \"you said Maple\"), after it had left the rolling six-turn, ninety-second window, and Primary answered \"I haven't mentioned anything called Maple\", which the voice relayed.",
+ "holdingLabels": [
+  "MAPLE",
+  "BIRCH",
+  "CEDARLEAF",
+  "SPCX",
+  "AAPL",
+  "TSLA",
+  "USDC"
+ ],
+ "fragments": [
+  {
+   "eventId": "f1",
+   "sequence": 1,
+   "role": "assistant",
+   "text": "Your portfolio",
+   "startMs": 2600,
+   "endMs": 2800
+  },
+  {
+   "eventId": "f2",
+   "sequence": 2,
+   "role": "assistant",
+   "text": " is",
+   "startMs": 3200,
+   "endMs": 3400
+  },
+  {
+   "eventId": "f3",
+   "sequence": 3,
+   "role": "assistant",
+   "text": " about",
+   "startMs": 3400,
+   "endMs": 3600
+  },
+  {
+   "eventId": "f4",
+   "sequence": 4,
+   "role": "assistant",
+   "text": " forty-one",
+   "startMs": 3600,
+   "endMs": 3800
+  },
+  {
+   "eventId": "f5",
+   "sequence": 5,
+   "role": "assistant",
+   "text": " dollars",
+   "startMs": 4200,
+   "endMs": 4400
+  },
+  {
+   "eventId": "f6",
+   "sequence": 6,
+   "role": "assistant",
+   "text": " and",
+   "startMs": 4600,
+   "endMs": 4800
+  },
+  {
+   "eventId": "f7",
+   "sequence": 7,
+   "role": "assistant",
+   "text": " twenty",
+   "startMs": 4800,
+   "endMs": 5000
+  },
+  {
+   "eventId": "f8",
+   "sequence": 8,
+   "role": "assistant",
+   "text": " cents.",
+   "startMs": 5400,
+   "endMs": 5600
+  },
+  {
+   "eventId": "f9",
+   "sequence": 9,
+   "role": "assistant",
+   "text": " MAP",
+   "startMs": 6400,
+   "endMs": 6600
+  },
+  {
+   "eventId": "f10",
+   "sequence": 10,
+   "role": "assistant",
+   "text": "LE",
+   "startMs": 6600,
+   "endMs": 6800
+  },
+  {
+   "eventId": "f11",
+   "sequence": 11,
+   "role": "assistant",
+   "text": " is",
+   "startMs": 6800,
+   "endMs": 7000
+  },
+  {
+   "eventId": "f12",
+   "sequence": 12,
+   "role": "assistant",
+   "text": " about",
+   "startMs": 7000,
+   "endMs": 7200
+  },
+  {
+   "eventId": "f13",
+   "sequence": 13,
+   "role": "assistant",
+   "text": " twenty-one",
+   "startMs": 7200,
+   "endMs": 7400
+  },
+  {
+   "eventId": "f14",
+   "sequence": 14,
+   "role": "assistant",
+   "text": " forty",
+   "startMs": 7800,
+   "endMs": 8000
+  },
+  {
+   "eventId": "f15",
+   "sequence": 15,
+   "role": "assistant",
+   "text": ",",
+   "startMs": 8000,
+   "endMs": 8200
+  },
+  {
+   "eventId": "f16",
+   "sequence": 16,
+   "role": "assistant",
+   "text": " Birch",
+   "startMs": 8600,
+   "endMs": 8800
+  },
+  {
+   "eventId": "f17",
+   "sequence": 17,
+   "role": "assistant",
+   "text": " nine",
+   "startMs": 9200,
+   "endMs": 9400
+  },
+  {
+   "eventId": "f18",
+   "sequence": 18,
+   "role": "assistant",
+   "text": " oh-five",
+   "startMs": 9600,
+   "endMs": 9800
+  },
+  {
+   "eventId": "f19",
+   "sequence": 19,
+   "role": "assistant",
+   "text": ",",
+   "startMs": 9800,
+   "endMs": 10000
+  },
+  {
+   "eventId": "f20",
+   "sequence": 20,
+   "role": "assistant",
+   "text": " Cedarleaf",
+   "startMs": 10400,
+   "endMs": 10600
+  },
+  {
+   "eventId": "f21",
+   "sequence": 21,
+   "role": "assistant",
+   "text": " four",
+   "startMs": 10800,
+   "endMs": 11000
+  },
+  {
+   "eventId": "f22",
+   "sequence": 22,
+   "role": "assistant",
+   "text": " eighty",
+   "startMs": 11200,
+   "endMs": 11400
+  },
+  {
+   "eventId": "f23",
+   "sequence": 23,
+   "role": "assistant",
+   "text": ",",
+   "startMs": 11400,
+   "endMs": 11600
+  },
+  {
+   "eventId": "f24",
+   "sequence": 24,
+   "role": "assistant",
+   "text": " SpaceX",
+   "startMs": 12000,
+   "endMs": 12200
+  },
+  {
+   "eventId": "f25",
+   "sequence": 25,
+   "role": "assistant",
+   "text": " two",
+   "startMs": 12600,
+   "endMs": 12800
+  },
+  {
+   "eventId": "f26",
+   "sequence": 26,
+   "role": "assistant",
+   "text": " ninety",
+   "startMs": 12800,
+   "endMs": 13000
+  },
+  {
+   "eventId": "f27",
+   "sequence": 27,
+   "role": "assistant",
+   "text": ",",
+   "startMs": 13000,
+   "endMs": 13200
+  },
+  {
+   "eventId": "f28",
+   "sequence": 28,
+   "role": "assistant",
+   "text": " Apple",
+   "startMs": 13400,
+   "endMs": 13600
+  },
+  {
+   "eventId": "f29",
+   "sequence": 29,
+   "role": "assistant",
+   "text": " one",
+   "startMs": 13800,
+   "endMs": 14000
+  },
+  {
+   "eventId": "f30",
+   "sequence": 30,
+   "role": "assistant",
+   "text": " sixty",
+   "startMs": 14200,
+   "endMs": 14400
+  },
+  {
+   "eventId": "f31",
+   "sequence": 31,
+   "role": "assistant",
+   "text": ",",
+   "startMs": 14400,
+   "endMs": 14600
+  },
+  {
+   "eventId": "f32",
+   "sequence": 32,
+   "role": "assistant",
+   "text": " Tesla",
+   "startMs": 14800,
+   "endMs": 15000
+  },
+  {
+   "eventId": "f33",
+   "sequence": 33,
+   "role": "assistant",
+   "text": " one",
+   "startMs": 15200,
+   "endMs": 15400
+  },
+  {
+   "eventId": "f34",
+   "sequence": 34,
+   "role": "assistant",
+   "text": " oh-five",
+   "startMs": 15600,
+   "endMs": 15800
+  },
+  {
+   "eventId": "f35",
+   "sequence": 35,
+   "role": "assistant",
+   "text": ",",
+   "startMs": 15800,
+   "endMs": 16000
+  },
+  {
+   "eventId": "f36",
+   "sequence": 36,
+   "role": "assistant",
+   "text": " USDC",
+   "startMs": 16400,
+   "endMs": 16600
+  },
+  {
+   "eventId": "f37",
+   "sequence": 37,
+   "role": "assistant",
+   "text": " forty",
+   "startMs": 17200,
+   "endMs": 17400
+  },
+  {
+   "eventId": "f38",
+   "sequence": 38,
+   "role": "assistant",
+   "text": " cents,",
+   "startMs": 17600,
+   "endMs": 17800
+  },
+  {
+   "eventId": "f39",
+   "sequence": 39,
+   "role": "assistant",
+   "text": " Okay.",
+   "startMs": 19800,
+   "endMs": 20000
+  },
+  {
+   "eventId": "f40",
+   "sequence": 40,
+   "role": "assistant",
+   "text": " Just",
+   "startMs": 20200,
+   "endMs": 20400
+  },
+  {
+   "eventId": "f41",
+   "sequence": 41,
+   "role": "assistant",
+   "text": " to confirm",
+   "startMs": 20400,
+   "endMs": 20600
+  },
+  {
+   "eventId": "f42",
+   "sequence": 42,
+   "role": "assistant",
+   "text": ":",
+   "startMs": 20600,
+   "endMs": 20800
+  },
+  {
+   "eventId": "f43",
+   "sequence": 43,
+   "role": "assistant",
+   "text": " sell",
+   "startMs": 21200,
+   "endMs": 21400
+  },
+  {
+   "eventId": "f44",
+   "sequence": 44,
+   "role": "assistant",
+   "text": " one",
+   "startMs": 21600,
+   "endMs": 21800
+  },
+  {
+   "eventId": "f45",
+   "sequence": 45,
+   "role": "assistant",
+   "text": " dollar",
+   "startMs": 21800,
+   "endMs": 22000
+  },
+  {
+   "eventId": "f46",
+   "sequence": 46,
+   "role": "assistant",
+   "text": " of your",
+   "startMs": 22200,
+   "endMs": 22400
+  },
+  {
+   "eventId": "f47",
+   "sequence": 47,
+   "role": "assistant",
+   "text": " SpaceX",
+   "startMs": 22400,
+   "endMs": 22600
+  },
+  {
+   "eventId": "f48",
+   "sequence": 48,
+   "role": "assistant",
+   "text": " stock",
+   "startMs": 23000,
+   "endMs": 23200
+  },
+  {
+   "eventId": "f49",
+   "sequence": 49,
+   "role": "assistant",
+   "text": " into",
+   "startMs": 23400,
+   "endMs": 23600
+  },
+  {
+   "eventId": "f50",
+   "sequence": 50,
+   "role": "assistant",
+   "text": " cash",
+   "startMs": 23600,
+   "endMs": 23800
+  },
+  {
+   "eventId": "f51",
+   "sequence": 51,
+   "role": "assistant",
+   "text": " at",
+   "startMs": 24000,
+   "endMs": 24200
+  },
+  {
+   "eventId": "f52",
+   "sequence": 52,
+   "role": "assistant",
+   "text": " market",
+   "startMs": 24200,
+   "endMs": 24400
+  },
+  {
+   "eventId": "f53",
+   "sequence": 53,
+   "role": "assistant",
+   "text": " price.",
+   "startMs": 24600,
+   "endMs": 24800
+  },
+  {
+   "eventId": "f54",
+   "sequence": 54,
+   "role": "assistant",
+   "text": " Should",
+   "startMs": 25200,
+   "endMs": 25400
+  },
+  {
+   "eventId": "f55",
+   "sequence": 55,
+   "role": "assistant",
+   "text": " I",
+   "startMs": 25400,
+   "endMs": 25600
+  },
+  {
+   "eventId": "f56",
+   "sequence": 56,
+   "role": "assistant",
+   "text": " run",
+   "startMs": 25600,
+   "endMs": 25800
+  },
+  {
+   "eventId": "f57",
+   "sequence": 57,
+   "role": "assistant",
+   "text": " it?",
+   "startMs": 25800,
+   "endMs": 26000
+  },
+  {
+   "eventId": "f58",
+   "sequence": 58,
+   "role": "user",
+   "text": " Yeah",
+   "startMs": 29400,
+   "endMs": 29600
+  },
+  {
+   "eventId": "f59",
+   "sequence": 59,
+   "role": "assistant",
+   "text": " Alright",
+   "startMs": 31800,
+   "endMs": 32000
+  },
+  {
+   "eventId": "f60",
+   "sequence": 60,
+   "role": "assistant",
+   "text": ",",
+   "startMs": 32000,
+   "endMs": 32200
+  },
+  {
+   "eventId": "f61",
+   "sequence": 61,
+   "role": "assistant",
+   "text": " on",
+   "startMs": 32200,
+   "endMs": 32400
+  },
+  {
+   "eventId": "f62",
+   "sequence": 62,
+   "role": "assistant",
+   "text": " it.",
+   "startMs": 32400,
+   "endMs": 32600
+  },
+  {
+   "eventId": "f63",
+   "sequence": 63,
+   "role": "assistant",
+   "text": " I'm running",
+   "startMs": 33400,
+   "endMs": 33600
+  },
+  {
+   "eventId": "f64",
+   "sequence": 64,
+   "role": "assistant",
+   "text": " that.",
+   "startMs": 33600,
+   "endMs": 33800
+  },
+  {
+   "eventId": "f65",
+   "sequence": 65,
+   "role": "assistant",
+   "text": " I'm here",
+   "startMs": 35000,
+   "endMs": 35200
+  },
+  {
+   "eventId": "f66",
+   "sequence": 66,
+   "role": "assistant",
+   "text": ".",
+   "startMs": 35200,
+   "endMs": 35400
+  },
+  {
+   "eventId": "f67",
+   "sequence": 67,
+   "role": "user",
+   "text": " I",
+   "startMs": 39400,
+   "endMs": 39600
+  },
+  {
+   "eventId": "f68",
+   "sequence": 68,
+   "role": "user",
+   "text": " know you",
+   "startMs": 39600,
+   "endMs": 39800
+  },
+  {
+   "eventId": "f69",
+   "sequence": 69,
+   "role": "user",
+   "text": " are",
+   "startMs": 39800,
+   "endMs": 40000
+  },
+  {
+   "eventId": "f70",
+   "sequence": 70,
+   "role": "assistant",
+   "text": " I'm still",
+   "startMs": 49200,
+   "endMs": 49400
+  },
+  {
+   "eventId": "f71",
+   "sequence": 71,
+   "role": "assistant",
+   "text": " waiting",
+   "startMs": 49600,
+   "endMs": 49800
+  },
+  {
+   "eventId": "f72",
+   "sequence": 72,
+   "role": "assistant",
+   "text": " on",
+   "startMs": 49800,
+   "endMs": 50000
+  },
+  {
+   "eventId": "f73",
+   "sequence": 73,
+   "role": "assistant",
+   "text": " the sale",
+   "startMs": 50000,
+   "endMs": 50200
+  },
+  {
+   "eventId": "f74",
+   "sequence": 74,
+   "role": "assistant",
+   "text": ".",
+   "startMs": 50200,
+   "endMs": 50400
+  },
+  {
+   "eventId": "f75",
+   "sequence": 75,
+   "role": "assistant",
+   "text": " I'll",
+   "startMs": 50600,
+   "endMs": 50800
+  },
+  {
+   "eventId": "f76",
+   "sequence": 76,
+   "role": "assistant",
+   "text": " let",
+   "startMs": 50800,
+   "endMs": 51000
+  },
+  {
+   "eventId": "f77",
+   "sequence": 77,
+   "role": "assistant",
+   "text": " you know",
+   "startMs": 51000,
+   "endMs": 51200
+  },
+  {
+   "eventId": "f78",
+   "sequence": 78,
+   "role": "assistant",
+   "text": " as",
+   "startMs": 51200,
+   "endMs": 51400
+  },
+  {
+   "eventId": "f79",
+   "sequence": 79,
+   "role": "assistant",
+   "text": " soon",
+   "startMs": 51400,
+   "endMs": 51600
+  },
+  {
+   "eventId": "f80",
+   "sequence": 80,
+   "role": "assistant",
+   "text": " as",
+   "startMs": 51600,
+   "endMs": 51800
+  },
+  {
+   "eventId": "f81",
+   "sequence": 81,
+   "role": "assistant",
+   "text": " I have",
+   "startMs": 51800,
+   "endMs": 52000
+  },
+  {
+   "eventId": "f82",
+   "sequence": 82,
+   "role": "assistant",
+   "text": " the result",
+   "startMs": 52000,
+   "endMs": 52200
+  },
+  {
+   "eventId": "f83",
+   "sequence": 83,
+   "role": "assistant",
+   "text": ".",
+   "startMs": 52200,
+   "endMs": 52400
+  },
+  {
+   "eventId": "f84",
+   "sequence": 84,
+   "role": "user",
+   "text": " Thanks. How",
+   "startMs": 55400,
+   "endMs": 55600
+  },
+  {
+   "eventId": "f85",
+   "sequence": 85,
+   "role": "user",
+   "text": " much",
+   "startMs": 55600,
+   "endMs": 55800
+  },
+  {
+   "eventId": "f86",
+   "sequence": 86,
+   "role": "assistant",
+   "text": " We have",
+   "startMs": 56200,
+   "endMs": 56400
+  },
+  {
+   "eventId": "f87",
+   "sequence": 87,
+   "role": "assistant",
+   "text": " about",
+   "startMs": 56400,
+   "endMs": 56600
+  },
+  {
+   "eventId": "f88",
+   "sequence": 88,
+   "role": "assistant",
+   "text": " forty",
+   "startMs": 56600,
+   "endMs": 56800
+  },
+  {
+   "eventId": "f89",
+   "sequence": 89,
+   "role": "assistant",
+   "text": " cents",
+   "startMs": 56800,
+   "endMs": 57000
+  },
+  {
+   "eventId": "f90",
+   "sequence": 90,
+   "role": "assistant",
+   "text": " in",
+   "startMs": 57200,
+   "endMs": 57400
+  },
+  {
+   "eventId": "f91",
+   "sequence": 91,
+   "role": "assistant",
+   "text": " USDC",
+   "startMs": 57400,
+   "endMs": 57600
+  },
+  {
+   "eventId": "f92",
+   "sequence": 92,
+   "role": "assistant",
+   "text": ".",
+   "startMs": 57600,
+   "endMs": 57800
+  },
+  {
+   "eventId": "f93",
+   "sequence": 93,
+   "role": "assistant",
+   "text": " That read",
+   "startMs": 59800,
+   "endMs": 60000
+  },
+  {
+   "eventId": "f94",
+   "sequence": 94,
+   "role": "assistant",
+   "text": " didn't",
+   "startMs": 60200,
+   "endMs": 60400
+  },
+  {
+   "eventId": "f95",
+   "sequence": 95,
+   "role": "user",
+   "text": " Ah, I",
+   "startMs": 60400,
+   "endMs": 60600
+  },
+  {
+   "eventId": "f96",
+   "sequence": 96,
+   "role": "assistant",
+   "text": " list",
+   "startMs": 60400,
+   "endMs": 60600
+  },
+  {
+   "eventId": "f97",
+   "sequence": 97,
+   "role": "user",
+   "text": " see",
+   "startMs": 60600,
+   "endMs": 60800
+  },
+  {
+   "eventId": "f98",
+   "sequence": 98,
+   "role": "assistant",
+   "text": " every",
+   "startMs": 60600,
+   "endMs": 60800
+  },
+  {
+   "eventId": "f99",
+   "sequence": 99,
+   "role": "assistant",
+   "text": " holding.",
+   "startMs": 61000,
+   "endMs": 61200
+  },
+  {
+   "eventId": "f100",
+   "sequence": 100,
+   "role": "assistant",
+   "text": " Dexter",
+   "startMs": 63000,
+   "endMs": 63200
+  },
+  {
+   "eventId": "f101",
+   "sequence": 101,
+   "role": "assistant",
+   "text": " wouldn't",
+   "startMs": 63400,
+   "endMs": 63600
+  },
+  {
+   "eventId": "f102",
+   "sequence": 102,
+   "role": "assistant",
+   "text": " accept",
+   "startMs": 63600,
+   "endMs": 63800
+  },
+  {
+   "eventId": "f103",
+   "sequence": 103,
+   "role": "assistant",
+   "text": " your",
+   "startMs": 63800,
+   "endMs": 64000
+  },
+  {
+   "eventId": "f104",
+   "sequence": 104,
+   "role": "assistant",
+   "text": " SpaceX",
+   "startMs": 64000,
+   "endMs": 64200
+  },
+  {
+   "eventId": "f105",
+   "sequence": 105,
+   "role": "assistant",
+   "text": " holding",
+   "startMs": 64600,
+   "endMs": 64800
+  },
+  {
+   "eventId": "f106",
+   "sequence": 106,
+   "role": "assistant",
+   "text": " as",
+   "startMs": 65200,
+   "endMs": 65400
+  },
+  {
+   "eventId": "f107",
+   "sequence": 107,
+   "role": "assistant",
+   "text": " an exact",
+   "startMs": 65400,
+   "endMs": 65600
+  },
+  {
+   "eventId": "f108",
+   "sequence": 108,
+   "role": "assistant",
+   "text": " catalog",
+   "startMs": 65800,
+   "endMs": 66000
+  },
+  {
+   "eventId": "f109",
+   "sequence": 109,
+   "role": "assistant",
+   "text": " selection",
+   "startMs": 66400,
+   "endMs": 66600
+  },
+  {
+   "eventId": "f110",
+   "sequence": 110,
+   "role": "assistant",
+   "text": " for",
+   "startMs": 66800,
+   "endMs": 67000
+  },
+  {
+   "eventId": "f111",
+   "sequence": 111,
+   "role": "assistant",
+   "text": " stock",
+   "startMs": 67000,
+   "endMs": 67200
+  },
+  {
+   "eventId": "f112",
+   "sequence": 112,
+   "role": "assistant",
+   "text": " trading,",
+   "startMs": 67200,
+   "endMs": 67400
+  },
+  {
+   "eventId": "f113",
+   "sequence": 113,
+   "role": "assistant",
+   "text": " so",
+   "startMs": 67800,
+   "endMs": 68000
+  },
+  {
+   "eventId": "f114",
+   "sequence": 114,
+   "role": "assistant",
+   "text": " no",
+   "startMs": 68200,
+   "endMs": 68400
+  },
+  {
+   "eventId": "f115",
+   "sequence": 115,
+   "role": "assistant",
+   "text": " order",
+   "startMs": 68400,
+   "endMs": 68600
+  },
+  {
+   "eventId": "f116",
+   "sequence": 116,
+   "role": "assistant",
+   "text": " was",
+   "startMs": 68800,
+   "endMs": 69000
+  },
+  {
+   "eventId": "f117",
+   "sequence": 117,
+   "role": "assistant",
+   "text": " created.",
+   "startMs": 69000,
+   "endMs": 69200
+  },
+  {
+   "eventId": "f118",
+   "sequence": 118,
+   "role": "assistant",
+   "text": " You",
+   "startMs": 70000,
+   "endMs": 70200
+  },
+  {
+   "eventId": "f119",
+   "sequence": 119,
+   "role": "assistant",
+   "text": " still",
+   "startMs": 70200,
+   "endMs": 70400
+  },
+  {
+   "eventId": "f120",
+   "sequence": 120,
+   "role": "assistant",
+   "text": " hold",
+   "startMs": 70600,
+   "endMs": 70800
+  },
+  {
+   "eventId": "f121",
+   "sequence": 121,
+   "role": "assistant",
+   "text": " that",
+   "startMs": 70800,
+   "endMs": 71000
+  },
+  {
+   "eventId": "f122",
+   "sequence": 122,
+   "role": "assistant",
+   "text": " SpaceX",
+   "startMs": 71000,
+   "endMs": 71200
+  },
+  {
+   "eventId": "f123",
+   "sequence": 123,
+   "role": "assistant",
+   "text": " stock,",
+   "startMs": 71400,
+   "endMs": 71600
+  },
+  {
+   "eventId": "f124",
+   "sequence": 124,
+   "role": "assistant",
+   "text": " worth",
+   "startMs": 72000,
+   "endMs": 72200
+  },
+  {
+   "eventId": "f125",
+   "sequence": 125,
+   "role": "assistant",
+   "text": " about",
+   "startMs": 72200,
+   "endMs": 72400
+  },
+  {
+   "eventId": "f126",
+   "sequence": 126,
+   "role": "assistant",
+   "text": " two",
+   "startMs": 72600,
+   "endMs": 72800
+  },
+  {
+   "eventId": "f127",
+   "sequence": 127,
+   "role": "assistant",
+   "text": " dollars",
+   "startMs": 73000,
+   "endMs": 73200
+  },
+  {
+   "eventId": "f128",
+   "sequence": 128,
+   "role": "assistant",
+   "text": " and",
+   "startMs": 73200,
+   "endMs": 73400
+  },
+  {
+   "eventId": "f129",
+   "sequence": 129,
+   "role": "assistant",
+   "text": " ninety",
+   "startMs": 73400,
+   "endMs": 73600
+  },
+  {
+   "eventId": "f130",
+   "sequence": 130,
+   "role": "assistant",
+   "text": " cents.",
+   "startMs": 73800,
+   "endMs": 74000
+  },
+  {
+   "eventId": "f131",
+   "sequence": 131,
+   "role": "user",
+   "text": " Can",
+   "startMs": 77800,
+   "endMs": 78000
+  },
+  {
+   "eventId": "f132",
+   "sequence": 132,
+   "role": "user",
+   "text": " you",
+   "startMs": 78000,
+   "endMs": 78200
+  },
+  {
+   "eventId": "f133",
+   "sequence": 133,
+   "role": "user",
+   "text": " sell",
+   "startMs": 78400,
+   "endMs": 78600
+  },
+  {
+   "eventId": "f134",
+   "sequence": 134,
+   "role": "user",
+   "text": " a",
+   "startMs": 78600,
+   "endMs": 78800
+  },
+  {
+   "eventId": "f135",
+   "sequence": 135,
+   "role": "user",
+   "text": " little",
+   "startMs": 79000,
+   "endMs": 79200
+  },
+  {
+   "eventId": "f136",
+   "sequence": 136,
+   "role": "user",
+   "text": " of",
+   "startMs": 79200,
+   "endMs": 79400
+  },
+  {
+   "eventId": "f137",
+   "sequence": 137,
+   "role": "user",
+   "text": " the",
+   "startMs": 79600,
+   "endMs": 79800
+  },
+  {
+   "eventId": "f138",
+   "sequence": 138,
+   "role": "user",
+   "text": " token",
+   "startMs": 80000,
+   "endMs": 80200
+  },
+  {
+   "eventId": "f139",
+   "sequence": 139,
+   "role": "user",
+   "text": " that",
+   "startMs": 81000,
+   "endMs": 81200
+  },
+  {
+   "eventId": "f140",
+   "sequence": 140,
+   "role": "user",
+   "text": " you",
+   "startMs": 81400,
+   "endMs": 81600
+  },
+  {
+   "eventId": "f141",
+   "sequence": 141,
+   "role": "user",
+   "text": " said",
+   "startMs": 82000,
+   "endMs": 82200
+  },
+  {
+   "eventId": "f142",
+   "sequence": 142,
+   "role": "user",
+   "text": " I",
+   "startMs": 82400,
+   "endMs": 82600
+  },
+  {
+   "eventId": "f143",
+   "sequence": 143,
+   "role": "user",
+   "text": " had",
+   "startMs": 82600,
+   "endMs": 82800
+  },
+  {
+   "eventId": "f144",
+   "sequence": 144,
+   "role": "user",
+   "text": " about",
+   "startMs": 82800,
+   "endMs": 83000
+  },
+  {
+   "eventId": "f145",
+   "sequence": 145,
+   "role": "user",
+   "text": " $20",
+   "startMs": 83000,
+   "endMs": 83200
+  },
+  {
+   "eventId": "f146",
+   "sequence": 146,
+   "role": "user",
+   "text": " worth",
+   "startMs": 83200,
+   "endMs": 83400
+  },
+  {
+   "eventId": "f147",
+   "sequence": 147,
+   "role": "user",
+   "text": " of",
+   "startMs": 83600,
+   "endMs": 83800
+  },
+  {
+   "eventId": "f148",
+   "sequence": 148,
+   "role": "assistant",
+   "text": " On",
+   "startMs": 84000,
+   "endMs": 84200
+  },
+  {
+   "eventId": "f149",
+   "sequence": 149,
+   "role": "assistant",
+   "text": " it.",
+   "startMs": 84200,
+   "endMs": 84400
+  },
+  {
+   "eventId": "f150",
+   "sequence": 150,
+   "role": "assistant",
+   "text": " I'm checking",
+   "startMs": 85200,
+   "endMs": 85400
+  },
+  {
+   "eventId": "f151",
+   "sequence": 151,
+   "role": "assistant",
+   "text": " how",
+   "startMs": 85600,
+   "endMs": 85800
+  },
+  {
+   "eventId": "f152",
+   "sequence": 152,
+   "role": "assistant",
+   "text": " to run",
+   "startMs": 86000,
+   "endMs": 86200
+  },
+  {
+   "eventId": "f153",
+   "sequence": 153,
+   "role": "assistant",
+   "text": " that",
+   "startMs": 86200,
+   "endMs": 86400
+  },
+  {
+   "eventId": "f154",
+   "sequence": 154,
+   "role": "assistant",
+   "text": " sale.",
+   "startMs": 86400,
+   "endMs": 86600
+  },
+  {
+   "eventId": "f155",
+   "sequence": 155,
+   "role": "assistant",
+   "text": " No",
+   "startMs": 94000,
+   "endMs": 94200
+  },
+  {
+   "eventId": "f156",
+   "sequence": 156,
+   "role": "assistant",
+   "text": " single",
+   "startMs": 94200,
+   "endMs": 94400
+  },
+  {
+   "eventId": "f157",
+   "sequence": 157,
+   "role": "assistant",
+   "text": " holding",
+   "startMs": 94600,
+   "endMs": 94800
+  },
+  {
+   "eventId": "f158",
+   "sequence": 158,
+   "role": "assistant",
+   "text": " is",
+   "startMs": 94800,
+   "endMs": 95000
+  },
+  {
+   "eventId": "f159",
+   "sequence": 159,
+   "role": "assistant",
+   "text": " worth",
+   "startMs": 95000,
+   "endMs": 95200
+  },
+  {
+   "eventId": "f160",
+   "sequence": 160,
+   "role": "assistant",
+   "text": " twenty",
+   "startMs": 95200,
+   "endMs": 95400
+  },
+  {
+   "eventId": "f161",
+   "sequence": 161,
+   "role": "assistant",
+   "text": " dollars.",
+   "startMs": 95600,
+   "endMs": 95800
+  },
+  {
+   "eventId": "f162",
+   "sequence": 162,
+   "role": "assistant",
+   "text": " That",
+   "startMs": 96000,
+   "endMs": 96200
+  },
+  {
+   "eventId": "f163",
+   "sequence": 163,
+   "role": "assistant",
+   "text": " was",
+   "startMs": 96400,
+   "endMs": 96600
+  },
+  {
+   "eventId": "f164",
+   "sequence": 164,
+   "role": "assistant",
+   "text": " your",
+   "startMs": 96600,
+   "endMs": 96800
+  },
+  {
+   "eventId": "f165",
+   "sequence": 165,
+   "role": "assistant",
+   "text": " whole",
+   "startMs": 97000,
+   "endMs": 97200
+  },
+  {
+   "eventId": "f166",
+   "sequence": 166,
+   "role": "assistant",
+   "text": " portfolio.",
+   "startMs": 97400,
+   "endMs": 97600
+  },
+  {
+   "eventId": "f167",
+   "sequence": 167,
+   "role": "assistant",
+   "text": " Birch",
+   "startMs": 98400,
+   "endMs": 98600
+  },
+  {
+   "eventId": "f168",
+   "sequence": 168,
+   "role": "assistant",
+   "text": " Labs",
+   "startMs": 99000,
+   "endMs": 99200
+  },
+  {
+   "eventId": "f169",
+   "sequence": 169,
+   "role": "assistant",
+   "text": " is the",
+   "startMs": 99400,
+   "endMs": 99600
+  },
+  {
+   "eventId": "f170",
+   "sequence": 170,
+   "role": "assistant",
+   "text": " largest,",
+   "startMs": 99600,
+   "endMs": 99800
+  },
+  {
+   "eventId": "f171",
+   "sequence": 171,
+   "role": "user",
+   "text": " No",
+   "startMs": 100600,
+   "endMs": 100800
+  },
+  {
+   "eventId": "f172",
+   "sequence": 172,
+   "role": "user",
+   "text": ", no,",
+   "startMs": 100800,
+   "endMs": 101000
+  },
+  {
+   "eventId": "f173",
+   "sequence": 173,
+   "role": "user",
+   "text": " you said",
+   "startMs": 101000,
+   "endMs": 101200
+  },
+  {
+   "eventId": "f174",
+   "sequence": 174,
+   "role": "assistant",
+   "text": " Oh!",
+   "startMs": 101400,
+   "endMs": 101600
+  },
+  {
+   "eventId": "f175",
+   "sequence": 175,
+   "role": "user",
+   "text": " Maple",
+   "startMs": 101600,
+   "endMs": 101800
+  },
+  {
+   "eventId": "f176",
+   "sequence": 176,
+   "role": "user",
+   "text": " You said",
+   "startMs": 102600,
+   "endMs": 102800
+  },
+  {
+   "eventId": "f177",
+   "sequence": 177,
+   "role": "user",
+   "text": ", what about",
+   "startMs": 102800,
+   "endMs": 103000
+  },
+  {
+   "eventId": "f178",
+   "sequence": 178,
+   "role": "user",
+   "text": " Maple",
+   "startMs": 103200,
+   "endMs": 103400
+  },
+  {
+   "eventId": "f179",
+   "sequence": 179,
+   "role": "assistant",
+   "text": " Right,",
+   "startMs": 103600,
+   "endMs": 103800
+  },
+  {
+   "eventId": "f180",
+   "sequence": 180,
+   "role": "assistant",
+   "text": " MAP",
+   "startMs": 104200,
+   "endMs": 104400
+  },
+  {
+   "eventId": "f181",
+   "sequence": 181,
+   "role": "assistant",
+   "text": "LE.",
+   "startMs": 104400,
+   "endMs": 104600
+  },
+  {
+   "eventId": "f182",
+   "sequence": 182,
+   "role": "assistant",
+   "text": " Checking",
+   "startMs": 105000,
+   "endMs": 105200
+  },
+  {
+   "eventId": "f183",
+   "sequence": 183,
+   "role": "assistant",
+   "text": " that",
+   "startMs": 105400,
+   "endMs": 105600
+  },
+  {
+   "eventId": "f184",
+   "sequence": 184,
+   "role": "assistant",
+   "text": " one.",
+   "startMs": 105600,
+   "endMs": 105800
+  },
+  {
+   "eventId": "f185",
+   "sequence": 185,
+   "role": "assistant",
+   "text": " I haven't",
+   "startMs": 114800,
+   "endMs": 115000
+  },
+  {
+   "eventId": "f186",
+   "sequence": 186,
+   "role": "assistant",
+   "text": " mentioned",
+   "startMs": 115000,
+   "endMs": 115200
+  },
+  {
+   "eventId": "f187",
+   "sequence": 187,
+   "role": "assistant",
+   "text": " anything",
+   "startMs": 115200,
+   "endMs": 115400
+  },
+  {
+   "eventId": "f188",
+   "sequence": 188,
+   "role": "assistant",
+   "text": " called",
+   "startMs": 115600,
+   "endMs": 115800
+  },
+  {
+   "eventId": "f189",
+   "sequence": 189,
+   "role": "assistant",
+   "text": " Maple,",
+   "startMs": 115800,
+   "endMs": 116000
+  },
+  {
+   "eventId": "f190",
+   "sequence": 190,
+   "role": "assistant",
+   "text": " but",
+   "startMs": 116600,
+   "endMs": 116800
+  },
+  {
+   "eventId": "f191",
+   "sequence": 191,
+   "role": "assistant",
+   "text": " Cedar",
+   "startMs": 116800,
+   "endMs": 117000
+  },
+  {
+   "eventId": "f192",
+   "sequence": 192,
+   "role": "assistant",
+   "text": " Leaf",
+   "startMs": 117000,
+   "endMs": 117200
+  },
+  {
+   "eventId": "f193",
+   "sequence": 193,
+   "role": "assistant",
+   "text": " is",
+   "startMs": 117400,
+   "endMs": 117600
+  },
+  {
+   "eventId": "f194",
+   "sequence": 194,
+   "role": "assistant",
+   "text": " five hundred",
+   "startMs": 117600,
+   "endMs": 117800
+  },
+  {
+   "eventId": "f195",
+   "sequence": 195,
+   "role": "assistant",
+   "text": " tokens",
+   "startMs": 118200,
+   "endMs": 118400
+  },
+  {
+   "eventId": "f196",
+   "sequence": 196,
+   "role": "assistant",
+   "text": " worth",
+   "startMs": 118600,
+   "endMs": 118800
+  },
+  {
+   "eventId": "f197",
+   "sequence": 197,
+   "role": "assistant",
+   "text": " about",
+   "startMs": 118800,
+   "endMs": 119000
+  },
+  {
+   "eventId": "f198",
+   "sequence": 198,
+   "role": "assistant",
+   "text": " four",
+   "startMs": 119200,
+   "endMs": 119400
+  },
+  {
+   "eventId": "f199",
+   "sequence": 199,
+   "role": "assistant",
+   "text": " dollars",
+   "startMs": 119400,
+   "endMs": 119600
+  },
+  {
+   "eventId": "f200",
+   "sequence": 200,
+   "role": "assistant",
+   "text": " and",
+   "startMs": 119800,
+   "endMs": 120000
+  },
+  {
+   "eventId": "f201",
+   "sequence": 201,
+   "role": "assistant",
+   "text": " eighty",
+   "startMs": 120000,
+   "endMs": 120200
+  },
+  {
+   "eventId": "f202",
+   "sequence": 202,
+   "role": "assistant",
+   "text": " cents.",
+   "startMs": 120200,
+   "endMs": 120400
+  },
+  {
+   "eventId": "f203",
+   "sequence": 203,
+   "role": "user",
+   "text": " Yes, you",
+   "startMs": 121000,
+   "endMs": 121200
+  },
+  {
+   "eventId": "f204",
+   "sequence": 204,
+   "role": "user",
+   "text": " did",
+   "startMs": 121400,
+   "endMs": 121600
+  },
+  {
+   "eventId": "f205",
+   "sequence": 205,
+   "role": "assistant",
+   "text": " Let",
+   "startMs": 123000,
+   "endMs": 123200
+  },
+  {
+   "eventId": "f206",
+   "sequence": 206,
+   "role": "assistant",
+   "text": " me",
+   "startMs": 123200,
+   "endMs": 123400
+  },
+  {
+   "eventId": "f207",
+   "sequence": 207,
+   "role": "assistant",
+   "text": " check.",
+   "startMs": 123400,
+   "endMs": 123600
+  },
+  {
+   "eventId": "f208",
+   "sequence": 208,
+   "role": "user",
+   "text": " Okay",
+   "startMs": 123600,
+   "endMs": 123800
+  },
+  {
+   "eventId": "f209",
+   "sequence": 209,
+   "role": "user",
+   "text": " never",
+   "startMs": 123800,
+   "endMs": 124000
+  },
+  {
+   "eventId": "f210",
+   "sequence": 210,
+   "role": "user",
+   "text": " mind",
+   "startMs": 124000,
+   "endMs": 124200
+  },
+  {
+   "eventId": "f211",
+   "sequence": 211,
+   "role": "user",
+   "text": " then",
+   "startMs": 124200,
+   "endMs": 124400
+  },
+  {
+   "eventId": "f212",
+   "sequence": 212,
+   "role": "assistant",
+   "text": " Okay.",
+   "startMs": 124600,
+   "endMs": 124800
+  }
+ ],
+ "requests": [
+  {
+   "firstSequence": 58,
+   "lastSequence": 58,
+   "result": "The SpaceX sale didn't go through, and nothing was sold. Dexter wouldn't accept your SpaceX holding as an exact catalog selection for stock trading, so it created no order. You still hold your SpaceX stock, worth about $2.90."
+  },
+  {
+   "firstSequence": 131,
+   "lastSequence": 147,
+   "result": "No single holding is worth $20. That was your whole portfolio, which was about $20 in total. Your largest holding is Birch Labs, at roughly $9. Which one do you want to sell, and how many dollars' worth?"
+  },
+  {
+   "firstSequence": 171,
+   "lastSequence": 178,
+   "result": "I haven't mentioned anything called Maple. The closest match in your portfolio is Cedar Leaf, which is 500 tokens worth about $4.80. Is that the one, and how many dollars' worth do you want to sell?"
+  },
+  {
+   "firstSequence": 203,
+   "lastSequence": 204
+  }
+ ]
+}
