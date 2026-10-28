@@ -60,6 +60,29 @@ async function enroll(f: ReturnType<typeof fixture>, phone = PHONE) {
 }
 const error = (code: string) => (e: unknown) => e instanceof SmsError && e.code === code;
 
+for (const outcome of ['completed', 'failed'] as const) {
+  test(`SMS stop during a ${outcome} API turn preserves pending inbox and prevents further dispatch`, async t => {
+    const { dispatchSmsInbox } = await import('../src/sms/dispatch.js');
+    const f = fixture(t); await enroll(f); await enroll(f, OTHER); f.options.sendEnabled = true;
+    f.service.inbound({ phone: PHONE, sid: SID, body: 'Balance?' });
+    f.service.inbound({ phone: OTHER, sid: `SM${'e'.repeat(32)}`, body: 'Balance too?' });
+    const before = fs.readFileSync(f.options.statePath, 'utf8');
+    let accepting = true, turns = 0, errors = 0;
+    await dispatchSmsInbox(f.service, { async turn() {
+      turns++; accepting = false;
+      if (outcome === 'failed') throw new Error('synthetic_api_outage');
+      return { state: 'completed', text: 'Balance: 12 USDC.' };
+    } }, () => { errors++; }, () => accepting);
+    assert.equal(turns, 1); assert.equal(errors, 0); assert.equal(f.sends.length, 0);
+    assert.equal(fs.readFileSync(f.options.statePath, 'utf8'), before, 'no reply, retry or completion mutation after stop');
+    await dispatchSmsInbox(f.service, { async turn() { throw new Error('already stopped'); } }, undefined, () => false);
+    assert.equal(fs.readFileSync(f.options.statePath, 'utf8'), before);
+    f.reopen();
+    await dispatchSmsInbox(f.service, { async turn() { return { state: 'completed', text: 'Balance: 12 USDC.' }; } });
+    assert.equal(f.sends.length, 2, 'pending SIDs resume after restart');
+  });
+}
+
 test('OTP proves ownership without enrolling; explicit versioned consent persists separately', async t => {
   const f = fixture(t);
   const proof = await verify(f);
@@ -312,7 +335,7 @@ test('closing on SIGTERM releases ledger ownership and preserves bytes for next 
   assert.equal(fs.readFileSync(statePath, 'utf8'), before);
 });
 
-test('dead PID SMS lock is cleared; live and malformed locks remain untouched', async t => {
+test('dead PID and malformed SMS locks recover; live writers remain exclusive', async t => {
   const f = fixture(t); f.service.close();
   const child = spawn(process.execPath, ['-e', '']);
   await once(child, 'exit');
@@ -323,8 +346,8 @@ test('dead PID SMS lock is cleared; live and malformed locks remain untouched', 
   assert.throws(() => new SmsService(f.options), /EEXIST/);
   f.service.close();
   fs.writeFileSync(lock, JSON.stringify({ pid: 'invalid' }), { mode: 0o600 });
-  assert.throws(() => new SmsService(f.options), /Invalid SMS writer lock/);
-  assert.equal(JSON.parse(fs.readFileSync(lock, 'utf8')).pid, 'invalid');
+  f.reopen();
+  assert.equal(JSON.parse(fs.readFileSync(lock, 'utf8')).pid, process.pid);
 });
 
 test('never-enrolled sender gets one signup reply across messages and restarts; STOP stays silent', async t => {

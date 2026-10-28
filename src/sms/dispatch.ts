@@ -2,10 +2,11 @@ import { PrimaryApiError, type PrimarySmsClient } from '../broker/primaryApi.js'
 import { SmsError, type SmsService } from './SmsService.js';
 
 /** One drain at a time; pending API turns retain their SID and per-phone order. */
-export async function dispatchSmsInbox(service: SmsService, primary: PrimarySmsClient, onError: (error: unknown) => void = () => {}) {
+export async function dispatchSmsInbox(service: SmsService, primary: PrimarySmsClient, onError: (error: unknown) => void = () => {}, accepting: () => boolean = () => true) {
   if (!service.config().deliveryActive) return;
   const blocked = new Set<string>();
   for (const item of service.pendingTexts()) {
+    if (!accepting()) break;
     if (blocked.has(item.phone)) continue;
     if (item.expired) { service.finishText(item.sid, 'suppressed'); continue; }
     if (item.deferred) { blocked.add(item.phone); continue; }
@@ -15,12 +16,14 @@ export async function dispatchSmsInbox(service: SmsService, primary: PrimarySmsC
       else {
         service.requestedEligibility(item.phone);
         const result = await primary.turn({ phone: item.phone, messageSid: item.sid, text: item.body });
+        if (!accepting()) break;
         if (result.state === 'queued' || result.state === 'running') { blocked.add(item.phone); continue; }
         if (result.state === 'unregistered' || result.state === 'setup_required') receipt = await service.sendSignupReply(item.phone, item.sid, result.state === 'setup_required');
         else if (result.state === 'completed') receipt = await service.sendThreadReply(item.phone, item.sid, result.text);
       }
       service.finishText(item.sid, receipt?.status === 'uncertain' || receipt?.status === 'dispatching' ? 'uncertain' : 'replied');
     } catch (error) {
+      if (!accepting()) break;
       if (error instanceof SmsError && ['sms_consent_required', 'carrier_opted_out'].includes(error.code))
         service.finishText(item.sid, 'suppressed');
       else if (error instanceof SmsError && error.code === 'sms_dispatch_uncertain')

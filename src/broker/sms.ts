@@ -18,6 +18,17 @@ export interface BrokerSmsBridge {
   close(): Promise<void>;
 }
 
+/** Voice has already stopped before cleanup waits on the isolated SMS worker. */
+export async function closeBrokerSms(sms?: Pick<BrokerSmsBridge, 'close'>): Promise<void> {
+  if (!sms) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([sms.close(), new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error('sms_shutdown_timeout')), 5_000);
+    })]);
+  } finally { clearTimeout(timer); }
+}
+
 /** Keep all ledger cloning, serialization and disk work off the voice event loop. */
 export async function createBrokerSmsBridge(env: NodeJS.ProcessEnv, releaseRoot: string,
   clients?: { verify: ReturnType<typeof Twilio>; messaging: ReturnType<typeof Twilio> },
@@ -56,9 +67,14 @@ export async function createBrokerSmsBridge(env: NodeJS.ProcessEnv, releaseRoot:
     await Promise.race([rpc.call('ready'), new Promise((_, reject) => {
       startupTimer = setTimeout(() => reject(new Error('sms_state_admission_failed')), 10_000);
     })]);
-  } catch (error) { void worker.terminate(); throw error; }
+  } catch (error) {
+    console.error(JSON.stringify({ service: 'sms', event: 'startup_failed', state: 'disabled', ...safeFailure(error) }));
+    await worker.terminate(); throw error;
+  }
   finally { clearTimeout(startupTimer); }
   initialized = true;
+  // Let the caller take ownership (and stop a late startup) before any saved inbox work starts.
+  setImmediate(() => { if (accepting) void rpc.call('start').catch(failed); });
   function failure(response: ServerResponse, status: number, error: string) {
     if (response.destroyed) return;
     response.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' });

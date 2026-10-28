@@ -24,6 +24,12 @@ const rpc = smsRpc(parentPort!, async (method, args) => {
   if (method === 'ready') return ready;
   await ready;
   if (method === 'stop') { accepting = false; clearInterval(timer); return; }
+  if (method === 'start') {
+    if (!accepting || timer) return;
+    timer = setInterval(drain, 2000); timer.unref();
+    setImmediate(drain);
+    return;
+  }
   if (method === 'close') {
     accepting = false; clearInterval(timer);
     await Promise.allSettled([...pending]);
@@ -76,7 +82,7 @@ function accountClient(ownerId: string) {
 function drain() {
   if (!accepting || draining || pending.size || !primary) return;
   const failure = (error: unknown) => console.error(JSON.stringify({ service: 'sms', event: 'dispatch_failed', ...safeFailure(error) }));
-  draining = dispatchSmsInbox(service!, primary, failure).catch(failure).finally(() => { draining = undefined; });
+  draining = dispatchSmsInbox(service!, primary, failure, () => accepting).catch(failure).finally(() => { draining = undefined; });
 }
 const ready = (async () => {
   if (!service) throw new Error('sms_state_admission_failed');
@@ -88,8 +94,6 @@ const ready = (async () => {
       publicBaseUrl: (env.DEXTER_PHONE_PUBLIC_URL || '').replace(/\/+$/, ''),
     });
     await app.ready();
-    timer = setInterval(drain, 2000); timer.unref();
-    setImmediate(drain);
   } catch (error) { await app.close().catch(() => {}); service.close(); throw error; }
 })();
 // The ready RPC owns reporting; avoid an unhandled rejection before its message arrives.

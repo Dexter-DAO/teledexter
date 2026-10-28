@@ -8,6 +8,7 @@ import { randomUUID } from 'node:crypto';
 import Twilio from 'twilio';
 import { WebSocket } from 'ws';
 import { createBrokerServer } from '../src/broker/server.js';
+import type { BrokerSmsBridge } from '../src/broker/sms.js';
 import { formatCallTranscript } from '../src/broker/callTranscript.js';
 import { streamToken } from '../src/broker/phone.js';
 import { brokerOpening } from '../src/broker/instructions.js';
@@ -39,7 +40,7 @@ test('repeated terminal callbacks log one transcript for a call without media', 
   assert.equal(logs.length, 1);
 });
 
-async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; failVoice?: boolean; ambiguousDial?: boolean; deferVoiceReady?: boolean; history?: PrimaryContextMessage[]; assignmentResponse?: 'missing' | 'wrong'; assignmentParser?: { parse(value: unknown): unknown }; retainedCall?: BrokerCall; dependencyHealth?: () => Promise<BrokerDependencyHealth>; greetingClip?: Buffer; gateBind?: boolean } = {}) {
+async function fixture(t: test.TestContext, overrides: { sms?: BrokerSmsBridge; eligibility?: boolean; failVoice?: boolean; ambiguousDial?: boolean; deferVoiceReady?: boolean; history?: PrimaryContextMessage[]; assignmentResponse?: 'missing' | 'wrong'; assignmentParser?: { parse(value: unknown): unknown }; retainedCall?: BrokerCall; dependencyHealth?: () => Promise<BrokerDependencyHealth>; greetingClip?: Buffer; gateBind?: boolean } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-server-test-'));
   const config: BrokerConfig = { host: '127.0.0.1', port: 3213, publicOrigin: 'https://phone.example.test', stateDir: directory,
     controlToken: 'c'.repeat(40), apiKey: 'fixture-key', model: 'gpt-live-1', voice: 'marin',
@@ -93,6 +94,7 @@ async function fixture(t: test.TestContext, overrides: { eligibility?: boolean; 
   if (overrides.retainedCall) fs.writeFileSync(path.join(directory, 'calls.json'),
     JSON.stringify({ version: 1, calls: { [overrides.retainedCall.id]: overrides.retainedCall } }, null, 2) + '\n');
   const broker = createBrokerServer({ config, primary, provider: { calls: provider } as unknown as ReturnType<typeof Twilio>,
+    sms: overrides.sms,
     dependencyHealth: overrides.dependencyHealth,
     ...(overrides.greetingClip ? { greetingClip: overrides.greetingClip } : {}),
     probe: async () => {
@@ -610,6 +612,38 @@ test('a broker shutdown whose in-flight outbound binding fails still finishes', 
   await closing;
   assert.equal(f.calls.close, 0);
   assert.equal(f.broker.store.get(call.id)!.primary, undefined);
+});
+
+test('active voice and Primary close before a pending SMS HTTP request or drain can finish', async t => {
+  let release!: () => void, requested!: () => void, closingSms!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { requested = resolve; });
+  const smsClosing = new Promise<void>(resolve => { closingSms = resolve; });
+  const sms: BrokerSmsBridge = {
+    requestedEligibility() { throw new Error('unexpected'); }, requestedReceipt() { return null; },
+    async sendRequested() { throw new Error('unexpected'); },
+    async handle(request, response) {
+      if (request.url !== '/sms/incoming') return false;
+      requested(); await held; response.end(); return true;
+    },
+    stop() {}, async close() { closingSms(); await held; },
+  };
+  const f = await fixture(t, { sms });
+  t.after(release);
+  assert.equal((await f.post('/internal/broker/calls', { requestId: randomUUID(), purpose: 'Read the current portfolio.' })).status, 201);
+  const call = f.broker.store.list()[0], media = await (await answeredStream(f, call)).connect();
+  t.after(() => media.ws.close());
+  await until(() => Boolean(f.voiceOptions()));
+  const incoming = fetch(f.base + '/sms/incoming', { method: 'POST' });
+  await started;
+  const closing = f.broker.close();
+  // close() reaching SMS proves all call cleanup has already completed while HTTP is still held.
+  await Promise.race([smsClosing, new Promise((_, reject) => setTimeout(() => reject(new Error('voice_waited_for_sms')), 1000))]);
+  assert.ok(f.broker.store.get(call.id)!.endedAt);
+  assert.equal(f.broker.store.get(call.id)!.primaryClosed?.state, 'closed');
+  assert.equal(f.calls.close, 1);
+  assert.ok(f.providerUpdates.some(update => update.status === 'completed'));
+  release(); await incoming; await closing;
 });
 
 test('caller cannot inject assignment provenance through unauthenticated or extra control fields', async t => {

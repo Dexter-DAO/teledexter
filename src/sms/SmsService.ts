@@ -1,5 +1,6 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { z } from 'zod';
 import { bindDurableFileParent, durablyReplaceJsonFile, type DurableParentBinding } from '../outbound/DurableFile.js';
 
@@ -61,7 +62,8 @@ export class SmsService {
   private parent: DurableParentBinding;
   private poisoned = false;
   private now: () => number;
-  private lockFd: number;
+  private lockFd = -1;
+  private guardFd = -1;
   private lockPath: string;
   private onExit = () => this.close();
   constructor(private options: SmsOptions) {
@@ -69,18 +71,31 @@ export class SmsService {
     this.now = options.now ?? Date.now;
     this.parent = bindDurableFileParent(options.statePath);
     this.lockPath = `${options.statePath}.lock`;
-    const acquire = () => fs.openSync(this.lockPath, 'wx', 0o600);
-    try { this.lockFd = acquire(); }
-    catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      const previous = JSON.parse(fs.readFileSync(this.lockPath, 'utf8')) as { pid: number };
-      if (!Number.isInteger(previous.pid) || previous.pid < 1) throw new Error('Invalid SMS writer lock');
-      try { process.kill(previous.pid, 0); throw error; }
-      catch (probe) { if ((probe as NodeJS.ErrnoException).code !== 'ESRCH') throw probe; }
-      fs.unlinkSync(this.lockPath);
-      this.lockFd = acquire();
-    }
     try {
+      // Linux flock stays on this inherited open file description after the utility exits.
+      // Never unlink the guard: it serializes recovery even when legacy metadata is incomplete.
+      this.guardFd = fs.openSync(`${this.lockPath}.guard`, fs.constants.O_CREAT | fs.constants.O_RDWR | fs.constants.O_NOFOLLOW, 0o600);
+      const guard = spawnSync('flock', ['-n', '-E', '75', '3'], { stdio: ['ignore', 'pipe', 'pipe', this.guardFd], timeout: 2000 });
+      if (guard.error || guard.signal || ![0, 75].includes(guard.status!)) throw new Error('sms_lock_flock_unavailable');
+      if (guard.status === 75) throw Object.assign(new Error('EEXIST: SMS writer lock'), { code: 'EEXIST' });
+      const acquire = () => fs.openSync(this.lockPath, 'wx', 0o600);
+      try { this.lockFd = acquire(); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        let pid: unknown;
+        try { pid = JSON.parse(fs.readFileSync(this.lockPath, 'utf8')).pid; } catch {}
+        if (typeof pid === 'number' && Number.isInteger(pid) && pid > 0 && pid <= 0x7fffffff) {
+          try { process.kill(pid, 0); throw error; }
+          catch (probe) { if ((probe as NodeJS.ErrnoException).code !== 'ESRCH') throw probe; }
+        }
+        // Pre-upgrade writers hold their metadata fd before writing a PID. Preserve those too.
+        const holders = spawnSync('fuser', ['-s', this.lockPath], { encoding: 'utf8', timeout: 2000 });
+        if (holders.error || holders.signal || ![0, 1].includes(holders.status!) || holders.stderr.trim())
+          throw new Error('sms_lock_fuser_unavailable');
+        if (holders.status === 0 || holders.stdout.trim()) throw error;
+        fs.unlinkSync(this.lockPath);
+        this.lockFd = acquire();
+      }
       fs.writeFileSync(this.lockFd, JSON.stringify({ pid: process.pid, acquiredAt: new Date(this.now()).toISOString() }));
       fs.fsyncSync(this.lockFd);
       this.state = fs.existsSync(options.statePath)
@@ -95,13 +110,15 @@ export class SmsService {
   }
   close() {
     process.removeListener('exit', this.onExit);
-    if (this.lockFd < 0) return;
-    try {
-      const held = fs.fstatSync(this.lockFd); const current = fs.lstatSync(this.lockPath);
-      if (held.ino === current.ino && held.dev === current.dev) fs.unlinkSync(this.lockPath);
-    } catch {}
-    try { fs.closeSync(this.lockFd); } catch {}
-    this.lockFd = -1;
+    if (this.lockFd >= 0) {
+      try {
+        const held = fs.fstatSync(this.lockFd); const current = fs.lstatSync(this.lockPath);
+        if (held.ino === current.ino && held.dev === current.dev) fs.unlinkSync(this.lockPath);
+      } catch {}
+      try { fs.closeSync(this.lockFd); } catch {}
+      this.lockFd = -1;
+    }
+    if (this.guardFd >= 0) { try { fs.closeSync(this.guardFd); } catch {} this.guardFd = -1; }
     this.poisoned = true;
   }
   config() {

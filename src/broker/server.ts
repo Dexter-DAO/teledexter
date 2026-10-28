@@ -1,5 +1,5 @@
 import { watchMediaSocket } from './phone.js';
-import type { BrokerSmsBridge } from './sms.js';
+import { closeBrokerSms, type BrokerSmsBridge } from './sms.js';
 import { SmsError, phoneSchema as smsPhoneSchema } from '../sms/SmsService.js';
 import { formatCallTranscript } from './callTranscript.js';
 import { createResultSmsClient, type ResultSmsClient } from './resultSmsClient.js';
@@ -757,6 +757,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
           || input.message.length > 1000 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(input.message))
           return json(response, 400, { ok: false, error: 'invalid_request' });
         const admittedCall = () => {
+          if (!accepting) return undefined;
           const call = store.bySid(input.callSid as string);
           if (!call || call.status !== 'in-progress' || !call.mediaStartedAt || call.endedAt || call.finalized
             || call.primaryClosed || call.primaryClosePending || call.restrictedSetup
@@ -1000,8 +1001,12 @@ export function createBrokerServer(options: BrokerServerOptions) {
       if (!response.headersSent) json(response, 503, { error: safeFailure(error) });
       else response.end();
     });
-    pendingRequests.add(pending);
-    void pending.finally(() => pendingRequests.delete(pending));
+    // SMS RPCs can be stuck behind worker disk I/O. They must never hold up call shutdown.
+    const smsRequest = /^(?:\/sms\/|\/internal\/sms\/|\/internal\/broker\/(?:sms(?:\/|$)|result-sms(?:\/|$)))/.test(request.url || '');
+    if (!smsRequest) {
+      pendingRequests.add(pending);
+      void pending.finally(() => pendingRequests.delete(pending));
+    }
   });
   server.requestTimeout = 30_000;
   const sockets = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
@@ -1595,10 +1600,9 @@ export function createBrokerServer(options: BrokerServerOptions) {
     for (const call of store.list()) if (call.inbound && !call.inbound.closure) inbound.stopLocal(call.id, 'service_shutdown');
     clearInterval(maintenanceTimer);
     server.close();
-    await Promise.allSettled([...pendingRequests]);
-    await options.sms?.close();
-    await maintenance;
     await Promise.allSettled([...active.values()].map(call => call.stop('service_shutdown')));
+    await Promise.allSettled([...pendingRequests]);
+    await maintenance;
     // The answer route finished long ago, but Primary may still be opening its binding. A binding
     // that lands now (accepting is false) is recorded and closed by its settlement, before the store closes.
     await Promise.allSettled([...bindSettlements]);
@@ -1624,6 +1628,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
     await flushHark();
     sockets.close();
     store.close();
+    await closeBrokerSms(options.sms);
   }
   return { server, store, close, maintain };
 }
