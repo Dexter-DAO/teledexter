@@ -9,7 +9,8 @@ export const SMS_TERMS_URL = 'https://dexter.cash/terms#sms';
 export const SMS_PRIVACY_URL = 'https://dexter.cash/privacy';
 const MINUTE = 60_000;
 const DAY = 24 * 60 * MINUTE;
-const phoneSchema = z.string().regex(/^\+1[2-9]\d{2}[2-9]\d{6}$/);
+export const SMS_TURN_MAX_AGE_MS = 10 * MINUTE;
+export const phoneSchema = z.string().regex(/^\+1[2-9]\d{2}[2-9]\d{6}$/);
 const iso = z.string().datetime();
 const consentSchema = z.object({
   phone: phoneSchema, enrolled: z.boolean(), carrierOptedOut: z.boolean(),
@@ -17,14 +18,14 @@ const consentSchema = z.object({
   verifiedAt: iso.nullable(), withdrawnAt: iso.nullable(),
   signupReplyAttempted: z.boolean().optional(),
 });
-const challengeSchema = z.object({ id: z.string(), phone: phoneSchema, client: z.string(), created: z.number(), expires: z.number(), attempts: z.number().int().min(0), state: z.enum(['pending', 'sent', 'checking', 'used', 'failed']) });
+const challengeSchema = z.object({ id: z.string(), phone: phoneSchema, client: z.string(), created: z.number(), expires: z.number(), attempts: z.number().int().min(0), state: z.enum(['pending', 'sent', 'checking', 'used', 'failed']), verified: z.number().optional() });
 const proofSchema = z.object({ hash: z.string(), phone: phoneSchema, client: z.string(), verified: z.number(), expires: z.number() });
 const eventSchema = z.object({ id: z.string(), phone: phoneSchema, type: z.string(), at: iso, disclosureVersion: z.string().nullable(), disclosure: z.string().nullable(), client: z.string().nullable(), verifiedAt: iso.nullable() });
 const messageSchema = z.object({ id: z.string(), phone: phoneSchema, callSid: z.string(), bodyHash: z.string(), created: z.number(), sid: z.string().nullable(), status: z.string(), errorCode: z.string().nullable() });
 const stateSchema = z.object({
   version: z.literal(1), consents: z.array(consentSchema), challenges: z.array(challengeSchema), proofs: z.array(proofSchema),
   events: z.array(eventSchema), messages: z.array(messageSchema),
-  inbox: z.array(z.object({ sid: z.string(), phone: phoneSchema, body: z.string(), received: z.number(), state: z.enum(['pending_dispatch', 'pending_signup', 'replied', 'suppressed', 'uncertain']) })),
+  inbox: z.array(z.object({ sid: z.string(), phone: phoneSchema, body: z.string(), received: z.number(), retries: z.number().int().min(0).optional(), retryAt: z.number().optional(), state: z.enum(['pending_dispatch', 'pending_signup', 'replied', 'suppressed', 'uncertain']) })),
   rates: z.array(z.object({ key: z.string(), at: z.number() })),
   webhooks: z.array(z.object({ id: z.string(), at: z.number() })),
 });
@@ -119,7 +120,8 @@ export class SmsService {
     const messageDays = this.options.messageRetentionDays ?? 90;
     const consentDays = this.options.consentRetentionDays ?? 1461;
     next.messages = next.messages.filter(x => x.created > now - messageDays * DAY);
-    next.inbox = next.inbox.filter(x => x.received > now - messageDays * DAY);
+    next.inbox = next.inbox.filter(x => x.received > now - DAY);
+    for (const item of next.inbox) if (!['pending_dispatch', 'pending_signup'].includes(item.state)) item.body = '';
     next.webhooks = next.webhooks.filter(x => x.at > now - 90 * DAY);
     // Expire withdrawn consent evidence; retain minimal suppression until recipient resubscribes.
     const expired = new Set(next.consents.filter(x => !x.enrolled && x.withdrawnAt && Date.parse(x.withdrawnAt) < now - consentDays * DAY).map(x => x.phone));
@@ -187,6 +189,7 @@ export class SmsService {
       const c = s.challenges.find(x => x.id === challengeId);
       if (!c || c.state !== 'checking') throw new SmsError('invalid_verification');
       c.state = approved ? 'used' : 'sent';
+      if (approved) c.verified = now;
       if (approved) s.proofs.push({ hash: hash(proofToken), phone: c.phone, client, verified: now, expires: now + 15 * MINUTE });
     });
     if (!approved) throw new SmsError('invalid_verification');
@@ -197,6 +200,16 @@ export class SmsService {
     const proof = this.state.proofs.find(x => x.hash === hash(token) && x.client === client);
     if (!proof || proof.expires <= this.now()) throw new SmsError('proof_expired', 401);
     return proof;
+  }
+  /** Internal owner-bound account enrollment; these results never grant SMS consent. */
+  verifiedPhone(token: string, client: string) {
+    const proof = this.proof(token, client);
+    return { phone: proof.phone, verifiedAt: new Date(proof.verified).toISOString() };
+  }
+  verifiedChallenge(challengeId: string, client: string) {
+    const c = this.state.challenges.find(value => value.id === challengeId && value.client === client
+      && value.state === 'used' && value.verified !== undefined && value.expires > this.now());
+    return c ? { phone: c.phone, verifiedAt: new Date(c.verified!).toISOString() } : null;
   }
   private summary(phone: string) {
     const c = this.state.consents.find(x => x.phone === phone);
@@ -253,6 +266,7 @@ export class SmsService {
           const c = s.consents.find(x => x.phone === phone);
           s.inbox.push({ sid: input.sid, phone, body: input.body.slice(0, 1600), received: this.now(), state: c?.enrolled && !c.carrierOptedOut && c.disclosureVersion === SMS_DISCLOSURE_VERSION ? 'pending_dispatch'
             : !c?.carrierOptedOut && !c?.withdrawnAt && !c?.signupReplyAttempted ? 'pending_signup' : 'suppressed' });
+          if (s.inbox.at(-1)!.state === 'suppressed') s.inbox.at(-1)!.body = '';
         }
         return;
       }
@@ -265,10 +279,19 @@ export class SmsService {
     return '';
   }
   pendingTexts() {
-    return this.state.inbox.filter(x => x.state === 'pending_dispatch' || x.state === 'pending_signup').map(x => ({ ...x }));
+    return this.state.inbox.filter(x => x.state === 'pending_dispatch' || x.state === 'pending_signup').map(x => ({ ...x,
+      expired: this.now() - x.received >= SMS_TURN_MAX_AGE_MS || (x.retries ?? 0) >= 6,
+      deferred: (x.retryAt ?? 0) > this.now(),
+    }));
+  }
+  retryText(sid: string) {
+    this.change(s => {
+      const item = s.inbox.find(x => x.sid === sid);
+      if (item) { item.retries = (item.retries ?? 0) + 1; item.retryAt = this.now() + Math.min(60_000, 2000 * 2 ** item.retries); }
+    });
   }
   finishText(sid: string, state: 'replied' | 'suppressed' | 'uncertain') {
-    this.change(s => { const item = s.inbox.find(x => x.sid === sid); if (item) item.state = state; });
+    this.change(s => { const item = s.inbox.find(x => x.sid === sid); if (item) { item.state = state; item.body = ''; } });
   }
   async sendThreadReply(phoneValue: string, messageSid: string, text: string) {
     const phone = this.phone(phoneValue);
@@ -277,14 +300,21 @@ export class SmsService {
     if (!this.state.inbox.some(x => x.sid === messageSid && x.phone === phone && x.state === 'pending_dispatch'))
       throw new SmsError('invalid_request');
     this.requestedEligibility(phone);
+    // Only Dexter's HTTPS origin may appear in a carrier answer. The API renders
+    // replies from trusted portfolio values; this also refuses stale unsafe answers.
+    const links = text.match(/(?:[a-z][a-z0-9+.-]*:\/\/|mailto:|tel:|www\.|(?:[\p{L}\p{N}-]+\.)+[\p{L}]{2,})[^\s<>]*/giu) ?? [];
+    if (links.some(link => {
+      try { const url = new URL(link.replace(/[.,!?;:)]+$/, '')); return url.origin !== 'https://dexter.cash' || !!url.username || !!url.password; }
+      catch { return true; }
+    })) text = 'Open https://dexter.cash and sign in with your passkey to continue.';
     return this.sendMessage(phone, messageSid, text);
   }
   /** A single inbound-requested signup response, never a substitute for subscription consent. */
-  async sendSignupReply(phone: string, messageSid: string) {
+  async sendSignupReply(phone: string, messageSid: string, setup = false) {
     if (!this.deliveryActive()) throw new SmsError('sms_delivery_pending', 503);
     const item = this.state.inbox.find(x => x.sid === messageSid && x.phone === phone);
     if (!item || !['pending_signup', 'pending_dispatch'].includes(item.state)) throw new SmsError('invalid_request');
-    return this.sendMessage(phone, messageSid, 'Sign up for Dexter texting at https://dexter.cash/sms', true);
+    return this.sendMessage(phone, messageSid, setup ? 'Finish setting up Dexter at https://dexter.cash' : 'Sign up for Dexter texting at https://dexter.cash/sms', true);
   }
   /** Read-only admission check; does not consume a rate slot or send an enrollment text. */
   requestedEligibility(phoneValue: string) {

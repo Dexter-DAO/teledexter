@@ -7,6 +7,8 @@ export async function dispatchSmsInbox(service: SmsService, primary: PrimarySmsC
   const blocked = new Set<string>();
   for (const item of service.pendingTexts()) {
     if (blocked.has(item.phone)) continue;
+    if (item.expired) { service.finishText(item.sid, 'suppressed'); continue; }
+    if (item.deferred) { blocked.add(item.phone); continue; }
     try {
       let receipt: Awaited<ReturnType<SmsService['sendThreadReply']>> | undefined;
       if (item.state === 'pending_signup') receipt = await service.sendSignupReply(item.phone, item.sid);
@@ -14,7 +16,7 @@ export async function dispatchSmsInbox(service: SmsService, primary: PrimarySmsC
         service.requestedEligibility(item.phone);
         const result = await primary.turn({ phone: item.phone, messageSid: item.sid, text: item.body });
         if (result.state === 'queued' || result.state === 'running') { blocked.add(item.phone); continue; }
-        if (result.state === 'unregistered') receipt = await service.sendSignupReply(item.phone, item.sid);
+        if (result.state === 'unregistered' || result.state === 'setup_required') receipt = await service.sendSignupReply(item.phone, item.sid, result.state === 'setup_required');
         else if (result.state === 'completed') receipt = await service.sendThreadReply(item.phone, item.sid, result.text);
       }
       service.finishText(item.sid, receipt?.status === 'uncertain' || receipt?.status === 'dispatching' ? 'uncertain' : 'replied');
@@ -24,9 +26,9 @@ export async function dispatchSmsInbox(service: SmsService, primary: PrimarySmsC
       else if (error instanceof SmsError && error.code === 'sms_dispatch_uncertain')
         service.finishText(item.sid, 'uncertain');
       else if ((error instanceof SmsError && error.code === 'invalid_request')
-        || (error instanceof PrimaryApiError && error.code === 'http_error' && [400, 409, 413, 415].includes(error.status ?? 0))) {
+        || (error instanceof PrimaryApiError && error.code === 'http_error' && [400, 401, 403, 404, 409, 410, 413, 415, 422].includes(error.status ?? 0))) {
         service.finishText(item.sid, 'suppressed'); onError(error);
-      } else { blocked.add(item.phone); onError(error); } // Retry the same read-only turn; carrier sends keep their durable reservation.
+      } else { service.retryText(item.sid); blocked.add(item.phone); onError(error); } // Bounded retry; carrier sends keep their durable reservation.
     }
   }
 }

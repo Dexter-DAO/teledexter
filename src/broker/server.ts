@@ -1,5 +1,6 @@
 import { watchMediaSocket } from './phone.js';
 import type { BrokerSmsBridge } from './sms.js';
+import { SmsError, phoneSchema as smsPhoneSchema } from '../sms/SmsService.js';
 import { formatCallTranscript } from './callTranscript.js';
 import { createResultSmsClient, type ResultSmsClient } from './resultSmsClient.js';
 import { dispatchResultSms, resultSmsFailure } from './resultSmsDispatch.js';
@@ -670,6 +671,31 @@ export function createBrokerServer(options: BrokerServerOptions) {
         }
       }
       if (!authorizedControl(request.headers.authorization, config.controlToken)) return json(response, 401, { error: 'unauthorized' });
+      if (request.method === 'POST' && ['/internal/broker/sms/enrollment/start', '/internal/broker/sms/enrollment/check'].includes(route)) {
+        const start = route.endsWith('/start');
+        let input: Record<string, unknown>;
+        try {
+          input = JSON.parse(await body(request, 2_048));
+          const keys = start ? ['ownerId', 'phone'] : ['ownerId', 'challengeId', 'code'];
+          if (!input || Array.isArray(input) || Object.keys(input).length !== keys.length
+            || Object.keys(input).some(key => !keys.includes(key))
+            || typeof input.ownerId !== 'string' || !UUID.test(input.ownerId)
+            || (start ? !smsPhoneSchema.safeParse(input.phone).success
+              : typeof input.challengeId !== 'string' || !UUID.test(input.challengeId)
+                || typeof input.code !== 'string' || !/^\d{6}$/.test(input.code))) throw new Error('invalid_request');
+        } catch { return json(response, 400, { ok: false, error: 'invalid_request' }); }
+        if (!accepting || !options.sms?.startAccountVerification || !options.sms.checkAccountVerification)
+          return json(response, 503, { ok: false, error: 'sms_unavailable' });
+        try {
+          const result = start ? await options.sms.startAccountVerification(input.ownerId as string, input.phone as string)
+            : await options.sms.checkAccountVerification(input.ownerId as string, input.challengeId as string, input.code as string);
+          return json(response, 200, result);
+        } catch (error) {
+          const e = error instanceof SmsError ? error : new SmsError('sms_unavailable', 503);
+          if (e.retryAfterSeconds) response.setHeader('Retry-After', String(e.retryAfterSeconds));
+          return json(response, e.status, { ok: false, error: e.code, ...(e.retryAfterSeconds ? { retryAfterSeconds: e.retryAfterSeconds } : {}) });
+        }
+      }
       if (request.method === 'POST' && route === '/internal/broker/result-sms') {
         let input: unknown;
         try { input = JSON.parse(await body(request, 2_048)); }
@@ -708,7 +734,11 @@ export function createBrokerServer(options: BrokerServerOptions) {
         const call = admittedCall();
         if (!call) return json(response, 409, { ok: false, error: 'sms_call_unavailable' });
         if (!options.sms) return json(response, 503, { ok: false, error: 'sms_delivery_pending' });
-        try { return json(response, 200, options.sms.requestedEligibility(call.number)); }
+        try {
+          const eligible = await options.sms.requestedEligibility(call.number);
+          if (!admittedCall()) return json(response, 409, { ok: false, error: 'sms_call_unavailable' });
+          return json(response, 200, eligible);
+        }
         catch (error) {
           const failure = resultSmsFailure(error);
           return json(response, ['sms_delivery_pending', 'sms_unavailable'].includes(failure.error) ? 503 : 409, failure);
