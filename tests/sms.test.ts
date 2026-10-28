@@ -446,3 +446,21 @@ test('API outage retains the same pending text and reports failure before retry'
   } });
   assert.equal(f.sends.length, 1);
 });
+
+
+test('permanently refused text cannot block the next message from the same phone', async t => {
+  const { dispatchSmsInbox } = await import('../src/sms/dispatch.js');
+  const { PrimaryApiError } = await import('../src/broker/primaryApi.js');
+  const f = fixture(t); await enroll(f); f.options.sendEnabled = true;
+  assert.throws(() => f.service.inbound({ phone: PHONE, sid: SID, body: '   ' }), error('invalid_request'));
+  assert.throws(() => f.service.inbound({ phone: PHONE, sid: SID, body: 'invalid\u0000text' }), error('invalid_request'));
+  f.service.inbound({ phone: PHONE, sid: SID, body: 'Legacy request' });
+  f.service.inbound({ phone: PHONE, sid: 'SM'+'a'.repeat(32), body: 'Balance?' });
+  const failures: unknown[] = [];
+  await dispatchSmsInbox(f.service, { async turn(input) {
+    if (input.messageSid === SID) throw new PrimaryApiError('http_error', 400);
+    return { state: 'completed', text: 'You have 12 USDC.' };
+  } }, failure => failures.push(failure));
+  assert.equal(failures.length, 1); assert.equal(f.sends.length, 1);
+  assert.deepEqual(f.persisted().inbox.map((item: any) => item.state), ['suppressed', 'replied']);
+});

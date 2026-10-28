@@ -1,4 +1,4 @@
-import type { PrimarySmsClient } from '../broker/primaryApi.js';
+import { PrimaryApiError, type PrimarySmsClient } from '../broker/primaryApi.js';
 import { SmsError, type SmsService } from './SmsService.js';
 
 /** One drain at a time; pending API turns retain their SID and per-phone order. */
@@ -23,7 +23,10 @@ export async function dispatchSmsInbox(service: SmsService, primary: PrimarySmsC
         service.finishText(item.sid, 'suppressed');
       else if (error instanceof SmsError && error.code === 'sms_dispatch_uncertain')
         service.finishText(item.sid, 'uncertain');
-      else { blocked.add(item.phone); onError(error); } // Retry the same read-only turn; carrier sends keep their durable reservation.
+      else if ((error instanceof SmsError && error.code === 'invalid_request')
+        || (error instanceof PrimaryApiError && error.code === 'http_error' && [400, 409, 413, 415].includes(error.status ?? 0))) {
+        service.finishText(item.sid, 'suppressed'); onError(error);
+      } else { blocked.add(item.phone); onError(error); } // Retry the same read-only turn; carrier sends keep their durable reservation.
     }
   }
 }

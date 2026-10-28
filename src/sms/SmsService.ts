@@ -241,6 +241,7 @@ export class SmsService {
     return this.summary(proof.phone);
   }
   inbound(input: { phone: string; sid: string; body: string; optOutType?: string }) {
+    if (!input.body.trim() || /[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(input.body)) throw new SmsError('invalid_request');
     const phone = this.phone(input.phone);
     const keyword = input.body.trim().toUpperCase();
     const type = input.optOutType || (['STOP', 'STOPALL', 'UNSUBSCRIBE', 'CANCEL', 'END', 'QUIT', 'REVOKE', 'OPTOUT'].includes(keyword) ? 'STOP' : ['START', 'UNSTOP', 'YES'].includes(keyword) ? 'START' : ['HELP', 'INFO'].includes(keyword) ? 'HELP' : 'OTHER');
