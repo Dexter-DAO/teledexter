@@ -269,6 +269,16 @@ test('signed webhook verifies exact form, account, recipient and URL; controls n
   const valid = await app.inject({ method: 'POST', url: '/sms/incoming', headers, payload: new URLSearchParams(body).toString() });
   assert.equal(valid.statusCode, 200); assert.equal(valid.body.includes('<Message>'), false);
   assert.equal(f.service.status(proof, CLIENT).carrierOptedOut, true);
+  for (const [index, keyword] of ['HELP', 'START'].entries()) {
+    const control = { ...body, MessageSid: 'SM' + String(index + 8).repeat(32), Body: keyword, OptOutType: keyword };
+    const response = await app.inject({ method: 'POST', url: '/sms/incoming',
+      headers: { ...headers, 'x-twilio-signature': Twilio.getExpectedTwilioSignature(WEBHOOK_TOKEN, `${BASE}/sms/incoming`, control) },
+      payload: new URLSearchParams(control).toString() });
+    assert.equal(response.statusCode, 200); assert.equal(response.body.includes('<Message>'), false);
+    assert.equal(f.service.status(proof, CLIENT).carrierOptedOut, keyword === 'HELP');
+  }
+  assert.equal(f.service.pendingTexts().length, 0);
+  assert.equal(f.sends.length, 0);
 });
 
 test('unconfigured service fails closed without opening Twilio clients or storage', () => {
@@ -300,4 +310,139 @@ test('closing on SIGTERM releases ledger ownership and preserves bytes for next 
   assert.equal(exitCode, 0); assert.equal(signal, null);
   assert.equal(fs.existsSync(`${statePath}.lock`), false);
   assert.equal(fs.readFileSync(statePath, 'utf8'), before);
+});
+
+test('dead PID SMS lock is cleared; live and malformed locks remain untouched', async t => {
+  const f = fixture(t); f.service.close();
+  const child = spawn(process.execPath, ['-e', '']);
+  await once(child, 'exit');
+  const lock = f.options.statePath + '.lock';
+  fs.writeFileSync(lock, JSON.stringify({ pid: child.pid }), { mode: 0o600 });
+  f.reopen();
+  assert.equal(JSON.parse(fs.readFileSync(lock, 'utf8')).pid, process.pid);
+  assert.throws(() => new SmsService(f.options), /EEXIST/);
+  f.service.close();
+  fs.writeFileSync(lock, JSON.stringify({ pid: 'invalid' }), { mode: 0o600 });
+  assert.throws(() => new SmsService(f.options), /Invalid SMS writer lock/);
+  assert.equal(JSON.parse(fs.readFileSync(lock, 'utf8')).pid, 'invalid');
+});
+
+test('never-enrolled sender gets one signup reply across messages and restarts; STOP stays silent', async t => {
+  const { dispatchSmsInbox } = await import('../src/sms/dispatch.js');
+  const f = fixture(t, { sendEnabled: true });
+  const primary = { async turn(): Promise<never> { throw Error('unconsented text must not reach Primary'); } };
+  f.service.inbound({ phone: PHONE, sid: SID, body: 'Hello' });
+  await dispatchSmsInbox(f.service, primary);
+  assert.equal(f.sends.length, 1);
+  assert.match(f.sends[0].body, /^Dexter: .*https:\/\/dexter.cash\/sms\nReply STOP.*HELP/);
+  f.reopen();
+  f.service.inbound({ phone: PHONE, sid: `SM${'a'.repeat(32)}`, body: 'Hello again' });
+  await dispatchSmsInbox(f.service, primary);
+  assert.equal(f.sends.length, 1);
+  f.service.inbound({ phone: OTHER, sid: `SM${'b'.repeat(32)}`, body: 'STOP' });
+  f.service.inbound({ phone: OTHER, sid: `SM${'c'.repeat(32)}`, body: 'Hello' });
+  await dispatchSmsInbox(f.service, primary);
+  assert.equal(f.sends.length, 1);
+  f.tick(100 * 24 * 60 * 60_000); f.reopen();
+  f.service.inbound({ phone: PHONE, sid: `SM${'d'.repeat(32)}`, body: 'After retention' });
+  await dispatchSmsInbox(f.service, primary);
+  assert.equal(f.sends.length, 1, 'minimal signup suppression outlives message retention');
+});
+
+test('signed-up turns retain phone order, reply once, and recheck consent after the turn', async t => {
+  const { dispatchSmsInbox } = await import('../src/sms/dispatch.js');
+  const f = fixture(t); const proof = await enroll(f); f.options.sendEnabled = true;
+  f.service.inbound({ phone: PHONE, sid: SID, body: 'Balance?' });
+  f.service.inbound({ phone: PHONE, sid: `SM${'a'.repeat(32)}`, body: 'And tokens?' });
+  let ready = false;
+  const turns: string[] = [];
+  const primary = { async turn(input: { messageSid: string }) {
+    turns.push(input.messageSid);
+    return ready ? { state: 'completed' as const, text: 'Your balance is 12 USDC.' } : { state: 'running' as const };
+  } };
+  await dispatchSmsInbox(f.service, primary);
+  assert.deepEqual(turns, [SID]); assert.equal(f.sends.length, 0);
+  f.reopen(); ready = true;
+  await dispatchSmsInbox(f.service, primary);
+  await dispatchSmsInbox(f.service, primary);
+  assert.equal(f.sends.length, 2); assert.match(f.sends[0].body, /12 USDC/);
+  f.service.inbound({ phone: PHONE, sid: `SM${'b'.repeat(32)}`, body: 'One more?' });
+  await dispatchSmsInbox(f.service, { async turn() {
+    f.service.withdraw(proof, CLIENT);
+    return { state: 'completed', text: 'Should never be sent' };
+  } });
+  assert.equal(f.sends.length, 2);
+  assert.equal(f.persisted().inbox.at(-1).state, 'suppressed');
+});
+
+test('thread replies use one send per inbound SID even when reply wording changes', async t => {
+  const f = fixture(t); await enroll(f); f.options.sendEnabled = true;
+  f.service.inbound({ phone: PHONE, sid: SID, body: 'Hello' });
+  await f.service.sendThreadReply(PHONE, SID, 'Hello back');
+  f.reopen();
+  await f.service.sendThreadReply(PHONE, SID, 'Different text');
+  assert.equal(f.sends.length, 1);
+  await assert.rejects(f.service.sendThreadReply(OTHER, SID, 'No'), error('invalid_request'));
+  f.service.inbound({ phone: PHONE, sid: `SM${'f'.repeat(32)}`, body: 'STOP' });
+  assert.equal(f.persisted().consents[0].carrierOptedOut, true);
+  await assert.rejects(f.service.sendThreadReply(PHONE, SID, 'No'), error('carrier_opted_out'));
+});
+
+test('thread sends permit sixty hourly replies, retain daily cap and voice call cap', async t => {
+  const f = fixture(t); await enroll(f); f.options.sendEnabled = true;
+  for (let i = 0; i < 60; i++) {
+    const sid = 'SM' + i.toString(16).padStart(32, '0');
+    f.service.inbound({ phone: PHONE, sid, body: 'Question' });
+    await f.service.sendThreadReply(PHONE, sid, 'Answer');
+  }
+  const extra = 'SM' + 'e'.repeat(32);
+  f.service.inbound({ phone: PHONE, sid: extra, body: 'Question' });
+  await assert.rejects(f.service.sendThreadReply(PHONE, extra, 'Answer'), error('rate_limited'));
+  f.tick(60 * 60_000 + 1);
+  await f.service.sendThreadReply(PHONE, extra, 'Answer');
+  assert.equal(f.sends.length, 61);
+});
+
+test('service daily and voice-call caps still refuse sends; rate-limited signup can wait', async t => {
+  const f = fixture(t); await enroll(f); f.options.sendEnabled = true;
+  for (let i = 0; i < 5; i++) await f.service.sendRequested(PHONE, CALL, `Requested ${i}`);
+  await assert.rejects(f.service.sendRequested(PHONE, CALL, 'Sixth'), error('rate_limited'));
+  const saved = f.persisted(); f.service.close();
+  saved.rates = Array.from({ length: 2000 }, () => ({ key: 'send:global', at: f.options.now!() }));
+  fs.writeFileSync(f.options.statePath, JSON.stringify(saved), { mode: 0o600 }); f.reopen();
+  const sid = 'SM' + 'a'.repeat(32);
+  f.service.inbound({ phone: OTHER, sid, body: 'Hello' });
+  await assert.rejects(f.service.sendSignupReply(OTHER, sid), error('rate_limited'));
+  assert.equal(f.persisted().consents.some((c: any) => c.phone === OTHER && c.signupReplyAttempted), false);
+  f.tick(24 * 60 * 60_000 + 1);
+  await f.service.sendSignupReply(OTHER, sid);
+  assert.equal(f.sends.length, 6);
+});
+
+
+test('crash-recovered thread send stays uncertain and cannot produce another carrier attempt', async t => {
+  const { dispatchSmsInbox } = await import('../src/sms/dispatch.js');
+  const f = fixture(t); await enroll(f); f.options.sendEnabled = true;
+  f.service.inbound({ phone: PHONE, sid: SID, body: 'Question' });
+  await f.service.sendThreadReply(PHONE, SID, 'Answer');
+  const saved = f.persisted(); f.service.close(); saved.messages[0].status = 'dispatching';
+  fs.writeFileSync(f.options.statePath, JSON.stringify(saved)); f.reopen();
+  await dispatchSmsInbox(f.service, { async turn() { return { state: 'completed', text: 'Another answer' }; } });
+  assert.equal(f.sends.length, 1);
+  assert.equal(f.persisted().inbox[0].state, 'uncertain');
+});
+
+
+test('API outage retains the same pending text and reports failure before retry', async t => {
+  const { dispatchSmsInbox } = await import('../src/sms/dispatch.js');
+  const f = fixture(t); await enroll(f); f.options.sendEnabled = true;
+  f.service.inbound({ phone: PHONE, sid: SID, body: 'Question' });
+  const failures: unknown[] = [], outage = Error('fixture_api_unavailable');
+  await dispatchSmsInbox(f.service, { async turn() { throw outage; } }, error => failures.push(error));
+  assert.deepEqual(failures, [outage]); assert.equal(f.sends.length, 0);
+  f.reopen();
+  await dispatchSmsInbox(f.service, { async turn(input) {
+    assert.equal(input.messageSid, SID); return { state: 'completed', text: 'Answer' };
+  } });
+  assert.equal(f.sends.length, 1);
 });

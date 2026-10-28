@@ -6,6 +6,9 @@ import { configureSms } from '../sms/configureSms.js';
 import { registerSmsRoutes } from '../sms/registerSmsRoutes.js';
 import { createCallerSmsSender } from '../sms/createSmsTool.js';
 import { SmsError, type SmsService } from '../sms/SmsService.js';
+import { createPrimarySmsClient, type PrimarySmsClient } from './primaryApi.js';
+import { dispatchSmsInbox } from '../sms/dispatch.js';
+import { safeFailure } from './phone.js';
 
 export interface BrokerSmsBridge {
   requestedEligibility(phone: string): ReturnType<SmsService['requestedEligibility']>;
@@ -19,6 +22,7 @@ export interface BrokerSmsBridge {
 /** Preserve the existing SMS service and ledger as one explicitly configured writer. */
 export async function createBrokerSmsBridge(env: NodeJS.ProcessEnv, releaseRoot: string,
   clients?: { verify: ReturnType<typeof Twilio>; messaging: ReturnType<typeof Twilio> },
+  primary?: PrimarySmsClient,
 ): Promise<BrokerSmsBridge | undefined> {
   if (!Object.keys(env).some(key => key.startsWith('DEXTER_SMS_') && env[key])) return undefined;
   const service = configureSms(env, clients ?? {
@@ -26,11 +30,18 @@ export async function createBrokerSmsBridge(env: NodeJS.ProcessEnv, releaseRoot:
       env.TWILIO_VERIFY_AUTH_TOKEN || env.TWILIO_AUTH_TOKEN, { autoRetry: false, timeout: 15_000 }),
     messaging: Twilio(env.TWILIO_ACCOUNT_SID, env.TWILIO_AUTH_TOKEN, { autoRetry: false, timeout: 15_000 }),
   }, releaseRoot);
-  // Misconfiguration, unreadable state, or an existing writer must prevent listen/readiness.
+  // SMS failures are isolated by startBrokerSmsBridge; this service never bypasses its writer lock.
   if (!service) throw new Error('sms_state_admission_failed');
   const app = Fastify({ logger: false });
   let accepting = true;
   const pending = new Set<Promise<unknown>>();
+  let draining: Promise<void> | undefined;
+  let timer: ReturnType<typeof setInterval> | undefined;
+  function drain() {
+    if (!accepting || draining || pending.size || !primary) return;
+    const failure = (error: unknown) => console.error(JSON.stringify({ service: 'sms', event: 'dispatch_failed', ...safeFailure(error) }));
+    draining = dispatchSmsInbox(service!, primary, failure).catch(failure).finally(() => { draining = undefined; });
+  }
   try {
     await app.register(formBody);
     registerSmsRoutes(app, { service, internalSecret: env.DEXTER_SMS_INTERNAL_SECRET || '',
@@ -39,6 +50,11 @@ export async function createBrokerSmsBridge(env: NodeJS.ProcessEnv, releaseRoot:
       publicBaseUrl: (env.DEXTER_PHONE_PUBLIC_URL || '').replace(/\/+$/, ''),
     });
     await app.ready();
+    if (!primary && env.DEXTER_API_URL && env.PHONE_SERVICE_SECRET)
+      primary = createPrimarySmsClient({ apiBaseUrl: env.DEXTER_API_URL, phoneServiceSecret: env.PHONE_SERVICE_SECRET });
+    timer = setInterval(drain, 2000);
+    timer.unref();
+    setImmediate(drain);
   } catch (error) { await app.close().catch(() => {}); service.close(); throw error; }
   function failure(response: ServerResponse, status: number, error: string) {
     response.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
@@ -57,7 +73,10 @@ export async function createBrokerSmsBridge(env: NodeJS.ProcessEnv, releaseRoot:
     const result = await app.inject({ method: request.method as 'GET' | 'POST' | 'HEAD', url: request.url || '/',
       headers: request.headers, payload: Buffer.concat(chunks),
     });
-    if (!response.destroyed) { response.writeHead(result.statusCode, result.headers); response.end(result.rawPayload); }
+    if (!response.destroyed) {
+      response.once('finish', () => { setImmediate(drain); });
+      response.writeHead(result.statusCode, result.headers); response.end(result.rawPayload);
+    }
   }
   return {
     requestedEligibility(phone) {
@@ -83,11 +102,22 @@ export async function createBrokerSmsBridge(env: NodeJS.ProcessEnv, releaseRoot:
       try { await task; } finally { pending.delete(task); }
       return true;
     },
-    stop() { accepting = false; },
+    stop() { accepting = false; clearInterval(timer); },
     async close() {
       accepting = false;
+      clearInterval(timer);
       await Promise.allSettled([...pending]);
+      await draining;
       await app.close();
     },
   };
+}
+
+/** A broken SMS dependency must leave the voice broker available. */
+export async function startBrokerSmsBridge(...args: Parameters<typeof createBrokerSmsBridge>) {
+  try { return await createBrokerSmsBridge(...args); }
+  catch (error) {
+    console.error(JSON.stringify({ service: 'sms', state: 'disabled', ...safeFailure(error) }));
+    return undefined;
+  }
 }

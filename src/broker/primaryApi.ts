@@ -391,6 +391,20 @@ function createTransport(options: PrimaryApiOptions) {
 export { createTransport as createPrimaryApiTransport };
 export type PrimaryApiTransport = ReturnType<typeof createTransport>;
 
+export const smsTurnResultSchema = z.discriminatedUnion('state', [
+  z.object({ state: z.literal('unregistered') }).strict(),
+  z.object({ state: z.enum(['queued', 'running']) }).strict(),
+  z.object({ state: z.literal('completed'), text: z.string().trim().min(1).max(1000) }).strict(),
+]);
+export type SmsTurnResult = z.infer<typeof smsTurnResultSchema>;
+export interface PrimarySmsClient {
+  turn(input: { phone: string; messageSid: string; text: string }): Promise<SmsTurnResult>;
+}
+export function createPrimarySmsClient(options: PrimaryApiOptions): PrimarySmsClient {
+  const transport = createTransport(options);
+  return { async turn(input) { return smsTurnResultSchema.parse(await transport('POST', '/sms/turns', input)); } };
+}
+
 const uuid = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
 const callSid = z.string().regex(/^CA[0-9a-fA-F]{32}$/);
 const itemId = z.string().regex(/^[a-zA-Z0-9_-]{1,128}$/);

@@ -1,6 +1,6 @@
 # Dexter SMS
 
-SMS enrollment verifies ownership of a phone number, then records a separate affirmative choice to receive Dexter messages. The initial sender attaches to an incoming phone call and uses that call's recipient. Incoming messages are stored for a future agent dispatcher. That dispatcher is still required before conversational SMS can be offered.
+SMS enrollment verifies ownership of a phone number, then records a separate affirmative choice to receive Dexter messages. Call-requested messages use the call's recipient. Conversational texts use a separate thread for each linked phone number and are dispatched after the signed incoming webhook is acknowledged.
 
 Production sending is disabled by default. Enrollment and general sending are controlled by separate flags. Existing Twilio Verify tools used during calls retain their separate purpose.
 
@@ -52,7 +52,7 @@ Retention defaults are implementation choices that must agree with the published
 
 The ledger uses atomic replacement with file and directory fsync and mode `0600`. One process owns an exclusive adjacent `.lock` file. A candidate must have its own state path; it cannot share the production file. SIGINT and SIGTERM stop SMS mutations, release the lock, and close the HTTP server. Graceful server close also releases the lock.
 
-SIGKILL or a host crash can leave a lock behind. Recovery requires the operator to inspect the recorded PID, verify that no process still owns or writes the ledger, and preserve the ledger bytes. Only then remove that specific stale lock and restart the SMS service. Confirm `/internal/sms/config` returns the intended readiness after restart. Never remove a lock held by a running process. Incomplete message dispatches recover as uncertain and remain excluded from automatic retries.
+SIGKILL or a host crash can leave a lock behind. Startup probes the recorded positive integer PID and removes the lock only when the operating system reports `ESRCH` (no such process), then acquires a new exclusive lock. A live PID, malformed record, or permission error keeps SMS disabled. Ledger bytes are preserved. SMS initialization failure is logged as `service: sms, state: disabled` and voice continues. Other broker startup failures exit with status 1. Incomplete carrier dispatches recover as uncertain and remain excluded from automatic retries.
 
 ## Messaging Service setup
 
@@ -64,9 +64,17 @@ STOP immediately records suppression. Web enrollment cannot clear a carrier opt-
 
 Every callback validates its signature against the configured HTTPS origin and exact form fields, then binds the account and recipient. Replayed control messages are deduplicated. Delivery callbacks bind message ID, Twilio SID, and destination, and avoid moving a delivered message back to an earlier transport state. Immediate Twilio error 21610 records suppression even when a later callback never arrives.
 
-The call tool accepts message text only. Its destination and call SID come from the call context, and the server requires active current-version consent. It adds Dexter identification and STOP/HELP instructions. A repeated call/message pair returns the recorded attempt. A transport failure stays uncertain and is never automatically retried. Limits are five messages per call, ten per recipient per hour, and 100 per service per day; enrollment confirmations count toward recipient and service limits.
+The call tool accepts message text only. Its destination and call SID come from the call context, and the server requires active current-version consent. It adds Dexter identification and STOP/HELP instructions. A repeated call/message pair returns the recorded attempt. A transport failure stays uncertain and is never automatically retried. Limits are five messages per call, 60 per recipient per hour, and 2,000 per service per day; enrollment confirmations count toward recipient and service limits.
 
-Ordinary incoming SMS is stored as `pending_dispatch` for enrolled recipients and `suppressed` otherwise. The pending state means the message awaits an agent integration. It does not mean a reply was produced or queued.
+Ordinary incoming SMS is stored as `pending_dispatch` for recipients with current consent. The broker drains the inbox after HTTP responses finish and every two seconds, preserving message order for each phone. Pending Primary turns use the same MessageSid on every poll. A completed answer sends through `sendThreadReply(phone, messageSid, text)` with a send reservation keyed by phone and MessageSid. A restart or a changed answer cannot create a second carrier attempt. Outcomes become `replied`, `suppressed`, or `uncertain`; `replied` records a saved outbound attempt, while delivery callbacks track transport outcome separately. A crash-recovered carrier reservation remains `uncertain`.
+
+A never-enrolled sender receives one response with `https://dexter.cash/sms`, triggered only by an ordinary inbound text. This is the sole subscription-consent exception: the reply invites signup and records no subscription. A durable `signupReplyAttempted` flag and carrier reservation are saved together before I/O; subsequent texts remain silent across restarts and message retention. STOP and web withdrawal suppress this response. For an enrolled phone with no linked Dexter account, the same one-time signup response is sent after the API lookup. HELP/START/STOP remain owned by Twilio Advanced Opt Out and produce empty application TwiML.
+
+Primary resolves the account with the voice path's existing phone resolver. SMS uses its own per-number thread and immutable `sms_read_only` execution policy. Only the current portfolio reader and a passkey-link response are available to the model. Financial actions, delegated work and account memory writes are unavailable from SMS. Money requests direct the owner to `https://dexter.cash`, where the existing passkey session provides approval. Consent is checked before a turn and immediately before its answer is sent. Answers are limited to 1,000 characters before the standard Dexter prefix and STOP/HELP footer.
+
+The new limits permit a conversation of up to one answer per minute while keeping a daily service ceiling. Rate limits reserve slots before provider I/O; carrier-uncertain sends are never retried. If the signup response reaches a rate cap, it can wait without consuming its one-time marker.
+
+The expanded inbox states require this reader. An older SMS reader cannot reopen a ledger containing these states. Preserve the complete ledger and its one-time signup markers during rollback; keep SMS disabled until a compatible reader is installed. Restoring an older ledger snapshot can cause duplicate sends.
 
 ## Requested results after a call
 
