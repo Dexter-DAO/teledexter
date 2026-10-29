@@ -1,7 +1,9 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { z } from 'zod';
 import { bindDurableFileParent, durablyReplaceJsonFile, type DurableParentBinding } from '../outbound/DurableFile.js';
+import { filterSmsReply } from './filterSmsReply.js';
 
 export const SMS_DISCLOSURE_VERSION = 'dexter-sms-2026-09-16';
 export const SMS_DISCLOSURE = 'I agree to receive SMS from Dexter about my requests, follow-ups, service links, and task and account activity. Message frequency varies. Message and data rates may apply. Reply HELP for help or STOP to opt out. Consent is optional and is not a condition of purchase.';
@@ -9,21 +11,23 @@ export const SMS_TERMS_URL = 'https://dexter.cash/terms#sms';
 export const SMS_PRIVACY_URL = 'https://dexter.cash/privacy';
 const MINUTE = 60_000;
 const DAY = 24 * 60 * MINUTE;
-const phoneSchema = z.string().regex(/^\+1[2-9]\d{2}[2-9]\d{6}$/);
+export const SMS_TURN_MAX_AGE_MS = 10 * MINUTE;
+export const phoneSchema = z.string().regex(/^\+1[2-9]\d{2}[2-9]\d{6}$/);
 const iso = z.string().datetime();
 const consentSchema = z.object({
   phone: phoneSchema, enrolled: z.boolean(), carrierOptedOut: z.boolean(),
   disclosureVersion: z.string().nullable(), updatedAt: iso,
   verifiedAt: iso.nullable(), withdrawnAt: iso.nullable(),
+  signupReplyAttempted: z.boolean().optional(),
 });
-const challengeSchema = z.object({ id: z.string(), phone: phoneSchema, client: z.string(), created: z.number(), expires: z.number(), attempts: z.number().int().min(0), state: z.enum(['pending', 'sent', 'checking', 'used', 'failed']) });
+const challengeSchema = z.object({ id: z.string(), phone: phoneSchema, client: z.string(), created: z.number(), expires: z.number(), attempts: z.number().int().min(0), state: z.enum(['pending', 'sent', 'checking', 'used', 'failed']), verified: z.number().optional() });
 const proofSchema = z.object({ hash: z.string(), phone: phoneSchema, client: z.string(), verified: z.number(), expires: z.number() });
 const eventSchema = z.object({ id: z.string(), phone: phoneSchema, type: z.string(), at: iso, disclosureVersion: z.string().nullable(), disclosure: z.string().nullable(), client: z.string().nullable(), verifiedAt: iso.nullable() });
 const messageSchema = z.object({ id: z.string(), phone: phoneSchema, callSid: z.string(), bodyHash: z.string(), created: z.number(), sid: z.string().nullable(), status: z.string(), errorCode: z.string().nullable() });
 const stateSchema = z.object({
   version: z.literal(1), consents: z.array(consentSchema), challenges: z.array(challengeSchema), proofs: z.array(proofSchema),
   events: z.array(eventSchema), messages: z.array(messageSchema),
-  inbox: z.array(z.object({ sid: z.string(), phone: phoneSchema, body: z.string(), received: z.number(), state: z.enum(['pending_dispatch', 'suppressed']) })),
+  inbox: z.array(z.object({ sid: z.string(), phone: phoneSchema, body: z.string(), received: z.number(), retries: z.number().int().min(0).optional(), retryAt: z.number().optional(), state: z.enum(['pending_dispatch', 'pending_signup', 'replied', 'suppressed', 'uncertain']) })),
   rates: z.array(z.object({ key: z.string(), at: z.number() })),
   webhooks: z.array(z.object({ id: z.string(), at: z.number() })),
 });
@@ -59,7 +63,8 @@ export class SmsService {
   private parent: DurableParentBinding;
   private poisoned = false;
   private now: () => number;
-  private lockFd: number;
+  private lockFd = -1;
+  private guardFd = -1;
   private lockPath: string;
   private onExit = () => this.close();
   constructor(private options: SmsOptions) {
@@ -67,8 +72,31 @@ export class SmsService {
     this.now = options.now ?? Date.now;
     this.parent = bindDurableFileParent(options.statePath);
     this.lockPath = `${options.statePath}.lock`;
-    this.lockFd = fs.openSync(this.lockPath, 'wx', 0o600);
     try {
+      // Linux flock stays on this inherited open file description after the utility exits.
+      // Never unlink the guard: it serializes recovery even when legacy metadata is incomplete.
+      this.guardFd = fs.openSync(`${this.lockPath}.guard`, fs.constants.O_CREAT | fs.constants.O_RDWR | fs.constants.O_NOFOLLOW, 0o600);
+      const guard = spawnSync('flock', ['-n', '-E', '75', '3'], { stdio: ['ignore', 'pipe', 'pipe', this.guardFd], timeout: 2000 });
+      if (guard.error || guard.signal || ![0, 75].includes(guard.status!)) throw new Error('sms_lock_flock_unavailable');
+      if (guard.status === 75) throw Object.assign(new Error('EEXIST: SMS writer lock'), { code: 'EEXIST' });
+      const acquire = () => fs.openSync(this.lockPath, 'wx', 0o600);
+      try { this.lockFd = acquire(); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        let pid: unknown;
+        try { pid = JSON.parse(fs.readFileSync(this.lockPath, 'utf8')).pid; } catch {}
+        if (typeof pid === 'number' && Number.isInteger(pid) && pid > 0 && pid <= 0x7fffffff) {
+          try { process.kill(pid, 0); throw error; }
+          catch (probe) { if ((probe as NodeJS.ErrnoException).code !== 'ESRCH') throw probe; }
+        }
+        // Pre-upgrade writers hold their metadata fd before writing a PID. Preserve those too.
+        const holders = spawnSync('fuser', ['-s', this.lockPath], { encoding: 'utf8', timeout: 2000 });
+        if (holders.error || holders.signal || ![0, 1].includes(holders.status!) || holders.stderr.trim())
+          throw new Error('sms_lock_fuser_unavailable');
+        if (holders.status === 0 || holders.stdout.trim()) throw error;
+        fs.unlinkSync(this.lockPath);
+        this.lockFd = acquire();
+      }
       fs.writeFileSync(this.lockFd, JSON.stringify({ pid: process.pid, acquiredAt: new Date(this.now()).toISOString() }));
       fs.fsyncSync(this.lockFd);
       this.state = fs.existsSync(options.statePath)
@@ -83,13 +111,15 @@ export class SmsService {
   }
   close() {
     process.removeListener('exit', this.onExit);
-    if (this.lockFd < 0) return;
-    try {
-      const held = fs.fstatSync(this.lockFd); const current = fs.lstatSync(this.lockPath);
-      if (held.ino === current.ino && held.dev === current.dev) fs.unlinkSync(this.lockPath);
-    } catch {}
-    try { fs.closeSync(this.lockFd); } catch {}
-    this.lockFd = -1;
+    if (this.lockFd >= 0) {
+      try {
+        const held = fs.fstatSync(this.lockFd); const current = fs.lstatSync(this.lockPath);
+        if (held.ino === current.ino && held.dev === current.dev) fs.unlinkSync(this.lockPath);
+      } catch {}
+      try { fs.closeSync(this.lockFd); } catch {}
+      this.lockFd = -1;
+    }
+    if (this.guardFd >= 0) { try { fs.closeSync(this.guardFd); } catch {} this.guardFd = -1; }
     this.poisoned = true;
   }
   config() {
@@ -108,7 +138,8 @@ export class SmsService {
     const messageDays = this.options.messageRetentionDays ?? 90;
     const consentDays = this.options.consentRetentionDays ?? 1461;
     next.messages = next.messages.filter(x => x.created > now - messageDays * DAY);
-    next.inbox = next.inbox.filter(x => x.received > now - messageDays * DAY);
+    next.inbox = next.inbox.filter(x => x.received > now - DAY);
+    for (const item of next.inbox) if (!['pending_dispatch', 'pending_signup'].includes(item.state)) item.body = '';
     next.webhooks = next.webhooks.filter(x => x.at > now - 90 * DAY);
     // Expire withdrawn consent evidence; retain minimal suppression until recipient resubscribes.
     const expired = new Set(next.consents.filter(x => !x.enrolled && x.withdrawnAt && Date.parse(x.withdrawnAt) < now - consentDays * DAY).map(x => x.phone));
@@ -176,6 +207,7 @@ export class SmsService {
       const c = s.challenges.find(x => x.id === challengeId);
       if (!c || c.state !== 'checking') throw new SmsError('invalid_verification');
       c.state = approved ? 'used' : 'sent';
+      if (approved) c.verified = now;
       if (approved) s.proofs.push({ hash: hash(proofToken), phone: c.phone, client, verified: now, expires: now + 15 * MINUTE });
     });
     if (!approved) throw new SmsError('invalid_verification');
@@ -186,6 +218,16 @@ export class SmsService {
     const proof = this.state.proofs.find(x => x.hash === hash(token) && x.client === client);
     if (!proof || proof.expires <= this.now()) throw new SmsError('proof_expired', 401);
     return proof;
+  }
+  /** Internal owner-bound account enrollment; these results never grant SMS consent. */
+  verifiedPhone(token: string, client: string) {
+    const proof = this.proof(token, client);
+    return { phone: proof.phone, verifiedAt: new Date(proof.verified).toISOString() };
+  }
+  verifiedChallenge(challengeId: string, client: string) {
+    const c = this.state.challenges.find(value => value.id === challengeId && value.client === client
+      && value.state === 'used' && value.verified !== undefined && value.expires > this.now());
+    return c ? { phone: c.phone, verifiedAt: new Date(c.verified!).toISOString() } : null;
   }
   private summary(phone: string) {
     const c = this.state.consents.find(x => x.phone === phone);
@@ -230,6 +272,7 @@ export class SmsService {
     return this.summary(proof.phone);
   }
   inbound(input: { phone: string; sid: string; body: string; optOutType?: string }) {
+    if (!input.body.trim() || /[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(input.body)) throw new SmsError('invalid_request');
     const phone = this.phone(input.phone);
     const keyword = input.body.trim().toUpperCase();
     const type = input.optOutType || (['STOP', 'STOPALL', 'UNSUBSCRIBE', 'CANCEL', 'END', 'QUIT', 'REVOKE', 'OPTOUT'].includes(keyword) ? 'STOP' : ['START', 'UNSTOP', 'YES'].includes(keyword) ? 'START' : ['HELP', 'INFO'].includes(keyword) ? 'HELP' : 'OTHER');
@@ -239,7 +282,9 @@ export class SmsService {
       if (type !== 'STOP' && type !== 'START') {
         if (type === 'OTHER') {
           const c = s.consents.find(x => x.phone === phone);
-          s.inbox.push({ sid: input.sid, phone, body: input.body.slice(0, 1600), received: this.now(), state: c?.enrolled && !c.carrierOptedOut ? 'pending_dispatch' : 'suppressed' });
+          s.inbox.push({ sid: input.sid, phone, body: input.body.slice(0, 1600), received: this.now(), state: c?.enrolled && !c.carrierOptedOut && c.disclosureVersion === SMS_DISCLOSURE_VERSION ? 'pending_dispatch'
+            : !c?.carrierOptedOut && !c?.withdrawnAt && !c?.signupReplyAttempted ? 'pending_signup' : 'suppressed' });
+          if (s.inbox.at(-1)!.state === 'suppressed') s.inbox.at(-1)!.body = '';
         }
         return;
       }
@@ -248,8 +293,39 @@ export class SmsService {
       c.enrolled = resubscribed; c.carrierOptedOut = type === 'STOP'; c.updatedAt = at; c.withdrawnAt = resubscribed ? null : at;
       s.events.push({ id: input.sid, phone, type: `sms_${type.toLowerCase()}`, at, disclosureVersion: c.disclosureVersion, disclosure: resubscribed ? SMS_DISCLOSURE : null, client: null, verifiedAt: null });
     });
-    // Twilio Advanced Opt Out owns keyword replies. Plain messages await agent integration.
+    // Twilio Advanced Opt Out owns keyword replies. The broker drains ordinary texts after acknowledgment.
     return '';
+  }
+  pendingTexts() {
+    return this.state.inbox.filter(x => x.state === 'pending_dispatch' || x.state === 'pending_signup').map(x => ({ ...x,
+      expired: this.now() - x.received >= SMS_TURN_MAX_AGE_MS || (x.retries ?? 0) >= 6,
+      deferred: (x.retryAt ?? 0) > this.now(),
+    }));
+  }
+  retryText(sid: string) {
+    this.change(s => {
+      const item = s.inbox.find(x => x.sid === sid);
+      if (item) { item.retries = (item.retries ?? 0) + 1; item.retryAt = this.now() + Math.min(60_000, 2000 * 2 ** item.retries); }
+    });
+  }
+  finishText(sid: string, state: 'replied' | 'suppressed' | 'uncertain') {
+    this.change(s => { const item = s.inbox.find(x => x.sid === sid); if (item) { item.state = state; item.body = ''; } });
+  }
+  async sendThreadReply(phoneValue: string, messageSid: string, text: string) {
+    const phone = this.phone(phoneValue);
+    if (!/^SM[0-9a-f]{32}$/i.test(messageSid) || !text.trim() || Array.from(text).length > 1000
+      || /[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(text)) throw new SmsError('invalid_request');
+    if (!this.state.inbox.some(x => x.sid === messageSid && x.phone === phone && x.state === 'pending_dispatch'))
+      throw new SmsError('invalid_request');
+    this.requestedEligibility(phone);
+    return this.sendMessage(phone, messageSid, filterSmsReply(text));
+  }
+  /** A single inbound-requested signup response, never a substitute for subscription consent. */
+  async sendSignupReply(phone: string, messageSid: string, setup = false) {
+    if (!this.deliveryActive()) throw new SmsError('sms_delivery_pending', 503);
+    const item = this.state.inbox.find(x => x.sid === messageSid && x.phone === phone);
+    if (!item || !['pending_signup', 'pending_dispatch'].includes(item.state)) throw new SmsError('invalid_request');
+    return this.sendMessage(phone, messageSid, setup ? 'Finish setting up Dexter at https://dexter.cash' : 'Sign up for Dexter texting at https://dexter.cash/sms', true);
   }
   /** Read-only admission check; does not consume a rate slot or send an enrollment text. */
   requestedEligibility(phoneValue: string) {
@@ -283,20 +359,26 @@ export class SmsService {
     if (!/^CA[0-9a-f]{32}$/i.test(callSid) || !message.trim() || message.length > 1000 || /[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(message)) throw new SmsError('invalid_request');
     return this.sendMessage(phone, callSid, message);
   }
-  private async sendMessage(phone: string, callSid: string, message: string) {
+  private async sendMessage(phone: string, callSid: string, message: string, signup = false) {
     if (!this.deliveryActive()) throw new SmsError('sms_delivery_pending', 503);
     const body = `Dexter: ${message.trim()}\nReply STOP to opt out. HELP for help.`;
     const bodyHash = hash(body);
-    const id = hash(`${callSid}:${phone}:${bodyHash}`);
+    const thread = callSid.startsWith('SM');
+    const id = hash(thread ? `sms:${callSid}:${phone}` : `${callSid}:${phone}:${bodyHash}`);
     const existing = this.state.messages.find(x => x.id === id);
     if (existing) return { ok: true, messageId: id, status: existing.status, duplicate: true };
     this.change(s => {
-      const c = s.consents.find(x => x.phone === phone);
-      if (!c?.enrolled || c.carrierOptedOut || c.disclosureVersion !== SMS_DISCLOSURE_VERSION) throw new SmsError('sms_consent_required', 403);
-      this.limit(s, `send:phone:${hash(phone)}`, 10, 60 * MINUTE);
-      this.limit(s, `send:call:${callSid}`, 5, DAY);
-      this.limit(s, 'send:global', 100, DAY);
+      let c = s.consents.find(x => x.phone === phone);
+      if (c?.carrierOptedOut || (signup ? !!c?.signupReplyAttempted || !!c?.withdrawnAt
+        : !c?.enrolled || c.disclosureVersion !== SMS_DISCLOSURE_VERSION)) throw new SmsError('sms_consent_required', 403);
+      this.limit(s, `send:phone:${hash(phone)}`, 60, 60 * MINUTE);
+      if (!thread) this.limit(s, `send:call:${callSid}`, 5, DAY);
+      this.limit(s, 'send:global', 2000, DAY);
       for (const key of [`send:phone:${hash(phone)}`, `send:call:${callSid}`, 'send:global']) s.rates.push({ key, at: this.now() });
+      if (signup) {
+        if (!c) { c = this.record(s, phone); c.withdrawnAt = null; }
+        c.signupReplyAttempted = true;
+      }
       s.messages.push({ id, phone, callSid, bodyHash, created: this.now(), sid: null, status: 'dispatching', errorCode: null });
     });
     try {

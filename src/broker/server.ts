@@ -1,5 +1,6 @@
 import { watchMediaSocket } from './phone.js';
-import type { BrokerSmsBridge } from './sms.js';
+import { closeBrokerSms, type BrokerSmsBridge } from './sms.js';
+import { SmsError, phoneSchema as smsPhoneSchema } from '../sms/SmsService.js';
 import { formatCallTranscript } from './callTranscript.js';
 import { createResultSmsClient, type ResultSmsClient } from './resultSmsClient.js';
 import { dispatchResultSms, resultSmsFailure } from './resultSmsDispatch.js';
@@ -670,6 +671,31 @@ export function createBrokerServer(options: BrokerServerOptions) {
         }
       }
       if (!authorizedControl(request.headers.authorization, config.controlToken)) return json(response, 401, { error: 'unauthorized' });
+      if (request.method === 'POST' && ['/internal/broker/sms/enrollment/start', '/internal/broker/sms/enrollment/check'].includes(route)) {
+        const start = route.endsWith('/start');
+        let input: Record<string, unknown>;
+        try {
+          input = JSON.parse(await body(request, 2_048));
+          const keys = start ? ['ownerId', 'phone'] : ['ownerId', 'challengeId', 'code'];
+          if (!input || Array.isArray(input) || Object.keys(input).length !== keys.length
+            || Object.keys(input).some(key => !keys.includes(key))
+            || typeof input.ownerId !== 'string' || !UUID.test(input.ownerId)
+            || (start ? !smsPhoneSchema.safeParse(input.phone).success
+              : typeof input.challengeId !== 'string' || !UUID.test(input.challengeId)
+                || typeof input.code !== 'string' || !/^\d{6}$/.test(input.code))) throw new Error('invalid_request');
+        } catch { return json(response, 400, { ok: false, error: 'invalid_request' }); }
+        if (!accepting || !options.sms?.startAccountVerification || !options.sms.checkAccountVerification)
+          return json(response, 503, { ok: false, error: 'sms_unavailable' });
+        try {
+          const result = start ? await options.sms.startAccountVerification(input.ownerId as string, input.phone as string)
+            : await options.sms.checkAccountVerification(input.ownerId as string, input.challengeId as string, input.code as string);
+          return json(response, 200, result);
+        } catch (error) {
+          const e = error instanceof SmsError ? error : new SmsError('sms_unavailable', 503);
+          if (e.retryAfterSeconds) response.setHeader('Retry-After', String(e.retryAfterSeconds));
+          return json(response, e.status, { ok: false, error: e.code, ...(e.retryAfterSeconds ? { retryAfterSeconds: e.retryAfterSeconds } : {}) });
+        }
+      }
       if (request.method === 'POST' && route === '/internal/broker/result-sms') {
         let input: unknown;
         try { input = JSON.parse(await body(request, 2_048)); }
@@ -708,7 +734,11 @@ export function createBrokerServer(options: BrokerServerOptions) {
         const call = admittedCall();
         if (!call) return json(response, 409, { ok: false, error: 'sms_call_unavailable' });
         if (!options.sms) return json(response, 503, { ok: false, error: 'sms_delivery_pending' });
-        try { return json(response, 200, options.sms.requestedEligibility(call.number)); }
+        try {
+          const eligible = await options.sms.requestedEligibility(call.number);
+          if (!admittedCall()) return json(response, 409, { ok: false, error: 'sms_call_unavailable' });
+          return json(response, 200, eligible);
+        }
         catch (error) {
           const failure = resultSmsFailure(error);
           return json(response, ['sms_delivery_pending', 'sms_unavailable'].includes(failure.error) ? 503 : 409, failure);
@@ -727,6 +757,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
           || input.message.length > 1000 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(input.message))
           return json(response, 400, { ok: false, error: 'invalid_request' });
         const admittedCall = () => {
+          if (!accepting) return undefined;
           const call = store.bySid(input.callSid as string);
           if (!call || call.status !== 'in-progress' || !call.mediaStartedAt || call.endedAt || call.finalized
             || call.primaryClosed || call.primaryClosePending || call.restrictedSetup
@@ -970,8 +1001,12 @@ export function createBrokerServer(options: BrokerServerOptions) {
       if (!response.headersSent) json(response, 503, { error: safeFailure(error) });
       else response.end();
     });
-    pendingRequests.add(pending);
-    void pending.finally(() => pendingRequests.delete(pending));
+    // SMS RPCs can be stuck behind worker disk I/O. They must never hold up call shutdown.
+    const smsRequest = /^(?:\/sms\/|\/internal\/sms\/|\/internal\/broker\/(?:sms(?:\/|$)|result-sms(?:\/|$)))/.test(request.url || '');
+    if (!smsRequest) {
+      pendingRequests.add(pending);
+      void pending.finally(() => pendingRequests.delete(pending));
+    }
   });
   server.requestTimeout = 30_000;
   const sockets = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
@@ -1565,10 +1600,9 @@ export function createBrokerServer(options: BrokerServerOptions) {
     for (const call of store.list()) if (call.inbound && !call.inbound.closure) inbound.stopLocal(call.id, 'service_shutdown');
     clearInterval(maintenanceTimer);
     server.close();
-    await Promise.allSettled([...pendingRequests]);
-    await options.sms?.close();
-    await maintenance;
     await Promise.allSettled([...active.values()].map(call => call.stop('service_shutdown')));
+    await Promise.allSettled([...pendingRequests]);
+    await maintenance;
     // The answer route finished long ago, but Primary may still be opening its binding. A binding
     // that lands now (accepting is false) is recorded and closed by its settlement, before the store closes.
     await Promise.allSettled([...bindSettlements]);
@@ -1594,6 +1628,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
     await flushHark();
     sockets.close();
     store.close();
+    await closeBrokerSms(options.sms);
   }
   return { server, store, close, maintain };
 }

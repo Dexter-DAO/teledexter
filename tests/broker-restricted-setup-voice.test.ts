@@ -193,8 +193,14 @@ test('deadline requests provider stop before a held Live close or host effect ca
   });
   assert.ok(captured); captured.onReady({ callId, sessionId });
   const c = channel(); const action = execute(captured, request, c);
-  try { await stop.promise; assert.equal(f.voice.appendAudio('AAAA'), false); assert.equal(c.published.length, 0); }
-  finally { liveClose.resolve(closed()); await action; }
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
+  try {
+    // Fake sockets hold no event-loop handle; the production deadline is intentionally unref'ed.
+    await Promise.race([stop.promise, new Promise<never>((_, reject) => {
+      watchdog = setTimeout(() => reject(new Error('provider_stop_deadline_not_observed')), 1000);
+    })]);
+    assert.equal(f.voice.appendAudio('AAAA'), false); assert.equal(c.published.length, 0);
+  } finally { clearTimeout(watchdog); liveClose.resolve(closed()); await action; }
 });
 
 test('existing Live session sends empty full startup input and setup-only named function delegation', async t => {
