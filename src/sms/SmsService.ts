@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { z } from 'zod';
 import { bindDurableFileParent, durablyReplaceJsonFile, type DurableParentBinding } from '../outbound/DurableFile.js';
+import { filterSmsReply } from './filterSmsReply.js';
 
 export const SMS_DISCLOSURE_VERSION = 'dexter-sms-2026-09-16';
 export const SMS_DISCLOSURE = 'I agree to receive SMS from Dexter about my requests, follow-ups, service links, and task and account activity. Message frequency varies. Message and data rates may apply. Reply HELP for help or STOP to opt out. Consent is optional and is not a condition of purchase.';
@@ -312,19 +313,12 @@ export class SmsService {
   }
   async sendThreadReply(phoneValue: string, messageSid: string, text: string) {
     const phone = this.phone(phoneValue);
-    if (!/^SM[0-9a-f]{32}$/i.test(messageSid) || !text.trim() || text.length > 1000
+    if (!/^SM[0-9a-f]{32}$/i.test(messageSid) || !text.trim() || Array.from(text).length > 1000
       || /[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(text)) throw new SmsError('invalid_request');
     if (!this.state.inbox.some(x => x.sid === messageSid && x.phone === phone && x.state === 'pending_dispatch'))
       throw new SmsError('invalid_request');
     this.requestedEligibility(phone);
-    // Only Dexter's HTTPS origin may appear in a carrier answer. The API renders
-    // replies from trusted portfolio values; this also refuses stale unsafe answers.
-    const links = text.match(/(?:[a-z][a-z0-9+.-]*:\/\/|mailto:|tel:|www\.|(?:[\p{L}\p{N}-]+\.)+[\p{L}]{2,})[^\s<>]*/giu) ?? [];
-    if (links.some(link => {
-      try { const url = new URL(link.replace(/[.,!?;:)]+$/, '')); return url.origin !== 'https://dexter.cash' || !!url.username || !!url.password; }
-      catch { return true; }
-    })) text = 'Open https://dexter.cash and sign in with your passkey to continue.';
-    return this.sendMessage(phone, messageSid, text);
+    return this.sendMessage(phone, messageSid, filterSmsReply(text));
   }
   /** A single inbound-requested signup response, never a substitute for subscription consent. */
   async sendSignupReply(phone: string, messageSid: string, setup = false) {

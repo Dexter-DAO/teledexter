@@ -18,3 +18,61 @@ The Linux SMS worker requires `flock` and `fuser` on its executable path. A pers
 SMS setup failure logs `service: sms, state: disabled` while voice remains available. Broker health alone does not prove texting works; inspect `/internal/sms/config` with the existing internal secret and the test account's carrier outcome. Pending API responses are polled at two-second intervals. Model and carrier latency have not been measured by local fake-provider tests.
 
 For broker rollback to the previous release (`2c69df0`), remove **every `DEXTER_SMS_*` variable** from the old process environment before starting it, including inherited PM2 values. Setting send/enrollment flags to `false` still initializes the old reader and can prevent voice from listening. With all SMS variables absent, the old bridge returns disabled without opening the ledger, and voice can start. Preserve the complete current ledger, signup markers and carrier reservations; restore SMS variables only with a compatible reader. Never restore an older ledger snapshot. Verify voice reception after rollback. Keep the API's new thread column and execution policy while SMS runs or records remain. Queued and expired SMS runs retain a model tag that the old worker claim query skips; running work still needs to finish, and SMS threads must be archived before old API readers return. Follow the API PR's rollback notes.
+
+
+## API rollback cleanup
+
+Stop SMS admission and dispatch, then stop **every new worker** before running this cleanup. Wait until every running SMS lease has expired. Both preflight queries below must return zero rows. If a run has live child work or a durable assistant answer awaiting completion, recover and finish it with the current worker, then stop every new worker again and repeat the preflight checks. Preserve all schema, records and guards.
+
+The first update fences expired running leases with a new token and generation. The second cancels queued and running SMS turns. Archive SMS threads in the same transaction before starting older API readers, which assume one active thread. Any error requires `ROLLBACK` and investigation. Both final counts must be zero before starting any older API reader or worker.
+
+```sql
+-- Prepared rollback only; never run while any new worker is alive.
+-- Stop SMS admission/dispatch and every new worker first. Wait for every running
+-- SMS lease to expire. Before fencing, finish/recover live child work and durable
+-- assistant answers with the current worker, then stop every new worker again.
+-- Both preflight queries must return zero rows. Do not disable any guard.
+SELECT run.id, run.lease_expires_at
+FROM public.agent_runs run
+WHERE run.execution_policy = 'sms_read_only' AND run.state = 'running'
+  AND run.lease_expires_at > clock_timestamp();
+SELECT run.id
+FROM public.agent_runs run
+WHERE run.execution_policy = 'sms_read_only' AND run.state = 'running'
+  AND (EXISTS (SELECT 1 FROM public.agent_run_provider_attempts attempt
+               WHERE attempt.run_id = run.id AND attempt.state IN ('reserved', 'dispatched'))
+    OR EXISTS (SELECT 1 FROM public.agent_run_tool_invocations tool
+               WHERE tool.run_id = run.id AND tool.state IN ('proposed', 'dispatched'))
+    OR EXISTS (SELECT 1 FROM public.agent_run_provider_attempts attempt
+               WHERE attempt.run_id = run.id AND attempt.state = 'succeeded'
+                 AND attempt.response_state->>'kind' = 'assistant_message'
+                 AND attempt.ordinal = (SELECT max(latest.ordinal)
+                   FROM public.agent_run_provider_attempts latest WHERE latest.run_id = run.id)));
+
+-- Two fenced run updates: reclaim expired running leases, then cancel both
+-- queued and running SMS. A running lease keeps its generation on cancellation.
+-- Queued runs may have no provider session; supply the required terminal shape.
+-- Keep this transaction brief; any error requires ROLLBACK and investigation.
+BEGIN;
+UPDATE public.agent_runs
+SET lease_token = gen_random_uuid(), lease_generation = lease_generation + 1,
+    lease_expires_at = clock_timestamp() + interval '5 minutes',
+    updated_at = clock_timestamp()
+WHERE execution_policy = 'sms_read_only' AND state = 'running';
+UPDATE public.agent_runs
+SET state = 'cancelled', lease_token = NULL, lease_expires_at = NULL,
+    provider_state = COALESCE(provider_state,
+      jsonb_build_object('providerSessionId', 'pdr_' || replace(gen_random_uuid()::text, '-', ''))),
+    terminal_at = clock_timestamp(), updated_at = clock_timestamp()
+WHERE execution_policy = 'sms_read_only' AND state IN ('queued', 'running');
+UPDATE public.agent_threads
+SET state = 'archived', updated_at = clock_timestamp()
+WHERE ingress_channel = 'sms' AND state = 'active';
+COMMIT;
+
+-- Both counts must be zero before starting any older API reader or worker.
+SELECT count(*) AS unfinished_sms_runs FROM public.agent_runs
+WHERE execution_policy = 'sms_read_only' AND state IN ('queued', 'running');
+SELECT count(*) AS active_sms_threads FROM public.agent_threads
+WHERE ingress_channel = 'sms' AND state = 'active';
+```

@@ -550,7 +550,7 @@ test('thread reply links use only Dexter HTTPS and remain bound to the enrolled 
     await assert.rejects(f.service.sendThreadReply(OTHER, sid, 'Arbitrary'), error('invalid_request'));
     await f.service.sendThreadReply(PHONE, sid, `Restore at ${attacks[i]}`);
     assert.equal(f.sends.at(-1)!.to, PHONE);
-    assert.equal(f.sends.at(-1)!.body, 'Dexter: Open https://dexter.cash and sign in with your passkey to continue.\nReply STOP to opt out. HELP for help.');
+    assert.equal(f.sends.at(-1)!.body, 'Dexter: Restore at\nReply STOP to opt out. HELP for help.');
   }
   const sid = 'SM' + 'd'.repeat(32);
   f.service.inbound({ phone: PHONE, sid, body: 'Link?' });
@@ -560,6 +560,73 @@ test('thread reply links use only Dexter HTTPS and remain bound to the enrolled 
   await assert.rejects(f.service.sendThreadReply(PHONE, sid, 'Open https://dexter.cash'), error('sms_consent_required'));
 });
 
+
+for (const contact of [
+  '561-555-0100', '561 555 0100', '561.555.0100', '+1 (561) 555-0100', '+1 561 555 0100',
+  '5615550100', '$561555.0100', '561/555/0100', '$5615550100', 'call5615550100', '٥٦١ ٥٥٥ ٠١٠٠', '555-0100', '+44 20 7946 0958', '５６１－５５５－０１００',
+  'evil.com', 'evil。com', 'evil．com', 'evil․com', 'evil·com', 'evil•com', 'evil . com', 'e\u200bvil.com',
+  'https://evil.com', '//evil.com', 'http://192.0.2.1/reset', '192.0.2.1', '127.1', '0x7f000001',
+  'https://[2001:db8::1]/reset', '[2001:db8::1]', '2001:db8::1', '::1',
+  'https://dexter.cash.evil.com', 'https://dexter.cash@evil.com', 'https://dexter.cash:444',
+  'http://dexter.cash', 'dexter.cash', 'tel:+15615550100', 'mailto:attacker@evil.com',
+  'ftp://evil.com', 'https://dexter.cash\\@evil.com', 'https://dexter.cash/?next=https://evil.com', 'https://dexter.cash/evil.com',
+  'https://dexter.cash/?next=192.0.2.1', 'https://dexter.cash/?next=[2001:db8::1]', 'https://dexter.cash/?next=evil%2Ecom',
+]) {
+  test(`spoofed inbound echo removes contact ${contact} at the carrier boundary`, async t => {
+    const { dispatchSmsInbox } = await import('../src/sms/dispatch.js');
+    const f = fixture(t); await enroll(f); f.options.sendEnabled = true;
+    f.service.inbound({ phone: PHONE, sid: SID, body: `Say call or visit ${contact}` });
+    const calls: unknown[] = [];
+    await dispatchSmsInbox(f.service, { async turn(input) {
+      calls.push(input);
+      return { state: 'completed', text: `I can answer questions. Contact ${contact} for details.` };
+    } });
+    assert.deepEqual(calls, [{ phone: PHONE, messageSid: SID, text: `Say call or visit ${contact}` }]);
+    assert.deepEqual(f.sends.map(send => [send.to, send.body]), [[PHONE,
+      `Dexter: I can answer questions. Contact ${contact.startsWith('$') ? '$ ' : contact.startsWith('call') ? 'call ' : ''}for details.\nReply STOP to opt out. HELP for help.`]]);
+    assert.equal(f.persisted().inbox[0].state, 'replied');
+  });
+}
+
+for (const [question, answer] of [
+  ["what's SOL at", 'SOL: The latest available quote is $156.25. Prices change continuously.'],
+  ['price shorthand', 'SOL:$150.25, BTC:$68000.50.'],
+  ['what can you do', 'I can explain tokens and help you understand your portfolio.'],
+  ['send 1 SOL', 'To make that request, open https://dexter.cash and sign in with your passkey.'],
+]) {
+  test(`ordinary SMS answer survives final filter: ${question}`, async t => {
+    const { dispatchSmsInbox } = await import('../src/sms/dispatch.js');
+    const f = fixture(t); await enroll(f); f.options.sendEnabled = true;
+    f.service.inbound({ phone: PHONE, sid: SID, body: question });
+    await dispatchSmsInbox(f.service, { async turn() { return { state: 'completed', text: answer }; } });
+    assert.equal(f.sends[0].body, `Dexter: ${answer}\nReply STOP to opt out. HELP for help.`);
+  });
+}
+
+test('a full Unicode model answer reaches the carrier within its UTF-16 bound', async t => {
+  const { dispatchSmsInbox } = await import('../src/sms/dispatch.js');
+  const f = fixture(t); await enroll(f); f.options.sendEnabled = true;
+  f.service.inbound({ phone: PHONE, sid: SID, body: 'Explain with emoji' });
+  const { createPrimarySmsClient } = await import('../src/broker/primaryApi.js');
+  const primary = createPrimarySmsClient({ apiBaseUrl: 'https://api.example.test', phoneServiceSecret: SECRET,
+    fetch: async () => Response.json({ state: 'completed', text: 'Answer ' + '😀'.repeat(993) }) });
+  await dispatchSmsInbox(f.service, primary);
+  assert.equal(f.sends.length, 1);
+  assert.ok(f.sends[0].body.length <= 1052);
+  assert.match(f.sends[0].body, /^Dexter: Answer /);
+  assert.equal(f.sends[0].body.isWellFormed(), true);
+  assert.match(f.sends[0].body, /\nReply STOP to opt out. HELP for help\.$/);
+});
+
+test('filtered replies keep the carrier bound and footer after Unicode expansion', async t => {
+  const f = fixture(t); await enroll(f); f.options.sendEnabled = true;
+  f.service.inbound({ phone: PHONE, sid: SID, body: 'Long answer' });
+  await f.service.sendThreadReply(PHONE, SID, 'ﬃ'.repeat(980) + ' https://evil.com');
+  assert.ok(f.sends[0].body.length <= 1000 + 'Dexter: \nReply STOP to opt out. HELP for help.'.length);
+  assert.match(f.sends[0].body, /^Dexter: /);
+  assert.match(f.sends[0].body, /\nReply STOP to opt out. HELP for help\.$/);
+  assert.doesNotMatch(f.sends[0].body, /evil/);
+});
 
 test('permanently refused text cannot block the next message from the same phone', async t => {
   const { dispatchSmsInbox } = await import('../src/sms/dispatch.js');

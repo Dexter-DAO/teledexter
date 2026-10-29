@@ -395,7 +395,7 @@ export const smsTurnResultSchema = z.discriminatedUnion('state', [
   z.object({ state: z.literal('unregistered') }).strict(),
   z.object({ state: z.literal('setup_required') }).strict(),
   z.object({ state: z.enum(['queued', 'running']) }).strict(),
-  z.object({ state: z.literal('completed'), text: z.string().trim().min(1).max(1000) }).strict(),
+  z.object({ state: z.literal('completed'), text: z.string().trim().min(1).refine(text => Array.from(text).length <= 1000) }).strict(),
 ]);
 export type SmsTurnResult = z.infer<typeof smsTurnResultSchema>;
 export interface PrimarySmsClient {
