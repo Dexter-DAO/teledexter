@@ -506,8 +506,41 @@ test('retryable carrier 503 retains original attempted identity and recovers bef
   assert.equal(next.inbound!.waitUntil, before.inbound!.waitUntil);
 });
 
+for (const committed of [false, true]) test(`Phone Tab refusal stops context retries and reconciles committed=${committed}`, async t => {
+  const f = await fixture(t), first = await f.begin(); f.approve();
+  f.consumeError(new PrimaryApiError('http_error', 403, { code: 'phone_tab_required', retryable: false }), !committed);
+  const stopped = await f.flow.tick(first.id);
+  assert.equal(stopped.inbound!.localStop?.reason, 'phone_tab_required');
+  assert.equal(stopped.inbound!.remote?.state, committed ? 'bound' : 'cancelled');
+  assert.equal(stopped.inbound!.closure?.state, committed ? 'closed' : undefined);
+  assert.deepEqual(stopped.failure, { code: 'http_error', message: 'Primary API request failed: http_error (HTTP 403)',
+    status: 403, remoteCode: 'phone_tab_required', retryable: false });
+  assert.equal(f.counts.consume, 1); assert.equal(f.counts.context, 0);
+  assert.equal(stopped.primary, undefined); assert.equal(f.flow.waitingMediaAllowed(stopped), false);
+  f.restart(); await f.flow.tick(first.id); await f.flow.tick(first.id);
+  assert.equal(f.counts.consume, 1); assert.equal(f.counts.begin, 1);
+  assert.equal(f.counts.close, committed ? 1 : 0);
+  assert.equal(f.store.get(first.id)!.failure?.remoteCode, 'phone_tab_required');
+});
+
+for (const refresh of [false, true]) test(`Phone Tab refusal from ${refresh ? 'refresh' : 'opening'} context closes the committed binding`, async t => {
+  const f = await fixture(t), first = await f.begin(); f.approve();
+  if (refresh) await f.flow.tick(first.id);
+  f.contextError(new PrimaryApiError('http_error', 403, { code: 'phone_tab_required', retryable: false }));
+  const stopped = await f.flow.tick(first.id);
+  assert.equal(stopped.inbound!.localStop?.reason, 'phone_tab_required');
+  assert.equal(stopped.inbound!.remote?.state, 'bound'); assert.equal(stopped.inbound!.closure?.state, 'closed');
+  assert.equal(f.counts.context, refresh ? 2 : 1); assert.equal(f.counts.consume, 1); assert.equal(f.counts.close, 1);
+  const failure = f.timings.find(event => event.phase === 'failed' && event.stage === (refresh ? 'refresh_context' : 'open_context'));
+  assert.equal(failure?.primaryApiRemoteCode, 'phone_tab_required'); assert.equal(failure?.primaryApiRetryable, false);
+  f.restart(); await f.flow.tick(first.id);
+  assert.equal(f.counts.context, refresh ? 2 : 1); assert.equal(f.counts.consume, 1); assert.equal(f.counts.close, 1);
+});
+
 for (const [index, error] of [new PrimaryApiError('http_error', 403, { code: 'inbound_enrollment_required', retryable: true }),
   new PrimaryApiError('http_error', 503, { code: 'inbound_enrollment_required', retryable: false }),
+  new PrimaryApiError('http_error', 403, { code: 'phone_tab_required', retryable: true }),
+  new PrimaryApiError('http_error', 503, { code: 'phone_tab_required', retryable: false }),
   new PrimaryApiError('http_error', 403, { code: 'other_refusal', retryable: false }),
   Object.assign(new Error('untrusted shape'), { status: 403, remoteCode: 'inbound_enrollment_required', retryable: false })].entries()) {
   test(`nonmatching error ${index} is not converted into carrier refusal: ${error.message}`, async t => {

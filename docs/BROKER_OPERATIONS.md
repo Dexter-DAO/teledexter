@@ -137,6 +137,10 @@ While an inbound stream waits, the broker polls the same admission after 100, 20
 
 Log events: `broker_audio_timing` stages `greetingClipStartedAt`, `greetingClipFirstPlaybackAcknowledgedAt` and `greetingClipPlayedAt`; `broker_account_media` (`mediaStartedAt`, `heldInputMs`, `droppedInputMs`, `greetingInputMs`) when Live attaches; `broker_greeting_stream_released` when an inbound stream is handed back to its TwiML; and `broker_opening_after_caller_speech` (`heldSpeechInputMs`, `waitedMs`) when an outbound opening waited for held caller speech.
 
+An API `403 phone_tab_required` with `retryable=false` ends the account wait immediately. After the greeting, the caller hears instructions to review and approve the Phone Tab at `dexter.cash/phone`. Maintenance uses the same spoken response if it reaches the waiting leg before the continuation. It then observes the provider status while the response plays. The original attachment is cancelled, or its exact binding is closed if consumption committed. Temporary service errors and the `call_not_active` pickup race retain their existing recovery path.
+
+The call's `failure` keeps `status`, `remoteCode` and `retryable` for a validated API error. Failed `broker_inbound_timing` events include these as `primaryApiStatus`, `primaryApiRemoteCode` and `primaryApiRetryable`, alongside the existing call, attempt, span and operation. Raw error bodies, phone numbers and provider proofs are excluded. The Phone Tab stop uses the existing journal fields, so the preceding release can still read it on rollback.
+
 ## Incoming calls
 
 Every Twilio webhook must carry a valid signature for the exact URL. Incoming calls follow one of two paths, selected at startup.
