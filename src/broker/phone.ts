@@ -1,6 +1,7 @@
 import { timingSafeEqual, createHmac } from 'node:crypto';
 import Twilio from 'twilio';
 import type { BrokerConfig } from './config.js';
+import { PrimaryApiError } from './primaryApi.js';
 
 export function authorizedControl(header: string | undefined, token: string): boolean {
   const actual = Buffer.from(header || '');
@@ -154,14 +155,21 @@ export function inputSpeechEnergy(bytes: Buffer): number {
   return Math.sqrt(squares / bytes.length);
 }
 
-export function safeFailure(error: unknown): { code: string; message: string } {
+export function safeFailure(error: unknown): {
+  code: string; message: string; status?: number; remoteCode?: string; retryable?: boolean;
+} {
   const value = error as { code?: string | number; message?: string };
+  const primary = error instanceof PrimaryApiError ? error : undefined;
+  const remoteCode = primary?.remoteCode && /^[a-z][a-z0-9_]{1,79}$/.test(primary.remoteCode) ? primary.remoteCode : undefined;
   return {
     code: String(value?.code || 'broker_error').slice(0, 80),
     message: String(value?.message || 'The operation could not finish')
       .replace(/\+[1-9]\d{7,14}/g, '[phone]')
       .replace(/sk-[A-Za-z0-9_-]+/g, '[credential]')
       .replace(/Bearer\s+\S+/gi, 'Bearer [credential]').slice(0, 400),
+    ...(primary?.status === undefined ? {} : { status: primary.status }),
+    ...(remoteCode === undefined ? {} : { remoteCode }),
+    ...(primary?.retryable === undefined ? {} : { retryable: primary.retryable }),
   };
 }
 

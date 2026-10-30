@@ -462,7 +462,7 @@ test('incoming legacy admission without frozen billing reference never posts a n
       callSid: call.callSid!, termsDigest: 'a'.repeat(64) } } as InboundOutcome }), /binding changed/);
 });
 
-async function fixture(t: test.TestContext, options: { portfolio?: PrimaryApiClient['portfolio']; selected?: boolean; retained?: BrokerCall; initialRemote?: InboundOutcome; eligible?: boolean; billing?: boolean; billingUrl?: string; duration?: string; preconnect?: boolean; replaceFirstGeneration?: boolean; greetingClip?: Buffer; outboundClipOnly?: Buffer; startupPageFreshMs?: number; defaultAdmissionPoll?: boolean } = {}) {
+async function fixture(t: test.TestContext, options: { portfolio?: PrimaryApiClient['portfolio']; selected?: boolean; retained?: BrokerCall; initialRemote?: InboundOutcome; eligible?: boolean; billing?: boolean; billingUrl?: string; duration?: string; preconnect?: boolean; replaceFirstGeneration?: boolean; greetingClip?: Buffer; outboundClipOnly?: Buffer; startupPageFreshMs?: number; defaultAdmissionPoll?: boolean; announcementInProgress?: boolean } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-inbound-http-'));
   if (options.retained) fs.writeFileSync(path.join(dir, 'calls.json'), JSON.stringify({ version: 1, calls: { [options.retained.id]: options.retained } }));
   const store = new BrokerStore(dir);
@@ -498,7 +498,7 @@ async function fixture(t: test.TestContext, options: { portfolio?: PrimaryApiCli
   let providerGate: Promise<void> | undefined; let releaseProvider: (() => void) | undefined;
   let providerEntered: (() => void) | undefined; let providerState = 'in-progress';
   let providerDuration = options.duration; let providerWrongIdentity = false; let providerFailures = 0;
-  let beginError: Error | undefined, pendingBeginError: Error | undefined;
+  let beginError: Error | undefined, pendingBeginError: Error | undefined, consumeError: Error | undefined;
   let beginGate: Promise<void> | undefined, releaseBegin: (() => void) | undefined;
   let statusGate: Promise<void> | undefined; let releaseStatus: (() => void) | undefined;
   const seen = { dial: 0, end: 0, voice: 0, begin: 0, consume: 0, context: 0, cancel: 0, close: 0, legacyClose: 0,
@@ -506,6 +506,7 @@ async function fixture(t: test.TestContext, options: { portfolio?: PrimaryApiCli
   const openings: string[] = [];
   const appended: string[] = [];
   const beginTimes: number[] = [];
+  const providerUpdates: Array<{ status?: string; twiml?: string }> = [];
   const context = () => {
     seen.context++;
     if (!authority) throw new Error('authority_unavailable');
@@ -540,6 +541,7 @@ async function fixture(t: test.TestContext, options: { portfolio?: PrimaryApiCli
       seen.consume++; assert.deepEqual(ref, approvalRef); assert.equal(proof.params.Direction, 'inbound');
       assert.equal(proof.params.CallSid, params.CallSid);
       assert.equal(store.list()[0].inbound!.consumeAttemptedAt !== undefined, true);
+      if (consumeError) throw consumeError;
       remote = { attachmentId, beginRef: remote!.beginRef, state: 'bound', approvalRef, bindingId, billing,
         consumedAt: new Date().toISOString(), callState: 'open' };
       if (consumeGate) await consumeGate;
@@ -562,7 +564,8 @@ async function fixture(t: test.TestContext, options: { portfolio?: PrimaryApiCli
       if (providerFailures > 0) { providerFailures--; throw new Error('provider_read_unavailable'); }
       return { sid, accountSid: config.twilioAccountSid, direction: 'inbound', from: params.From, to: params.To, status: providerState, ...(providerWrongIdentity ? { to: '+12025550999' } : {}),
       ...(providerDuration === undefined ? {} : { duration: providerDuration, startTime: new Date('2020-01-01T10:00:00Z'), endTime: new Date(1577872800000 + Number(providerDuration) * 1000) }) }; },
-    async update() { seen.end++; return { sid, status: 'completed' }; },
+    async update(input: { status?: string; twiml?: string }) { providerUpdates.push(input); seen.end++;
+      return { sid, status: input.twiml && options.announcementInProgress ? 'in-progress' : 'completed' }; },
   }), { async create() { seen.dial++; throw new Error('inbound_must_not_dial'); } });
   // Background admission (after the continuation and while a greeting stream waits) is
   // observed through these doubles: settle() waits until none of their calls is in flight.
@@ -630,7 +633,7 @@ async function fixture(t: test.TestContext, options: { portfolio?: PrimaryApiCli
     }
   }
   t.after(async () => { releaseBegin?.(); await close(); fs.rmSync(dir, { recursive: true, force: true }); });
-  return { broker, store, base, config, params, seen, openings, appended, lifecycle, webhook, close, provider, billing, transports, beginTimes,
+  return { broker, store, base, config, params, seen, openings, appended, lifecycle, webhook, close, provider, billing, transports, beginTimes, providerUpdates,
     gateBegin() { beginGate = new Promise<void>(resolve => { releaseBegin = resolve; }); return () => releaseBegin!(); },
     gateConsume() { consumeGate = new Promise<void>(resolve => { releaseConsume = resolve; }); return () => releaseConsume!(); },
     gateAssert() { assertGate = new Promise<void>(resolve => { releaseAssert = resolve; }); return () => releaseAssert!(); },
@@ -648,6 +651,7 @@ async function fixture(t: test.TestContext, options: { portfolio?: PrimaryApiCli
     settle,
     beginError(error?: Error) { beginError = error; },
     pendingBeginError(error?: Error) { pendingBeginError = error; },
+    consumeError(error?: Error) { consumeError = error; },
     approve() { assert.ok(remote?.state === 'pending'); remote = { ...remote, state: 'approved', approvalRef }; },
     loseBegin() { lostBegin = true; }, loseConsume() { loseConsume = true; }, refuseContext() { authority = false; },
     refuseCancellation() { cancellationUnavailable = true; },
@@ -1444,6 +1448,50 @@ test('a refusal while the greeting plays hands the leg back after the greeting; 
   assert.equal(f.seen.end, 0); assert.equal(f.seen.voice, 0); assert.equal(f.seen.consume, 0);
   const next = await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text();
   assert.match(next, /<Hangup/); assert.doesNotMatch(next, /<Stream/);
+});
+
+test('an approved caller without a Phone Tab hears recovery instructions after the greeting instead of repeated context attempts', async t => {
+  const f = await fixture(t, { greetingClip: greetingFixtureClip });
+  await (await f.webhook('/broker/incoming-call')).text(); await f.waitForAdmission();
+  const call = f.store.list()[0];
+  f.consumeError(new PrimaryApiError('http_error', 403, { code: 'phone_tab_required', retryable: false }));
+  f.approve();
+  const g = await greetingMedia(f, call); t.after(() => g.ws.close());
+  await preconnectUntil(() => f.store.get(call.id)!.inbound!.localStop?.reason === 'phone_tab_required');
+  await preconnectUntil(() => g.clipFrames() === 15);
+  assert.equal(g.ws.readyState, WebSocket.OPEN, 'the already playing greeting finishes');
+  const closed = new Promise<void>(resolve => g.ws.once('close', () => resolve()));
+  g.ackClip(); await closed;
+  const refused = f.store.get(call.id)!;
+  assert.equal(refused.inbound!.remote?.state, 'cancelled');
+  assert.equal(refused.failure?.remoteCode, 'phone_tab_required'); assert.equal(refused.failure?.retryable, false);
+  assert.equal(f.seen.consume, 1); assert.equal(f.seen.voice, 0); assert.equal(f.seen.dial, 0);
+  assert.equal(refused.primary, undefined); assert.equal(refused.inboundBilling, undefined);
+  const next = await (await f.webhook(`/broker/inbound/${call.id}/continue`)).text();
+  assert.match(next, /<Say voice="Polly.Matthew">Your Phone Tab needs approval/);
+  assert.match(next, /dexter dot cash slash phone/); assert.match(next, /<\/Say><Hangup/);
+  assert.doesNotMatch(next, /<Stream|<Redirect/);
+  assert.equal(f.seen.consume, 1, 'the continuation reconciles cleanup without opening context again');
+  await f.broker.maintain();
+  assert.equal(f.providerUpdates.length, 0, 'maintenance leaves the returned speech playing');
+});
+
+test('maintenance that reaches a refused Phone Tab before its continuation also sends the spoken recovery', async t => {
+  const f = await fixture(t, { announcementInProgress: true });
+  f.beginError(new PrimaryApiError('http_error', 403, { code: 'phone_tab_required', retryable: false }));
+  await (await f.webhook('/broker/incoming-call')).text(); await f.waitForAdmission();
+  const call = f.store.list()[0];
+  await f.broker.maintain();
+  assert.equal(f.providerUpdates.length, 1);
+  assert.equal(f.providerUpdates[0].status, undefined, 'no silent provider hangup command');
+  assert.match(f.providerUpdates[0].twiml!, /Phone Tab needs approval/);
+  assert.match(f.providerUpdates[0].twiml!, /dexter dot cash slash phone/);
+  assert.equal(f.seen.begin, 1); assert.equal(f.seen.consume, 0); assert.equal(f.seen.voice, 0);
+  assert.equal(f.store.get(call.id)!.inbound!.localStop?.reason, 'phone_tab_required');
+  await f.broker.maintain();
+  assert.equal(f.providerUpdates.length, 1, 'a still-playing announcement is not interrupted or restarted');
+  f.providerEnded(); await f.broker.maintain();
+  assert.equal(f.store.get(call.id)!.status, 'completed'); assert.equal(f.providerUpdates.length, 1);
 });
 
 

@@ -4,6 +4,21 @@ import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { createInboundAttemptTiming, observeInboundStreamResponse, observeInboundHoldResponse, type InboundTimingEvent } from '../src/broker/inboundTiming.js';
 import { PrimaryApiError } from '../src/broker/primaryApi.js';
+import { safeFailure } from '../src/broker/phone.js';
+
+test('Phone Tab rejection retains its API reason in the call failure and correlated timing event', async () => {
+  const events: InboundTimingEvent[] = [], callId = randomUUID();
+  const timing = createInboundAttemptTiming(callId, event => events.push(event));
+  const error = new PrimaryApiError('http_error', 403, { code: 'phone_tab_required', retryable: false });
+  await assert.rejects(timing.measure('open_context', async () => { throw error; }), received => received === error);
+  assert.equal(events[1].callId, callId); assert.equal(events[1].stage, 'open_context');
+  assert.equal(events[1].primaryApiCode, 'http_error'); assert.equal(events[1].primaryApiStatus, 403);
+  assert.equal(events[1].primaryApiRemoteCode, 'phone_tab_required'); assert.equal(events[1].primaryApiRetryable, false);
+  assert.deepEqual(safeFailure(error), { code: 'http_error', message: error.message,
+    status: 403, remoteCode: 'phone_tab_required', retryable: false });
+  assert.equal(safeFailure(new PrimaryApiError('http_error', 403, { code: 'https://provider.test/?token=secret', retryable: false })).remoteCode, undefined);
+  assert.equal(safeFailure(Object.assign(new Error('unknown failure'), { remoteCode: 'secret', retryable: false })).remoteCode, undefined);
+});
 
 test('a failed stage retains elapsed time across wall-clock movement and never logs the error body', async () => {
   let wall = Date.now(), monotonic = 10;

@@ -302,6 +302,15 @@ export function createInboundFlow(options: InboundFlowOptions) {
     catch (error) {
       options.onTransportDiscard?.(id);
       if (error instanceof PrimaryApiError && error.status === 403 && error.retryable === false
+        && error.remoteCode === 'phone_tab_required'
+        && (!saved(id).inbound!.mode || saved(id).inbound!.mode?.kind === 'ordinary')) {
+        // Waiting cannot restore an expired billing permission. Keep the ordinary stop
+        // journal so a rollback can still read it, and reconcile any committed binding.
+        store.update(id, { failure: safeFailure(error) });
+        stopLocal(id, 'phone_tab_required');
+        return settle(id);
+      }
+      if (error instanceof PrimaryApiError && error.status === 403 && error.retryable === false
         && (error.remoteCode === 'inbound_carrier_attestation_required' || error.remoteCode === 'inbound_enrollment_required')
         && (!saved(id).inbound!.mode || saved(id).inbound!.mode?.kind === 'ordinary')
         && !saved(id).inbound!.admissionRefusal) {

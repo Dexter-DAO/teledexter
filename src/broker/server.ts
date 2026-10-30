@@ -81,6 +81,7 @@ export function inboundAdmissionPollDelay(poll: number): number {
 }
 /** Spoken before the provider hangup for stops the caller should hear explained. */
 const SPOKEN_STOPS: Record<string, string> = {
+  phone_tab_required: 'Your Phone Tab needs approval before we can talk. Open dexter dot cash slash phone to review and approve it, then call me back.',
   voice_unavailable: 'My voice connection stopped working. Please try me again shortly.',
   primary_unavailable: 'I could not reach your Dexter account just now. Please try again shortly.',
   // A Dexter API failure mid-call is never blamed on the voice. The full sentence is built from the
@@ -263,6 +264,9 @@ export function createBrokerServer(options: BrokerServerOptions) {
   // A restart recovers only the durable captures and reply-read obligations.
   const selectedHosts = new Map<string, GenerationVoiceSession>();
   let accepting = true;
+  // Once this process has handed Twilio the refusal speech, maintenance observes
+  // the leg instead of interrupting or restarting that speech on its next pass.
+  const phoneRefusalSpeech = new Set<string>();
   const providerFinished = (call: BrokerCall) => call.verificationCallback ? Boolean(call.verificationCallback.providerTerminal) : call.outboundObservation
     ? outboundSettlementFromObservation(call)?.state === 'settled'
     : call.callSid && managedNotification(call)
@@ -275,6 +279,7 @@ export function createBrokerServer(options: BrokerServerOptions) {
     catch (error) { console.error('[dexter-broker] Hark receipt journal unavailable', { code: safeFailure(error).code }); }
   };
   function observeProviderState(id: string, status: HarkProviderStatus, timing?: HarkEndedTiming): BrokerCall {
+    if (terminalCallStatuses.has(status)) phoneRefusalSpeech.delete(id);
     const call = store.get(id)!;
     const observedAt = new Date().toISOString();
     if (call.inboundBilling) return store.observeInboundProvider(id, status, observedAt);
@@ -542,6 +547,23 @@ export function createBrokerServer(options: BrokerServerOptions) {
   async function endWaitingCall(call: BrokerCall): Promise<void> {
     if (!call.callSid || active.has(call.id) || claimed.has(call.id) || providerFinished(call)) return;
     try {
+      if (call.inbound?.localStop?.reason === 'phone_tab_required') {
+        // Maintenance can win the race with the greeting stream's trailing redirect.
+        // Give that leg the same explanation instead of ending it silently.
+        if (phoneRefusalSpeech.has(call.id)) {
+          const observed = await provider.calls(call.callSid).fetch();
+          if (observed.sid !== call.callSid || observed.accountSid !== config.twilioAccountSid
+            || observed.from !== call.number || observed.to !== config.from) throw new Error('provider_call_identity_mismatch');
+          observeProviderRecord(store.get(call.id)!, observed, 'authenticated_fetch');
+          return;
+        }
+        phoneRefusalSpeech.add(call.id);
+        let spoken;
+        try { spoken = await provider.calls(call.callSid).update({ twiml: fallbackTwiml(SPOKEN_STOPS.phone_tab_required!) }); }
+        catch (error) { phoneRefusalSpeech.delete(call.id); throw error; }
+        if (providerStates.has(spoken.status as CallStatus)) observeProviderRecord(store.get(call.id)!, spoken, 'authenticated_update');
+        return;
+      }
       const ended = await provider.calls(call.callSid).update({ status: 'completed' });
       const current = store.get(call.id)!;
       if (ended.status === 'completed') observeProviderRecord(current, ended, 'authenticated_update');
@@ -555,7 +577,12 @@ export function createBrokerServer(options: BrokerServerOptions) {
     if (!options.inboundAttachment || !accepting) inbound.stopLocal(call.id, 'service_unavailable');
     if (call.inbound?.localStop || call.endedAt || terminalCallStatuses.has(call.status) || !options.inboundAttachment || !accepting) {
       // Hanging up this HTTP leg and closing its account attachment have separate receipts.
-      xml(response, '<Response><Hangup/></Response>');
+      const phoneRefusal = call.inbound?.localStop?.reason === 'phone_tab_required' && !providerFinished(call);
+      if (phoneRefusal) {
+        phoneRefusalSpeech.add(call.id);
+        response.once('close', () => { if (!response.writableFinished) phoneRefusalSpeech.delete(call.id); });
+      }
+      xml(response, phoneRefusal ? fallbackTwiml(SPOKEN_STOPS.phone_tab_required!) : '<Response><Hangup/></Response>');
       await inbound.stop(call.id, call.inbound?.localStop?.reason ?? 'provider_terminal').catch(error => {
         store.update(call.id, { failure: safeFailure(error) });
       });

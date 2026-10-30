@@ -8,6 +8,7 @@ export interface InboundTimingEvent {
   event: 'broker_inbound_timing'; version: 1; callId: string; attemptId: string; spanId: string;
   stage: InboundTimingStage; phase: 'started' | 'completed' | 'failed' | 'aborted'; observedAt: string;
   elapsedMs?: number; primaryApiStatus?: number;
+  primaryApiCode?: string; primaryApiRemoteCode?: string; primaryApiRetryable?: boolean;
 }
 export type InboundTimingSink = (event: InboundTimingEvent) => void;
 
@@ -22,10 +23,15 @@ export function createInboundAttemptTiming(callId: string, sink?: InboundTimingS
       try {
         const primaryApiStatus = error instanceof PrimaryApiError && Number.isInteger(error.status)
           && error.status! >= 100 && error.status! <= 599 ? error.status : undefined;
+        const primary = error instanceof PrimaryApiError ? error : undefined;
+        const remoteCode = primary?.remoteCode && /^[a-z][a-z0-9_]{1,79}$/.test(primary.remoteCode) ? primary.remoteCode : undefined;
         sink?.({ event: 'broker_inbound_timing', version: 1, callId, attemptId, spanId, stage, phase,
           observedAt: new Date(clock.wall()).toISOString(),
           ...(phase === 'started' ? {} : { elapsedMs: Math.round(Math.max(0, clock.monotonic() - began) * 1000) / 1000 }),
-          ...(primaryApiStatus === undefined ? {} : { primaryApiStatus }) });
+          ...(primaryApiStatus === undefined ? {} : { primaryApiStatus }),
+          ...(primary === undefined ? {} : { primaryApiCode: primary.code }),
+          ...(remoteCode === undefined ? {} : { primaryApiRemoteCode: remoteCode }),
+          ...(primary?.retryable === undefined ? {} : { primaryApiRetryable: primary.retryable }) });
       } catch { /* Diagnostic output must not alter admission or recovery. */ }
     }
     emit('started');

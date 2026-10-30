@@ -84,7 +84,7 @@ export interface BrokerCall {
   verificationCallback?: VerificationCallbackJournal;
   restrictedSetup?: RestrictedSetupJournal;
   voiceOpening?: { status: string; eventId?: string; reason?: string };
-  finalized?: boolean; failure?: { code: string; message: string };
+  finalized?: boolean; failure?: { code: string; message: string; status?: number; remoteCode?: string; retryable?: boolean };
   /** Why the call ended (the first stop reason), and each voice session's real close reason. */
   endReason?: string;
   voiceCloses?: import('./voiceEvidence.js').VoiceCloseRecord[];
