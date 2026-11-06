@@ -3,9 +3,11 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { spawnSync } from 'node:child_process';
+import type { PrimarySmsClient } from '../src/broker/primaryApi.js';
 import { pathToFileURL } from 'node:url';
 import Twilio from 'twilio';
-import { createBrokerSmsBridge } from '../src/broker/sms.js';
+import { createBrokerSmsBridge, startBrokerSmsBridge } from '../src/broker/sms.js';
 import { createBrokerServer } from '../src/broker/server.js';
 import { SmsService, SMS_DISCLOSURE_VERSION, type SmsOptions } from '../src/sms/SmsService.js';
 import type { BrokerConfig } from '../src/broker/config.js';
@@ -17,7 +19,8 @@ function settings(t: test.TestContext) {
   const stateHome = path.join(os.homedir(), '.local/state');
   fs.mkdirSync(stateHome, { recursive: true });
   const dir = fs.mkdtempSync(path.join(stateHome, 'broker-sms-test-'));
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const close: Array<() => Promise<void>> = [];
+  t.after(async () => { for (const stop of close.reverse()) await stop(); fs.rmSync(dir, { recursive: true, force: true }); });
   const env: NodeJS.ProcessEnv = {
     DEXTER_SMS_STATE_PATH: path.join(dir, 'sms.json'), DEXTER_SMS_INTERNAL_SECRET: SECRET,
     DEXTER_SMS_ENROLLMENT_ENABLED: 'true', DEXTER_SMS_SEND_ENABLED: 'false',
@@ -36,11 +39,11 @@ function settings(t: test.TestContext) {
     messagingServiceSid: env.TWILIO_MESSAGING_SERVICE_SID!, publicBaseUrl: BASE,
     provider: { async startVerification() {}, async checkVerification() { return true; }, async send() { throw Error('unexpected_send'); } },
   };
-  return { dir, env, calls, clients, options };
+  return { dir, env, calls, clients, options, close };
 }
-async function serve(t: test.TestContext, f: ReturnType<typeof settings>) {
-  const sms = await createBrokerSmsBridge(f.env, path.join(f.dir, 'release'), f.clients);
-  assert.ok(sms);
+async function serve(t: test.TestContext, f: ReturnType<typeof settings>, primary?: PrimarySmsClient, isolateFailure = false) {
+  const sms = await (isolateFailure ? startBrokerSmsBridge : createBrokerSmsBridge)(f.env, path.join(f.dir, 'release'), f.clients, primary);
+  if (!isolateFailure) assert.ok(sms);
   const config: BrokerConfig = { host: '127.0.0.1', port: 0, publicOrigin: BASE, stateDir: path.join(f.dir, 'calls'),
     controlToken: 'c'.repeat(40), apiKey: 'fixture', model: 'fixture', voice: 'marin',
     twilioAccountSid: ACCOUNT, twilioAuthToken: TOKEN, from: SENDER,
@@ -48,7 +51,7 @@ async function serve(t: test.TestContext, f: ReturnType<typeof settings>) {
   const broker = createBrokerServer({ config, sms });
   await new Promise<void>(resolve => broker.server.listen(0, '127.0.0.1', resolve));
   const origin = `http://127.0.0.1:${(broker.server.address() as { port: number }).port}`;
-  t.after(async () => { await broker.close(); });
+  f.close.push(() => broker.close());
   const request = (action: string, body?: unknown, client = CLIENT, secret = SECRET) => fetch(origin + '/internal/sms/' + action, {
     method: body === undefined ? 'GET' : 'POST', headers: { 'content-type': 'application/json',
       'x-dexter-sms-internal-secret': secret, 'x-dexter-sms-client-id': client },
@@ -170,4 +173,66 @@ test('shutdown retains ownership through an in-flight provider verification', as
   await assert.rejects(createBrokerSmsBridge(f.env, '/unused', f.clients), /sms_state_admission_failed/);
   finish(); assert.equal((await response).status, 200); await closing;
   const next = await createBrokerSmsBridge(f.env, '/unused', f.clients); assert.ok(next); await next.close();
+});
+
+
+test('startup failure exits non-zero even with an open handle', () => {
+  const result = spawnSync(process.execPath, ['--import', 'tsx', '--import',
+    'data:text/javascript,setInterval(() => {}, 1000)', 'src/broker/main.ts'], {
+    cwd: process.cwd(), env: { PATH: process.env.PATH, BROKER_ENV_FILE: '/nonexistent-test-env' },
+    encoding: 'utf8', timeout: 10_000,
+  });
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 1);
+  assert.equal(result.signal, null);
+  assert.match(result.stderr, /Missing BROKER_CONTROL_TOKEN/);
+});
+
+test('SMS initialization failure preserves voice HTTP listener and signed call handling', async t => {
+  const f = settings(t);
+  f.env.DEXTER_SMS_STATE_PATH = undefined;
+  const server = await serve(t, f, undefined, true);
+  assert.equal(server.sms, undefined);
+  const response = await server.webhook('/broker/incoming-call', {
+    AccountSid: ACCOUNT, CallSid: 'CA' + '9'.repeat(32), From: PHONE, To: SENDER,
+    Direction: 'inbound', CallStatus: 'ringing',
+  });
+  assert.equal(response.status, 200);
+  assert.match(await response.text(), /<Response>/);
+  assert.equal(f.calls.sends, 0);
+});
+
+test('broker acknowledges inbound SMS before Primary finishes and sends the answer separately once', async t => {
+  const f = settings(t);
+  f.env.DEXTER_SMS_SEND_ENABLED = 'true';
+  f.env.DEXTER_SMS_CAMPAIGN_APPROVED = 'true';
+  f.env.DEXTER_SMS_ADVANCED_OPT_OUT_CONFIGURED = 'true';
+  const sends: string[] = [];
+  f.clients.messaging.messages.create = (async (input: { body: string }) => {
+    sends.push(input.body); return { sid: MESSAGE, status: 'queued' };
+  }) as any;
+  let finish!: () => void;
+  const held = new Promise<void>(resolve => { finish = resolve; });
+  let turns = 0;
+  const server = await serve(t, f, { async turn(input) {
+    turns++;
+    assert.deepEqual(input, { phone: PHONE, messageSid: MESSAGE, text: 'Balance?' });
+    await held;
+    return { state: 'completed', text: 'You have 12 USDC.' };
+  } });
+  const proof = await verify(server);
+  await server.request('enroll', { proofToken: proof.proofToken, consent: true, disclosureVersion: SMS_DISCLOSURE_VERSION });
+  sends.length = 0;
+  const input = { AccountSid: ACCOUNT, MessageSid: MESSAGE, From: PHONE, To: SENDER, Body: 'Balance?' };
+  const response = await server.webhook('/sms/incoming', input);
+  assert.equal(response.status, 200);
+  assert.doesNotMatch(await response.text(), /<Message>/);
+  assert.equal(sends.length, 0, 'webhook completion does not wait for the answer');
+  finish();
+  for (let attempt = 0; attempt < 100 && sends.length === 0; attempt++) await new Promise(resolve => setTimeout(resolve, 20));
+  assert.deepEqual(sends, ['Dexter: You have 12 USDC.\nReply STOP to opt out. HELP for help.']);
+  assert.equal((await server.webhook('/sms/incoming', input)).status, 200);
+  await server.sms!.close();
+  assert.equal(turns, 1);
+  assert.equal(sends.length, 1);
 });
